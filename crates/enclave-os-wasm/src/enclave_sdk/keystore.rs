@@ -26,6 +26,7 @@ use std::collections::BTreeMap;
 use std::string::String;
 use std::vec::Vec;
 
+use crate::wasmtime;
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{self, EcdsaKeyPair, KeyPair};
 

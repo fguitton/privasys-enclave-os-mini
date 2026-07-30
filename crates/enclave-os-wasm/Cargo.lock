@@ -349,7 +349,6 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
- "wasmtime",
 ]
 
 [[package]]

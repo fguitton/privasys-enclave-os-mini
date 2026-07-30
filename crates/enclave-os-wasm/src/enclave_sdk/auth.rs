@@ -21,6 +21,7 @@
 use std::string::String;
 use std::vec::Vec;
 
+use crate::wasmtime;
 use wasmtime::component::Linker;
 use wasmtime::StoreContextMut;
 

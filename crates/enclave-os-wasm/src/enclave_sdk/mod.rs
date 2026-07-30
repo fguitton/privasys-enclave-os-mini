@@ -37,6 +37,7 @@ pub mod keystore;
 pub use crate::wasi::AppContext;
 pub use keystore::{KeyMaterial, KeyStore};
 
+use crate::wasmtime;
 use wasmtime::component::Linker;
 
 /// Register all `privasys:enclave-os@0.1.0` host function implementations.

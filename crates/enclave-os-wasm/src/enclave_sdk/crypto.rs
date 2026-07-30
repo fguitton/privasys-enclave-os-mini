@@ -31,6 +31,7 @@
 use std::string::String;
 use std::vec::Vec;
 
+use crate::wasmtime;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
 use ring::digest;
 use ring::hmac;

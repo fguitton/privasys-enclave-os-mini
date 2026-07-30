@@ -66,6 +66,8 @@
 //! - Thread-local storage via `sgx_tstd::thread_local!`
 //! - Stub unwind registration
 
+extern crate honest_wasmtime_profile as wasmtime;
+
 pub mod enclave_sdk;
 pub mod engine;
 pub mod jwks_fetcher;

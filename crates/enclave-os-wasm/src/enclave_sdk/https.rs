@@ -31,6 +31,7 @@
 use std::string::String;
 use std::vec::Vec;
 
+use crate::wasmtime;
 use wasmtime::component::{HasSelf, Linker};
 
 use enclave_os_egress::client;

@@ -29,10 +29,11 @@ use std::collections::BTreeMap;
 use std::string::String;
 use std::vec::Vec;
 
-use wasmtime::component::{Component, Linker};
-use wasmtime::{Config, Engine, Store};
+use honest_wasmtime_profile::wasmtime::component::{Component, Linker};
+use honest_wasmtime_profile::wasmtime::{Engine, Store};
 
 use crate::wasi::AppContext;
+use crate::wasmtime;
 use enclave_os_common::types::AEAD_KEY_SIZE;
 
 // ---------------------------------------------------------------------------
@@ -67,67 +68,10 @@ impl WasmEngine {
     /// - Conservative memory limits suitable for SGX EPC
     /// - No CoW image init (no mmap file backing in SGX)
     pub fn new() -> Result<Self, String> {
-        let mut config = Config::new();
-
-        // ── Core settings ──────────────────────────────────────────
-        config.wasm_component_model(true);
-        config.wasm_multi_memory(true);
-        config.wasm_simd(true);
-
-        // ── SGX-appropriate limits ─────────────────────────────────
-        // SGX Enclave Page Cache (EPC) is limited.  Conservative defaults
-        // prevent a single WASM app from exhausting enclave memory.
-        //
-        // memory_reservation:
-        //   Max size of a single linear memory.  4 MiB is generous for
-        //   most apps and avoids over-committing EPC.
-        config.memory_reservation(4 * 1024 * 1024);
-
-        // memory_guard_size:
-        //   Guard pages after each memory.  Reduced from the default 2 GiB
-        //   because SGX doesn't have virtual memory overcommit.
-        config.memory_guard_size(64 * 1024);
-
-        // ── No CoW / no disk-backed images ─────────────────────────
-        config.memory_init_cow(false);
-
-        // ── Pinned WASM proposal set ───────────────────────────────
-        // Set the enabled proposals explicitly rather than inheriting
-        // wasmtime's shifting per-version defaults. This MUST stay in lock-step
-        // with the AOT compiler's `build_engine_config` (enclave-os-wasm-compile
-        // / wasm-precompile): a mismatch makes `Component::deserialize` reject
-        // the `.cwasm`.
-        //
-        // (The `threads` proposal is compiled out — the `threads` cargo feature
-        // is not enabled — so shared-memory threads are already unavailable,
-        // which suits SGX's single-thread-per-TCS model.)
-        // Exception-handling proposal (wasmtime 47+, requires the `gc` feature).
-        // Enabled so apps can use try/catch; unwinding uses wasmtime's tail-call
-        // exception ABI (the `unwinder` crate), not the host unwinder — so it
-        // works even though our host `UnwindRegistration` is a no-op in SGX.
-        config.wasm_gc(true);
-        config.wasm_function_references(true);
-        config.wasm_exceptions(true);
-
-        // Fuel metering — compute billing's primary dimension. Without this,
-        // set_fuel/get_fuel error (silently .ok()'d) and every call meters 0
-        // fuel, leaving compute unbilled and the per-call max_fuel budget
-        // unenforced (a runaway call could spin forever). Enabled in
-        // lock-step with the reproducible-app-builder AOT config: a
-        // fuel-enabled runtime rejects .cwasm artifacts compiled without
-        // fuel support, so apps built before the builder flag must be
-        // rebuilt before deploying to this runtime.
-        config.consume_fuel(true);
-        // The host unwinder is a no-op stub in SGX (see sgx_platform.rs), so the
-        // native `.eh_frame` unwind tables baked into each `.cwasm` are dead
-        // weight — drop them to shrink artefacts and EPC footprint.
-        config.native_unwind_info(false);
-        // Force explicit (PC-based) bounds checks instead of guard-page signal
-        // traps. In SGX every wasm trap then becomes an explicit trap opcode at a
-        // known PC inside the RWX code pool, which the VEH forwards to wasmtime
-        // uniformly (see sgx_platform.rs) — no faulting-address recovery needed,
-        // and no reliance on SGX guard-page semantics.
-        config.signals_based_traps(false);
+        // The runtime and both host AOT tools consume this sole factory.
+        // Its role-independent descriptor is the compatibility gate for
+        // precompiled native components.
+        let config = honest_wasmtime_profile::canonical_config();
 
         let engine =
             Engine::new(&config).map_err(|e| format!("wasmtime engine init failed: {}", e))?;

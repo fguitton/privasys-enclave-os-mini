@@ -14,6 +14,7 @@
 //! - **input-stream** / **output-stream** (`wasi:io/streams`) — byte
 //!   streams backed by AppContext I/O buffers, sockets, or the KV store.
 
+use crate::wasmtime;
 use wasmtime::component::{Linker, Resource, ResourceType};
 use wasmtime::{AsContextMut, StoreContextMut};
 

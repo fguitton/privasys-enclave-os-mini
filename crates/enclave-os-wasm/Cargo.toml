@@ -29,43 +29,6 @@ enclave-os-fido2 = { path = "../enclave-os-fido2", optional = true }
 # Per-app role management (optional — enclave-managed RBAC for FIDO2 users)
 enclave-os-app-auth = { path = "../enclave-os-app-auth", optional = true }
 
-# Wasmtime with SGX support (Privasys fork, `sgx` branch).
-#
-# The fork adds a `target_vendor = "teaclave"` check in `sys/mod.rs`
-# to route to `sys::custom` instead of `sys::unix`, and an `sgx` feature
-# that enables `custom-virtual-memory` + `custom-native-signals`.
-#
-# Our `sgx_platform.rs` then provides the `#[no_mangle] extern "C"`
-# symbols that wasmtime's `sys::custom::capi` declares:
-#   - Memory: RWX code pool (.wasm_code section) + heap allocation
-#   - Traps: sgx_register_exception_handler (VEH)
-#   - TLS: std::thread_local!  (→ sgx_tstd)
-#
-# Reference: https://github.com/bytecodealliance/wasmtime/commit/fbbcd2ac
-#
-# Features:
-#   component-model  — Component Model / WIT support for typed interfaces
-#   runtime          — the core execution engine
-#   sgx              — routes to sys::custom + enables EDMM/VEH C API
-#
-# Excluded features:
-#   cranelift        — not needed; AOT-only (pre-compiled components)
-#   async            — not needed; synchronous dispatch only
-#   pooling-allocator— complex SGX memory constraints
-#   cache            — no filesystem in SGX
-#   wat              — text format parsing not needed at runtime
-wasmtime = { git = "https://github.com/Privasys/wasmtime", tag = "privasys-v0.2.0", default-features = false, features = [
-    "component-model",
-    "runtime",
-    "std",
-    "sgx",
-    # gc-drc pulls the `gc` feature + the deferred-reference-counting collector.
-    # Required for the WASM exception-handling proposal (exnref is GC-managed)
-    # and the function-references / GC proposals. See engine.rs for the pinned
-    # proposal set.
-    "gc-drc",
-] }
-
 # Crypto (SHA-256 for WASM code hashing, RNG for WASI random)
 ring = "0.17"
 

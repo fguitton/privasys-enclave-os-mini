@@ -32,9 +32,9 @@
 //! ```
 
 use clap::Parser;
+use honest_wasmtime_profile::wasmtime::component::Component;
+use honest_wasmtime_profile::wasmtime::Engine;
 use std::path::PathBuf;
-use wasmtime::{Config, Engine};
-use wasmtime::component::Component;
 
 #[derive(Parser)]
 #[command(name = "enclave-os-wasm-compile")]
@@ -47,43 +47,6 @@ struct Cli {
     /// Defaults to `<input>.cwasm`.
     #[arg(short, long)]
     output: Option<PathBuf>,
-}
-
-/// Build the wasmtime Engine configuration.
-///
-/// **This MUST stay in sync with `WasmEngine::new()` in
-/// `crates/enclave-os-wasm/src/engine.rs`.**
-///
-/// Any mismatch will cause `Component::deserialize` inside the
-/// enclave to fail with a configuration error.
-fn build_engine_config() -> Config {
-    let mut config = Config::new();
-
-    // ── Core settings ──────────────────────────────────────────
-    config.wasm_component_model(true);
-    config.wasm_multi_memory(true);
-    config.wasm_simd(true);
-
-    // Pinned proposal set + SGX codegen — MUST match engine.rs.
-    config.wasm_gc(true);
-    config.wasm_function_references(true);
-    config.wasm_exceptions(true);
-    config.native_unwind_info(false);
-    config.signals_based_traps(false);
-
-    // ── SGX-appropriate limits ─────────────────────────────────
-    config.memory_reservation(4 * 1024 * 1024);
-    config.memory_guard_size(64 * 1024);
-
-    // ── No CoW / no disk-backed images ─────────────────────────
-    config.memory_init_cow(false);
-
-    // ── Optimization level ─────────────────────────────────────
-    // Use Speed for AOT — compilation time is not a concern on the
-    // host, and the generated code runs faster inside the enclave.
-    config.cranelift_opt_level(wasmtime::OptLevel::Speed);
-
-    config
 }
 
 fn main() {
@@ -108,7 +71,7 @@ fn main() {
     );
 
     // Create engine with matching config
-    let config = build_engine_config();
+    let config = honest_wasmtime_profile::canonical_config();
     let engine = Engine::new(&config).unwrap_or_else(|e| {
         eprintln!("error: engine creation failed: {}", e);
         std::process::exit(1);
@@ -116,10 +79,12 @@ fn main() {
 
     // AOT compile
     eprintln!("Compiling...");
-    let cwasm = engine.precompile_component(&wasm_bytes).unwrap_or_else(|e| {
-        eprintln!("error: compilation failed: {}", e);
-        std::process::exit(1);
-    });
+    let cwasm = engine
+        .precompile_component(&wasm_bytes)
+        .unwrap_or_else(|e| {
+            eprintln!("error: compilation failed: {}", e);
+            std::process::exit(1);
+        });
 
     // Verify round-trip (optional sanity check)
     unsafe {
@@ -135,10 +100,6 @@ fn main() {
         std::process::exit(1);
     });
 
-    eprintln!(
-        "Output: {} ({} bytes)",
-        output.display(),
-        cwasm.len()
-    );
+    eprintln!("Output: {} ({} bytes)", output.display(), cwasm.len());
     eprintln!("Done.");
 }

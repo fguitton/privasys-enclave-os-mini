@@ -47,6 +47,7 @@ use std::vec::Vec;
 use ring::digest;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
+use crate::wasmtime;
 use wasmtime::component::{Component, Func, Val};
 use wasmtime::Store;
 

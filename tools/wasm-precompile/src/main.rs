@@ -20,41 +20,7 @@ use std::env;
 use std::fs;
 use std::process;
 
-use wasmtime::{Config, Engine};
-
-/// Build the same wasmtime `Config` the enclave uses.
-///
-/// Keep this in sync with `WasmEngine::new()` in
-/// `crates/enclave-os-wasm/src/engine.rs`.
-fn enclave_compatible_config() -> Config {
-    let mut config = Config::new();
-
-    // ── Core settings ──────────────────────────────────────────
-    config.wasm_component_model(true);
-    config.wasm_multi_memory(true);
-    config.wasm_simd(true);
-
-    // ── Pinned WASM proposal set (MUST match engine.rs) ────────
-    config.wasm_gc(true);
-    config.wasm_function_references(true);
-    config.wasm_exceptions(true);
-
-    // ── SGX-appropriate limits ─────────────────────────────────
-    config.memory_reservation(4 * 1024 * 1024);
-    config.memory_guard_size(64 * 1024);
-
-    // ── No CoW / no disk-backed images ─────────────────────────
-    config.memory_init_cow(false);
-
-    // ── SGX codegen (MUST match engine.rs) ─────────────────────
-    // No host `.eh_frame` unwind tables (the enclave's host unwinder is a
-    // no-op), and explicit (PC-based) bounds checks so every wasm trap is an
-    // explicit trap opcode the SGX VEH can forward to wasmtime.
-    config.native_unwind_info(false);
-    config.signals_based_traps(false);
-
-    config
-}
+use honest_wasmtime_profile::wasmtime::Engine;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -77,30 +43,24 @@ fn main() {
         process::exit(1);
     });
 
-    eprintln!(
-        "Input:  {} ({} bytes)",
-        input_path,
-        wasm_bytes.len()
-    );
+    eprintln!("Input:  {} ({} bytes)", input_path, wasm_bytes.len());
 
     // Create engine with enclave-matching config
-    let config = enclave_compatible_config();
+    let config = honest_wasmtime_profile::canonical_config();
     let engine = Engine::new(&config).unwrap_or_else(|e| {
         eprintln!("Engine creation failed: {}", e);
         process::exit(1);
     });
 
     // AOT-compile the component
-    let precompiled = engine.precompile_component(&wasm_bytes).unwrap_or_else(|e| {
-        eprintln!("Precompilation failed: {}", e);
-        process::exit(1);
-    });
+    let precompiled = engine
+        .precompile_component(&wasm_bytes)
+        .unwrap_or_else(|e| {
+            eprintln!("Precompilation failed: {}", e);
+            process::exit(1);
+        });
 
-    eprintln!(
-        "Output: {} ({} bytes)",
-        output_path,
-        precompiled.len()
-    );
+    eprintln!("Output: {} ({} bytes)", output_path, precompiled.len());
 
     // Write the precompiled artifact
     fs::write(&output_path, &precompiled).unwrap_or_else(|e| {

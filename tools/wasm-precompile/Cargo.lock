@@ -815,7 +815,6 @@ name = "wasm-precompile"
 version = "0.1.0"
 dependencies = [
  "honest-wasmtime-profile",
- "wasmtime",
 ]
 
 [[package]]
