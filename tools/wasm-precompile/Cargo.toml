@@ -13,6 +13,8 @@ name = "wasm-precompile"
 path = "src/main.rs"
 
 [dependencies]
+honest-wasmtime-profile = { path = "../../crates/honest-wasmtime-profile", features = ["aot"] }
+
 # Wasmtime with Cranelift — needed to compile, NOT needed at runtime.
 # The enclave only deserialises; this tool does the heavy lifting.
 wasmtime = { git = "https://github.com/Privasys/wasmtime", tag = "privasys-v0.2.0", default-features = false, features = [

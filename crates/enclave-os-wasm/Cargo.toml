@@ -21,6 +21,7 @@ name = "enclave_os_wasm"
 enclave-os-common = { path = "../../common", features = ["jwt"] }
 enclave-os-kvstore = { path = "../enclave-os-kvstore" }
 enclave-os-egress = { path = "../enclave-os-egress" }
+honest-wasmtime-profile = { path = "../honest-wasmtime-profile", features = ["runtime-sgx"] }
 
 # FIDO2 session token validation (optional — only needed when apps use FIDO2 auth)
 enclave-os-fido2 = { path = "../enclave-os-fido2", optional = true }

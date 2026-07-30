@@ -1,0 +1,25 @@
+# Copyright (c) Privasys. All rights reserved.
+# Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
+
+[package]
+name = "honest-wasmtime-profile"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "AGPL-3.0"
+description = "Shared Wasmtime role boundary for Honest enclave and AOT builds."
+
+[workspace]
+
+[features]
+default = []
+runtime-sgx = ["wasmtime/sgx"]
+aot = ["wasmtime/cranelift"]
+
+[dependencies]
+wasmtime = { git = "https://github.com/Privasys/wasmtime", tag = "privasys-v0.2.0", default-features = false, features = [
+    "component-model",
+    "runtime",
+    "std",
+    "gc-drc",
+] }
