@@ -3,20 +3,23 @@
 
 //! Enclave-side RPC client.
 //!
-//! Wraps the SPSC queues to provide a typed, synchronous call interface.
-//! Each method encodes an RPC request, sends it to the host via the
-//! `enc_to_host` queue, calls `ocall_notify()` to wake the host dispatcher,
-//! and then spin-waits for the matching response on the `host_to_enc` queue.
+//! Wraps the SPSC queues to provide typed host calls. Legacy Mini services use
+//! the synchronous interface. Honest's control-plane Ready persistence uses a
+//! separate polled interface: submission performs one `try_send`, and each
+//! poll performs at most one `try_recv`.
 //!
 //! This replaces all the individual OCALL wrappers with a single
 //! message-passing channel.
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use std::string::String;
 use std::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
 
-use enclave_os_common::queue::{SpscProducer, SpscConsumer};
-use enclave_os_common::rpc::{self, RpcMethod};
+use enclave_os_common::queue::{SpscConsumer, SpscProducer};
+use enclave_os_common::rpc::{
+    self, PersistRaftReadyBatch, PersistRaftReadyResponseError, PersistedRaftReadyBatch,
+    RaftReadyBatchCodecError, RpcMethod,
+};
 
 // ---------------------------------------------------------------------------
 //  External: the single OCALL
@@ -51,6 +54,32 @@ pub struct RpcClient {
     request_tx: SpscProducer,
     /// Receives responses from the host.
     response_rx: SpscConsumer,
+    /// Zero when idle, otherwise the only request allowed on these SPSC
+    /// endpoints. This prevents a legacy synchronous call from stealing the
+    /// response of a polled control operation.
+    in_flight_request_id: AtomicU64,
+}
+
+/// Token owned by the control scheduler while one Ready batch is in flight.
+///
+/// It deliberately exposes no request ID: callers can only return it to the
+/// same [`RpcClient`] for a bounded poll.
+#[derive(Debug)]
+pub struct PendingRaftReadyBatch {
+    request_id: u64,
+    batch_id: u64,
+}
+
+/// Fail-closed errors from the polled Ready persistence interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolledRaftReadyError {
+    InvalidRequest(RaftReadyBatchCodecError),
+    Busy,
+    QueueFull,
+    NotPending,
+    MalformedResponse,
+    UnexpectedResponse,
+    HostStatus(i32),
 }
 
 // SAFETY: RpcClient uses SPSC queues backed by shared memory pointers.
@@ -69,6 +98,85 @@ impl RpcClient {
         Self {
             request_tx,
             response_rx,
+            in_flight_request_id: AtomicU64::new(0),
+        }
+    }
+
+    fn try_reserve_request(&self) -> Result<u64, PolledRaftReadyError> {
+        let request_id = next_req_id();
+        self.in_flight_request_id
+            .compare_exchange(0, request_id, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| request_id)
+            .map_err(|_| PolledRaftReadyError::Busy)
+    }
+
+    fn release_request(&self, request_id: u64) {
+        let _ = self.in_flight_request_id.compare_exchange(
+            request_id,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    // ====================================================================
+    //  Polled control-plane persistence
+    // ====================================================================
+
+    /// Try to submit one atomic Raft Ready batch without waiting for queue
+    /// capacity or a host response.
+    pub fn try_persist_raft_ready_batch(
+        &self,
+        batch: &PersistRaftReadyBatch,
+    ) -> Result<PendingRaftReadyBatch, PolledRaftReadyError> {
+        let payload = rpc::encode_persist_raft_ready_batch(batch)
+            .map_err(PolledRaftReadyError::InvalidRequest)?;
+        let request_id = self.try_reserve_request()?;
+        let message = rpc::encode_request(request_id, RpcMethod::PersistRaftReadyBatch, &payload);
+        if self.request_tx.try_send(&message).is_err() {
+            self.release_request(request_id);
+            return Err(PolledRaftReadyError::QueueFull);
+        }
+        notify_host();
+        Ok(PendingRaftReadyBatch {
+            request_id,
+            batch_id: batch.batch_id,
+        })
+    }
+
+    /// Poll one submitted Ready batch.
+    ///
+    /// `Ok(None)` means the host has not replied. Every call consumes at most
+    /// one response frame and never waits. A malformed, stale, mismatched or
+    /// negative response terminates the operation fail-closed.
+    pub fn poll_persist_raft_ready_batch(
+        &self,
+        pending: &PendingRaftReadyBatch,
+    ) -> Result<Option<PersistedRaftReadyBatch>, PolledRaftReadyError> {
+        if self.in_flight_request_id.load(Ordering::Acquire) != pending.request_id {
+            return Err(PolledRaftReadyError::NotPending);
+        }
+        let Some(raw_response) = self.response_rx.try_recv() else {
+            return Ok(None);
+        };
+        self.release_request(pending.request_id);
+
+        match rpc::decode_persist_raft_ready_response(
+            &raw_response,
+            pending.request_id,
+            pending.batch_id,
+        ) {
+            Ok(persisted) => Ok(Some(persisted)),
+            Err(PersistRaftReadyResponseError::MalformedResponse) => {
+                Err(PolledRaftReadyError::MalformedResponse)
+            }
+            Err(
+                PersistRaftReadyResponseError::UnexpectedRequestId
+                | PersistRaftReadyResponseError::UnexpectedBatch,
+            ) => Err(PolledRaftReadyError::UnexpectedResponse),
+            Err(PersistRaftReadyResponseError::HostStatus(status)) => {
+                Err(PolledRaftReadyError::HostStatus(status))
+            }
         }
     }
 
@@ -80,7 +188,13 @@ impl RpcClient {
     ///
     /// Returns `(status, payload)` from the host's response.
     fn call(&self, method: RpcMethod, payload: &[u8]) -> (i32, Vec<u8>) {
-        let req_id = next_req_id();
+        let req_id = match self.try_reserve_request() {
+            Ok(request_id) => request_id,
+            // Legacy callers cannot safely interleave with a polled Ready
+            // operation. Return EBUSY instead of blocking the control TCS.
+            Err(PolledRaftReadyError::Busy) => return (-16, Vec::new()),
+            Err(_) => unreachable!("request reservation only returns Busy"),
+        };
         let msg = rpc::encode_request(req_id, method, payload);
 
         // Send
@@ -94,6 +208,7 @@ impl RpcClient {
             let resp_raw = self.response_rx.recv();
             if let Some((resp_id, status, resp_payload)) = rpc::decode_response(&resp_raw) {
                 if resp_id == req_id {
+                    self.release_request(req_id);
                     return (status, resp_payload.to_vec());
                 }
                 // Mismatched ID – shouldn't happen in SPSC, but be safe
@@ -179,7 +294,11 @@ impl RpcClient {
     pub fn kv_put(&self, table: &[u8], enc_key: &[u8], enc_val: &[u8]) -> Result<(), i32> {
         let payload = rpc::encode_kv_put_req(table, enc_key, enc_val);
         let (status, _) = self.call(RpcMethod::KvPut, &payload);
-        if status == 0 { Ok(()) } else { Err(status) }
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(status)
+        }
     }
 
     /// Get an encrypted value from the given table. Returns `Ok(None)` if not found (status == 1).

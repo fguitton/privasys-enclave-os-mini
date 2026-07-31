@@ -35,31 +35,31 @@ use serde::{Deserialize, Serialize};
 #[repr(u16)]
 pub enum RpcMethod {
     // -- Network --
-    NetTcpListen     = 0x0100,
-    NetTcpAccept     = 0x0101,
-    NetTcpConnect    = 0x0102,
-    NetSend          = 0x0103,
-    NetRecv          = 0x0104,
-    NetClose         = 0x0105,
+    NetTcpListen = 0x0100,
+    NetTcpAccept = 0x0101,
+    NetTcpConnect = 0x0102,
+    NetSend = 0x0103,
+    NetRecv = 0x0104,
+    NetClose = 0x0105,
 
     // -- KV Store --
-    KvPut            = 0x0200,
-    KvGet            = 0x0201,
-    KvDelete         = 0x0202,
-    KvListKeys       = 0x0203,
+    KvPut = 0x0200,
+    KvGet = 0x0201,
+    KvDelete = 0x0202,
+    KvListKeys = 0x0203,
     /// Control-role-only synchronous atomic S1/Raft persistence.
     PersistRaftReadyBatch = 0x0204,
 
     // -- Utility --
-    GetCurrentTime   = 0x0300,
-    Log              = 0x0301,
+    GetCurrentTime = 0x0300,
+    Log = 0x0301,
 
     // -- Attestation (DCAP quoting) --
-    QeGetTargetInfo  = 0x0400,
-    QeGetQuote       = 0x0401,
+    QeGetTargetInfo = 0x0400,
+    QeGetQuote = 0x0401,
 
     // -- Lifecycle --
-    Shutdown         = 0xFF00,
+    Shutdown = 0xFF00,
 }
 
 impl RpcMethod {
@@ -223,6 +223,16 @@ pub struct PersistedRaftReadyBatch {
     pub durable_id: u64,
 }
 
+/// Fail-closed validation errors for an outer RPC response carrying a
+/// successful Ready persistence acknowledgement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistRaftReadyResponseError {
+    MalformedResponse,
+    UnexpectedRequestId,
+    HostStatus(i32),
+    UnexpectedBatch,
+}
+
 /// Fail-closed codec errors for Ready persistence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RaftReadyBatchCodecError {
@@ -306,9 +316,7 @@ pub fn encode_persist_raft_ready_batch(
 pub fn decode_persist_raft_ready_batch(
     encoded: &[u8],
 ) -> Result<PersistRaftReadyBatch, RaftReadyBatchCodecError> {
-    if encoded.len() < RAFT_READY_BATCH_HEADER_SIZE
-        || encoded.len() > MAX_RAFT_READY_BATCH_BYTES
-    {
+    if encoded.len() < RAFT_READY_BATCH_HEADER_SIZE || encoded.len() > MAX_RAFT_READY_BATCH_BYTES {
         return Err(RaftReadyBatchCodecError::BatchBound);
     }
     let version = u16::from_le_bytes(
@@ -415,6 +423,35 @@ pub fn decode_persisted_raft_ready_batch(encoded: &[u8]) -> Option<PersistedRaft
     })
 }
 
+/// Validate the exact outer response frame and bind it to the submitted
+/// request and batch. Profile v1 requires the durable ID to equal the batch
+/// ID, so a host cannot acknowledge an unrelated predecessor chain.
+pub fn decode_persist_raft_ready_response(
+    encoded: &[u8],
+    expected_request_id: u64,
+    expected_batch_id: u64,
+) -> Result<PersistedRaftReadyBatch, PersistRaftReadyResponseError> {
+    let Some((request_id, status, payload)) = decode_response(encoded) else {
+        return Err(PersistRaftReadyResponseError::MalformedResponse);
+    };
+    if RESP_HEADER_SIZE + payload.len() != encoded.len() {
+        return Err(PersistRaftReadyResponseError::MalformedResponse);
+    }
+    if request_id != expected_request_id {
+        return Err(PersistRaftReadyResponseError::UnexpectedRequestId);
+    }
+    if status != 0 {
+        return Err(PersistRaftReadyResponseError::HostStatus(status));
+    }
+    let Some(persisted) = decode_persisted_raft_ready_batch(payload) else {
+        return Err(PersistRaftReadyResponseError::MalformedResponse);
+    };
+    if persisted.batch_id != expected_batch_id || persisted.durable_id != expected_batch_id {
+        return Err(PersistRaftReadyResponseError::UnexpectedBatch);
+    }
+    Ok(persisted)
+}
+
 // ========================================================================
 //  Typed request/response payloads (compact binary encoding)
 // ========================================================================
@@ -431,15 +468,21 @@ pub fn encode_net_tcp_listen_req(port: u16, backlog: i32) -> Vec<u8> {
     buf
 }
 pub fn decode_net_tcp_listen_req(p: &[u8]) -> Option<(u16, i32)> {
-    if p.len() < 6 { return None; }
+    if p.len() < 6 {
+        return None;
+    }
     let port = u16::from_le_bytes(p[0..2].try_into().ok()?);
     let backlog = i32::from_le_bytes(p[2..6].try_into().ok()?);
     Some((port, backlog))
 }
 /// Response payload for listen: just the fd (4 bytes), status carries error.
-pub fn encode_fd(fd: i32) -> Vec<u8> { fd.to_le_bytes().to_vec() }
+pub fn encode_fd(fd: i32) -> Vec<u8> {
+    fd.to_le_bytes().to_vec()
+}
 pub fn decode_fd(p: &[u8]) -> Option<i32> {
-    if p.len() < 4 { return None; }
+    if p.len() < 4 {
+        return None;
+    }
     Some(i32::from_le_bytes(p[0..4].try_into().ok()?))
 }
 
@@ -447,7 +490,9 @@ pub fn decode_fd(p: &[u8]) -> Option<i32> {
 pub fn encode_net_tcp_accept_req(listener_fd: i32) -> Vec<u8> {
     listener_fd.to_le_bytes().to_vec()
 }
-pub fn decode_net_tcp_accept_req(p: &[u8]) -> Option<i32> { decode_fd(p) }
+pub fn decode_net_tcp_accept_req(p: &[u8]) -> Option<i32> {
+    decode_fd(p)
+}
 /// Response: [i32 client_fd] [peer_addr as utf8 string]
 pub fn encode_net_tcp_accept_resp(client_fd: i32, peer_addr: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(4 + peer_addr.len());
@@ -456,7 +501,9 @@ pub fn encode_net_tcp_accept_resp(client_fd: i32, peer_addr: &str) -> Vec<u8> {
     buf
 }
 pub fn decode_net_tcp_accept_resp(p: &[u8]) -> Option<(i32, String)> {
-    if p.len() < 4 { return None; }
+    if p.len() < 4 {
+        return None;
+    }
     let fd = i32::from_le_bytes(p[0..4].try_into().ok()?);
     let addr = core::str::from_utf8(&p[4..]).ok()?.to_string();
     Some((fd, addr))
@@ -471,7 +518,9 @@ pub fn encode_net_tcp_connect_req(host: &str, port: u16) -> Vec<u8> {
     buf
 }
 pub fn decode_net_tcp_connect_req(p: &[u8]) -> Option<(String, u16)> {
-    if p.len() < 2 { return None; }
+    if p.len() < 2 {
+        return None;
+    }
     let port = u16::from_le_bytes(p[0..2].try_into().ok()?);
     let host = core::str::from_utf8(&p[2..]).ok()?.to_string();
     Some((host, port))
@@ -486,14 +535,20 @@ pub fn encode_net_send_req(fd: i32, data: &[u8]) -> Vec<u8> {
     buf
 }
 pub fn decode_net_send_req(p: &[u8]) -> Option<(i32, &[u8])> {
-    if p.len() < 4 { return None; }
+    if p.len() < 4 {
+        return None;
+    }
     let fd = i32::from_le_bytes(p[0..4].try_into().ok()?);
     Some((fd, &p[4..]))
 }
 /// Response: number of bytes sent (i32)
-pub fn encode_i32(v: i32) -> Vec<u8> { v.to_le_bytes().to_vec() }
+pub fn encode_i32(v: i32) -> Vec<u8> {
+    v.to_le_bytes().to_vec()
+}
 pub fn decode_i32(p: &[u8]) -> Option<i32> {
-    if p.len() < 4 { return None; }
+    if p.len() < 4 {
+        return None;
+    }
     Some(i32::from_le_bytes(p[0..4].try_into().ok()?))
 }
 
@@ -506,7 +561,9 @@ pub fn encode_net_recv_req(fd: i32, max_len: u32) -> Vec<u8> {
     buf
 }
 pub fn decode_net_recv_req(p: &[u8]) -> Option<(i32, u32)> {
-    if p.len() < 8 { return None; }
+    if p.len() < 8 {
+        return None;
+    }
     let fd = i32::from_le_bytes(p[0..4].try_into().ok()?);
     let max_len = u32::from_le_bytes(p[4..8].try_into().ok()?);
     Some((fd, max_len))
@@ -515,8 +572,12 @@ pub fn decode_net_recv_req(p: &[u8]) -> Option<(i32, u32)> {
 
 // -- NetClose --
 /// Payload: just fd
-pub fn encode_net_close_req(fd: i32) -> Vec<u8> { fd.to_le_bytes().to_vec() }
-pub fn decode_net_close_req(p: &[u8]) -> Option<i32> { decode_fd(p) }
+pub fn encode_net_close_req(fd: i32) -> Vec<u8> {
+    fd.to_le_bytes().to_vec()
+}
+pub fn decode_net_close_req(p: &[u8]) -> Option<i32> {
+    decode_fd(p)
+}
 
 // -- KvPut --
 /// Payload: [u16 table_len] [table] [u32 key_len] [key] [value]
@@ -530,13 +591,19 @@ pub fn encode_kv_put_req(table: &[u8], key: &[u8], value: &[u8]) -> Vec<u8> {
     buf
 }
 pub fn decode_kv_put_req(p: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
-    if p.len() < 2 { return None; }
+    if p.len() < 2 {
+        return None;
+    }
     let table_len = u16::from_le_bytes(p[0..2].try_into().ok()?) as usize;
-    if p.len() < 2 + table_len + 4 { return None; }
+    if p.len() < 2 + table_len + 4 {
+        return None;
+    }
     let table = &p[2..2 + table_len];
     let off = 2 + table_len;
     let key_len = u32::from_le_bytes(p[off..off + 4].try_into().ok()?) as usize;
-    if p.len() < off + 4 + key_len { return None; }
+    if p.len() < off + 4 + key_len {
+        return None;
+    }
     let key = &p[off + 4..off + 4 + key_len];
     let value = &p[off + 4 + key_len..];
     Some((table, key, value))
@@ -553,9 +620,13 @@ pub fn encode_kv_get_req(table: &[u8], key: &[u8]) -> Vec<u8> {
     buf
 }
 pub fn decode_kv_get_req(p: &[u8]) -> Option<(&[u8], &[u8])> {
-    if p.len() < 2 { return None; }
+    if p.len() < 2 {
+        return None;
+    }
     let table_len = u16::from_le_bytes(p[0..2].try_into().ok()?) as usize;
-    if p.len() < 2 + table_len { return None; }
+    if p.len() < 2 + table_len {
+        return None;
+    }
     let table = &p[2..2 + table_len];
     let key = &p[2 + table_len..];
     Some((table, key))
@@ -595,15 +666,21 @@ pub fn encode_kv_list_keys_resp(keys: &[&[u8]]) -> Vec<u8> {
     buf
 }
 pub fn decode_kv_list_keys_resp(p: &[u8]) -> Option<Vec<Vec<u8>>> {
-    if p.len() < 4 { return None; }
+    if p.len() < 4 {
+        return None;
+    }
     let count = u32::from_le_bytes(p[0..4].try_into().ok()?) as usize;
     let mut off = 4;
     let mut keys = Vec::with_capacity(count);
     for _ in 0..count {
-        if off + 4 > p.len() { return None; }
+        if off + 4 > p.len() {
+            return None;
+        }
         let kl = u32::from_le_bytes(p[off..off + 4].try_into().ok()?) as usize;
         off += 4;
-        if off + kl > p.len() { return None; }
+        if off + kl > p.len() {
+            return None;
+        }
         keys.push(p[off..off + kl].to_vec());
         off += kl;
     }
@@ -613,9 +690,13 @@ pub fn decode_kv_list_keys_resp(p: &[u8]) -> Option<Vec<Vec<u8>>> {
 // -- GetCurrentTime --
 /// Request: no payload
 /// Response: [u64 timestamp LE]
-pub fn encode_u64(v: u64) -> Vec<u8> { v.to_le_bytes().to_vec() }
+pub fn encode_u64(v: u64) -> Vec<u8> {
+    v.to_le_bytes().to_vec()
+}
 pub fn decode_u64(p: &[u8]) -> Option<u64> {
-    if p.len() < 8 { return None; }
+    if p.len() < 8 {
+        return None;
+    }
     Some(u64::from_le_bytes(p[0..8].try_into().ok()?))
 }
 
@@ -628,7 +709,9 @@ pub fn encode_log_req(level: i32, message: &str) -> Vec<u8> {
     buf
 }
 pub fn decode_log_req(p: &[u8]) -> Option<(i32, &str)> {
-    if p.len() < 4 { return None; }
+    if p.len() < 4 {
+        return None;
+    }
     let level = i32::from_le_bytes(p[0..4].try_into().ok()?);
     let msg = core::str::from_utf8(&p[4..]).ok()?;
     Some((level, msg))
@@ -1000,7 +1083,7 @@ mod tests {
 
     #[test]
     fn test_rpc_over_spsc_roundtrip() {
-        use crate::queue::{SpscQueueHeader, SpscProducer, SpscConsumer};
+        use crate::queue::{SpscConsumer, SpscProducer, SpscQueueHeader};
 
         fn alloc(cap: u64) -> (SpscProducer, SpscConsumer) {
             let header = Box::into_raw(Box::new(SpscQueueHeader::new(cap)));
@@ -1063,7 +1146,10 @@ mod tests {
         );
         assert_eq!(RpcMethod::from_u16(0x0300), Some(RpcMethod::GetCurrentTime));
         assert_eq!(RpcMethod::from_u16(0x0301), Some(RpcMethod::Log));
-        assert_eq!(RpcMethod::from_u16(0x0400), Some(RpcMethod::QeGetTargetInfo));
+        assert_eq!(
+            RpcMethod::from_u16(0x0400),
+            Some(RpcMethod::QeGetTargetInfo)
+        );
         assert_eq!(RpcMethod::from_u16(0x0401), Some(RpcMethod::QeGetQuote));
         assert_eq!(RpcMethod::from_u16(0xFF00), Some(RpcMethod::Shutdown));
 
@@ -1115,6 +1201,55 @@ mod tests {
         assert_eq!(
             encode_persist_raft_ready_batch(&duplicate),
             Err(RaftReadyBatchCodecError::DuplicateRecord)
+        );
+    }
+
+    #[test]
+    fn raft_ready_response_is_exact_and_bound_to_request_and_batch() {
+        let acknowledgement = PersistedRaftReadyBatch {
+            batch_id: 7,
+            durable_id: 7,
+        };
+        let payload = encode_persisted_raft_ready_batch(acknowledgement);
+        let response = encode_response(11, 0, &payload);
+        assert_eq!(
+            decode_persist_raft_ready_response(&response, 11, 7),
+            Ok(acknowledgement)
+        );
+
+        assert_eq!(
+            decode_persist_raft_ready_response(&response, 12, 7),
+            Err(PersistRaftReadyResponseError::UnexpectedRequestId)
+        );
+        assert_eq!(
+            decode_persist_raft_ready_response(&response, 11, 8),
+            Err(PersistRaftReadyResponseError::UnexpectedBatch)
+        );
+
+        let wrong_durable = encode_response(
+            11,
+            0,
+            &encode_persisted_raft_ready_batch(PersistedRaftReadyBatch {
+                batch_id: 7,
+                durable_id: 6,
+            }),
+        );
+        assert_eq!(
+            decode_persist_raft_ready_response(&wrong_durable, 11, 7),
+            Err(PersistRaftReadyResponseError::UnexpectedBatch)
+        );
+
+        let mut trailing = response.clone();
+        trailing.push(0);
+        assert_eq!(
+            decode_persist_raft_ready_response(&trailing, 11, 7),
+            Err(PersistRaftReadyResponseError::MalformedResponse)
+        );
+
+        let rejected = encode_response(11, -5, &[]);
+        assert_eq!(
+            decode_persist_raft_ready_response(&rejected, 11, 7),
+            Err(PersistRaftReadyResponseError::HostStatus(-5))
         );
     }
 
