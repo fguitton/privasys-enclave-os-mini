@@ -274,7 +274,12 @@ fn endpoint_expected_oids() -> Result<Vec<ExpectedOid>, String> {
     ])
 }
 
-fn request(args: &Args, method: &str, path: &str, body: Option<&[u8]>) -> Result<Vec<u8>, String> {
+fn request_with_status(
+    args: &Args,
+    method: &str,
+    path: &str,
+    body: Option<&[u8]>,
+) -> Result<(u16, Vec<u8>), String> {
     let mut nonce = [0_u8; 32];
     SystemRandom::new()
         .fill(&mut nonce)
@@ -303,10 +308,15 @@ fn request(args: &Args, method: &str, path: &str, body: Option<&[u8]>) -> Result
     let url = format!("https://{}:{}{}", args.host, args.port, path);
     let roots = root_store().ok_or_else(|| "RA-TLS root store is unavailable".to_string())?;
     let response = https_fetch(method, &url, &headers, body, roots, Some(&policy))?;
-    if response.status != 200 {
-        return Err(format!("{method} {path} returned HTTP {}", response.status));
+    Ok((response.status, response.body))
+}
+
+fn request(args: &Args, method: &str, path: &str, body: Option<&[u8]>) -> Result<Vec<u8>, String> {
+    let (status, body) = request_with_status(args, method, path, body)?;
+    if status != 200 {
+        return Err(format!("{method} {path} returned HTTP {status}"));
     }
-    Ok(response.body)
+    Ok(body)
 }
 
 fn parse_object(body: &[u8], operation: &str) -> Result<Value, String> {
@@ -335,6 +345,31 @@ fn await_health(args: &Args) -> Result<(), String> {
     }
     Err(format!(
         "healthz failed after {} attempts: {last_error}",
+        args.health_attempts
+    ))
+}
+
+fn await_endpoint_result(args: &Args, body: &[u8]) -> Result<Value, String> {
+    let mut last_error = String::new();
+    for attempt in 1..=args.health_attempts {
+        match request_with_status(args, "POST", "/honest/v1/proposals", Some(body)) {
+            Ok((200, response)) => return parse_object(&response, "endpoint join"),
+            Ok((202, response)) => {
+                let pending = parse_object(&response, "endpoint pending")?;
+                if pending.get("status") != Some(&Value::String("in-wasm-pending".into())) {
+                    return Err("endpoint returned an invalid pending response".into());
+                }
+                last_error = "in-WASM result remained pending".into();
+            }
+            Ok((status, _)) => last_error = format!("endpoint returned HTTP {status}"),
+            Err(error) => last_error = error,
+        }
+        if attempt < args.health_attempts {
+            thread::sleep(args.retry_delay);
+        }
+    }
+    Err(format!(
+        "endpoint result failed after {} attempts: {last_error}",
         args.health_attempts
     ))
 }
@@ -369,16 +404,25 @@ fn run() -> Result<(), String> {
             "workflow_manifest_digest": M0_WORKFLOW_MANIFEST_DIGEST,
         }))
         .map_err(|error| format!("failed to encode endpoint request: {error}"))?;
-        let response = parse_object(
-            &request(&args, "POST", "/honest/v1/proposals", Some(&body))?,
-            "endpoint join",
-        )?;
-        if response.get("status") != Some(&Value::String("endpoint-manifest-joined".into())) {
-            return Err("endpoint request did not preserve the committed identity join".into());
+        let response = await_endpoint_result(&args, &body)?;
+        let ticket_evidence = response
+            .get("ticket_evidence_commitment")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if response.get("status") != Some(&Value::String("in-wasm-result".into()))
+            || response.get("canonical_result_hex") != Some(&Value::String("44cd091c00".into()))
+            || response.get("endpoint_manifest_digest")
+                != Some(&Value::String(M0_ENDPOINT_MANIFEST_DIGEST.into()))
+            || ticket_evidence.len() != 64
+            || !ticket_evidence.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(format!(
+                "endpoint request did not preserve the committed identity join: {response}"
+            ));
         }
         println!(
             "ENDPOINT-JOIN-001: PASS assurance=sgx_hardware \
-             path=https/challenge-ratls/sni/committed-endpoint"
+             path=https/challenge-ratls/sni/committed-endpoint/ticket/in-wasm"
         );
         return Ok(());
     }
