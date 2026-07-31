@@ -1,4 +1,4 @@
-// Copyright (c) Privasys. All rights reserved.
+// Copyright (c) Florian Guitton. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
 //! SGX attestation integration for RA-TLS.
@@ -225,6 +225,34 @@ pub fn generate_app_certificate(
     for (oid, value) in &app.oid_extensions {
         extensions.push((*oid, value.clone()));
     }
+    if let Some(endpoint) = app.attested_endpoint {
+        extensions.extend([
+            (
+                enclave_os_common::oids::HONEST_ENDPOINT_MANIFEST_ID_OID,
+                endpoint.endpoint_manifest_id.to_vec(),
+            ),
+            (
+                enclave_os_common::oids::HONEST_ENDPOINT_MANIFEST_DIGEST_OID,
+                endpoint.endpoint_manifest_digest.to_vec(),
+            ),
+            (
+                enclave_os_common::oids::HONEST_WORKFLOW_ID_OID,
+                endpoint.workflow_id.to_vec(),
+            ),
+            (
+                enclave_os_common::oids::HONEST_WORKFLOW_MANIFEST_DIGEST_OID,
+                endpoint.workflow_manifest_digest.to_vec(),
+            ),
+            (
+                enclave_os_common::oids::HONEST_ENDPOINT_ROUTE_DIGEST_OID,
+                endpoint.route_digest.to_vec(),
+            ),
+            (
+                enclave_os_common::oids::HONEST_ENDPOINT_ACTIVATION_EPOCH_OID,
+                endpoint.activation_epoch.to_be_bytes().to_vec(),
+            ),
+        ]);
+    }
 
     // In challenge mode, generate a client challenge nonce (sent via
     // TLS CertificateRequest extension 0xFFBB, not embedded in the cert)
@@ -281,6 +309,7 @@ pub fn mint_vault_client_cert(
         hostname: String::from("vault-client"),
         merkle_root: [0u8; 32],
         oid_extensions,
+        attested_endpoint: None,
     };
     // Fold the session channel binder (TLS 1.3) into the quote's report_data so
     // the vault can confirm this client cert commits to the live session and is

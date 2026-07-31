@@ -1,4 +1,4 @@
-// Copyright (c) Privasys. All rights reserved.
+// Copyright (c) Florian Guitton. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
 //! **WASM** — WebAssembly Component runtime module for enclave-os.
@@ -2185,6 +2185,7 @@ fn build_app_identity(meta: &AppMeta) -> AppIdentity {
     AppIdentity {
         hostname: meta.hostname.clone(),
         config,
+        attested_endpoint: None,
     }
 }
 

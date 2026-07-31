@@ -1,4 +1,4 @@
-// Copyright (c) Privasys. All rights reserved.
+// Copyright (c) Florian Guitton. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
 //! Per-app certificate store with SNI-based resolution.
@@ -26,14 +26,14 @@
 
 use std::collections::BTreeMap;
 use std::string::String;
-use std::sync::{Arc, OnceLock, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::vec::Vec;
 
 use ring::digest;
 
-use enclave_os_common::modules::{AppIdentity, ConfigEntry};
 use crate::ratls::attestation::CaContext;
+use enclave_os_common::modules::{AppIdentity, AttestedEndpointIdentity, ConfigEntry};
 
 // ---------------------------------------------------------------------------
 //  Global accessor
@@ -73,6 +73,8 @@ pub struct AppCertData {
     ///
     /// Each tuple is `(OID arc sequence, raw value bytes)`.
     pub oid_extensions: Vec<(&'static [u64], Vec<u8>)>,
+    /// S1-activated workflow identity selected with this SNI leaf.
+    pub attested_endpoint: Option<AttestedEndpointIdentity>,
 }
 
 // ---------------------------------------------------------------------------
@@ -85,6 +87,8 @@ struct RegisteredApp {
     merkle_root: [u8; 32],
     /// Direct OID extensions from config entries.
     oid_extensions: Vec<(&'static [u64], Vec<u8>)>,
+    /// S1-activated workflow identity selected with this SNI leaf.
+    attested_endpoint: Option<AttestedEndpointIdentity>,
     /// Leaf manifest entries `(key, hash)` for auditing.
     #[allow(dead_code)]
     manifest: Vec<(String, [u8; 32])>,
@@ -136,7 +140,7 @@ impl CertStore {
     /// entries and stores the result. If an app with the same hostname
     /// is already registered, it is replaced.
     pub fn register(&self, identity: AppIdentity) {
-        let registered = Self::compute_app(&identity.config);
+        let registered = Self::compute_app(&identity.config, identity.attested_endpoint);
         if let Ok(mut inner) = self.inner.write() {
             inner.insert(identity.hostname, registered);
         }
@@ -169,6 +173,7 @@ impl CertStore {
             hostname: hostname.to_string(),
             merkle_root: app.merkle_root,
             oid_extensions: app.oid_extensions.clone(),
+            attested_endpoint: app.attested_endpoint,
         })
     }
 
@@ -185,8 +190,12 @@ impl CertStore {
     /// Compute per-app Merkle root + OID extensions from config entries.
     ///
     /// Merkle root = `SHA-256( SHA-256(e0.value) || SHA-256(e1.value) || … )`
-    fn compute_app(config: &[ConfigEntry]) -> RegisteredApp {
-        let mut leaf_hashes = Vec::with_capacity(config.len());
+    fn compute_app(
+        config: &[ConfigEntry],
+        attested_endpoint: Option<AttestedEndpointIdentity>,
+    ) -> RegisteredApp {
+        let mut leaf_hashes =
+            Vec::with_capacity(config.len() + usize::from(attested_endpoint.is_some()));
         let mut manifest = Vec::with_capacity(config.len());
         let mut oid_extensions = Vec::new();
 
@@ -201,6 +210,21 @@ impl CertStore {
             if let Some(oid) = entry.oid {
                 oid_extensions.push((oid, entry.value.clone()));
             }
+        }
+
+        if let Some(endpoint) = attested_endpoint {
+            let mut projection = Vec::with_capacity(136);
+            projection.extend_from_slice(&endpoint.endpoint_manifest_id);
+            projection.extend_from_slice(&endpoint.endpoint_manifest_digest);
+            projection.extend_from_slice(&endpoint.workflow_id);
+            projection.extend_from_slice(&endpoint.workflow_manifest_digest);
+            projection.extend_from_slice(&endpoint.route_digest);
+            projection.extend_from_slice(&endpoint.activation_epoch.to_be_bytes());
+            let d = digest::digest(&digest::SHA256, &projection);
+            let mut h = [0u8; 32];
+            h.copy_from_slice(d.as_ref());
+            manifest.push(("honest.attested_endpoint".to_string(), h));
+            leaf_hashes.push(h);
         }
 
         // Concatenate leaf hashes and compute root
@@ -220,7 +244,31 @@ impl CertStore {
         RegisteredApp {
             merkle_root,
             oid_extensions,
+            attested_endpoint,
             manifest,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use enclave_os_common::modules::AttestedEndpointIdentity;
+
+    use super::CertStore;
+
+    #[test]
+    fn endpoint_identity_is_retained_and_changes_the_app_root() {
+        let endpoint = AttestedEndpointIdentity {
+            endpoint_manifest_id: [1; 16],
+            endpoint_manifest_digest: [2; 32],
+            workflow_id: [3; 16],
+            workflow_manifest_digest: [4; 32],
+            route_digest: [5; 32],
+            activation_epoch: 6,
+        };
+        let without = CertStore::compute_app(&[], None);
+        let with = CertStore::compute_app(&[], Some(endpoint));
+        assert_ne!(with.merkle_root, without.merkle_root);
+        assert_eq!(with.attested_endpoint, Some(endpoint));
     }
 }

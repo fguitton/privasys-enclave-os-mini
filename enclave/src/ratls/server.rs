@@ -1,4 +1,4 @@
-// Copyright (c) Privasys. All rights reserved.
+// Copyright (c) Florian Guitton. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
 //! RA-TLS ingress server — data-channel driven.
@@ -365,6 +365,7 @@ impl IngressServer {
         let base_ctx = enclave_os_common::modules::RequestContext {
             connection_id: conn_id,
             server_name: session.server_name().map(str::to_owned),
+            attested_endpoint: session.attested_endpoint(),
             peer_cert_der: session.peer_cert_der(),
             client_challenge_nonce: session.client_challenge_nonce().cloned(),
             channel_binder: session.ratls_channel_binder(),
@@ -509,6 +510,7 @@ impl IngressServer {
             server_conn,
             tls_result.client_challenge_nonce,
             hello.sni,
+            tls_result.attested_endpoint,
         );
 
         // Collect any initial handshake output (ServerHello, etc.)
@@ -566,6 +568,9 @@ impl IngressServer {
                 return Ok(TlsConfigResult {
                     config: cached.config.clone(),
                     client_challenge_nonce: None,
+                    attested_endpoint: app_data
+                        .as_ref()
+                        .and_then(|app| app.attested_endpoint),
                 });
             }
         }
@@ -587,6 +592,7 @@ impl IngressServer {
         Ok(TlsConfigResult {
             config: tls_result.config,
             client_challenge_nonce: None, // deterministic mode: no nonce
+            attested_endpoint: tls_result.attested_endpoint,
         })
     }
 
@@ -803,6 +809,8 @@ struct TlsConfigResult {
     config: Arc<ServerConfig>,
     /// Client challenge nonce (present only in challenge-response mode).
     client_challenge_nonce: Option<Vec<u8>>,
+    /// Endpoint identity selected with the per-SNI leaf.
+    attested_endpoint: Option<enclave_os_common::modules::AttestedEndpointIdentity>,
 }
 
 /// Per-connection RA-TLS channel-binding minter. Captures the challenge
@@ -911,6 +919,7 @@ fn build_tls_config(
     Ok(TlsConfigResult {
         config: Arc::new(config),
         client_challenge_nonce: result.client_challenge_nonce,
+        attested_endpoint: app.and_then(|app| app.attested_endpoint),
     })
 }
 
@@ -1485,6 +1494,7 @@ fn handle_fido2_request(
     let ctx = enclave_os_common::modules::RequestContext {
         connection_id: base_ctx.connection_id,
         server_name: base_ctx.server_name.clone(),
+        attested_endpoint: base_ctx.attested_endpoint,
         peer_cert_der: base_ctx.peer_cert_der.clone(),
         client_challenge_nonce: base_ctx.client_challenge_nonce.clone(),
         channel_binder: base_ctx.channel_binder.clone(),
@@ -1584,6 +1594,7 @@ fn handle_data_request_http(
     let ctx = enclave_os_common::modules::RequestContext {
         connection_id: base_ctx.connection_id,
         server_name: base_ctx.server_name.clone(),
+        attested_endpoint: base_ctx.attested_endpoint,
         peer_cert_der: base_ctx.peer_cert_der.clone(),
         client_challenge_nonce: base_ctx.client_challenge_nonce.clone(),
         channel_binder: base_ctx.channel_binder.clone(),
@@ -1664,6 +1675,7 @@ fn handle_rpc_request(
     let ctx = enclave_os_common::modules::RequestContext {
         connection_id: base_ctx.connection_id,
         server_name: base_ctx.server_name.clone(),
+        attested_endpoint: base_ctx.attested_endpoint,
         peer_cert_der: base_ctx.peer_cert_der.clone(),
         client_challenge_nonce: base_ctx.client_challenge_nonce.clone(),
         channel_binder: base_ctx.channel_binder.clone(),
@@ -1789,6 +1801,7 @@ fn handle_mcp_tools_request(
     let ctx = enclave_os_common::modules::RequestContext {
         connection_id: base_ctx.connection_id,
         server_name: base_ctx.server_name.clone(),
+        attested_endpoint: base_ctx.attested_endpoint,
         peer_cert_der: base_ctx.peer_cert_der.clone(),
         client_challenge_nonce: base_ctx.client_challenge_nonce.clone(),
         channel_binder: base_ctx.channel_binder.clone(),

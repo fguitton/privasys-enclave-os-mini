@@ -1,4 +1,4 @@
-// Copyright (c) Privasys. All rights reserved.
+// Copyright (c) Florian Guitton. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
 //! X.509 extension OID constants for RA-TLS certificates.
@@ -177,3 +177,31 @@ pub const APP_CONFIGURATION_HASH_OID_STR: &str = "1.3.6.1.4.1.65230.3.5";
 pub const ATTESTED_DEPENDENCY_SET_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 6, 1];
 /// Attested Dependency Set (dotted-string).
 pub const ATTESTED_DEPENDENCY_SET_OID_STR: &str = "1.3.6.1.4.1.65230.6.1";
+
+// =========================================================================
+//  Honest workflow endpoint OIDs
+// =========================================================================
+
+/// S1-activated endpoint-manifest ID — `1.3.6.1.4.1.65230.7.1`.
+pub const HONEST_ENDPOINT_MANIFEST_ID_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 7, 1];
+pub const HONEST_ENDPOINT_MANIFEST_ID_OID_STR: &str = "1.3.6.1.4.1.65230.7.1";
+
+/// S1-activated endpoint-manifest digest — `1.3.6.1.4.1.65230.7.2`.
+pub const HONEST_ENDPOINT_MANIFEST_DIGEST_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 7, 2];
+pub const HONEST_ENDPOINT_MANIFEST_DIGEST_OID_STR: &str = "1.3.6.1.4.1.65230.7.2";
+
+/// Workflow ID covered by the endpoint — `1.3.6.1.4.1.65230.7.3`.
+pub const HONEST_WORKFLOW_ID_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 7, 3];
+pub const HONEST_WORKFLOW_ID_OID_STR: &str = "1.3.6.1.4.1.65230.7.3";
+
+/// Workflow-manifest digest covered by the endpoint — `1.3.6.1.4.1.65230.7.4`.
+pub const HONEST_WORKFLOW_MANIFEST_DIGEST_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 7, 4];
+pub const HONEST_WORKFLOW_MANIFEST_DIGEST_OID_STR: &str = "1.3.6.1.4.1.65230.7.4";
+
+/// Canonical SNI/route profile digest — `1.3.6.1.4.1.65230.7.5`.
+pub const HONEST_ENDPOINT_ROUTE_DIGEST_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 7, 5];
+pub const HONEST_ENDPOINT_ROUTE_DIGEST_OID_STR: &str = "1.3.6.1.4.1.65230.7.5";
+
+/// Endpoint activation epoch, unsigned big-endian — `1.3.6.1.4.1.65230.7.6`.
+pub const HONEST_ENDPOINT_ACTIVATION_EPOCH_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 7, 6];
+pub const HONEST_ENDPOINT_ACTIVATION_EPOCH_OID_STR: &str = "1.3.6.1.4.1.65230.7.6";

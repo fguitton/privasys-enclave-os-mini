@@ -1,4 +1,4 @@
-// Copyright (c) Privasys. All rights reserved.
+// Copyright (c) Florian Guitton. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
 //! RA-TLS session management — pure bytes-in / bytes-out interface.
@@ -37,6 +37,8 @@ pub struct RaTlsSession {
     client_challenge_nonce: Option<Vec<u8>>,
     /// Exact SNI selected before the TLS connection was constructed.
     server_name: Option<String>,
+    /// Endpoint identity selected with the SNI leaf for this session.
+    attested_endpoint: Option<enclave_os_common::modules::AttestedEndpointIdentity>,
     /// FIDO2 identity, set after a successful FIDO2 ceremony on this
     /// session.  When present, subsequent requests on this TLS session
     /// are authenticated without tokens.
@@ -73,12 +75,14 @@ impl RaTlsSession {
         tls_conn: rustls::ServerConnection,
         client_challenge_nonce: Option<Vec<u8>>,
         server_name: Option<String>,
+        attested_endpoint: Option<enclave_os_common::modules::AttestedEndpointIdentity>,
     ) -> Self {
         Self {
             tls_conn,
             read_buf: Vec::new(),
             client_challenge_nonce,
             server_name,
+            attested_endpoint,
             fido2_identity: None,
         }
     }
@@ -352,6 +356,13 @@ impl RaTlsSession {
     /// Return the exact SNI selected by the ClientHello.
     pub fn server_name(&self) -> Option<&str> {
         self.server_name.as_deref()
+    }
+
+    /// Return the endpoint identity selected with this session's SNI leaf.
+    pub fn attested_endpoint(
+        &self,
+    ) -> Option<enclave_os_common::modules::AttestedEndpointIdentity> {
+        self.attested_endpoint
     }
 
     /// Return this session's 32-byte RA-TLS channel binder (TLS 1.3), derived

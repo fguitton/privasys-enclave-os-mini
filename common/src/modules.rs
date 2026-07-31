@@ -1,4 +1,4 @@
-// Copyright (c) Privasys. All rights reserved.
+// Copyright (c) Florian Guitton. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
 //! Module trait and shared types.
@@ -67,6 +67,20 @@ pub struct ConfigEntry {
     pub oid: Option<&'static [u64]>,
 }
 
+/// S1-activated workflow endpoint identity projected into an SNI leaf.
+///
+/// The certificate carries this identity as evidence. It remains inert until
+/// an adopter compares it with current replicated state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttestedEndpointIdentity {
+    pub endpoint_manifest_id: [u8; 16],
+    pub endpoint_manifest_digest: [u8; 32],
+    pub workflow_id: [u8; 16],
+    pub workflow_manifest_digest: [u8; 32],
+    pub route_digest: [u8; 32],
+    pub activation_epoch: u64,
+}
+
 /// Identity of an app endpoint that gets its own X.509 certificate.
 ///
 /// Each identity is served via SNI-based TLS routing.
@@ -75,6 +89,8 @@ pub struct AppIdentity {
     pub hostname: String,
     /// Configuration entries for this app's Merkle tree.
     pub config: Vec<ConfigEntry>,
+    /// Optional S1-activated workflow endpoint projected into this leaf.
+    pub attested_endpoint: Option<AttestedEndpointIdentity>,
 }
 
 // ---------------------------------------------------------------------------
@@ -98,6 +114,12 @@ pub struct RequestContext {
     /// not a request header. Adopter profiles use it to keep peer and client
     /// routes non-interchangeable on a shared listener.
     pub server_name: Option<String>,
+
+    /// Endpoint identity selected with the SNI leaf for this exact session.
+    ///
+    /// This is certificate evidence, not admission authority. Adopters must
+    /// compare it with current replicated state before accepting a proposal.
+    pub attested_endpoint: Option<AttestedEndpointIdentity>,
 
     /// DER-encoded leaf certificate presented by the TLS client.
     ///
@@ -218,6 +240,7 @@ mod tests {
         RequestContext {
             connection_id: 0,
             server_name: server_name.map(str::to_owned),
+            attested_endpoint: None,
             peer_cert_der: mutual.then(|| vec![1]),
             client_challenge_nonce: mutual.then(|| vec![2]),
             channel_binder: mutual.then(|| vec![3]),

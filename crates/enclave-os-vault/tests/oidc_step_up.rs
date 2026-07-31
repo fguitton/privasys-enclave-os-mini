@@ -1,4 +1,4 @@
-// Copyright (c) Privasys. All rights reserved.
+// Copyright (c) Florian Guitton. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
 //! `OidcStepUp` policy condition (promote step-up): an owner bearer must carry a
@@ -40,6 +40,7 @@ fn ctx_with_amr(sub: &str, amr: &[&str]) -> RequestContext {
     RequestContext {
         connection_id: 0,
         server_name: None,
+        attested_endpoint: None,
         peer_cert_der: None,
         client_challenge_nonce: None,
         channel_binder: None,
@@ -68,6 +69,7 @@ fn ctx_step_up(
     RequestContext {
         connection_id: 0,
         server_name: None,
+        attested_endpoint: None,
         peer_cert_der: None,
         client_challenge_nonce: None,
         channel_binder: None,
