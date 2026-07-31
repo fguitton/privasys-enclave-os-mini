@@ -17,7 +17,7 @@ use base64::Engine;
 use enclave_os_common::modules::AppIdentity;
 use enclave_os_common::ocall::{self, OcallVtable};
 use enclave_os_egress::{
-    https_fetch, root_store, EgressModule, RaTlsPolicy, ReportDataBinding, TeeType,
+    https_fetch, root_store, EgressModule, ExpectedOid, RaTlsPolicy, ReportDataBinding, TeeType,
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{json, Value};
@@ -25,6 +25,10 @@ use sha2::{Digest, Sha256};
 
 const APP_NAME: &str = "honest-f0-opaque";
 const EXPECTED_RESPONSE: &str = "honest-opaque-fixture/0.1.0";
+const M0_WORKFLOW_MANIFEST_DIGEST: &str =
+    "953eff6856105cf5e1ab77b94b94ceaf7c8d4c45a84f9ea590f6a506636dd3bd";
+const M0_ENDPOINT_MANIFEST_DIGEST: &str =
+    "bd712af1d1f77e78c165d382500c1ba0ccf9de80eb61bdc0aad1e4de841f4694";
 
 static SOCKETS: OnceLock<Mutex<HashMap<i32, TcpStream>>> = OnceLock::new();
 static SOCKET_TIMEOUT: OnceLock<Duration> = OnceLock::new();
@@ -45,6 +49,7 @@ struct Args {
     retry_delay: Duration,
     health_only: bool,
     shutdown_after_health: bool,
+    endpoint_join: bool,
 }
 
 fn sockets() -> &'static Mutex<HashMap<i32, TcpStream>> {
@@ -180,6 +185,7 @@ fn parse_args() -> Result<Args, String> {
     let mut retry_delay = Duration::from_secs(5);
     let mut health_only = false;
     let mut shutdown_after_health = false;
+    let mut endpoint_join = false;
 
     while let Some(flag) = values.next() {
         match flag.as_str() {
@@ -217,6 +223,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--health-only" => health_only = true,
             "--shutdown-after-health" => shutdown_after_health = true,
+            "--endpoint-join" => endpoint_join = true,
             _ => return Err(format!("unknown argument: {flag}")),
         }
     }
@@ -234,7 +241,37 @@ fn parse_args() -> Result<Args, String> {
         retry_delay,
         health_only,
         shutdown_after_health,
+        endpoint_join,
     })
+}
+
+fn endpoint_expected_oids() -> Result<Vec<ExpectedOid>, String> {
+    Ok(vec![
+        ExpectedOid {
+            oid: enclave_os_common::oids::HONEST_ENDPOINT_MANIFEST_ID_OID_STR.into(),
+            expected_value: vec![0x41; 16],
+        },
+        ExpectedOid {
+            oid: enclave_os_common::oids::HONEST_ENDPOINT_MANIFEST_DIGEST_OID_STR.into(),
+            expected_value: decode_mrenclave(M0_ENDPOINT_MANIFEST_DIGEST)?.to_vec(),
+        },
+        ExpectedOid {
+            oid: enclave_os_common::oids::HONEST_WORKFLOW_ID_OID_STR.into(),
+            expected_value: vec![0x40; 16],
+        },
+        ExpectedOid {
+            oid: enclave_os_common::oids::HONEST_WORKFLOW_MANIFEST_DIGEST_OID_STR.into(),
+            expected_value: decode_mrenclave(M0_WORKFLOW_MANIFEST_DIGEST)?.to_vec(),
+        },
+        ExpectedOid {
+            oid: enclave_os_common::oids::HONEST_ENDPOINT_ROUTE_DIGEST_OID_STR.into(),
+            expected_value: vec![0x42; 32],
+        },
+        ExpectedOid {
+            oid: enclave_os_common::oids::HONEST_ENDPOINT_ACTIVATION_EPOCH_OID_STR.into(),
+            expected_value: 1_u64.to_be_bytes().to_vec(),
+        },
+    ])
 }
 
 fn request(args: &Args, method: &str, path: &str, body: Option<&[u8]>) -> Result<Vec<u8>, String> {
@@ -250,7 +287,11 @@ fn request(args: &Args, method: &str, path: &str, body: Option<&[u8]>) -> Result
         report_data: ReportDataBinding::ChallengeResponse {
             nonce: nonce.to_vec(),
         },
-        expected_oids: Vec::new(),
+        expected_oids: if args.endpoint_join {
+            endpoint_expected_oids()?
+        } else {
+            Vec::new()
+        },
         attestation_servers: vec![args.appraiser_url.clone()],
         client_identity: None,
         dependencies: None,
@@ -320,6 +361,27 @@ fn run() -> Result<(), String> {
     let cwasm = fs::read(&args.cwasm).map_err(|error| format!("failed to read cwasm: {error}"))?;
 
     await_health(&args)?;
+    if args.endpoint_join {
+        let body = serde_json::to_vec(&json!({
+            "endpoint_manifest_id": "41414141414141414141414141414141",
+            "endpoint_manifest_digest": M0_ENDPOINT_MANIFEST_DIGEST,
+            "workflow_id": "40404040404040404040404040404040",
+            "workflow_manifest_digest": M0_WORKFLOW_MANIFEST_DIGEST,
+        }))
+        .map_err(|error| format!("failed to encode endpoint request: {error}"))?;
+        let response = parse_object(
+            &request(&args, "POST", "/honest/v1/proposals", Some(&body))?,
+            "endpoint join",
+        )?;
+        if response.get("status") != Some(&Value::String("endpoint-manifest-joined".into())) {
+            return Err("endpoint request did not preserve the committed identity join".into());
+        }
+        println!(
+            "ENDPOINT-JOIN-001: PASS assurance=sgx_hardware \
+             path=https/challenge-ratls/sni/committed-endpoint"
+        );
+        return Ok(());
+    }
     if args.shutdown_after_health {
         let status_body = request(&args, "GET", "/status", None)?;
         let status: Value = serde_json::from_slice(&status_body)
