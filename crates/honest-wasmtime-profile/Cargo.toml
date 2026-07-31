@@ -14,9 +14,10 @@ description = "Shared Wasmtime role boundary for Honest enclave and AOT builds."
 [features]
 default = []
 runtime-sgx = ["wasmtime/sgx"]
-aot = ["wasmtime/cranelift"]
+aot = ["wasmtime/cranelift", "wasmtime/parallel-compilation"]
 
 [dependencies]
+sha2 = { version = "=0.10.9", default-features = false }
 wasmtime = { git = "https://github.com/Privasys/wasmtime", tag = "privasys-v0.2.0", default-features = false, features = [
     "component-model",
     "runtime",
