@@ -35,6 +35,8 @@ pub struct RaTlsSession {
     /// extension `0xFFBB` (challenge mode only).  The client binds it
     /// into its own attestation report_data.
     client_challenge_nonce: Option<Vec<u8>>,
+    /// Exact SNI selected before the TLS connection was constructed.
+    server_name: Option<String>,
     /// FIDO2 identity, set after a successful FIDO2 ceremony on this
     /// session.  When present, subsequent requests on this TLS session
     /// are authenticated without tokens.
@@ -70,8 +72,15 @@ impl RaTlsSession {
     pub fn new(
         tls_conn: rustls::ServerConnection,
         client_challenge_nonce: Option<Vec<u8>>,
+        server_name: Option<String>,
     ) -> Self {
-        Self { tls_conn, read_buf: Vec::new(), client_challenge_nonce, fido2_identity: None }
+        Self {
+            tls_conn,
+            read_buf: Vec::new(),
+            client_challenge_nonce,
+            server_name,
+            fido2_identity: None,
+        }
     }
 
     /// Whether the TLS handshake is still in progress.
@@ -338,6 +347,11 @@ impl RaTlsSession {
     /// extension `0xFFBB`.
     pub fn client_challenge_nonce(&self) -> Option<&Vec<u8>> {
         self.client_challenge_nonce.as_ref()
+    }
+
+    /// Return the exact SNI selected by the ClientHello.
+    pub fn server_name(&self) -> Option<&str> {
+        self.server_name.as_deref()
     }
 
     /// Return this session's 32-byte RA-TLS channel binder (TLS 1.3), derived

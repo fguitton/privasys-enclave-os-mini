@@ -326,6 +326,7 @@ impl IngressServer {
         // because different requests in the same session may carry
         // different tokens (or none — e.g. GET /healthz).
         let base_ctx = enclave_os_common::modules::RequestContext {
+            server_name: session.server_name().map(str::to_owned),
             peer_cert_der: session.peer_cert_der(),
             client_challenge_nonce: session.client_challenge_nonce().cloned(),
             channel_binder: session.ratls_channel_binder(),
@@ -469,6 +470,7 @@ impl IngressServer {
         let mut session = RaTlsSession::new(
             server_conn,
             tls_result.client_challenge_nonce,
+            hello.sni,
         );
 
         // Collect any initial handshake output (ServerHello, etc.)
@@ -836,20 +838,36 @@ fn handle_http_request(
     http_req: &enclave_os_common::protocol::HttpRequest,
     base_ctx: &enclave_os_common::modules::RequestContext,
 ) -> HttpHandleResult {
+    use enclave_os_common::modules::HonestIngressRoute;
     use enclave_os_common::protocol::HttpMethod;
 
     // The Honest composition has no executable legacy module, RPC, MCP,
     // session-relay or management route. This check precedes every dispatch,
     // including decrypted session-relay inner requests.
-    if crate::honest_ingress_profile_selected()
-        && !matches!(
-            (&http_req.method, http_req.path.as_str()),
-            (HttpMethod::Get, "/healthz")
-                | (HttpMethod::Get, "/status")
-                | (HttpMethod::Post, "/shutdown")
-        )
-    {
-        return HttpHandleResult::err(404, "not found");
+    if crate::honest_ingress_profile_selected() {
+        match enclave_os_common::modules::classify_honest_ingress(
+            &http_req.method,
+            &http_req.path,
+            base_ctx,
+        ) {
+            HonestIngressRoute::Operational => {}
+            HonestIngressRoute::Peer | HonestIngressRoute::Proposal => {
+                return crate::dispatch_honest_ingress(http_req, base_ctx).map_or_else(
+                    || HttpHandleResult::err(503, "honest ingress unavailable"),
+                    |response| HttpHandleResult {
+                        status: response.status,
+                        body: response.body,
+                        shutdown: false,
+                        content_type: Some(response.content_type.to_string()),
+                        extra_headers: Vec::new(),
+                    },
+                );
+            }
+            HonestIngressRoute::PeerAuthenticationRequired => {
+                return HttpHandleResult::err(403, "challenge-bound peer RA-TLS required");
+            }
+            HonestIngressRoute::Denied => return HttpHandleResult::err(404, "not found"),
+        }
     }
 
     match (&http_req.method, http_req.path.as_str()) {
@@ -1325,6 +1343,7 @@ fn handle_fido2_request(
     };
 
     let ctx = enclave_os_common::modules::RequestContext {
+        server_name: base_ctx.server_name.clone(),
         peer_cert_der: base_ctx.peer_cert_der.clone(),
         client_challenge_nonce: base_ctx.client_challenge_nonce.clone(),
         channel_binder: base_ctx.channel_binder.clone(),
@@ -1422,6 +1441,7 @@ fn handle_data_request_http(
     };
 
     let ctx = enclave_os_common::modules::RequestContext {
+        server_name: base_ctx.server_name.clone(),
         peer_cert_der: base_ctx.peer_cert_der.clone(),
         client_challenge_nonce: base_ctx.client_challenge_nonce.clone(),
         channel_binder: base_ctx.channel_binder.clone(),
@@ -1500,6 +1520,7 @@ fn handle_rpc_request(
     };
 
     let ctx = enclave_os_common::modules::RequestContext {
+        server_name: base_ctx.server_name.clone(),
         peer_cert_der: base_ctx.peer_cert_der.clone(),
         client_challenge_nonce: base_ctx.client_challenge_nonce.clone(),
         channel_binder: base_ctx.channel_binder.clone(),
@@ -1623,6 +1644,7 @@ fn handle_mcp_tools_request(
     };
 
     let ctx = enclave_os_common::modules::RequestContext {
+        server_name: base_ctx.server_name.clone(),
         peer_cert_der: base_ctx.peer_cert_der.clone(),
         client_challenge_nonce: base_ctx.client_challenge_nonce.clone(),
         channel_binder: base_ctx.channel_binder.clone(),

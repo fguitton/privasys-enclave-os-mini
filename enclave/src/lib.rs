@@ -95,6 +95,20 @@ static CORE_PHASE: CorePhaseCell = CorePhaseCell::new();
 /// routes.
 static HONEST_INGRESS_PROFILE: AtomicBool = AtomicBool::new(false);
 
+/// Adopter-owned handler for the closed Honest peer/proposal route surface.
+pub type HonestIngressHook = fn(
+    request: &enclave_os_common::protocol::HttpRequest,
+    context: &enclave_os_common::modules::RequestContext,
+) -> HonestIngressResponse;
+static HONEST_INGRESS_HOOK: OnceLock<HonestIngressHook> = OnceLock::new();
+
+/// Bounded response returned by the adopter-owned Honest ingress handler.
+pub struct HonestIngressResponse {
+    pub status: u16,
+    pub content_type: &'static str,
+    pub body: std::vec::Vec<u8>,
+}
+
 /// Optional adopter-owned execution worker.
 pub type ExecutionWorkerHook = fn(worker_id: u32) -> i32;
 static EXECUTION_WORKER_HOOK: OnceLock<ExecutionWorkerHook> = OnceLock::new();
@@ -234,6 +248,24 @@ pub fn select_honest_ingress_profile() -> Result<(), CorePhase> {
 #[must_use]
 pub(crate) fn honest_ingress_profile_selected() -> bool {
     HONEST_INGRESS_PROFILE.load(Ordering::Acquire)
+}
+
+/// Register the sole adopter-owned Honest peer/proposal handler.
+///
+/// The hook must be installed during initialisation before the ingress server
+/// is published.
+pub fn register_honest_ingress_hook(hook: HonestIngressHook) -> Result<(), i32> {
+    if CORE_PHASE.load() != CorePhase::Initialising {
+        return Err(-1);
+    }
+    HONEST_INGRESS_HOOK.set(hook).map_err(|_| -1)
+}
+
+pub(crate) fn dispatch_honest_ingress(
+    request: &enclave_os_common::protocol::HttpRequest,
+    context: &enclave_os_common::modules::RequestContext,
+) -> Option<HonestIngressResponse> {
+    HONEST_INGRESS_HOOK.get().map(|hook| hook(request, context))
 }
 
 /// Publish successful control-plane initialisation.
