@@ -23,3 +23,9 @@ wasmtime = { git = "https://github.com/Privasys/wasmtime", tag = "privasys-v0.2.
     "std",
     "gc-drc",
 ] }
+
+[target.'cfg(target_vendor = "teaclave")'.dependencies]
+enclave-os-common = { path = "../../common" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_vendor, values("teaclave"))'] }

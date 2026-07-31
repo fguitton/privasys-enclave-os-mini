@@ -8,7 +8,14 @@
 //! crate is the sole source of that configuration and rejects mutated profile
 //! descriptors before constructing a [`wasmtime::Config`].
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
+
+// Wasmtime's custom SGX target requires one C-ABI platform implementation.
+// Keeping it in this shared runtime-profile crate lets Honest compositions
+// link the minimum engine mechanics without linking the legacy WASM module.
+#[cfg(all(feature = "runtime-sgx", target_vendor = "teaclave"))]
+#[allow(unsafe_code)]
+mod sgx_platform;
 
 pub use wasmtime;
 pub use wasmtime::*;

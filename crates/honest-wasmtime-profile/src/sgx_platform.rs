@@ -361,7 +361,7 @@ unsafe extern "C" fn sgx_veh_handler(info: *mut SgxExceptionInfo) -> i32 {
     }
     TRAP_PC.store(info.cpu_context.rip as usize, Ordering::SeqCst);
     TRAP_FP.store(info.cpu_context.rbp as usize, Ordering::SeqCst);
-    info.cpu_context.rip = wasm_trap_trampoline as usize as u64;
+    info.cpu_context.rip = wasm_trap_trampoline as *const () as usize as u64;
     EXCEPTION_CONTINUE_EXECUTION
 }
 
@@ -434,8 +434,10 @@ pub extern "C" fn wasmtime_memory_image_free(_image: *mut u8) {}
 /// state. WASM execution is single-threaded per TCS, so plain atomics suffice;
 /// both slots default to NULL. `.get(slot)` keeps an unexpected index from
 /// panicking inside this `extern "C"` boundary (which cannot unwind).
-static TRAP_TLS: [AtomicPtr<u8>; 2] =
-    [AtomicPtr::new(ptr::null_mut()), AtomicPtr::new(ptr::null_mut())];
+static TRAP_TLS: [AtomicPtr<u8>; 2] = [
+    AtomicPtr::new(ptr::null_mut()),
+    AtomicPtr::new(ptr::null_mut()),
+];
 
 /// Get the current trap-handling TLS value for `slot`.
 #[no_mangle]

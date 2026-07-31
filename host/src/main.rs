@@ -111,6 +111,11 @@ struct Cli {
     /// S1.2 test-only synthetic worker budget. Ignored by legacy compositions.
     #[arg(long)]
     s1_2_synthetic_work_units: Option<u64>,
+
+    /// S2.0 test-only private executor fixture. Ignored by legacy
+    /// compositions and absent unless explicitly requested.
+    #[arg(long)]
+    s2_0_private_fixture: bool,
 }
 
 fn spawn_control_ecall(enclave_id: u64, config_bytes: Vec<u8>) -> Result<thread::JoinHandle<i32>> {
@@ -382,6 +387,9 @@ fn main() -> Result<()> {
 
     if let Some(work_units) = cli.s1_2_synthetic_work_units {
         config["s1_2_synthetic_work_units"] = serde_json::Value::from(work_units);
+    }
+    if cli.s2_0_private_fixture {
+        config["s2_0_private_fixture"] = serde_json::Value::Bool(true);
     }
 
     let config_bytes = serde_json::to_vec(&config)?;

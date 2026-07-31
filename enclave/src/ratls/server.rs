@@ -838,6 +838,20 @@ fn handle_http_request(
 ) -> HttpHandleResult {
     use enclave_os_common::protocol::HttpMethod;
 
+    // The Honest composition has no executable legacy module, RPC, MCP,
+    // session-relay or management route. This check precedes every dispatch,
+    // including decrypted session-relay inner requests.
+    if crate::honest_ingress_profile_selected()
+        && !matches!(
+            (&http_req.method, http_req.path.as_str()),
+            (HttpMethod::Get, "/healthz")
+                | (HttpMethod::Get, "/status")
+                | (HttpMethod::Post, "/shutdown")
+        )
+    {
+        return HttpHandleResult::err(404, "not found");
+    }
+
     match (&http_req.method, http_req.path.as_str()) {
         // ── Healthz (no auth) ───────────────────────────────────────
         (HttpMethod::Get, "/healthz") => {

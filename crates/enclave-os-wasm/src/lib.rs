@@ -74,8 +74,6 @@ pub mod jwks_fetcher;
 pub mod metrics;
 pub mod protocol;
 pub mod registry;
-#[cfg(target_vendor = "teaclave")]
-pub mod sgx_platform;
 pub mod vaultkey;
 pub mod wasi;
 pub mod wasm_docs;

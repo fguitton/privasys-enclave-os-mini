@@ -90,6 +90,10 @@ static EXECUTION_RPC_CLIENT: OnceLock<RpcClient> = OnceLock::new();
 
 /// Enclave-owned lifecycle barrier shared by the control and worker TCS.
 static CORE_PHASE: CorePhaseCell = CorePhaseCell::new();
+/// Default-false ingress selector. The custom Honest composition sets this
+/// exactly during initialisation; legacy compositions retain their existing
+/// routes.
+static HONEST_INGRESS_PROFILE: AtomicBool = AtomicBool::new(false);
 
 /// Optional adopter-owned execution worker.
 pub type ExecutionWorkerHook = fn(worker_id: u32) -> i32;
@@ -210,6 +214,26 @@ pub fn signal_shutdown() {
 /// Return the current enclave lifecycle phase.
 pub fn core_phase() -> CorePhase {
     CORE_PHASE.load()
+}
+
+/// Select the Honest operational-only ingress profile before publication.
+///
+/// # Errors
+///
+/// Rejects attempts to change the executable route surface after the trusted
+/// core has left initialisation.
+pub fn select_honest_ingress_profile() -> Result<(), CorePhase> {
+    let phase = CORE_PHASE.load();
+    if phase != CorePhase::Initialising {
+        return Err(phase);
+    }
+    HONEST_INGRESS_PROFILE.store(true, Ordering::Release);
+    Ok(())
+}
+
+#[must_use]
+pub(crate) fn honest_ingress_profile_selected() -> bool {
+    HONEST_INGRESS_PROFILE.load(Ordering::Acquire)
 }
 
 /// Publish successful control-plane initialisation.
