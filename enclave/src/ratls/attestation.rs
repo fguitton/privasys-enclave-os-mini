@@ -159,6 +159,7 @@ pub struct CertGenerationResult {
 pub fn generate_ratls_certificate(
     ca: &CaContext,
     mode: CertMode,
+    server_name: Option<&str>,
 ) -> Result<CertGenerationResult, String> {
     let is_challenge = matches!(mode, CertMode::Challenge { .. });
     let ctx = prepare_attestation(&mode)?;
@@ -186,7 +187,7 @@ pub fn generate_ratls_certificate(
 
     let leaf_der = build_leaf_cert(
         &ctx.pkcs8_bytes, &ctx.quote, ctx.not_before, ctx.not_after, ca,
-        "Enclave OS RA-TLS", &extensions,
+        "Enclave OS RA-TLS", server_name, &extensions,
     )?;
 
     Ok(CertGenerationResult {
@@ -235,7 +236,7 @@ pub fn generate_app_certificate(
 
     let leaf_der = build_leaf_cert(
         &ctx.pkcs8_bytes, &ctx.quote, ctx.not_before, ctx.not_after, ca,
-        &app.hostname, &extensions,
+        &app.hostname, Some(&app.hostname), &extensions,
     )?;
 
     Ok(CertGenerationResult {
@@ -560,6 +561,7 @@ fn build_leaf_cert(
     not_after: OffsetDateTime,
     ca: &CaContext,
     common_name: &str,
+    server_name: Option<&str>,
     extensions: &[(&'static [u64], Vec<u8>)],
 ) -> Result<Vec<u8>, String> {
     use rcgen::{
@@ -581,7 +583,13 @@ fn build_leaf_cert(
     .map_err(|e| format!("leaf key: {}", e))?;
 
     // --- Leaf params ---
-    let mut leaf_params = CertificateParams::new(Vec::<String>::new())
+    // WebPKI does not fall back to Subject CN. Bind the leaf to an admitted DNS
+    // identity so a normal verifier can keep hostname checks enabled. The
+    // server must never pass through an arbitrary, unregistered SNI here.
+    let subject_alt_names = server_name
+        .map(|name| vec![name.to_string()])
+        .unwrap_or_default();
+    let mut leaf_params = CertificateParams::new(subject_alt_names)
         .map_err(|e| format!("leaf params: {}", e))?;
 
     // CN is always the app hostname (or enclave-wide fallback name).

@@ -74,6 +74,11 @@ enum SessionState {
 /// ClientHello (even with the RA-TLS challenge extension) is ~1-2 KiB.
 const MAX_PENDING_CLIENTHELLO: usize = 16 * 1024;
 
+/// Stable DNS identity for the enclave-wide endpoint. Per-app identities use
+/// their admitted CertStore hostname instead. Never reflect an arbitrary SNI
+/// into a CA-signed SAN.
+const ENCLAVE_WIDE_SERVER_NAME: &str = "enclave-os.invalid";
+
 // ========================================================================
 //  IngressServer
 // ========================================================================
@@ -500,7 +505,12 @@ impl IngressServer {
             // The channel binder is injected by the deferred mint hook (later
             // slice), which re-mints with the handshake secret available.
             let mode = CertMode::Challenge { nonce: n.clone(), binder: None };
-            return build_tls_config(&self.ca, mode, app_data.as_ref());
+            return build_tls_config(
+                &self.ca,
+                mode,
+                app_data.as_ref(),
+                Some(ENCLAVE_WIDE_SERVER_NAME),
+            );
         }
 
         // Deterministic: check per-hostname cache
@@ -518,7 +528,12 @@ impl IngressServer {
         }
 
         let mode = CertMode::Deterministic { creation_time: now };
-        let tls_result = build_tls_config(&self.ca, mode, app_data.as_ref())?;
+        let tls_result = build_tls_config(
+            &self.ca,
+            mode,
+            app_data.as_ref(),
+            Some(ENCLAVE_WIDE_SERVER_NAME),
+        )?;
 
         self.cached_configs.insert(cache_key, CachedConfig {
             config: tls_result.config.clone(),
@@ -661,6 +676,7 @@ struct ChannelBindingMinter {
     ca: CaContext,
     nonce: Vec<u8>,
     app: Option<cert_store::AppCertData>,
+    server_name: Option<String>,
 }
 
 impl core::fmt::Debug for ChannelBindingMinter {
@@ -678,7 +694,11 @@ impl RaTlsBindCertificate for ChannelBindingMinter {
         };
         let result = match &self.app {
             Some(a) => attestation::generate_app_certificate(&self.ca, mode, a),
-            None => attestation::generate_ratls_certificate(&self.ca, mode),
+            None => attestation::generate_ratls_certificate(
+                &self.ca,
+                mode,
+                self.server_name.as_deref(),
+            ),
         }
         .ok()?;
         let certs: Vec<CertificateDer<'static>> = result
@@ -698,6 +718,7 @@ fn build_tls_config(
     ca: &CaContext,
     mode: CertMode,
     app: Option<&cert_store::AppCertData>,
+    server_name: Option<&str>,
 ) -> Result<TlsConfigResult, String> {
     // Capture the challenge nonce for the channel-binding hook before `mode`
     // is consumed by the initial (placeholder) mint below.
@@ -708,7 +729,7 @@ fn build_tls_config(
 
     let result = match app {
         Some(a) => attestation::generate_app_certificate(ca, mode, a)?,
-        None => attestation::generate_ratls_certificate(ca, mode)?,
+        None => attestation::generate_ratls_certificate(ca, mode, server_name)?,
     };
 
     let certs: Vec<CertificateDer<'static>> = result.cert_chain_der
@@ -740,6 +761,7 @@ fn build_tls_config(
             ca: ca.clone(),
             nonce,
             app: app.cloned(),
+            server_name: server_name.map(str::to_owned),
         }));
     }
 

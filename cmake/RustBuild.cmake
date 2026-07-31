@@ -35,6 +35,7 @@ function(rust_build_host CRATE_DIR OUTPUT_NAME)
         COMMAND ${CMAKE_COMMAND} -E env
             "SGX_SDK_PATH=${SGX_SDK_PATH}"
             "RUSTUP_TOOLCHAIN=${RUST_ENCLAVE_TOOLCHAIN}"
+            "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}"
             ${CARGO_EXECUTABLE} build
                 ${CARGO_BUILD_TYPE}
                 --locked
@@ -75,6 +76,8 @@ function(rust_build_enclave CRATE_DIR OUTPUT_NAME)
     if(_FEATURES)
         set(_FEATURES_ARGS --no-default-features --features "sgx,default-ecall,${_FEATURES}")
     endif()
+    set(_ENCLAVE_TARGET_DIR
+        "${CMAKE_SOURCE_DIR}/target/cmake-enclave-${_FEATURES}-${SOURCE_DATE_EPOCH}")
 
     set(_BUILD_COMMENT "Building enclave Rust crate: ${OUTPUT_NAME}")
     if(_FEATURES)
@@ -85,6 +88,10 @@ function(rust_build_enclave CRATE_DIR OUTPUT_NAME)
         COMMAND ${CMAKE_COMMAND} -E env
             "SGX_SDK_PATH=${SGX_SDK_PATH}"
             "RUSTUP_TOOLCHAIN=${RUST_ENCLAVE_TOOLCHAIN}"
+            "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}"
+            "CARGO_TARGET_DIR=${_ENCLAVE_TARGET_DIR}"
+            "CC=${CMAKE_C_COMPILER}"
+            "CXX=${CMAKE_CXX_COMPILER}"
             "RUSTFLAGS=--sysroot ${SGX_SYSROOT_DIR} -C target-feature=+rdrand"
             ${CARGO_EXECUTABLE} build
                 ${CARGO_BUILD_TYPE}
@@ -98,7 +105,7 @@ function(rust_build_enclave CRATE_DIR OUTPUT_NAME)
     )
 
     set(${OUTPUT_NAME}_STATIC_LIB
-        "${CRATE_DIR}/target/${RUST_ENCLAVE_TARGET}/${CARGO_OUT_DIR}/lib${OUTPUT_NAME}.a"
+        "${_ENCLAVE_TARGET_DIR}/${RUST_ENCLAVE_TARGET}/${CARGO_OUT_DIR}/lib${OUTPUT_NAME}.a"
         PARENT_SCOPE)
 endfunction()
 

@@ -1,0 +1,20 @@
+[package]
+name = "f0-ratls-client"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+description = "Challenge-bound RA-TLS client for the F0 SGX hardware gate"
+
+[[bin]]
+name = "f0-ratls-client"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.21"
+enclave-os-common = { path = "../../common" }
+enclave-os-egress = { path = "../../crates/enclave-os-egress", features = ["native-sgx-types"] }
+ring = "0.17"
+serde_json = "1"
+sha2 = "0.10"
+
+[workspace]

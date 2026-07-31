@@ -383,12 +383,18 @@ fn https_request_inner(
         verify_channel_binding(&tls_conn, policy)?;
     }
 
-    // Send the HTTP request.
-    {
-        let mut writer = tls_conn.writer();
-        writer.write_all(request).map_err(|e| format!("write failed: {}", e))?;
+    // Send the HTTP request in bounded chunks. rustls limits queued plaintext;
+    // buffering a complete WASM load request can otherwise return WriteZero
+    // before any TLS records are flushed.
+    for chunk in request.chunks(16 * 1024) {
+        {
+            let mut writer = tls_conn.writer();
+            writer
+                .write_all(chunk)
+                .map_err(|e| format!("write failed: {}", e))?;
+        }
+        flush_tls(fd, &mut tls_conn).map_err(|_| "flush failed".to_string())?;
     }
-    flush_tls(fd, &mut tls_conn).map_err(|_| "flush failed".to_string())?;
 
     // Read the complete response with cursor-based multi-record TLS
     // reads. We MUST drain decrypted plaintext between successive
