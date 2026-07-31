@@ -173,6 +173,34 @@ fn canonical_factory_matches_every_exposed_compatibility_getter() {
 }
 
 #[test]
+#[cfg(feature = "aot")]
+fn excluded_simd_and_shared_memory_modules_fail_admission() {
+    // Minimal module containing `v128.const 0; drop`.
+    let simd = [
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03,
+        0x02, 0x01, 0x00, 0x0a, 0x17, 0x01, 0x15, 0x00, 0xfd, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1a, 0x0b,
+    ];
+    // Minimal module declaring a shared one-page memory with maximum one.
+    let shared_memory = [
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x05, 0x04, 0x01, 0x03, 0x01, 0x01,
+    ];
+    let engine = honest_wasmtime_profile::wasmtime::Engine::new(
+        &build_config(&ProfileDescriptor::canonical()).expect("canonical profile"),
+    )
+    .expect("AOT engine");
+
+    assert!(
+        honest_wasmtime_profile::wasmtime::Module::new(&engine, simd).is_err(),
+        "SIMD must remain outside profile v1"
+    );
+    assert!(
+        honest_wasmtime_profile::wasmtime::Module::new(&engine, shared_memory).is_err(),
+        "shared memory/threads must remain outside profile v1"
+    );
+}
+
+#[test]
 #[cfg(feature = "runtime-sgx")]
 fn runtime_factory_matches_non_compiler_compatibility_getters() {
     let descriptor = ProfileDescriptor::canonical();
