@@ -1,4 +1,4 @@
-// Copyright (c) Privasys. All rights reserved.
+// Copyright (c) Florian Guitton. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
 //! HTTPS Egress module for enclave-os.
@@ -68,7 +68,10 @@ pub use client::{
     register_enclave_attestation_provider,
     enclave_attestation_quote,
     enclave_self_mrenclave,
-    https_fetch,
+    BoundedHttpsRequest,
+    InterruptibleBlockingNetIo,
+    MAX_REQUEST_BODY, MAX_REQUEST_HEADERS, MAX_REQUEST_HEADER_BYTES,
+    https_fetch, https_fetch_interruptible,
     mozilla_root_store,
     root_store_from_der,
 };
