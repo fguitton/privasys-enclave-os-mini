@@ -1,4 +1,4 @@
-// Copyright (c) Privasys. All rights reserved.
+// Copyright (c) Florian Guitton. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
 //! RPC protocol over SPSC shared-memory queues.
@@ -152,6 +152,9 @@ pub fn decode_response(data: &[u8]) -> Option<(u64, i32, &[u8])> {
     let payload = &data[RESP_HEADER_SIZE..RESP_HEADER_SIZE + payload_len];
     Some((req_id, status, payload))
 }
+
+mod honest;
+pub use honest::*;
 
 // ========================================================================
 //  Honest S1 control-only Ready persistence
@@ -849,6 +852,81 @@ mod tests {
         assert_eq!(req_id, 5);
         assert_eq!(status, -42);
         assert_eq!(payload, b"error detail");
+    }
+
+    fn honest_identity(role: RpcRole, method: RpcMethod) -> HonestRpcIdentity {
+        HonestRpcIdentity {
+            role,
+            node_id: 4,
+            node_generation: 7,
+            operation_id: 19,
+            method,
+        }
+    }
+
+    #[test]
+    fn honest_framed_request_and_response_echo_complete_identity() {
+        let identity = honest_identity(RpcRole::Execution, RpcMethod::NetRecv);
+        let request = encode_honest_request(identity, b"request").unwrap();
+        let decoded = decode_honest_request(&request).unwrap();
+        assert_eq!(decoded.identity, identity);
+        assert_eq!(decoded.payload, b"request");
+
+        let response = encode_honest_response(identity, -11, b"response").unwrap();
+        let decoded = decode_honest_response(&response).unwrap();
+        assert_eq!(decoded.identity, identity);
+        assert_eq!(decoded.status, -11);
+        assert_eq!(decoded.payload, b"response");
+    }
+
+    #[test]
+    fn honest_framed_codec_rejects_identity_and_bound_mutations() {
+        let identity = honest_identity(RpcRole::Control, RpcMethod::PersistRaftReadyBatch);
+        let encoded = encode_honest_response(identity, 0, b"ok").unwrap();
+
+        for offset in [4_usize, 6, 7, 8, 16, 24, 32, 38] {
+            let mut mutated = encoded.clone();
+            mutated[offset] ^= 0xff;
+            assert!(
+                decode_honest_response_for(&mutated, identity).is_err(),
+                "offset {offset} must be rejected"
+            );
+        }
+
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert_eq!(
+            decode_honest_response(&trailing),
+            Err(HonestRpcFrameError::Malformed)
+        );
+        assert_eq!(
+            encode_honest_request(identity, &vec![0; MAX_HONEST_RPC_PAYLOAD_BYTES + 1]),
+            Err(HonestRpcFrameError::PayloadBound)
+        );
+    }
+
+    #[test]
+    fn honest_role_method_allowlist_is_closed() {
+        assert!(honest_role_allows_method(
+            RpcRole::Control,
+            RpcMethod::PersistRaftReadyBatch
+        ));
+        assert!(!honest_role_allows_method(
+            RpcRole::Control,
+            RpcMethod::NetRecv
+        ));
+        assert!(honest_role_allows_method(
+            RpcRole::Execution,
+            RpcMethod::NetRecv
+        ));
+        assert!(!honest_role_allows_method(
+            RpcRole::Execution,
+            RpcMethod::PersistRaftReadyBatch
+        ));
+        assert!(!honest_role_allows_method(
+            RpcRole::Execution,
+            RpcMethod::QeGetQuote
+        ));
     }
 
     #[test]

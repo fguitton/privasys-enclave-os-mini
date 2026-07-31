@@ -1,4 +1,4 @@
-// Copyright (c) Privasys. All rights reserved.
+// Copyright (c) Florian Guitton. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
 //! enclave-os-host: the untrusted host application.
@@ -28,6 +28,7 @@ use std::thread;
 
 use enclave::SharedChannel;
 use enclave_os_common::queue::DEFAULT_QUEUE_CAPACITY;
+use enclave_os_common::rpc::RpcRole;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum EcallStartOrder {
@@ -259,7 +260,7 @@ fn main() -> Result<()> {
         .name("control-rpc-dispatcher".into())
         .spawn(move || {
             let dispatcher = dispatcher::RpcDispatcher::new(
-                "control",
+                RpcRole::Control,
                 control_request_rx,
                 control_response_tx,
                 shutdown_clone,
@@ -273,7 +274,7 @@ fn main() -> Result<()> {
         .name("execution-rpc-dispatcher".into())
         .spawn(move || {
             let dispatcher = dispatcher::RpcDispatcher::new(
-                "execution",
+                RpcRole::Execution,
                 execution_request_rx,
                 execution_response_tx,
                 shutdown_clone,

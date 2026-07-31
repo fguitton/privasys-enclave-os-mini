@@ -1,4 +1,4 @@
-// Copyright (c) Privasys. All rights reserved.
+// Copyright (c) Florian Guitton. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
 //! Host-side TCP socket management.
@@ -7,11 +7,11 @@
 //! sockets by integer handles through OCALLs.
 
 use anyhow::{Context, Result};
+use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, SocketAddr};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Mutex;
-use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 //  Global socket table
@@ -49,8 +49,8 @@ impl SocketTable {
 /// Create a TCP listener socket, bind to `0.0.0.0:port`, and listen.
 pub fn tcp_listen(port: u16, _backlog: i32) -> Result<i32> {
     let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
-    let listener = TcpListener::bind(addr)
-        .with_context(|| format!("Failed to bind to {}", addr))?;
+    let listener =
+        TcpListener::bind(addr).with_context(|| format!("Failed to bind to {}", addr))?;
 
     // Set non-blocking so the enclave poll loop doesn't block forever
     listener.set_nonblocking(true)?;
@@ -64,11 +64,12 @@ pub fn tcp_listen(port: u16, _backlog: i32) -> Result<i32> {
 /// Accept an incoming connection on a listener.
 pub fn tcp_accept(listener_fd: i32) -> Result<(i32, String)> {
     let mut table = SOCKET_TABLE.lock().unwrap();
-    let listener = table.listeners.get(&listener_fd)
+    let listener = table
+        .listeners
+        .get(&listener_fd)
         .ok_or_else(|| anyhow::anyhow!("Invalid listener fd {}", listener_fd))?;
 
-    let (stream, peer_addr) = listener.accept()
-        .with_context(|| "accept() failed")?;
+    let (stream, peer_addr) = listener.accept().with_context(|| "accept() failed")?;
 
     stream.set_nonblocking(true)?;
 
@@ -80,13 +81,28 @@ pub fn tcp_accept(listener_fd: i32) -> Result<(i32, String)> {
 
 /// Connect to a remote TCP endpoint.
 pub fn tcp_connect(host: &str, port: u16) -> Result<i32> {
-    let addr = format!("{}:{}", host, port);
-    let stream = TcpStream::connect(&addr)
-        .with_context(|| format!("Failed to connect to {}", addr))?;
-
-    // Set a read timeout so the enclave's net_recv OCALL cannot block
-    // the host dispatcher indefinitely (e.g. server is slow or gone).
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+    let endpoint = format!("{}:{}", host, port);
+    let addr = endpoint
+        .to_socket_addrs()
+        .with_context(|| format!("Failed to resolve {endpoint}"))?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("No address resolved for {endpoint}"))?;
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+        .with_context(|| format!("Failed to create socket for {endpoint}"))?;
+    socket.set_nonblocking(true)?;
+    if let Err(error) = socket.connect(&addr.into()) {
+        // Linux reports EINPROGRESS (115), while some socket layers expose
+        // EWOULDBLOCK. Both mean the non-blocking connection is now pending.
+        if !matches!(error.raw_os_error(), Some(11) | Some(115)) {
+            return Err(error).with_context(|| format!("Failed to connect to {endpoint}"));
+        }
+    }
+    let stream: TcpStream = socket.into();
 
     let mut table = SOCKET_TABLE.lock().unwrap();
     let fd = table.alloc_fd();
@@ -97,7 +113,9 @@ pub fn tcp_connect(host: &str, port: u16) -> Result<i32> {
 /// Send data on a connected socket.
 pub fn tcp_send(fd: i32, data: &[u8]) -> Result<usize> {
     let mut table = SOCKET_TABLE.lock().unwrap();
-    let stream = table.streams.get_mut(&fd)
+    let stream = table
+        .streams
+        .get_mut(&fd)
         .ok_or_else(|| anyhow::anyhow!("Invalid stream fd {}", fd))?;
     let n = stream.write(data)?;
     Ok(n)
@@ -106,7 +124,9 @@ pub fn tcp_send(fd: i32, data: &[u8]) -> Result<usize> {
 /// Receive data from a connected socket.
 pub fn tcp_recv(fd: i32, buf: &mut [u8]) -> Result<usize> {
     let mut table = SOCKET_TABLE.lock().unwrap();
-    let stream = table.streams.get_mut(&fd)
+    let stream = table
+        .streams
+        .get_mut(&fd)
         .ok_or_else(|| anyhow::anyhow!("Invalid stream fd {}", fd))?;
     let n = stream.read(buf)?;
     Ok(n)

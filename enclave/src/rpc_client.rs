@@ -1,4 +1,4 @@
-// Copyright (c) Privasys. All rights reserved.
+// Copyright (c) Florian Guitton. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
 //! Enclave-side RPC client.
@@ -17,8 +17,8 @@ use std::vec::Vec;
 
 use enclave_os_common::queue::{SpscConsumer, SpscProducer};
 use enclave_os_common::rpc::{
-    self, PersistRaftReadyBatch, PersistRaftReadyResponseError, PersistedRaftReadyBatch,
-    RaftReadyBatchCodecError, RpcMethod,
+    self, HonestRpcFrameError, HonestRpcIdentity, PersistRaftReadyBatch, PersistedRaftReadyBatch,
+    RaftReadyBatchCodecError, RpcMethod, RpcRole,
 };
 
 // ---------------------------------------------------------------------------
@@ -44,8 +44,13 @@ fn notify_host() {
 /// Global request ID counter (monotonically increasing).
 static NEXT_REQ_ID: AtomicU64 = AtomicU64::new(1);
 
-fn next_req_id() -> u64 {
-    NEXT_REQ_ID.fetch_add(1, Ordering::Relaxed)
+fn next_req_id() -> Option<u64> {
+    NEXT_REQ_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .ok()
+        .filter(|request_id| *request_id != 0)
 }
 
 /// Enclave-side RPC client for calling host services.
@@ -66,8 +71,36 @@ pub struct RpcClient {
 /// same [`RpcClient`] for a bounded poll.
 #[derive(Debug)]
 pub struct PendingRaftReadyBatch {
-    request_id: u64,
+    identity: HonestRpcIdentity,
     batch_id: u64,
+}
+
+/// Token owned by the execution worker while one host operation is in flight.
+///
+/// Its complete framed identity is private; only the submitting client may
+/// poll it.
+#[derive(Debug)]
+pub struct PendingExecutionRpc {
+    identity: HonestRpcIdentity,
+}
+
+/// One bounded execution response returned by a single non-blocking poll.
+#[derive(Debug)]
+pub struct ExecutionRpcCompletion {
+    status: i32,
+    payload: Vec<u8>,
+}
+
+impl ExecutionRpcCompletion {
+    #[must_use]
+    pub const fn status(&self) -> i32 {
+        self.status
+    }
+
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
 }
 
 /// Fail-closed errors from the polled Ready persistence interface.
@@ -75,11 +108,31 @@ pub struct PendingRaftReadyBatch {
 pub enum PolledRaftReadyError {
     InvalidRequest(RaftReadyBatchCodecError),
     Busy,
+    OperationIdExhausted,
     QueueFull,
     NotPending,
     MalformedResponse,
     UnexpectedResponse,
     HostStatus(i32),
+}
+
+/// Fail-closed errors from the role-owned execution submit/poll interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolledExecutionRpcError {
+    MethodDenied,
+    InvalidRequest,
+    Busy,
+    OperationIdExhausted,
+    QueueFull,
+    NotPending,
+    MalformedResponse,
+    UnexpectedResponse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestReserveError {
+    Busy,
+    OperationIdExhausted,
 }
 
 // SAFETY: RpcClient uses SPSC queues backed by shared memory pointers.
@@ -102,12 +155,12 @@ impl RpcClient {
         }
     }
 
-    fn try_reserve_request(&self) -> Result<u64, PolledRaftReadyError> {
-        let request_id = next_req_id();
+    fn try_reserve_request(&self) -> Result<u64, RequestReserveError> {
+        let request_id = next_req_id().ok_or(RequestReserveError::OperationIdExhausted)?;
         self.in_flight_request_id
             .compare_exchange(0, request_id, Ordering::AcqRel, Ordering::Acquire)
             .map(|_| request_id)
-            .map_err(|_| PolledRaftReadyError::Busy)
+            .map_err(|_| RequestReserveError::Busy)
     }
 
     fn release_request(&self, request_id: u64) {
@@ -131,15 +184,28 @@ impl RpcClient {
     ) -> Result<PendingRaftReadyBatch, PolledRaftReadyError> {
         let payload = rpc::encode_persist_raft_ready_batch(batch)
             .map_err(PolledRaftReadyError::InvalidRequest)?;
-        let request_id = self.try_reserve_request()?;
-        let message = rpc::encode_request(request_id, RpcMethod::PersistRaftReadyBatch, &payload);
+        let request_id = self.try_reserve_request().map_err(|error| match error {
+            RequestReserveError::Busy => PolledRaftReadyError::Busy,
+            RequestReserveError::OperationIdExhausted => PolledRaftReadyError::OperationIdExhausted,
+        })?;
+        let identity = HonestRpcIdentity {
+            role: RpcRole::Control,
+            node_id: batch.node_id,
+            node_generation: batch.node_generation,
+            operation_id: request_id,
+            method: RpcMethod::PersistRaftReadyBatch,
+        };
+        let message = rpc::encode_honest_request(identity, &payload).map_err(|_| {
+            self.release_request(request_id);
+            PolledRaftReadyError::InvalidRequest(RaftReadyBatchCodecError::BatchBound)
+        })?;
         if self.request_tx.try_send(&message).is_err() {
             self.release_request(request_id);
             return Err(PolledRaftReadyError::QueueFull);
         }
         notify_host();
         Ok(PendingRaftReadyBatch {
-            request_id,
+            identity,
             batch_id: batch.batch_id,
         })
     }
@@ -153,31 +219,185 @@ impl RpcClient {
         &self,
         pending: &PendingRaftReadyBatch,
     ) -> Result<Option<PersistedRaftReadyBatch>, PolledRaftReadyError> {
-        if self.in_flight_request_id.load(Ordering::Acquire) != pending.request_id {
+        if self.in_flight_request_id.load(Ordering::Acquire) != pending.identity.operation_id {
             return Err(PolledRaftReadyError::NotPending);
         }
         let Some(raw_response) = self.response_rx.try_recv() else {
             return Ok(None);
         };
-        self.release_request(pending.request_id);
+        self.release_request(pending.identity.operation_id);
 
-        match rpc::decode_persist_raft_ready_response(
-            &raw_response,
-            pending.request_id,
-            pending.batch_id,
-        ) {
-            Ok(persisted) => Ok(Some(persisted)),
-            Err(PersistRaftReadyResponseError::MalformedResponse) => {
-                Err(PolledRaftReadyError::MalformedResponse)
-            }
-            Err(
-                PersistRaftReadyResponseError::UnexpectedRequestId
-                | PersistRaftReadyResponseError::UnexpectedBatch,
-            ) => Err(PolledRaftReadyError::UnexpectedResponse),
-            Err(PersistRaftReadyResponseError::HostStatus(status)) => {
-                Err(PolledRaftReadyError::HostStatus(status))
-            }
+        let response =
+            rpc::decode_honest_response_for(&raw_response, pending.identity).map_err(|error| {
+                match error {
+                    HonestRpcFrameError::UnexpectedIdentity => {
+                        PolledRaftReadyError::UnexpectedResponse
+                    }
+                    _ => PolledRaftReadyError::MalformedResponse,
+                }
+            })?;
+        if response.status != 0 {
+            return Err(PolledRaftReadyError::HostStatus(response.status));
         }
+        let persisted = rpc::decode_persisted_raft_ready_batch(response.payload)
+            .ok_or(PolledRaftReadyError::MalformedResponse)?;
+        if persisted.batch_id != pending.batch_id || persisted.durable_id != pending.batch_id {
+            return Err(PolledRaftReadyError::UnexpectedResponse);
+        }
+        Ok(Some(persisted))
+    }
+
+    // ====================================================================
+    //  Polled execution-plane networking
+    // ====================================================================
+
+    fn try_execution_request(
+        &self,
+        node_id: u64,
+        node_generation: u64,
+        method: RpcMethod,
+        payload: &[u8],
+    ) -> Result<PendingExecutionRpc, PolledExecutionRpcError> {
+        if !rpc::honest_role_allows_method(RpcRole::Execution, method) {
+            return Err(PolledExecutionRpcError::MethodDenied);
+        }
+        let operation_id = self.try_reserve_request().map_err(|error| match error {
+            RequestReserveError::Busy => PolledExecutionRpcError::Busy,
+            RequestReserveError::OperationIdExhausted => {
+                PolledExecutionRpcError::OperationIdExhausted
+            }
+        })?;
+        let identity = HonestRpcIdentity {
+            role: RpcRole::Execution,
+            node_id,
+            node_generation,
+            operation_id,
+            method,
+        };
+        let message = rpc::encode_honest_request(identity, payload).map_err(|_| {
+            self.release_request(operation_id);
+            PolledExecutionRpcError::InvalidRequest
+        })?;
+        if self.request_tx.try_send(&message).is_err() {
+            self.release_request(operation_id);
+            return Err(PolledExecutionRpcError::QueueFull);
+        }
+        notify_host();
+        Ok(PendingExecutionRpc { identity })
+    }
+
+    /// Try to submit one execution-owned non-blocking connect.
+    pub fn try_execution_net_tcp_connect(
+        &self,
+        node_id: u64,
+        node_generation: u64,
+        host: &str,
+        port: u16,
+    ) -> Result<PendingExecutionRpc, PolledExecutionRpcError> {
+        self.try_execution_request(
+            node_id,
+            node_generation,
+            RpcMethod::NetTcpConnect,
+            &rpc::encode_net_tcp_connect_req(host, port),
+        )
+    }
+
+    /// Try to submit one execution-owned bounded send.
+    pub fn try_execution_net_send(
+        &self,
+        node_id: u64,
+        node_generation: u64,
+        fd: i32,
+        bytes: &[u8],
+    ) -> Result<PendingExecutionRpc, PolledExecutionRpcError> {
+        self.try_execution_request(
+            node_id,
+            node_generation,
+            RpcMethod::NetSend,
+            &rpc::encode_net_send_req(fd, bytes),
+        )
+    }
+
+    /// Try to submit one execution-owned bounded receive.
+    pub fn try_execution_net_recv(
+        &self,
+        node_id: u64,
+        node_generation: u64,
+        fd: i32,
+        maximum_length: u32,
+    ) -> Result<PendingExecutionRpc, PolledExecutionRpcError> {
+        self.try_execution_request(
+            node_id,
+            node_generation,
+            RpcMethod::NetRecv,
+            &rpc::encode_net_recv_req(fd, maximum_length),
+        )
+    }
+
+    /// Try to submit one execution-owned socket close.
+    pub fn try_execution_net_close(
+        &self,
+        node_id: u64,
+        node_generation: u64,
+        fd: i32,
+    ) -> Result<PendingExecutionRpc, PolledExecutionRpcError> {
+        self.try_execution_request(
+            node_id,
+            node_generation,
+            RpcMethod::NetClose,
+            &rpc::encode_net_close_req(fd),
+        )
+    }
+
+    /// Poll one exact execution operation without waiting.
+    ///
+    /// A response with any substituted role, generation, operation or method
+    /// consumes and terminates the operation fail-closed.
+    pub fn poll_execution_rpc(
+        &self,
+        pending: &PendingExecutionRpc,
+    ) -> Result<Option<ExecutionRpcCompletion>, PolledExecutionRpcError> {
+        if self.in_flight_request_id.load(Ordering::Acquire) != pending.identity.operation_id {
+            return Err(PolledExecutionRpcError::NotPending);
+        }
+        let Some(raw_response) = self.response_rx.try_recv() else {
+            return Ok(None);
+        };
+        self.release_request(pending.identity.operation_id);
+        let response =
+            rpc::decode_honest_response_for(&raw_response, pending.identity).map_err(|error| {
+                match error {
+                    HonestRpcFrameError::UnexpectedIdentity => {
+                        PolledExecutionRpcError::UnexpectedResponse
+                    }
+                    _ => PolledExecutionRpcError::MalformedResponse,
+                }
+            })?;
+        Ok(Some(ExecutionRpcCompletion {
+            status: response.status,
+            payload: response.payload.to_vec(),
+        }))
+    }
+
+    /// Abandon one exact execution operation after its committed fence or
+    /// local budget expires.
+    ///
+    /// A late response remains framed with the abandoned identity. A future
+    /// operation can consume it only as an explicit `UnexpectedResponse`;
+    /// it can never be accepted for the new operation.
+    pub fn abandon_execution_rpc(
+        &self,
+        pending: PendingExecutionRpc,
+    ) -> Result<(), PolledExecutionRpcError> {
+        self.in_flight_request_id
+            .compare_exchange(
+                pending.identity.operation_id,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|_| PolledExecutionRpcError::NotPending)
     }
 
     // ====================================================================
@@ -192,8 +412,8 @@ impl RpcClient {
             Ok(request_id) => request_id,
             // Legacy callers cannot safely interleave with a polled Ready
             // operation. Return EBUSY instead of blocking the control TCS.
-            Err(PolledRaftReadyError::Busy) => return (-16, Vec::new()),
-            Err(_) => unreachable!("request reservation only returns Busy"),
+            Err(RequestReserveError::Busy) => return (-16, Vec::new()),
+            Err(RequestReserveError::OperationIdExhausted) => return (-75, Vec::new()),
         };
         let msg = rpc::encode_request(req_id, method, payload);
 

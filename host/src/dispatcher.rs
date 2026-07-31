@@ -1,4 +1,4 @@
-// Copyright (c) Privasys. All rights reserved.
+// Copyright (c) Florian Guitton. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
 //! Host-side RPC dispatcher.
@@ -21,19 +21,38 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use enclave_os_common::queue::{SpscConsumer, SpscProducer};
-use enclave_os_common::rpc::{self, RpcMethod};
+use enclave_os_common::rpc::{self, HonestRpcIdentity, RpcMethod, RpcRole};
 
 use crate::kvstore;
 use crate::net;
 
-fn role_allows_method(role: &str, method: RpcMethod) -> bool {
-    method != RpcMethod::PersistRaftReadyBatch || role == "control"
+fn legacy_role_allows_method(role: RpcRole, method: RpcMethod) -> bool {
+    method != RpcMethod::PersistRaftReadyBatch || role == RpcRole::Control
+}
+
+const fn role_name(role: RpcRole) -> &'static str {
+    match role {
+        RpcRole::Control => "control",
+        RpcRole::Execution => "execution",
+    }
+}
+
+fn network_error_status(error: &anyhow::Error) -> i32 {
+    error.downcast_ref::<std::io::Error>().map_or(-1, |error| {
+        if error.kind() == std::io::ErrorKind::WouldBlock
+            || matches!(error.raw_os_error(), Some(11) | Some(115))
+        {
+            -11
+        } else {
+            -1
+        }
+    })
 }
 
 /// RPC dispatcher that bridges enclave requests to host services.
 pub struct RpcDispatcher {
-    /// Stable role name for diagnostics and thread ownership evidence.
-    name: &'static str,
+    /// Stable physical role of this dispatcher and its queue pair.
+    role: RpcRole,
     /// Reads requests from the enclave.
     request_rx: SpscConsumer,
     /// Writes responses back to the enclave.
@@ -49,13 +68,13 @@ impl RpcDispatcher {
     /// The producers/consumers must be correctly paired to the shared-memory
     /// queues allocated for the enclave channel.
     pub fn new(
-        name: &'static str,
+        role: RpcRole,
         request_rx: SpscConsumer,
         response_tx: SpscProducer,
         shutdown: Arc<AtomicBool>,
     ) -> Self {
         Self {
-            name,
+            role,
             request_rx,
             response_tx,
             shutdown,
@@ -64,13 +83,16 @@ impl RpcDispatcher {
 
     /// Run the dispatcher loop. Blocks until shutdown is signalled.
     pub fn run(&self) {
-        info!("{} RPC dispatcher started", self.name);
+        info!("{} RPC dispatcher started", role_name(self.role));
 
         let mut backoff = Backoff::new();
 
         loop {
             if self.shutdown.load(Ordering::Relaxed) {
-                info!("{} RPC dispatcher: shutdown requested", self.name);
+                info!(
+                    "{} RPC dispatcher: shutdown requested",
+                    role_name(self.role)
+                );
                 break;
             }
 
@@ -85,17 +107,84 @@ impl RpcDispatcher {
             }
         }
 
-        info!("{} RPC dispatcher stopped", self.name);
+        info!("{} RPC dispatcher stopped", role_name(self.role));
     }
 
     /// Dispatch a single RPC request message.
     fn dispatch(&self, raw_msg: &[u8]) {
+        if rpc::has_honest_rpc_magic(raw_msg) {
+            self.dispatch_honest(raw_msg);
+        } else {
+            self.dispatch_legacy(raw_msg);
+        }
+    }
+
+    fn dispatch_honest(&self, raw_msg: &[u8]) {
+        let request = match rpc::decode_honest_request(raw_msg) {
+            Ok(request) => request,
+            Err(error) => {
+                error!(
+                    "{} Honest RPC dispatcher rejected frame: {:?}",
+                    role_name(self.role),
+                    error
+                );
+                return;
+            }
+        };
+        let identity = request.identity;
+        trace!(
+            "Honest RPC dispatch: role={:?} node={}/{} operation={} method={:?} payload_len={}",
+            identity.role,
+            identity.node_id,
+            identity.node_generation,
+            identity.operation_id,
+            identity.method,
+            request.payload.len()
+        );
+        let (status, payload) = if identity.role != self.role
+            || !rpc::honest_role_allows_method(self.role, identity.method)
+        {
+            warn!(
+                "{} Honest RPC dispatcher denied role={:?} method={:?}",
+                role_name(self.role),
+                identity.role,
+                identity.method
+            );
+            (-13, Vec::new())
+        } else {
+            self.dispatch_method(identity.method, request.payload)
+        };
+        self.try_send_honest_response(identity, status, &payload);
+    }
+
+    fn try_send_honest_response(&self, identity: HonestRpcIdentity, status: i32, payload: &[u8]) {
+        let response = match rpc::encode_honest_response(identity, status, payload) {
+            Ok(response) => response,
+            Err(error) => {
+                error!(
+                    "{} Honest RPC response rejected: {:?}",
+                    role_name(self.role),
+                    error
+                );
+                return;
+            }
+        };
+        if self.response_tx.try_send(&response).is_err() {
+            error!(
+                "{} Honest RPC response queue saturated for operation {}",
+                role_name(self.role),
+                identity.operation_id
+            );
+        }
+    }
+
+    fn dispatch_legacy(&self, raw_msg: &[u8]) {
         let (req_id, method, payload) = match rpc::decode_request(raw_msg) {
             Some(r) => r,
             None => {
                 error!(
                     "{} RPC dispatcher: malformed request ({} bytes)",
-                    self.name,
+                    role_name(self.role),
                     raw_msg.len()
                 );
                 return;
@@ -109,17 +198,26 @@ impl RpcDispatcher {
             payload.len()
         );
 
-        if !role_allows_method(self.name, method) {
+        if !legacy_role_allows_method(self.role, method) {
             warn!(
                 "{} RPC dispatcher denied method {:?} owned by another role",
-                self.name, method
+                role_name(self.role),
+                method
             );
             let response = rpc::encode_response(req_id, -13, &[]);
             self.response_tx.send(&response);
             return;
         }
 
-        let (status, response_payload) = match method {
+        let (status, response_payload) = self.dispatch_method(method, payload);
+
+        // Send response back to legacy Mini callers.
+        let resp = rpc::encode_response(req_id, status, &response_payload);
+        self.response_tx.send(&resp);
+    }
+
+    fn dispatch_method(&self, method: RpcMethod, payload: &[u8]) -> (i32, Vec<u8>) {
+        match method {
             // ---- Network ----
             RpcMethod::NetTcpListen => self.handle_net_tcp_listen(payload),
             RpcMethod::NetTcpAccept => self.handle_net_tcp_accept(payload),
@@ -149,11 +247,7 @@ impl RpcDispatcher {
                 self.shutdown.store(true, Ordering::Relaxed);
                 (0, Vec::new())
             }
-        };
-
-        // Send response back to the enclave
-        let resp = rpc::encode_response(req_id, status, &response_payload);
-        self.response_tx.send(&resp);
+        }
     }
 
     // ====================================================================
@@ -202,7 +296,7 @@ impl RpcDispatcher {
             Ok(fd) => (0, rpc::encode_fd(fd)),
             Err(e) => {
                 error!("NetTcpConnect failed: {}", e);
-                (-1, Vec::new())
+                (network_error_status(&e), Vec::new())
             }
         }
     }
@@ -216,7 +310,7 @@ impl RpcDispatcher {
             Ok(n) => (0, rpc::encode_i32(n as i32)),
             Err(e) => {
                 error!("NetSend failed: {}", e);
-                (-1, Vec::new())
+                (network_error_status(&e), Vec::new())
             }
         }
     }
@@ -232,10 +326,7 @@ impl RpcDispatcher {
                 buf.truncate(n);
                 (0, buf)
             }
-            Err(_) => {
-                // EWOULDBLOCK or error
-                (-11, Vec::new())
-            }
+            Err(error) => (network_error_status(&error), Vec::new()),
         }
     }
 
@@ -320,7 +411,10 @@ impl RpcDispatcher {
         let request = match rpc::decode_persist_raft_ready_batch(payload) {
             Ok(request) => request,
             Err(error) => {
-                warn!("PersistRaftReadyBatch rejected malformed payload: {:?}", error);
+                warn!(
+                    "PersistRaftReadyBatch rejected malformed payload: {:?}",
+                    error
+                );
                 return (-1, Vec::new());
             }
         };
@@ -451,19 +545,87 @@ impl Backoff {
 
 #[cfg(test)]
 mod tests {
-    use super::role_allows_method;
-    use enclave_os_common::rpc::RpcMethod;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    use super::{legacy_role_allows_method, RpcDispatcher};
+    use enclave_os_common::queue::{SpscConsumer, SpscProducer, SpscQueueHeader};
+    use enclave_os_common::rpc::{
+        self, honest_role_allows_method, HonestRpcIdentity, RpcMethod, RpcRole,
+    };
+
+    fn queue() -> (SpscProducer, SpscConsumer) {
+        let capacity = 8_192_u64;
+        let header = Box::into_raw(Box::new(SpscQueueHeader::new(capacity)));
+        let buffer = vec![0_u8; capacity as usize];
+        let buffer = Box::into_raw(buffer.into_boxed_slice()).cast::<u8>();
+        // SAFETY: test-owned header and backing allocation remain live for
+        // the process and each endpoint retains its sole SPSC role.
+        unsafe {
+            (
+                SpscProducer::from_raw(header, buffer),
+                SpscConsumer::from_raw(header, buffer),
+            )
+        }
+    }
 
     #[test]
     fn ready_persistence_is_control_role_only() {
-        assert!(role_allows_method(
-            "control",
+        assert!(legacy_role_allows_method(
+            RpcRole::Control,
             RpcMethod::PersistRaftReadyBatch
         ));
-        assert!(!role_allows_method(
-            "execution",
+        assert!(!legacy_role_allows_method(
+            RpcRole::Execution,
             RpcMethod::PersistRaftReadyBatch
         ));
-        assert!(role_allows_method("execution", RpcMethod::NetRecv));
+        assert!(legacy_role_allows_method(
+            RpcRole::Execution,
+            RpcMethod::NetRecv
+        ));
+        assert!(!honest_role_allows_method(
+            RpcRole::Control,
+            RpcMethod::NetRecv
+        ));
+        assert!(honest_role_allows_method(
+            RpcRole::Execution,
+            RpcMethod::NetRecv
+        ));
+    }
+
+    #[test]
+    fn honest_dispatcher_echoes_identity_and_denies_wrong_physical_role() {
+        let (_unused_request_tx, request_rx) = queue();
+        let (response_tx, response_rx) = queue();
+        let dispatcher = RpcDispatcher::new(
+            RpcRole::Execution,
+            request_rx,
+            response_tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let identity = HonestRpcIdentity {
+            role: RpcRole::Execution,
+            node_id: 3,
+            node_generation: 8,
+            operation_id: 13,
+            method: RpcMethod::NetClose,
+        };
+        dispatcher.dispatch(&rpc::encode_honest_request(identity, &123_i32.to_le_bytes()).unwrap());
+        let encoded_response = response_rx.try_recv().expect("framed response");
+        let response =
+            rpc::decode_honest_response_for(&encoded_response, identity).expect("exact identity");
+        assert_eq!(response.status, 0);
+
+        let wrong_role = HonestRpcIdentity {
+            role: RpcRole::Control,
+            operation_id: 14,
+            ..identity
+        };
+        dispatcher
+            .dispatch(&rpc::encode_honest_request(wrong_role, &123_i32.to_le_bytes()).unwrap());
+        let encoded_response = response_rx.try_recv().expect("denial response");
+        let response = rpc::decode_honest_response_for(&encoded_response, wrong_role)
+            .expect("denial still echoes submitted identity");
+        assert_eq!(response.status, -13);
     }
 }
