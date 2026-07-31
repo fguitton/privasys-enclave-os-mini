@@ -26,6 +26,10 @@ use enclave_os_common::rpc::{self, RpcMethod};
 use crate::kvstore;
 use crate::net;
 
+fn role_allows_method(role: &str, method: RpcMethod) -> bool {
+    method != RpcMethod::PersistRaftReadyBatch || role == "control"
+}
+
 /// RPC dispatcher that bridges enclave requests to host services.
 pub struct RpcDispatcher {
     /// Stable role name for diagnostics and thread ownership evidence.
@@ -105,6 +109,16 @@ impl RpcDispatcher {
             payload.len()
         );
 
+        if !role_allows_method(self.name, method) {
+            warn!(
+                "{} RPC dispatcher denied method {:?} owned by another role",
+                self.name, method
+            );
+            let response = rpc::encode_response(req_id, -13, &[]);
+            self.response_tx.send(&response);
+            return;
+        }
+
         let (status, response_payload) = match method {
             // ---- Network ----
             RpcMethod::NetTcpListen => self.handle_net_tcp_listen(payload),
@@ -119,6 +133,7 @@ impl RpcDispatcher {
             RpcMethod::KvGet => self.handle_kv_get(payload),
             RpcMethod::KvDelete => self.handle_kv_delete(payload),
             RpcMethod::KvListKeys => self.handle_kv_list_keys(payload),
+            RpcMethod::PersistRaftReadyBatch => self.handle_persist_raft_ready_batch(payload),
 
             // ---- Utility ----
             RpcMethod::GetCurrentTime => self.handle_get_current_time(),
@@ -301,6 +316,33 @@ impl RpcDispatcher {
         }
     }
 
+    fn handle_persist_raft_ready_batch(&self, payload: &[u8]) -> (i32, Vec<u8>) {
+        let request = match rpc::decode_persist_raft_ready_batch(payload) {
+            Ok(request) => request,
+            Err(error) => {
+                warn!("PersistRaftReadyBatch rejected malformed payload: {:?}", error);
+                return (-1, Vec::new());
+            }
+        };
+        match kvstore::persist_raft_ready_batch(&request) {
+            Ok(kvstore::RaftReadyPersistenceResult::Persisted {
+                batch_id,
+                durable_id,
+            }) => (
+                0,
+                rpc::encode_persisted_raft_ready_batch(rpc::PersistedRaftReadyBatch {
+                    batch_id,
+                    durable_id,
+                }),
+            ),
+            Ok(kvstore::RaftReadyPersistenceResult::Conflict) => (1, Vec::new()),
+            Err(error) => {
+                error!("PersistRaftReadyBatch failed: {}", error);
+                (-1, Vec::new())
+            }
+        }
+    }
+
     // ====================================================================
     //  Utility handlers
     // ====================================================================
@@ -404,5 +446,24 @@ impl Backoff {
             // Sleep briefly (1ms) — the enclave will call ocall_notify to wake us
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::role_allows_method;
+    use enclave_os_common::rpc::RpcMethod;
+
+    #[test]
+    fn ready_persistence_is_control_role_only() {
+        assert!(role_allows_method(
+            "control",
+            RpcMethod::PersistRaftReadyBatch
+        ));
+        assert!(!role_allows_method(
+            "execution",
+            RpcMethod::PersistRaftReadyBatch
+        ));
+        assert!(role_allows_method("execution", RpcMethod::NetRecv));
     }
 }

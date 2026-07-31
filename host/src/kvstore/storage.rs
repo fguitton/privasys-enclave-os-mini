@@ -8,7 +8,10 @@
 //! ciphertext – all encryption/decryption happens inside the enclave.
 
 use anyhow::{Context, Result};
-use rocksdb::{ColumnFamilyDescriptor, Options, DB};
+use enclave_os_common::rpc::{
+    encode_persist_raft_ready_batch, PersistRaftReadyBatch, RaftReadyRecordKind,
+};
+use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, WriteOptions, DB};
 use std::sync::{Mutex, OnceLock};
 
 static DB_INSTANCE: OnceLock<Mutex<DB>> = OnceLock::new();
@@ -100,6 +103,122 @@ pub fn delete(table: &str, enc_key: &[u8]) -> Result<bool> {
     Ok(existed)
 }
 
+/// Outcome of one predecessor-bound synchronous Ready batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RaftReadyPersistenceResult {
+    Persisted { batch_id: u64, durable_id: u64 },
+    Conflict,
+}
+
+fn raft_ready_prefix(node_id: u64, node_generation: u64) -> Vec<u8> {
+    let mut key = b"honest-s1/ready/v1/".to_vec();
+    key.extend_from_slice(&node_id.to_be_bytes());
+    key.extend_from_slice(&node_generation.to_be_bytes());
+    key.push(b'/');
+    key
+}
+
+fn raft_ready_meta_key(prefix: &[u8]) -> Vec<u8> {
+    let mut key = prefix.to_vec();
+    key.extend_from_slice(b"current");
+    key
+}
+
+fn raft_ready_batch_key(prefix: &[u8], batch_id: u64) -> Vec<u8> {
+    let mut key = prefix.to_vec();
+    key.extend_from_slice(b"batch/");
+    key.extend_from_slice(&batch_id.to_be_bytes());
+    key
+}
+
+fn raft_ready_record_key(
+    prefix: &[u8],
+    kind: RaftReadyRecordKind,
+    record_key: &[u8],
+) -> Vec<u8> {
+    let mut key = prefix.to_vec();
+    key.extend_from_slice(b"record/");
+    key.push(kind as u8);
+    key.push(b'/');
+    key.extend_from_slice(record_key);
+    key
+}
+
+fn read_durable_id(db: &DB, key: &[u8]) -> Result<u64> {
+    let Some(bytes) = db.get(key).context("RocksDB Ready metadata read failed")? else {
+        return Ok(0);
+    };
+    if bytes.len() != 8 {
+        anyhow::bail!("RocksDB Ready metadata has an invalid durable ID");
+    }
+    Ok(u64::from_be_bytes(
+        bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid Ready durable ID"))?,
+    ))
+}
+
+/// Persist one canonical encrypted/authenticated Ready batch with a single
+/// synchronous RocksDB `WriteBatch`.
+///
+/// A matching replay is accepted only while that batch remains the current
+/// durable tip. A changed replay or wrong predecessor writes nothing.
+pub fn persist_raft_ready_batch_on_db(
+    db: &DB,
+    request: &PersistRaftReadyBatch,
+) -> Result<RaftReadyPersistenceResult> {
+    let canonical = encode_persist_raft_ready_batch(request)
+        .map_err(|error| anyhow::anyhow!("invalid Ready batch: {error:?}"))?;
+    let prefix = raft_ready_prefix(request.node_id, request.node_generation);
+    let meta_key = raft_ready_meta_key(&prefix);
+    let batch_key = raft_ready_batch_key(&prefix, request.batch_id);
+    let current = read_durable_id(db, &meta_key)?;
+
+    if let Some(previous) = db
+        .get(&batch_key)
+        .context("RocksDB Ready replay read failed")?
+    {
+        if previous == canonical && current == request.batch_id {
+            return Ok(RaftReadyPersistenceResult::Persisted {
+                batch_id: request.batch_id,
+                durable_id: request.batch_id,
+            });
+        }
+        return Ok(RaftReadyPersistenceResult::Conflict);
+    }
+    if current != request.expected_previous_durable_id {
+        return Ok(RaftReadyPersistenceResult::Conflict);
+    }
+
+    let mut batch = WriteBatch::default();
+    for record in &request.records {
+        batch.put(
+            raft_ready_record_key(&prefix, record.kind, &record.key),
+            &record.value,
+        );
+    }
+    batch.put(&batch_key, canonical);
+    batch.put(&meta_key, request.batch_id.to_be_bytes());
+
+    let mut options = WriteOptions::default();
+    options.set_sync(true);
+    db.write_opt(batch, &options)
+        .context("synchronous RocksDB Ready WriteBatch failed")?;
+    Ok(RaftReadyPersistenceResult::Persisted {
+        batch_id: request.batch_id,
+        durable_id: request.batch_id,
+    })
+}
+
+/// Persist through the process-global host database.
+pub fn persist_raft_ready_batch(
+    request: &PersistRaftReadyBatch,
+) -> Result<RaftReadyPersistenceResult> {
+    let database = db();
+    persist_raft_ready_batch_on_db(&database, request)
+}
+
 /// List all keys in a table, optionally filtered by a prefix.
 ///
 /// Returns up to `limit` keys whose raw bytes start with `prefix`.
@@ -130,15 +249,31 @@ pub fn list_keys(table: &str, prefix: &[u8], limit: usize) -> Result<Vec<Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct TestDbDirectory(PathBuf);
+
+    impl Drop for TestDbDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     /// Helper: open a fresh RocksDB in a temp dir for one test.
-    fn open_tmp() -> (tempfile::TempDir, DB) {
-        let tmp = tempfile::tempdir().unwrap();
+    fn open_tmp() -> (TestDbDirectory, DB) {
+        static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+        let path = std::env::temp_dir().join(format!(
+            "honest-mini-rocksdb-test-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path).unwrap();
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
-        let db = DB::open(&opts, tmp.path()).unwrap();
-        (tmp, db)
+        let db = DB::open(&opts, &path).unwrap();
+        (TestDbDirectory(path), db)
     }
 
     #[test]
@@ -207,5 +342,81 @@ mod tests {
 
         // Default CF should NOT have "key".
         assert_eq!(db.get(b"key").unwrap(), None);
+    }
+
+    #[test]
+    fn raft_ready_batch_is_atomic_idempotent_and_predecessor_bound() {
+        use enclave_os_common::rpc::{
+            PersistRaftReadyBatch, RaftReadyRecord, RaftReadyRecordKind,
+        };
+
+        let (_tmp, db) = open_tmp();
+        let first = PersistRaftReadyBatch {
+            node_id: 3,
+            node_generation: 7,
+            batch_id: 1,
+            expected_previous_durable_id: 0,
+            records: vec![
+                RaftReadyRecord {
+                    kind: RaftReadyRecordKind::HardState,
+                    key: b"hard-state".to_vec(),
+                    value: b"ciphertext-hs-1".to_vec(),
+                },
+                RaftReadyRecord {
+                    kind: RaftReadyRecordKind::AppliedIndex,
+                    key: b"applied-index".to_vec(),
+                    value: b"ciphertext-index-1".to_vec(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            persist_raft_ready_batch_on_db(&db, &first).unwrap(),
+            RaftReadyPersistenceResult::Persisted {
+                batch_id: 1,
+                durable_id: 1
+            }
+        );
+        assert_eq!(
+            persist_raft_ready_batch_on_db(&db, &first).unwrap(),
+            RaftReadyPersistenceResult::Persisted {
+                batch_id: 1,
+                durable_id: 1
+            }
+        );
+
+        let mut altered_replay = first.clone();
+        altered_replay.records[0].value = b"different-ciphertext".to_vec();
+        assert_eq!(
+            persist_raft_ready_batch_on_db(&db, &altered_replay).unwrap(),
+            RaftReadyPersistenceResult::Conflict
+        );
+
+        let wrong_predecessor = PersistRaftReadyBatch {
+            batch_id: 2,
+            expected_previous_durable_id: 0,
+            records: vec![RaftReadyRecord {
+                kind: RaftReadyRecordKind::AppliedIndex,
+                key: b"applied-index".to_vec(),
+                value: b"must-not-be-written".to_vec(),
+            }],
+            ..first.clone()
+        };
+        assert_eq!(
+            persist_raft_ready_batch_on_db(&db, &wrong_predecessor).unwrap(),
+            RaftReadyPersistenceResult::Conflict
+        );
+
+        let second = PersistRaftReadyBatch {
+            expected_previous_durable_id: 1,
+            ..wrong_predecessor
+        };
+        assert_eq!(
+            persist_raft_ready_batch_on_db(&db, &second).unwrap(),
+            RaftReadyPersistenceResult::Persisted {
+                batch_id: 2,
+                durable_id: 2
+            }
+        );
     }
 }
