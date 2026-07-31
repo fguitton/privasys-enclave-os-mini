@@ -1,3 +1,6 @@
+# Copyright (c) Florian Guitton. All rights reserved.
+# Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
+
 [package]
 name = "f0-ratls-client"
 version = "0.1.0"
