@@ -582,6 +582,7 @@ name = "honest-wasmtime-profile"
 version = "0.1.0"
 dependencies = [
  "enclave-os-common",
+ "sha2",
  "wasmtime",
 ]
 
