@@ -55,7 +55,9 @@ pub mod jwks;
 
 // Re-export RA-TLS verification types for convenience.
 pub use client::{
-    ExpectedOid, HttpResponse, RaTlsPolicy, ReportDataBinding, TeeType,
+    ExpectedOid, HttpResponse, IncrementalTlsClient, RaTlsPolicy,
+    ReportDataBinding, SgxPeerCertificateEvidence, TeeType,
+    locally_verify_sgx_peer_certificate,
     OID_CONFIG_MERKLE_ROOT, OID_EGRESS_CA_HASH, OID_WASM_APPS_HASH,
     OID_ATTESTATION_SERVERS_HASH,
     MAX_RESPONSE_BODY,

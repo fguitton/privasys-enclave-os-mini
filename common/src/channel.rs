@@ -34,6 +34,15 @@
 //! | `TcpData`    | 0x02 | raw bytes | TLS bytes to send to client            |
 //! | `TcpClose`   | 0x03 | (empty)   | Enclave closing connection             |
 //! | `DataReady`  | 0x04 | (empty)   | Data channel consumer ready — start accepting |
+//! | `TcpConnect` | 0x05 | u64 request ID + UTF-8 IP:port | Request a non-blocking outbound dial |
+//!
+//! The host assigns the connection ID for a `TcpConnect`; its request must use
+//! ID zero. Completion returns on the host → enclave queue:
+//!
+//! | Type | Value | Payload | Description |
+//! |------|-------|---------|-------------|
+//! | `TcpConnected`     | 0x06 | u64 request ID | Outbound socket connected |
+//! | `TcpConnectFailed` | 0x07 | u64 request ID + u8 reason | Outbound socket failed |
 //!
 //! # Queue layout
 //!
@@ -57,6 +66,7 @@ pub const CHANNEL_MSG_HEADER: usize = 5;
 /// The 1 MiB limit is a safety cap — large WASM uploads arrive as
 /// multiple TCP segments anyway.
 pub const MAX_CHANNEL_PAYLOAD: usize = 1024 * 1024;
+const CONNECT_REQUEST_ID_BYTES: usize = 8;
 
 // ========================================================================
 //  Message types
@@ -83,6 +93,38 @@ pub enum ChannelMsgType {
     /// event loop.  The TCP proxy must not accept connections until
     /// it has received this message.
     DataReady = 0x04,
+
+    /// Request one asynchronous outbound TCP connection (enclave → host).
+    /// The request uses conn_id zero; the host allocates the real ID.
+    TcpConnect = 0x05,
+
+    /// A host-assigned outbound connection completed (host → enclave).
+    TcpConnected = 0x06,
+
+    /// A host-assigned outbound connection failed (host → enclave).
+    TcpConnectFailed = 0x07,
+}
+
+/// Bounded, non-sensitive reason for an asynchronous connect failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TcpConnectFailure {
+    MalformedEndpoint = 0x01,
+    ConnectionLimit = 0x02,
+    SocketFailure = 0x03,
+    Timeout = 0x04,
+}
+
+impl TcpConnectFailure {
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0x01 => Some(Self::MalformedEndpoint),
+            0x02 => Some(Self::ConnectionLimit),
+            0x03 => Some(Self::SocketFailure),
+            0x04 => Some(Self::Timeout),
+            _ => None,
+        }
+    }
 }
 
 impl ChannelMsgType {
@@ -93,6 +135,9 @@ impl ChannelMsgType {
             0x02 => Some(Self::TcpData),
             0x03 => Some(Self::TcpClose),
             0x04 => Some(Self::DataReady),
+            0x05 => Some(Self::TcpConnect),
+            0x06 => Some(Self::TcpConnected),
+            0x07 => Some(Self::TcpConnectFailed),
             _ => None,
         }
     }
@@ -152,6 +197,64 @@ pub fn encode_tcp_close(conn_id: u32) -> Vec<u8> {
     encode_channel_msg(ChannelMsgType::TcpClose, conn_id, &[])
 }
 
+/// Request a host-owned asynchronous outbound connection.
+#[inline]
+pub fn encode_tcp_connect(request_id: u64, endpoint: &str) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(CONNECT_REQUEST_ID_BYTES + endpoint.len());
+    payload.extend_from_slice(&request_id.to_le_bytes());
+    payload.extend_from_slice(endpoint.as_bytes());
+    encode_channel_msg(ChannelMsgType::TcpConnect, 0, &payload)
+}
+
+/// Report successful completion of a host-owned outbound connection.
+#[inline]
+pub fn encode_tcp_connected(request_id: u64, conn_id: u32) -> Vec<u8> {
+    encode_channel_msg(
+        ChannelMsgType::TcpConnected,
+        conn_id,
+        &request_id.to_le_bytes(),
+    )
+}
+
+/// Report failure of a host-owned outbound connection.
+#[inline]
+pub fn encode_tcp_connect_failed(request_id: u64, reason: TcpConnectFailure) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(CONNECT_REQUEST_ID_BYTES + 1);
+    payload.extend_from_slice(&request_id.to_le_bytes());
+    payload.push(reason as u8);
+    encode_channel_msg(
+        ChannelMsgType::TcpConnectFailed,
+        0,
+        &payload,
+    )
+}
+
+/// Decode a `TcpConnect` payload into its correlation ID and literal endpoint.
+pub fn decode_tcp_connect(payload: &[u8]) -> Option<(u64, &str)> {
+    if payload.len() <= CONNECT_REQUEST_ID_BYTES {
+        return None;
+    }
+    let request_id = u64::from_le_bytes(payload[..CONNECT_REQUEST_ID_BYTES].try_into().ok()?);
+    let endpoint = core::str::from_utf8(&payload[CONNECT_REQUEST_ID_BYTES..]).ok()?;
+    Some((request_id, endpoint))
+}
+
+/// Decode a `TcpConnected` payload.
+pub fn decode_tcp_connected(payload: &[u8]) -> Option<u64> {
+    (payload.len() == CONNECT_REQUEST_ID_BYTES)
+        .then(|| u64::from_le_bytes(payload.try_into().expect("length checked")))
+}
+
+/// Decode a `TcpConnectFailed` payload.
+pub fn decode_tcp_connect_failed(payload: &[u8]) -> Option<(u64, TcpConnectFailure)> {
+    if payload.len() != CONNECT_REQUEST_ID_BYTES + 1 {
+        return None;
+    }
+    let request_id = u64::from_le_bytes(payload[..CONNECT_REQUEST_ID_BYTES].try_into().ok()?);
+    let reason = TcpConnectFailure::from_u8(payload[CONNECT_REQUEST_ID_BYTES])?;
+    Some((request_id, reason))
+}
+
 // ========================================================================
 //  Tests
 // ========================================================================
@@ -198,5 +301,43 @@ mod tests {
         let mut msg = encode_tcp_data(1, b"hello");
         msg[0] = 0xFF; // corrupt type
         assert!(decode_channel_msg(&msg).is_none());
+    }
+
+    #[test]
+    fn test_outbound_connect_roundtrip_uses_host_assigned_id() {
+        let request = encode_tcp_connect(91, "127.0.0.1:8443");
+        let (typ, conn_id, payload) = decode_channel_msg(&request).unwrap();
+        assert_eq!(typ, ChannelMsgType::TcpConnect);
+        assert_eq!(conn_id, 0);
+        assert_eq!(
+            decode_tcp_connect(payload),
+            Some((91, "127.0.0.1:8443"))
+        );
+
+        let connected = encode_tcp_connected(91, 77);
+        let (typ, conn_id, payload) = decode_channel_msg(&connected).unwrap();
+        assert_eq!(typ, ChannelMsgType::TcpConnected);
+        assert_eq!(conn_id, 77);
+        assert_eq!(decode_tcp_connected(payload), Some(91));
+
+        let failed = encode_tcp_connect_failed(92, TcpConnectFailure::SocketFailure);
+        let (typ, conn_id, payload) = decode_channel_msg(&failed).unwrap();
+        assert_eq!(typ, ChannelMsgType::TcpConnectFailed);
+        assert_eq!(conn_id, 0);
+        assert_eq!(
+            decode_tcp_connect_failed(payload),
+            Some((92, TcpConnectFailure::SocketFailure))
+        );
+    }
+
+    #[test]
+    fn test_outbound_connect_decoders_reject_ambiguous_payloads() {
+        assert!(decode_tcp_connect(&[0; 8]).is_none());
+        assert!(decode_tcp_connected(&[0; 7]).is_none());
+        assert!(decode_tcp_connect_failed(&[0; 8]).is_none());
+
+        let mut unknown_reason = vec![0; 9];
+        unknown_reason[8] = 0xff;
+        assert!(decode_tcp_connect_failed(&unknown_reason).is_none());
     }
 }

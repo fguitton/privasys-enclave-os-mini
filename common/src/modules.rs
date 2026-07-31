@@ -85,6 +85,13 @@ pub struct AppIdentity {
 ///
 /// Carries optional metadata extracted from the TLS session and OIDC auth.
 pub struct RequestContext {
+    /// Host-assigned connection correlation ID.
+    ///
+    /// This is routing metadata only and conveys no peer identity or
+    /// authority. It lets an adopter bind pending asynchronous appraisal to
+    /// the exact enclave-resident TLS session.
+    pub connection_id: u32,
+
     /// Exact SNI hostname selected by the TLS ClientHello.
     ///
     /// This is trusted transport metadata from the enclave TLS terminator,
@@ -209,6 +216,7 @@ mod tests {
 
     fn context(server_name: Option<&str>, mutual: bool) -> RequestContext {
         RequestContext {
+            connection_id: 0,
             server_name: server_name.map(str::to_owned),
             peer_cert_der: mutual.then(|| vec![1]),
             client_challenge_nonce: mutual.then(|| vec![2]),

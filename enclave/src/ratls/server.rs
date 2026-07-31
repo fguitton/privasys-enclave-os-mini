@@ -24,7 +24,9 @@
 //! used for non-network operations (KV store, time, logging) via the
 //! separate RPC channel.
 
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::string::String;
 use std::sync::Arc;
 use std::vec::Vec;
@@ -39,6 +41,7 @@ use crate::{enclave_log_info, enclave_log_error};
 use enclave_os_common::channel::{self, ChannelMsgType};
 use enclave_os_common::queue::SpscProducer;
 
+use rustls::crypto::{verify_tls12_signature, verify_tls13_signature};
 use rustls::crypto::ring::default_provider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, UnixTime};
 use rustls::server::Acceptor;
@@ -73,6 +76,7 @@ enum SessionState {
 /// fragmented hello to complete. A TLS record maxes at 16 KiB; a real
 /// ClientHello (even with the RA-TLS challenge extension) is ~1-2 KiB.
 const MAX_PENDING_CLIENTHELLO: usize = 16 * 1024;
+const MAX_PENDING_ENCLAVE_OUTPUT: usize = 4 * 1024 * 1024;
 
 /// Stable DNS identity for the enclave-wide endpoint. Per-app identities use
 /// their admitted CertStore hostname instead. Never reflect an arbitrary SNI
@@ -95,6 +99,10 @@ pub struct IngressServer {
     shutdown: bool,
     /// Per-hostname cached deterministic TLS configs.
     cached_configs: BTreeMap<String, CachedConfig>,
+    /// Bounded ciphertext backlog when the host-side SPSC queue has no credit.
+    pending_output: RefCell<VecDeque<Vec<u8>>>,
+    pending_output_bytes: Cell<usize>,
+    output_failed: Cell<bool>,
 }
 
 /// A cached ServerConfig for deterministic (non-challenge) connections.
@@ -119,6 +127,9 @@ impl IngressServer {
             data_tx,
             shutdown: false,
             cached_configs: BTreeMap::new(),
+            pending_output: RefCell::new(VecDeque::new()),
+            pending_output_bytes: Cell::new(0),
+            output_failed: Cell::new(false),
         }
     }
 
@@ -167,12 +178,38 @@ impl IngressServer {
             ChannelMsgType::DataReady => {
                 // DataReady is an enclave→host signal; ignore if received inbound.
             }
+            ChannelMsgType::TcpConnect => {
+                // TcpConnect is an enclave→host request.
+            }
+            ChannelMsgType::TcpConnected | ChannelMsgType::TcpConnectFailed => {
+                enclave_log_error!(
+                    "Unexpected outbound connection event conn_id={}",
+                    conn_id
+                );
+            }
         }
     }
 
     /// Are we shutting down?
     pub fn is_shutdown(&self) -> bool {
-        self.shutdown
+        self.shutdown || self.output_failed.get()
+    }
+
+    /// Flush at most one queued enclave→host channel message.
+    ///
+    /// This is called from Mini's control loop during bounded idle progress.
+    pub fn progress_output(&self) -> bool {
+        let mut pending = self.pending_output.borrow_mut();
+        let Some(message) = pending.front() else {
+            return false;
+        };
+        if self.data_tx.try_send(message).is_err() {
+            return false;
+        }
+        let sent = pending.pop_front().expect("front existed");
+        self.pending_output_bytes
+            .set(self.pending_output_bytes.get() - sent.len());
+        true
     }
 
     /// Invalidate cached cert for a hostname (called when an app is
@@ -326,6 +363,7 @@ impl IngressServer {
         // because different requests in the same session may carry
         // different tokens (or none — e.g. GET /healthz).
         let base_ctx = enclave_os_common::modules::RequestContext {
+            connection_id: conn_id,
             server_name: session.server_name().map(str::to_owned),
             peer_cert_der: session.peer_cert_der(),
             client_challenge_nonce: session.client_challenge_nonce().cloned(),
@@ -501,6 +539,8 @@ impl IngressServer {
         // Resolve per-app identity from the global CertStore
         let app_data = sni.as_deref()
             .and_then(|h| cert_store::cert_store().resolve(h));
+        let require_peer_client_auth =
+            sni.as_deref() == Some(enclave_os_common::modules::HONEST_PEER_SNI);
 
         if let Some(n) = nonce {
             // binder=None here: pre-handshake mint has no key schedule yet.
@@ -512,6 +552,7 @@ impl IngressServer {
                 mode,
                 app_data.as_ref(),
                 Some(ENCLAVE_WIDE_SERVER_NAME),
+                require_peer_client_auth,
             );
         }
 
@@ -535,6 +576,7 @@ impl IngressServer {
             mode,
             app_data.as_ref(),
             Some(ENCLAVE_WIDE_SERVER_NAME),
+            require_peer_client_auth,
         )?;
 
         self.cached_configs.insert(cache_key, CachedConfig {
@@ -562,14 +604,35 @@ impl IngressServer {
         const CHUNK: usize = channel::MAX_CHANNEL_PAYLOAD;
         for chunk in tls_bytes.chunks(CHUNK) {
             let msg = channel::encode_tcp_data(conn_id, chunk);
-            self.data_tx.send(&msg);
+            self.queue_to_proxy(msg);
         }
     }
 
     /// Send a TcpClose to the TCP proxy.
     fn send_close(&self, conn_id: u32) {
         let msg = channel::encode_tcp_close(conn_id);
-        self.data_tx.send(&msg);
+        self.queue_to_proxy(msg);
+    }
+
+    fn queue_to_proxy(&self, message: Vec<u8>) {
+        let mut pending = self.pending_output.borrow_mut();
+        if pending.is_empty() && self.data_tx.try_send(&message).is_ok() {
+            return;
+        }
+        let next_size = self
+            .pending_output_bytes
+            .get()
+            .saturating_add(message.len());
+        if next_size > MAX_PENDING_ENCLAVE_OUTPUT {
+            enclave_log_error!(
+                "Enclave-to-host credit backlog exceeded {} bytes",
+                MAX_PENDING_ENCLAVE_OUTPUT
+            );
+            self.output_failed.set(true);
+            return;
+        }
+        self.pending_output_bytes.set(next_size);
+        pending.push_back(message);
     }
 }
 
@@ -663,6 +726,78 @@ impl ClientCertVerifier for PermissiveClientAuth {
     }
 }
 
+/// Mandatory peer-SNI client authentication with CertificateVerify checking.
+///
+/// The certificate chain and SGX quote are appraised after the handshake,
+/// when the server challenge and TLS 1.3 channel binder are both available.
+/// This verifier still proves possession of the leaf private key during the
+/// handshake; unlike the legacy optional path it never accepts an unchecked
+/// CertificateVerify signature.
+#[derive(Debug)]
+struct StrictPeerClientAuth;
+
+impl ClientCertVerifier for StrictPeerClientAuth {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        true
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, TlsError> {
+        if end_entity.as_ref().is_empty() {
+            return Err(TlsError::General(
+                "peer client certificate is empty".to_string(),
+            ));
+        }
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, TlsError> {
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, TlsError> {
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 /// Result of building a TLS config for a single connection.
 struct TlsConfigResult {
     config: Arc<ServerConfig>,
@@ -721,6 +856,7 @@ fn build_tls_config(
     mode: CertMode,
     app: Option<&cert_store::AppCertData>,
     server_name: Option<&str>,
+    require_peer_client_auth: bool,
 ) -> Result<TlsConfigResult, String> {
     // Capture the challenge nonce for the channel-binding hook before `mode`
     // is consumed by the initial (placeholder) mint below.
@@ -741,10 +877,15 @@ fn build_tls_config(
 
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(result.pkcs8_key));
 
-    let mut config = ServerConfig::builder_with_provider(Arc::new(default_provider()))
+    let builder = ServerConfig::builder_with_provider(Arc::new(default_provider()))
         .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|e| format!("TLS config error: {:?}", e))?
-        .with_client_cert_verifier(Arc::new(PermissiveClientAuth))
+        .map_err(|e| format!("TLS config error: {:?}", e))?;
+    let builder = if require_peer_client_auth {
+        builder.with_client_cert_verifier(Arc::new(StrictPeerClientAuth))
+    } else {
+        builder.with_client_cert_verifier(Arc::new(PermissiveClientAuth))
+    };
+    let mut config = builder
         .with_single_cert(certs, key)
         .map_err(|e| format!("cert chain error: {:?}", e))?;
 
@@ -1244,7 +1385,6 @@ fn handle_set_attestation_servers(
     _base_ctx: &enclave_os_common::modules::RequestContext,
 ) -> HttpHandleResult {
     // Require Manager role when OIDC is configured.
-    let raw_auth_token = http_req.authorization.clone();
     if let Some(ref oidc_config) = crate::oidc_config() {
         let _ = oidc_config;
         match verify_auth_header(http_req) {
@@ -1343,6 +1483,7 @@ fn handle_fido2_request(
     };
 
     let ctx = enclave_os_common::modules::RequestContext {
+        connection_id: base_ctx.connection_id,
         server_name: base_ctx.server_name.clone(),
         peer_cert_der: base_ctx.peer_cert_der.clone(),
         client_challenge_nonce: base_ctx.client_challenge_nonce.clone(),
@@ -1441,6 +1582,7 @@ fn handle_data_request_http(
     };
 
     let ctx = enclave_os_common::modules::RequestContext {
+        connection_id: base_ctx.connection_id,
         server_name: base_ctx.server_name.clone(),
         peer_cert_der: base_ctx.peer_cert_der.clone(),
         client_challenge_nonce: base_ctx.client_challenge_nonce.clone(),
@@ -1520,6 +1662,7 @@ fn handle_rpc_request(
     };
 
     let ctx = enclave_os_common::modules::RequestContext {
+        connection_id: base_ctx.connection_id,
         server_name: base_ctx.server_name.clone(),
         peer_cert_der: base_ctx.peer_cert_der.clone(),
         client_challenge_nonce: base_ctx.client_challenge_nonce.clone(),
@@ -1644,6 +1787,7 @@ fn handle_mcp_tools_request(
     };
 
     let ctx = enclave_os_common::modules::RequestContext {
+        connection_id: base_ctx.connection_id,
         server_name: base_ctx.server_name.clone(),
         peer_cert_der: base_ctx.peer_cert_der.clone(),
         client_challenge_nonce: base_ctx.client_challenge_nonce.clone(),

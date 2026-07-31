@@ -454,7 +454,10 @@ pub fn initialise_runtime_and_ingress(
     // The proxy blocks new connections until it receives this message.
     {
         let ready_msg = channel::encode_channel_msg(channel::ChannelMsgType::DataReady, 0, &[]);
-        crate::data_tx().send(&ready_msg);
+        if crate::data_tx().try_send(&ready_msg).is_err() {
+            enclave_log_error!("DataReady could not acquire data-channel credit");
+            return Err(-23);
+        }
         enclave_log_info!("DataReady sent to host TCP proxy");
     }
 
@@ -486,6 +489,20 @@ pub enum ControlLoopAction {
 /// Implementations must perform bounded work and return without waiting for a
 /// worker, host RPC response, socket or persistence operation.
 pub trait ControlLoopHook {
+    /// Offer one decoded data-channel message to adopter-owned outbound I/O.
+    ///
+    /// Return `true` only for a message belonging to an adopter connection.
+    /// Implementations must remain bounded and must not wait for network or
+    /// host progress.
+    fn on_data_channel_message(
+        &mut self,
+        _msg_type: channel::ChannelMsgType,
+        _conn_id: u32,
+        _payload: &[u8],
+    ) -> bool {
+        false
+    }
+
     fn on_opportunity(&mut self, opportunity: ControlLoopOpportunity) -> ControlLoopAction;
 }
 
@@ -512,23 +529,36 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
     // Main event loop: read from data channel, dispatch to IngressServer
     let data_rx = crate::data_rx();
     while !crate::is_shutdown() {
+        if let Ok(mut st) = crate::state().lock() {
+            if let Some(ref mut srv) = st.ingress_server {
+                let _ = srv.progress_output();
+                if srv.is_shutdown() {
+                    crate::signal_shutdown();
+                }
+            }
+        } else {
+            break;
+        }
+
         // Try to receive a data channel message
         match data_rx.try_recv() {
             Some(msg) => {
                 // Decode the channel message
                 match channel::decode_channel_msg(&msg) {
                     Some((msg_type, conn_id, payload)) => {
-                        let mut st = match crate::state().lock() {
-                            Ok(st) => st,
-                            Err(_) => break,
-                        };
-                        if let Some(ref mut srv) = st.ingress_server {
-                            srv.handle_message(msg_type, conn_id, payload);
-                            if srv.is_shutdown() {
-                                crate::signal_shutdown();
+                        if !hook.on_data_channel_message(msg_type, conn_id, payload) {
+                            let mut st = match crate::state().lock() {
+                                Ok(st) => st,
+                                Err(_) => break,
+                            };
+                            if let Some(ref mut srv) = st.ingress_server {
+                                srv.handle_message(msg_type, conn_id, payload);
+                                if srv.is_shutdown() {
+                                    crate::signal_shutdown();
+                                }
                             }
+                            drop(st);
                         }
-                        drop(st);
                         apply_control_action(
                             hook.on_opportunity(ControlLoopOpportunity::DataChannelProgress),
                         );

@@ -116,6 +116,10 @@ struct Cli {
     /// compositions and absent unless explicitly requested.
     #[arg(long)]
     s2_0_private_fixture: bool,
+
+    /// Test-only literal IP:port for the incremental appraised peer probe.
+    #[arg(long)]
+    s1_peer_probe_endpoint: Option<String>,
 }
 
 fn spawn_control_ecall(enclave_id: u64, config_bytes: Vec<u8>) -> Result<thread::JoinHandle<i32>> {
@@ -390,6 +394,9 @@ fn main() -> Result<()> {
     }
     if cli.s2_0_private_fixture {
         config["s2_0_private_fixture"] = serde_json::Value::Bool(true);
+    }
+    if let Some(endpoint) = cli.s1_peer_probe_endpoint {
+        config["s1_peer_probe_endpoint"] = serde_json::Value::String(endpoint);
     }
 
     let config_bytes = serde_json::to_vec(&config)?;

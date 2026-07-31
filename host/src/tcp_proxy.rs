@@ -15,15 +15,15 @@
 //!
 //! All sockets are non-blocking. The proxy runs in its own thread.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use enclave_os_common::channel::{
-    self, ChannelMsgType, CHANNEL_MSG_HEADER,
+    self, ChannelMsgType, TcpConnectFailure, CHANNEL_MSG_HEADER,
 };
 use enclave_os_common::queue::{SpscProducer, SpscConsumer};
 
@@ -31,6 +31,10 @@ use log::{info, warn, error, debug};
 
 /// Maximum bytes to read from a TCP socket in one call.
 const TCP_READ_BUF: usize = 32_768;
+/// Per-connection cap for enclave-produced TLS ciphertext awaiting a writable
+/// socket. Exceeding it closes only that connection.
+const MAX_PENDING_WRITE: usize = 2 * 1024 * 1024;
+const MAX_PENDING_TO_ENCLAVE: usize = 2 * 1024 * 1024;
 
 /// Hard cap on simultaneously-tracked connections. Leaves headroom under
 /// the conventional 1024 default `RLIMIT_NOFILE`. New `accept()` calls
@@ -59,6 +63,19 @@ const KEEPALIVE_RETRIES: u32 = 3;
 struct ConnState {
     stream: TcpStream,
     last_activity: Instant,
+    origin: ConnectionOrigin,
+    write_buffer: Vec<u8>,
+    write_offset: usize,
+    close_after_write: bool,
+}
+
+enum ConnectionOrigin {
+    Inbound,
+    OutboundConnecting {
+        request_id: u64,
+        endpoint: String,
+    },
+    Outbound,
 }
 
 /// TCP proxy for enclave inbound connections.
@@ -79,6 +96,9 @@ pub struct TcpProxy {
     ready: bool,
     /// Last time we ran the idle-connection sweep.
     last_idle_scan: Instant,
+    /// Bounded credit backlog when the enclave's SPSC queue is full.
+    pending_to_enclave: VecDeque<Vec<u8>>,
+    pending_to_enclave_bytes: usize,
 }
 
 impl TcpProxy {
@@ -104,6 +124,8 @@ impl TcpProxy {
             shutdown,
             ready: false,
             last_idle_scan: Instant::now(),
+            pending_to_enclave: VecDeque::new(),
+            pending_to_enclave_bytes: 0,
         })
     }
 
@@ -117,6 +139,7 @@ impl TcpProxy {
 
             // 3 (first). Read from enclave → write to TCP sockets / check DataReady
             did_work |= self.drain_enclave_output();
+            did_work |= self.flush_pending_to_enclave();
 
             if !self.ready {
                 // Don't accept or read until the enclave signals DataReady
@@ -126,11 +149,22 @@ impl TcpProxy {
                 continue;
             }
 
-            // 1. Accept new connections
-            did_work |= self.accept_connections();
+            // Make at most one non-blocking write per connection this round.
+            did_work |= self.flush_socket_writes();
 
-            // 2. Read from TCP sockets → send to enclave
-            did_work |= self.read_sockets(&mut read_buf);
+            // Apply credit backpressure instead of spinning when the enclave
+            // queue is full. Existing socket writes continue to drain.
+            if self.pending_to_enclave.is_empty() {
+                // 1. Accept new connections
+                did_work |= self.accept_connections();
+
+                // Advance every non-blocking outbound connect without delaying
+                // accepted connections or another peer's socket.
+                did_work |= self.progress_outbound_connections();
+
+                // 2. Read from TCP sockets → send to enclave
+                did_work |= self.read_sockets(&mut read_buf);
+            }
 
             // 4. Periodically reap idle connections (catches half-dead peers
             //    that never trigger TCP keepalive — e.g. stalled TLS handshakes).
@@ -173,11 +207,11 @@ impl TcpProxy {
                         continue;
                     }
 
-                    let conn_id = self.next_conn_id;
-                    self.next_conn_id = self.next_conn_id.wrapping_add(1);
-                    if self.next_conn_id == 0 {
-                        self.next_conn_id = 1; // skip 0
-                    }
+                    let Some(conn_id) = self.allocate_conn_id() else {
+                        warn!("No free connection ID; dropping connection from {}", addr);
+                        drop(stream);
+                        continue;
+                    };
 
                     if let Err(e) = stream.set_nonblocking(true) {
                         warn!("set_nonblocking failed for conn_id={}: {}", conn_id, e);
@@ -198,11 +232,18 @@ impl TcpProxy {
 
                     // Send TcpNew to enclave
                     let msg = channel::encode_tcp_new(conn_id, &peer_addr);
-                    self.data_tx.send(&msg);
+                    self.send_to_enclave(msg);
 
                     self.connections.insert(
                         conn_id,
-                        ConnState { stream, last_activity: Instant::now() },
+                        ConnState {
+                            stream,
+                            last_activity: Instant::now(),
+                            origin: ConnectionOrigin::Inbound,
+                            write_buffer: Vec::new(),
+                            write_offset: 0,
+                            close_after_write: false,
+                        },
                     );
                     accepted = true;
                 }
@@ -221,8 +262,12 @@ impl TcpProxy {
     fn read_sockets(&mut self, buf: &mut [u8]) -> bool {
         let mut did_work = false;
         let mut to_close = Vec::new();
+        let mut to_enclave = Vec::new();
 
         for (&conn_id, conn) in self.connections.iter_mut() {
+            if matches!(conn.origin, ConnectionOrigin::OutboundConnecting { .. }) {
+                continue;
+            }
             match conn.stream.read(buf) {
                 Ok(0) => {
                     // Peer closed connection
@@ -230,8 +275,7 @@ impl TcpProxy {
                     to_close.push(conn_id);
                 }
                 Ok(n) => {
-                    let msg = channel::encode_tcp_data(conn_id, &buf[..n]);
-                    self.data_tx.send(&msg);
+                    to_enclave.push(channel::encode_tcp_data(conn_id, &buf[..n]));
                     conn.last_activity = Instant::now();
                     did_work = true;
                 }
@@ -248,9 +292,11 @@ impl TcpProxy {
         // Close connections and notify enclave
         for conn_id in to_close {
             self.connections.remove(&conn_id);
-            let msg = channel::encode_tcp_close(conn_id);
-            self.data_tx.send(&msg);
+            to_enclave.push(channel::encode_tcp_close(conn_id));
             did_work = true;
+        }
+        for message in to_enclave {
+            self.send_to_enclave(message);
         }
 
         did_work
@@ -281,7 +327,7 @@ impl TcpProxy {
         for conn_id in stale {
             self.connections.remove(&conn_id);
             let msg = channel::encode_tcp_close(conn_id);
-            self.data_tx.send(&msg);
+            self.send_to_enclave(msg);
         }
     }
 
@@ -304,12 +350,31 @@ impl TcpProxy {
                         }
                         Some((ChannelMsgType::TcpClose, conn_id, _)) => {
                             debug!("Enclave closed conn_id={}", conn_id);
-                            self.connections.remove(&conn_id);
+                            self.close_from_enclave(conn_id);
+                        }
+                        Some((ChannelMsgType::TcpConnect, conn_id, payload)) => {
+                            if conn_id != 0 {
+                                warn!(
+                                    "Outbound connect request carried non-zero conn_id={}",
+                                    conn_id
+                                );
+                            } else {
+                                self.begin_outbound_connection(payload);
+                            }
                         }
                         Some((ChannelMsgType::TcpNew, conn_id, _)) => {
-                            // Enclave shouldn't send TcpNew — ignore
                             warn!(
                                 "Unexpected TcpNew from enclave for conn_id={}",
+                                conn_id
+                            );
+                        }
+                        Some((
+                            ChannelMsgType::TcpConnected | ChannelMsgType::TcpConnectFailed,
+                            conn_id,
+                            _,
+                        )) => {
+                            warn!(
+                                "Unexpected outbound completion from enclave for conn_id={}",
                                 conn_id
                             );
                         }
@@ -330,39 +395,325 @@ impl TcpProxy {
 
     /// Write data to a TCP socket. If the write fails, close the connection.
     fn write_to_socket(&mut self, conn_id: u32, data: &[u8]) {
+        let mut close = false;
         if let Some(conn) = self.connections.get_mut(&conn_id) {
-            // Write all data (may need multiple writes for large payloads)
-            let mut offset = 0;
-            while offset < data.len() {
-                match conn.stream.write(&data[offset..]) {
-                    Ok(0) => {
-                        warn!("Zero-length write on conn_id={}", conn_id);
-                        self.connections.remove(&conn_id);
-                        let msg = channel::encode_tcp_close(conn_id);
-                        self.data_tx.send(&msg);
-                        return;
-                    }
-                    Ok(n) => {
-                        offset += n;
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        // Socket buffer full — spin briefly and retry
-                        std::thread::yield_now();
-                    }
-                    Err(e) => {
-                        warn!("Write error on conn_id={}: {}", conn_id, e);
-                        self.connections.remove(&conn_id);
-                        let msg = channel::encode_tcp_close(conn_id);
-                        self.data_tx.send(&msg);
-                        return;
-                    }
-                }
+            if matches!(conn.origin, ConnectionOrigin::OutboundConnecting { .. }) {
+                warn!("Write before outbound connect completed for conn_id={}", conn_id);
+                return;
             }
-            conn.last_activity = Instant::now();
+            let pending = conn.write_buffer.len().saturating_sub(conn.write_offset);
+            if pending.saturating_add(data.len()) > MAX_PENDING_WRITE {
+                warn!(
+                    "Pending write cap exceeded for conn_id={} ({} + {} bytes)",
+                    conn_id,
+                    pending,
+                    data.len()
+                );
+                close = true;
+            } else {
+                if conn.write_offset > 0 {
+                    conn.write_buffer.drain(..conn.write_offset);
+                    conn.write_offset = 0;
+                }
+                conn.write_buffer.extend_from_slice(data);
+            }
         } else {
             debug!("Write to unknown conn_id={}, ignoring", conn_id);
         }
+        if close {
+            self.connections.remove(&conn_id);
+            self.send_to_enclave(channel::encode_tcp_close(conn_id));
+        }
     }
+
+    fn close_from_enclave(&mut self, conn_id: u32) {
+        let remove_now = self
+            .connections
+            .get_mut(&conn_id)
+            .map(|conn| {
+                conn.close_after_write = true;
+                conn.write_offset == conn.write_buffer.len()
+            })
+            .unwrap_or(false);
+        if remove_now {
+            self.connections.remove(&conn_id);
+        }
+    }
+
+    fn allocate_conn_id(&mut self) -> Option<u32> {
+        for _ in 0..=MAX_CONNS {
+            let candidate = self.next_conn_id;
+            self.next_conn_id = self.next_conn_id.wrapping_add(1);
+            if self.next_conn_id == 0 {
+                self.next_conn_id = 1;
+            }
+            if candidate != 0 && !self.connections.contains_key(&candidate) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    fn begin_outbound_connection(&mut self, payload: &[u8]) {
+        const MAX_ENDPOINT_BYTES: usize = 128;
+        let (request_id, endpoint) = match channel::decode_tcp_connect(payload) {
+            Some((request_id, endpoint))
+                if !endpoint.is_empty() && endpoint.len() <= MAX_ENDPOINT_BYTES =>
+            {
+                (request_id, endpoint.to_string())
+            }
+            Some((request_id, _)) => {
+                warn!("Rejected malformed outbound endpoint");
+                self.send_to_enclave(channel::encode_tcp_connect_failed(
+                    request_id,
+                    TcpConnectFailure::MalformedEndpoint,
+                ));
+                return;
+            }
+            None => {
+                warn!("Rejected malformed outbound connect request");
+                return;
+            }
+        };
+        let Some(conn_id) = self.allocate_conn_id() else {
+            warn!("No free connection ID for outbound endpoint {}", endpoint);
+            self.send_to_enclave(channel::encode_tcp_connect_failed(
+                request_id,
+                TcpConnectFailure::ConnectionLimit,
+            ));
+            return;
+        };
+        if self.connections.len() >= MAX_CONNS {
+            warn!(
+                "Connection cap reached ({}), rejecting outbound endpoint {}",
+                MAX_CONNS, endpoint
+            );
+            self.send_to_enclave(channel::encode_tcp_connect_failed(
+                request_id,
+                TcpConnectFailure::ConnectionLimit,
+            ));
+            return;
+        }
+        let address = match endpoint.parse::<SocketAddr>() {
+            Ok(address) => address,
+            Err(_) => {
+                warn!("Rejected non-IP outbound endpoint {}", endpoint);
+                self.send_to_enclave(channel::encode_tcp_connect_failed(
+                    request_id,
+                    TcpConnectFailure::MalformedEndpoint,
+                ));
+                return;
+            }
+        };
+        match begin_nonblocking_connect(address) {
+            Ok((stream, connected)) => {
+                if let Err(error) = stream.set_nodelay(true) {
+                    warn!(
+                        "set_nodelay failed for outbound conn_id={}: {}",
+                        conn_id, error
+                    );
+                }
+                if let Err(error) = enable_keepalive(&stream) {
+                    warn!(
+                        "set keepalive failed for outbound conn_id={}: {}",
+                        conn_id, error
+                    );
+                }
+                let origin = if connected {
+                    ConnectionOrigin::Outbound
+                } else {
+                    ConnectionOrigin::OutboundConnecting {
+                        request_id,
+                        endpoint: endpoint.clone(),
+                    }
+                };
+                self.connections.insert(
+                    conn_id,
+                    ConnState {
+                        stream,
+                        last_activity: Instant::now(),
+                        origin,
+                        write_buffer: Vec::new(),
+                        write_offset: 0,
+                        close_after_write: false,
+                    },
+                );
+                if connected {
+                    self.send_to_enclave(channel::encode_tcp_connected(request_id, conn_id));
+                }
+            }
+            Err(error) => {
+                warn!(
+                    "Outbound connect setup failed conn_id={} endpoint={}: {}",
+                    conn_id, endpoint, error
+                );
+                self.send_to_enclave(channel::encode_tcp_connect_failed(
+                    request_id,
+                    TcpConnectFailure::SocketFailure,
+                ));
+            }
+        }
+    }
+
+    fn progress_outbound_connections(&mut self) -> bool {
+        let mut connected = Vec::new();
+        let mut failed = Vec::new();
+        for (&conn_id, conn) in &self.connections {
+            let ConnectionOrigin::OutboundConnecting {
+                request_id,
+                endpoint,
+            } = &conn.origin
+            else {
+                continue;
+            };
+            match conn.stream.take_error() {
+                Ok(Some(error)) => {
+                    warn!(
+                        "Outbound connect failed conn_id={} endpoint={}: {}",
+                        conn_id, endpoint, error
+                    );
+                    failed.push((conn_id, *request_id, endpoint.clone()));
+                }
+                Ok(None) => match conn.stream.peer_addr() {
+                    Ok(_) => connected.push((conn_id, *request_id, endpoint.clone())),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::NotConnected | io::ErrorKind::WouldBlock
+                        ) => {}
+                    Err(error) => {
+                        warn!(
+                            "Outbound connect state failed conn_id={} endpoint={}: {}",
+                            conn_id, endpoint, error
+                        );
+                        failed.push((conn_id, *request_id, endpoint.clone()));
+                    }
+                },
+                Err(error) => {
+                    warn!(
+                        "Outbound connect status failed conn_id={} endpoint={}: {}",
+                        conn_id, endpoint, error
+                    );
+                    failed.push((conn_id, *request_id, endpoint.clone()));
+                }
+            }
+        }
+        for (conn_id, request_id, _) in &connected {
+            if let Some(conn) = self.connections.get_mut(conn_id) {
+                conn.origin = ConnectionOrigin::Outbound;
+                conn.last_activity = Instant::now();
+            }
+            self.send_to_enclave(channel::encode_tcp_connected(*request_id, *conn_id));
+        }
+        for (conn_id, request_id, _) in &failed {
+            self.connections.remove(conn_id);
+            self.send_to_enclave(channel::encode_tcp_connect_failed(
+                *request_id,
+                TcpConnectFailure::SocketFailure,
+            ));
+        }
+        !connected.is_empty() || !failed.is_empty()
+    }
+
+    fn flush_socket_writes(&mut self) -> bool {
+        let mut did_work = false;
+        let mut to_close = Vec::new();
+        for (&conn_id, conn) in &mut self.connections {
+            if matches!(conn.origin, ConnectionOrigin::OutboundConnecting { .. })
+                || conn.write_offset == conn.write_buffer.len()
+            {
+                continue;
+            }
+            match conn.stream.write(&conn.write_buffer[conn.write_offset..]) {
+                Ok(0) => {
+                    warn!("Zero-length write on conn_id={}", conn_id);
+                    to_close.push((conn_id, true));
+                }
+                Ok(written) => {
+                    conn.write_offset += written;
+                    conn.last_activity = Instant::now();
+                    did_work = true;
+                    if conn.write_offset == conn.write_buffer.len() {
+                        conn.write_buffer.clear();
+                        conn.write_offset = 0;
+                        if conn.close_after_write {
+                            to_close.push((conn_id, false));
+                        }
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => {
+                    warn!("Write error on conn_id={}: {}", conn_id, error);
+                    to_close.push((conn_id, true));
+                }
+            }
+        }
+        for (conn_id, notify_enclave) in to_close {
+            self.connections.remove(&conn_id);
+            if notify_enclave {
+                self.send_to_enclave(channel::encode_tcp_close(conn_id));
+            }
+            did_work = true;
+        }
+        did_work
+    }
+
+    fn send_to_enclave(&mut self, message: Vec<u8>) {
+        if self.pending_to_enclave.is_empty() && self.data_tx.try_send(&message).is_ok() {
+            return;
+        }
+        if self
+            .pending_to_enclave_bytes
+            .saturating_add(message.len())
+            > MAX_PENDING_TO_ENCLAVE
+        {
+            error!(
+                "Host-to-enclave credit backlog exceeded {} bytes; shutting down proxy",
+                MAX_PENDING_TO_ENCLAVE
+            );
+            self.shutdown.store(true, Ordering::Release);
+            return;
+        }
+        self.pending_to_enclave_bytes += message.len();
+        self.pending_to_enclave.push_back(message);
+    }
+
+    fn flush_pending_to_enclave(&mut self) -> bool {
+        let Some(message) = self.pending_to_enclave.front() else {
+            return false;
+        };
+        if self.data_tx.try_send(message).is_err() {
+            return false;
+        }
+        let sent = self
+            .pending_to_enclave
+            .pop_front()
+            .expect("front existed");
+        self.pending_to_enclave_bytes -= sent.len();
+        true
+    }
+}
+
+fn begin_nonblocking_connect(address: SocketAddr) -> io::Result<(TcpStream, bool)> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let socket = Socket::new(
+        Domain::for_address(address),
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )?;
+    socket.set_nonblocking(true)?;
+    let connected = match socket.connect(&address.into()) {
+        Ok(()) => true,
+        Err(error) if connect_is_in_progress(&error) => false,
+        Err(error) => return Err(error),
+    };
+    Ok((socket.into(), connected))
+}
+
+fn connect_is_in_progress(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::WouldBlock
+        || matches!(error.raw_os_error(), Some(114 | 115))
 }
 
 /// Enable TCP keepalive on a stream with our standard parameters.
@@ -376,4 +727,76 @@ fn enable_keepalive(stream: &TcpStream) -> io::Result<()> {
         .with_interval(KEEPALIVE_INTERVAL)
         .with_retries(KEEPALIVE_RETRIES);
     sock.set_tcp_keepalive(&ka)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use enclave_os_common::queue::SpscQueueHeader;
+
+    struct QueueMemory {
+        header: Box<SpscQueueHeader>,
+        buffer: Box<[u8]>,
+    }
+
+    impl QueueMemory {
+        fn new() -> Self {
+            Self {
+                header: Box::new(SpscQueueHeader::new(4096)),
+                buffer: vec![0_u8; 4096].into_boxed_slice(),
+            }
+        }
+
+        fn producer(&mut self) -> SpscProducer {
+            unsafe { SpscProducer::from_raw(&*self.header, self.buffer.as_mut_ptr()) }
+        }
+
+        fn consumer(&mut self) -> SpscConsumer {
+            unsafe { SpscConsumer::from_raw(&*self.header, self.buffer.as_ptr()) }
+        }
+    }
+
+    #[test]
+    fn enclave_close_drains_buffered_ciphertext_before_socket_close() {
+        let mut host_to_enclave = QueueMemory::new();
+        let mut enclave_to_host = QueueMemory::new();
+        let data_tx = host_to_enclave.producer();
+        let data_rx = enclave_to_host.consumer();
+        let mut proxy = TcpProxy::new(
+            0,
+            1,
+            data_tx,
+            data_rx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        server.set_nonblocking(true).unwrap();
+        proxy.connections.insert(
+            7,
+            ConnState {
+                stream: server,
+                last_activity: Instant::now(),
+                origin: ConnectionOrigin::Inbound,
+                write_buffer: Vec::new(),
+                write_offset: 0,
+                close_after_write: false,
+            },
+        );
+
+        proxy.write_to_socket(7, b"encrypted response");
+        proxy.close_from_enclave(7);
+        assert!(proxy.connections.contains_key(&7));
+        assert!(proxy.flush_socket_writes());
+        assert!(!proxy.connections.contains_key(&7));
+
+        let mut received = [0_u8; 18];
+        client.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"encrypted response");
+        let mut eof = [0_u8; 1];
+        assert_eq!(client.read(&mut eof).unwrap(), 0);
+    }
 }

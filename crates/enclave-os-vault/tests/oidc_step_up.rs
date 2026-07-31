@@ -38,9 +38,11 @@ fn owner_policy(sub: &str, ops: Vec<Operation>) -> KeyPolicy {
 
 fn ctx_with_amr(sub: &str, amr: &[&str]) -> RequestContext {
     RequestContext {
+        connection_id: 0,
         server_name: None,
         peer_cert_der: None,
         client_challenge_nonce: None,
+        channel_binder: None,
         oidc_claims: Some(OidcClaims {
             sub: sub.to_string(),
             roles: Vec::new(),
@@ -64,9 +66,11 @@ fn ctx_step_up(
     exp: u64,
 ) -> RequestContext {
     RequestContext {
+        connection_id: 0,
         server_name: None,
         peer_cert_der: None,
         client_challenge_nonce: None,
+        channel_binder: None,
         oidc_claims: Some(OidcClaims {
             sub: sub.to_string(),
             roles: Vec::new(),

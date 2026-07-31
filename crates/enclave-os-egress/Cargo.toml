@@ -22,7 +22,7 @@ native-sgx-types = ["dep:sgx_types", "enclave-os-common/jwt"]
 
 [dependencies]
 # Shared types, module trait, and OCall vtable
-enclave-os-common = { path = "../../common", features = ["crypto"] }
+enclave-os-common = { path = "../../common", features = ["crypto", "jwt"] }
 
 # TLS (Privasys fork with RA-TLS 0xFFBB challenge extension)
 rustls = { git = "https://github.com/Privasys/rustls", tag = "privasys-v0.8.1", default-features = false, features = ["ring", "tls12", "std"] }

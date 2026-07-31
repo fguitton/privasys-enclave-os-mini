@@ -40,6 +40,10 @@ use sgx_types::types::{Quote3, Quote4};
 
 use enclave_os_common::oids;
 
+mod incremental;
+
+pub use incremental::IncrementalTlsClient;
+
 // Re-export shared quote primitives for callers building `RaTlsPolicy` values.
 pub use enclave_os_common::quote::TeeType;
 
@@ -288,6 +292,63 @@ pub struct RaTlsPolicy {
     /// (the ordinary policy above governs it). `None` (the default) disables the
     /// check.
     pub dependencies: Option<Vec<u8>>,
+}
+
+/// Locally verified SGX peer certificate evidence awaiting remote appraisal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SgxPeerCertificateEvidence {
+    /// SHA-256 of the exact DER leaf certificate.
+    pub certificate_digest: [u8; 32],
+    /// SHA-256 of the exact SGX quote extension bytes.
+    pub quote_digest: [u8; 32],
+    /// MRENCLAVE extracted from the structurally valid SGX quote.
+    pub mr_enclave: [u8; 32],
+    /// Exact quote bytes to submit through the separately incremental
+    /// appraisal-service connection.
+    pub quote: Vec<u8>,
+}
+
+/// Verify an incoming challenge-bound SGX peer certificate locally.
+///
+/// This checks the exact expected MRENCLAVE, server challenge and TLS 1.3
+/// binder, but deliberately does not call an appraisal service. The caller
+/// must submit the returned quote through its incremental control-TCS client
+/// and must not treat these facts as appraised until that service accepts.
+pub fn locally_verify_sgx_peer_certificate(
+    der: &[u8],
+    expected_mr_enclave: [u8; 32],
+    challenge: &[u8],
+    channel_binder: &[u8],
+) -> Result<SgxPeerCertificateEvidence, String> {
+    if challenge.len() != 32 {
+        return Err("RA-TLS peer: challenge must be exactly 32 bytes".into());
+    }
+    if channel_binder.len() != 32 {
+        return Err("RA-TLS peer: channel binder must be exactly 32 bytes".into());
+    }
+    let policy = RaTlsPolicy {
+        tee: TeeType::Sgx,
+        mr_enclave: Some(expected_mr_enclave),
+        mr_signer: None,
+        mr_td: None,
+        report_data: ReportDataBinding::ChallengeResponse {
+            nonce: challenge.to_vec(),
+        },
+        expected_oids: Vec::new(),
+        attestation_servers: Vec::new(),
+        client_identity: None,
+        dependencies: None,
+    };
+    let verified = verify_ratls_cert(der, &policy)?;
+    verify_certificate_channel_binding(der, &policy, channel_binder)?;
+    Ok(SgxPeerCertificateEvidence {
+        certificate_digest: verified.certificate_digest,
+        quote_digest: verified.quote_digest,
+        mr_enclave: verified
+            .peer_mrenclave
+            .ok_or_else(|| "RA-TLS peer: SGX measurement unavailable".to_string())?,
+        quote: verified.quote,
+    })
 }
 
 /// Perform a full HTTPS request with any method, custom headers, and
@@ -886,6 +947,7 @@ impl ServerCertVerifier for RaTlsVerifier {
 
         // 2. RA-TLS attestation verification (the real identity check).
         verify_ratls_cert(end_entity.as_ref(), &self.policy)
+            .map(|_| ())
             .map_err(Error::General)?;
 
         Ok(ServerCertVerified::assertion())
@@ -919,7 +981,17 @@ impl ServerCertVerifier for RaTlsVerifier {
 // =========================================================================
 
 /// Verify the RA-TLS attestation evidence in a DER-encoded leaf certificate.
-fn verify_ratls_cert(der: &[u8], policy: &RaTlsPolicy) -> Result<(), String> {
+struct VerifiedRaTlsCertificate {
+    certificate_digest: [u8; 32],
+    quote_digest: [u8; 32],
+    peer_mrenclave: Option<[u8; 32]>,
+    quote: Vec<u8>,
+}
+
+fn verify_ratls_cert(
+    der: &[u8],
+    policy: &RaTlsPolicy,
+) -> Result<VerifiedRaTlsCertificate, String> {
     let (_, cert) = X509Certificate::from_der(der)
         .map_err(|_| "RA-TLS: failed to parse leaf certificate DER".to_string())?;
 
@@ -996,7 +1068,12 @@ fn verify_ratls_cert(der: &[u8], policy: &RaTlsPolicy) -> Result<(), String> {
     // hardware and has not been tampered with.
     crate::attestation::verify_quote(quote, &policy.attestation_servers)?;
 
-    Ok(())
+    Ok(VerifiedRaTlsCertificate {
+        certificate_digest: sha256_array(der),
+        quote_digest: sha256_array(quote),
+        peer_mrenclave,
+        quote: quote.to_vec(),
+    })
 }
 
 /// Verify expected configuration OIDs in the certificate.
@@ -1307,26 +1384,34 @@ fn verify_channel_binding(
     tls_conn: &ClientConnection,
     policy: &RaTlsPolicy,
 ) -> Result<(), String> {
-    let nonce = match &policy.report_data {
-        ReportDataBinding::ChallengeResponse { nonce } => nonce.clone(),
-        ReportDataBinding::Deterministic => return Ok(()),
-    };
-
     let certs = tls_conn
         .peer_certificates()
         .ok_or_else(|| "RA-TLS: no peer certificate for channel-binding check".to_string())?;
     let leaf = certs
         .first()
         .ok_or_else(|| "RA-TLS: empty peer certificate chain".to_string())?;
-    let (_, cert) = X509Certificate::from_der(leaf)
-        .map_err(|_| "RA-TLS: failed to parse leaf for channel binding".to_string())?;
 
     let binder = tls_conn
         .ratls_channel_binder()
         .ok_or_else(|| "RA-TLS: channel binder unavailable".to_string())?;
 
+    verify_certificate_channel_binding(leaf, policy, &binder)
+}
+
+fn verify_certificate_channel_binding(
+    der: &[u8],
+    policy: &RaTlsPolicy,
+    binder: &[u8],
+) -> Result<(), String> {
+    let nonce = match &policy.report_data {
+        ReportDataBinding::ChallengeResponse { nonce } => nonce.clone(),
+        ReportDataBinding::Deterministic => return Ok(()),
+    };
+    let (_, cert) = X509Certificate::from_der(der)
+        .map_err(|_| "RA-TLS: failed to parse leaf for channel binding".to_string())?;
+
     let mut binding = nonce;
-    binding.extend_from_slice(&binder);
+    binding.extend_from_slice(binder);
 
     let ec_point = cert.public_key().subject_public_key.as_ref();
     let spki_der = enclave_os_common::quote::build_p256_spki_der(ec_point);
@@ -1364,4 +1449,33 @@ fn verify_channel_binding(
 /// Re-exported from [`enclave_os_common::quote::compute_report_data_hash`].
 fn compute_report_data_hash(pubkey_bytes: &[u8], binding: &[u8]) -> digest::Digest {
     enclave_os_common::quote::compute_report_data_hash(pubkey_bytes, binding)
+}
+
+fn sha256_array(bytes: &[u8]) -> [u8; 32] {
+    let value = digest::digest(&digest::SHA256, bytes);
+    let mut out = [0_u8; 32];
+    out.copy_from_slice(value.as_ref());
+    out
+}
+
+#[cfg(test)]
+mod peer_appraisal_tests {
+    use super::locally_verify_sgx_peer_certificate;
+
+    #[test]
+    fn strict_peer_appraisal_rejects_missing_or_malformed_live_bindings_first() {
+        let expected = [0x51; 32];
+        let challenge = [0x41; 32];
+        let binder = [0x42; 32];
+        assert_eq!(
+            locally_verify_sgx_peer_certificate(&[], expected, &challenge[..31], &binder)
+                .unwrap_err(),
+            "RA-TLS peer: challenge must be exactly 32 bytes"
+        );
+        assert_eq!(
+            locally_verify_sgx_peer_certificate(&[], expected, &challenge, &binder[..31])
+                .unwrap_err(),
+            "RA-TLS peer: channel binder must be exactly 32 bytes"
+        );
+    }
 }
