@@ -19,7 +19,7 @@ use crate::rpc_client::RpcClient;
 //  Global RPC client accessor
 // ---------------------------------------------------------------------------
 
-/// Access the global RPC client (set during `ecall_init_channel`).
+/// Access the control RPC client (set during `ecall_init_control_channel`).
 fn rpc() -> &'static RpcClient {
     crate::rpc_client_ref()
 }
@@ -71,7 +71,11 @@ pub fn kv_store_put(table: &[u8], enc_key: &[u8], enc_val: &[u8]) -> Result<(), 
 }
 
 /// Get an encrypted value from the host. Returns None if not found.
-pub fn kv_store_get(table: &[u8], enc_key: &[u8], _max_val_size: usize) -> Result<Option<Vec<u8>>, i32> {
+pub fn kv_store_get(
+    table: &[u8],
+    enc_key: &[u8],
+    _max_val_size: usize,
+) -> Result<Option<Vec<u8>>, i32> {
     // max_val_size is no longer needed – the RPC response carries the full value
     rpc().kv_get(table, enc_key)
 }

@@ -3,10 +3,13 @@
 
 //! ECall entry points – functions called by the host into the enclave.
 //!
-//! With the SPSC queue architecture, only three ECALLs are needed:
-//! - `ecall_init_channel`: receive shared-memory queue pointers
+//! With the SPSC queue architecture, the ECALL surface is:
+//! - `ecall_init_control_channel`: receive control RPC queue pointers
+//! - `ecall_init_execution_channel`: receive execution RPC queue pointers
+//! - `ecall_init_data_channel`: receive ingress data queue pointers
 //! - `ecall_run`: main enclave entry – init subsystems, run event loop
-//! - `ecall_shutdown`: signal graceful stop
+//! - `ecall_execution_worker`: long-lived worker entry on the second TCS
+//! - `ecall_shutdown`: pre-run/future spare-TCS shutdown only
 //!
 //! ## Composition
 //!
@@ -38,45 +41,116 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::rpc_client::RpcClient;
 use crate::ratls::attestation::CaContext;
 use crate::ratls::server::IngressServer;
+use crate::rpc_client::RpcClient;
 use crate::sealed_config::SealedConfig;
-use crate::{enclave_log_info, enclave_log_error};
-use enclave_os_common::hex::{hex_decode, hex_encode};
-use enclave_os_common::types::AEAD_KEY_SIZE;
-use enclave_os_common::queue::{SpscProducer, SpscConsumer, SpscQueueHeader};
+use crate::{enclave_log_error, enclave_log_info};
 use enclave_os_common::channel;
+use enclave_os_common::hex::{hex_decode, hex_encode};
+use enclave_os_common::queue::{SpscConsumer, SpscProducer, SpscQueueHeader};
+use enclave_os_common::types::AEAD_KEY_SIZE;
 
 // ==========================================================================
-//  ecall_init_channel – set up the shared-memory RPC channel
+//  Channel initialisation
 // ==========================================================================
 
-/// Called by the host to pass shared-memory queue pointers into the enclave.
-///
-/// # Parameters
-/// - `enc_to_host_header`/`enc_to_host_buf`: queue for enclave→host requests
-/// - `host_to_enc_header`/`host_to_enc_buf`: queue for host→enclave responses
-/// - `capacity`: ring buffer size (same for both queues)
-///
-/// All pointers are in host (untrusted) memory. The enclave accesses them
-/// directly – no OCALL needed for data transfer.
-#[no_mangle]
-pub extern "C" fn ecall_init_channel(
+const MAX_SHARED_QUEUE_CAPACITY: u64 = 16 * 1024 * 1024;
+const MAX_CONFIG_BYTES: usize = 4 * 1024 * 1024;
+const QUEUE_BUFFER_ALIGNMENT: usize = 64;
+
+#[derive(Clone, Copy)]
+struct HostSpan {
+    start: usize,
+    end: usize,
+}
+
+impl HostSpan {
+    fn overlaps(self, other: Self) -> bool {
+        self.start < other.end && other.start < self.end
+    }
+}
+
+fn checked_host_span(ptr: *const u8, len: usize, alignment: usize) -> Option<HostSpan> {
+    if ptr.is_null() || len == 0 || (ptr as usize) % alignment != 0 {
+        return None;
+    }
+    let end = (ptr as usize).checked_add(len)?;
+    if !sgx_trts::trts::is_within_host(ptr, len) {
+        return None;
+    }
+    Some(HostSpan {
+        start: ptr as usize,
+        end,
+    })
+}
+
+fn validate_channel_description(
     enc_to_host_header: *mut u8,
     enc_to_host_buf: *mut u8,
     host_to_enc_header: *mut u8,
     host_to_enc_buf: *mut u8,
-    _capacity: u64,
+    capacity: u64,
+) -> Result<(), i32> {
+    if !capacity.is_power_of_two() || capacity < 4096 || capacity > MAX_SHARED_QUEUE_CAPACITY {
+        return Err(-1);
+    }
+    let capacity = usize::try_from(capacity).map_err(|_| -1)?;
+    let header_len = core::mem::size_of::<SpscQueueHeader>();
+    let header_alignment = core::mem::align_of::<SpscQueueHeader>();
+    let spans = [
+        checked_host_span(enc_to_host_header, header_len, header_alignment).ok_or(-1)?,
+        checked_host_span(enc_to_host_buf, capacity, QUEUE_BUFFER_ALIGNMENT).ok_or(-1)?,
+        checked_host_span(host_to_enc_header, header_len, header_alignment).ok_or(-1)?,
+        checked_host_span(host_to_enc_buf, capacity, QUEUE_BUFFER_ALIGNMENT).ok_or(-1)?,
+    ];
+    for left in 0..spans.len() {
+        for right in (left + 1)..spans.len() {
+            if spans[left].overlaps(spans[right]) {
+                return Err(-1);
+            }
+        }
+    }
+
+    // The untrusted header is checked before construction. The queue handles
+    // snapshot this validated capacity, so later host mutation cannot expand
+    // an enclave-side buffer view.
+    let described_capacity = capacity as u64;
+    let first_capacity = unsafe {
+        core::ptr::read_volatile(core::ptr::addr_of!(
+            (*(enc_to_host_header as *const SpscQueueHeader)).capacity
+        ))
+    };
+    let second_capacity = unsafe {
+        core::ptr::read_volatile(core::ptr::addr_of!(
+            (*(host_to_enc_header as *const SpscQueueHeader)).capacity
+        ))
+    };
+    if first_capacity != described_capacity || second_capacity != described_capacity {
+        return Err(-1);
+    }
+    Ok(())
+}
+
+fn initialise_rpc_channel(
+    enc_to_host_header: *mut u8,
+    enc_to_host_buf: *mut u8,
+    host_to_enc_header: *mut u8,
+    host_to_enc_buf: *mut u8,
+    capacity: u64,
+    install: fn(RpcClient) -> Result<(), i32>,
 ) -> i32 {
-    if enc_to_host_header.is_null()
-        || enc_to_host_buf.is_null()
-        || host_to_enc_header.is_null()
-        || host_to_enc_buf.is_null()
+    if validate_channel_description(
+        enc_to_host_header,
+        enc_to_host_buf,
+        host_to_enc_header,
+        host_to_enc_buf,
+        capacity,
+    )
+    .is_err()
     {
         return -1;
     }
-
     // The enclave is the **producer** for enc_to_host and the **consumer**
     // for host_to_enc.
     let request_tx = unsafe {
@@ -93,14 +167,45 @@ pub extern "C" fn ecall_init_channel(
     };
 
     let client = RpcClient::new(request_tx, response_rx);
+    install(client).map(|()| 0).unwrap_or(-1)
+}
 
-    match crate::set_rpc_client(client) {
-        Ok(()) => {
-            // Use raw ocall_notify briefly to confirm init – or just return 0.
-            0
-        }
-        Err(_) => -1,
-    }
+/// Initialise the control-plane RPC channel.
+#[no_mangle]
+pub extern "C" fn ecall_init_control_channel(
+    enc_to_host_header: *mut u8,
+    enc_to_host_buf: *mut u8,
+    host_to_enc_header: *mut u8,
+    host_to_enc_buf: *mut u8,
+    capacity: u64,
+) -> i32 {
+    initialise_rpc_channel(
+        enc_to_host_header,
+        enc_to_host_buf,
+        host_to_enc_header,
+        host_to_enc_buf,
+        capacity,
+        crate::set_control_rpc_client,
+    )
+}
+
+/// Initialise the execution-plane RPC channel.
+#[no_mangle]
+pub extern "C" fn ecall_init_execution_channel(
+    enc_to_host_header: *mut u8,
+    enc_to_host_buf: *mut u8,
+    host_to_enc_header: *mut u8,
+    host_to_enc_buf: *mut u8,
+    capacity: u64,
+) -> i32 {
+    initialise_rpc_channel(
+        enc_to_host_header,
+        enc_to_host_buf,
+        host_to_enc_header,
+        host_to_enc_buf,
+        capacity,
+        crate::set_execution_rpc_client,
+    )
 }
 
 // ==========================================================================
@@ -120,12 +225,16 @@ pub extern "C" fn ecall_init_data_channel(
     enc_to_host_buf: *mut u8,
     host_to_enc_header: *mut u8,
     host_to_enc_buf: *mut u8,
-    _capacity: u64,
+    capacity: u64,
 ) -> i32 {
-    if enc_to_host_header.is_null()
-        || enc_to_host_buf.is_null()
-        || host_to_enc_header.is_null()
-        || host_to_enc_buf.is_null()
+    if validate_channel_description(
+        enc_to_host_header,
+        enc_to_host_buf,
+        host_to_enc_header,
+        host_to_enc_buf,
+        capacity,
+    )
+    .is_err()
     {
         return -1;
     }
@@ -166,10 +275,16 @@ pub fn init_enclave(
     config_len: u64,
 ) -> Result<(EnclaveConfig, SealedConfig), i32> {
     // Parse config
-    let config_bytes = if !config_json.is_null() && config_len > 0 {
-        unsafe { core::slice::from_raw_parts(config_json, config_len as usize) }
-    } else {
+    let config_bytes = if config_len == 0 {
         b"{}" as &[u8]
+    } else {
+        let config_len = usize::try_from(config_len).map_err(|_| -2)?;
+        if config_len > MAX_CONFIG_BYTES || checked_host_span(config_json, config_len, 1).is_none()
+        {
+            enclave_log_error!("Config pointer description rejected");
+            return Err(-2);
+        }
+        unsafe { core::slice::from_raw_parts(config_json, config_len) }
     };
 
     let config: EnclaveConfig = match serde_json::from_slice(config_bytes) {
@@ -237,23 +352,23 @@ pub fn init_enclave(
 }
 
 // ==========================================================================
-//  finalize_and_run – Merkle tree, RA-TLS server, event loop
+//  Reusable runtime initialisation and control loop
 // ==========================================================================
 
-/// Build the config Merkle tree, start the RA-TLS server, and enter the
-/// main event loop.
+/// Build the config Merkle tree and start the RA-TLS ingress runtime.
 ///
 /// Call this after all modules have been registered and the sealed config
 /// has been updated with any module-generated data.
-///
-/// This function **blocks** until shutdown is signalled. It re-seals the
-/// config to disk before starting the server (persisting any module data
-/// written during init).
-pub fn finalize_and_run(_config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i32 {
+pub fn initialise_runtime_and_ingress(
+    _config: &EnclaveConfig,
+    sealed_cfg: &SealedConfig,
+) -> Result<(), i32> {
+    let _initialisation_guard = crate::CoreInitialisationGuard::new();
+
     // Persist the (possibly updated) sealed config
     if let Err(e) = sealed_cfg.seal_to_disk() {
         enclave_log_error!("Failed to seal config: {}", e);
-        return -12;
+        return Err(-12);
     }
     enclave_log_info!("Sealed config persisted to disk");
 
@@ -288,7 +403,7 @@ pub fn finalize_and_run(_config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i
     // Initialise enclave state
     if let Err(code) = crate::init_state() {
         enclave_log_error!("init_state failed ({})", code);
-        return code;
+        return Err(code);
     }
     enclave_log_info!("Enclave state initialised");
 
@@ -300,7 +415,7 @@ pub fn finalize_and_run(_config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i
         Ok(ca) => Arc::new(ca),
         Err(e) => {
             enclave_log_error!("CA validation failed: {}", e);
-            return -20;
+            return Err(-20);
         }
     };
 
@@ -329,7 +444,7 @@ pub fn finalize_and_run(_config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i
     {
         let mut st = match crate::state().lock() {
             Ok(st) => st,
-            Err(_) => return -22,
+            Err(_) => return Err(-22),
         };
         st.ingress_server = Some(server);
     }
@@ -338,13 +453,60 @@ pub fn finalize_and_run(_config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i
     // Signal the host TCP proxy that the data channel consumer is ready.
     // The proxy blocks new connections until it receives this message.
     {
-        let ready_msg = channel::encode_channel_msg(
-            channel::ChannelMsgType::DataReady,
-            0,
-            &[],
-        );
+        let ready_msg = channel::encode_channel_msg(channel::ChannelMsgType::DataReady, 0, &[]);
         crate::data_tx().send(&ready_msg);
         enclave_log_info!("DataReady sent to host TCP proxy");
+    }
+
+    if let Err(phase) = crate::publish_core_running() {
+        enclave_log_error!("Cannot publish Running from phase {:?}", phase);
+        return Err(-23);
+    }
+    enclave_log_info!("CorePhase Running published");
+    Ok(())
+}
+
+/// A bounded opportunity offered by Mini's reusable control loop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControlLoopOpportunity {
+    DataChannelProgress,
+    Idle,
+    Shutdown,
+}
+
+/// Action returned by an adopter-owned control hook.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControlLoopAction {
+    Continue,
+    Shutdown,
+}
+
+/// Non-blocking adopter hook invoked by the control TCS.
+///
+/// Implementations must perform bounded work and return without waiting for a
+/// worker, host RPC response, socket or persistence operation.
+pub trait ControlLoopHook {
+    fn on_opportunity(&mut self, opportunity: ControlLoopOpportunity) -> ControlLoopAction;
+}
+
+struct NoopControlLoopHook;
+
+impl ControlLoopHook for NoopControlLoopHook {
+    fn on_opportunity(&mut self, _opportunity: ControlLoopOpportunity) -> ControlLoopAction {
+        ControlLoopAction::Continue
+    }
+}
+
+fn apply_control_action(action: ControlLoopAction) {
+    if action == ControlLoopAction::Shutdown {
+        crate::signal_shutdown();
+    }
+}
+
+/// Run the control event loop after [`initialise_runtime_and_ingress`].
+pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
+    if crate::core_phase() != enclave_os_common::core_phase::CorePhase::Running {
+        return -24;
     }
 
     // Main event loop: read from data channel, dispatch to IngressServer
@@ -366,6 +528,10 @@ pub fn finalize_and_run(_config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i
                                 crate::signal_shutdown();
                             }
                         }
+                        drop(st);
+                        apply_control_action(
+                            hook.on_opportunity(ControlLoopOpportunity::DataChannelProgress),
+                        );
                     }
                     None => {
                         enclave_log_error!(
@@ -376,19 +542,115 @@ pub fn finalize_and_run(_config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i
                 }
             }
             None => {
-                // No message available — yield
+                apply_control_action(hook.on_opportunity(ControlLoopOpportunity::Idle));
                 core::hint::spin_loop();
             }
         }
     }
 
+    let _ = hook.on_opportunity(ControlLoopOpportunity::Shutdown);
+    crate::signal_shutdown();
+    if let Some(state) = crate::try_state() {
+        if let Ok(mut st) = state.lock() {
+            st.ingress_server = None;
+        }
+    }
     enclave_log_info!("Event loop exited");
     0
+}
+
+/// Compatibility wrapper used by Mini's default composition.
+///
+/// This function blocks until shutdown. Honest compositions call
+/// [`initialise_runtime_and_ingress`] and [`run_control_loop`] separately so
+/// they can install their bounded control hook without copying bootstrap code.
+pub fn finalize_and_run(config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i32 {
+    if let Err(code) = initialise_runtime_and_ingress(config, sealed_cfg) {
+        return code;
+    }
+    run_control_loop(&mut NoopControlLoopHook)
+}
+
+// ==========================================================================
+//  ecall_execution_worker – long-lived execution TCS
+// ==========================================================================
+
+#[no_mangle]
+pub extern "C" fn ecall_execution_worker(worker_id: u32) -> i32 {
+    crate::run_execution_worker(worker_id)
 }
 
 // ==========================================================================
 //  ecall_run – default implementation (feature-gated)
 // ==========================================================================
+
+/// Register Mini's single shared OCall vtable.
+///
+/// Custom compositions call this helper instead of copying the host-service
+/// bindings. Role-specific Honest RPC façades are layered above the explicit
+/// control/execution clients and do not replace this bootstrap registration.
+pub fn register_ocall_vtable() {
+    enclave_os_common::ocall::register(enclave_os_common::ocall::OcallVtable {
+        net_tcp_listen: crate::ocall::net_tcp_listen,
+        net_tcp_accept: crate::ocall::net_tcp_accept,
+        net_tcp_connect: crate::ocall::net_tcp_connect,
+        net_send: crate::ocall::net_send,
+        net_recv: crate::ocall::net_recv,
+        net_close: crate::ocall::net_close,
+        kv_store_put: crate::ocall::kv_store_put,
+        kv_store_get: |table, key| crate::ocall::kv_store_get(table, key, 0),
+        kv_store_delete: crate::ocall::kv_store_delete,
+        kv_store_list_keys: crate::ocall::kv_store_list_keys,
+        get_current_time: crate::ocall::get_current_time,
+        log: |level, msg| {
+            let ll = match level {
+                0 => enclave_os_common::types::LogLevel::Trace,
+                1 => enclave_os_common::types::LogLevel::Debug,
+                2 => enclave_os_common::types::LogLevel::Info,
+                3 => enclave_os_common::types::LogLevel::Warn,
+                _ => enclave_os_common::types::LogLevel::Error,
+            };
+            crate::ocall::log(ll, msg);
+        },
+        cert_store_register: |identity| {
+            crate::ratls::cert_store::cert_store().register(identity);
+        },
+        cert_store_unregister: |hostname| {
+            crate::ratls::cert_store::cert_store().unregister(hostname)
+        },
+    });
+}
+
+/// Apply Mini-owned OIDC and attestation-server configuration.
+pub fn configure_core(config: &EnclaveConfig) {
+    if let Some(ref oidc) = config.oidc {
+        enclave_log_info!(
+            "OIDC enabled: issuer={}, audience={}",
+            oidc.issuer,
+            oidc.audience
+        );
+        crate::set_oidc_config(oidc.clone());
+        enclave_os_common::oidc::set_global_oidc_config(oidc.clone());
+    } else {
+        enclave_log_info!("OIDC not configured — auth layer disabled");
+    }
+
+    use enclave_os_common::protocol::AttestationServer;
+    let servers: Vec<AttestationServer> = config
+        .extra
+        .get("attestation_servers")
+        .map(|value| serde_json::from_value(value.clone()).unwrap_or_default())
+        .unwrap_or_default();
+    let (count, hash) = enclave_os_common::attestation_servers::init(servers);
+    if count > 0 {
+        let hash_hex = hash.map(|value| hex_encode(&value)).unwrap_or_default();
+        enclave_log_info!(
+            "Attestation servers: {} configured, hash={}",
+            count,
+            hash_hex,
+        );
+    }
+}
 
 /// Default `ecall_run` that registers modules based on enabled Cargo features.
 ///
@@ -403,80 +665,18 @@ pub fn finalize_and_run(_config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i
 #[cfg(feature = "default-ecall")]
 #[no_mangle]
 pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
-    // Register the OCall vtable so module crates (which depend on common,
-    // not on enclave) can reach host services.
-    enclave_os_common::ocall::register(enclave_os_common::ocall::OcallVtable {
-        net_tcp_listen:    crate::ocall::net_tcp_listen,
-        net_tcp_accept:    crate::ocall::net_tcp_accept,
-        net_tcp_connect:   crate::ocall::net_tcp_connect,
-        net_send:          crate::ocall::net_send,
-        net_recv:          crate::ocall::net_recv,
-        net_close:         crate::ocall::net_close,
-        kv_store_put:      crate::ocall::kv_store_put,
-        kv_store_get:      |table, key| crate::ocall::kv_store_get(table, key, 0),
-        kv_store_delete:   crate::ocall::kv_store_delete,
-        kv_store_list_keys: crate::ocall::kv_store_list_keys,
-        get_current_time:  crate::ocall::get_current_time,
-        log:               |level, msg| {
-            let ll = match level {
-                0 => enclave_os_common::types::LogLevel::Trace,
-                1 => enclave_os_common::types::LogLevel::Debug,
-                2 => enclave_os_common::types::LogLevel::Info,
-                3 => enclave_os_common::types::LogLevel::Warn,
-                _ => enclave_os_common::types::LogLevel::Error,
-            };
-            crate::ocall::log(ll, msg);
-        },
-        cert_store_register:   |identity| {
-            crate::ratls::cert_store::cert_store().register(identity);
-        },
-        cert_store_unregister: |hostname| {
-            crate::ratls::cert_store::cert_store().unregister(hostname)
-        },
-    });
+    let _initialisation_guard = crate::CoreInitialisationGuard::new();
+
+    register_ocall_vtable();
 
     let (config, sealed_cfg) = match init_enclave(config_json, config_len) {
         Ok(pair) => pair,
         Err(code) => return code,
     };
 
-    // ── OIDC configuration (global, used by auth layer) ──────────────
-    if let Some(ref oidc) = config.oidc {
-        enclave_log_info!(
-            "OIDC enabled: issuer={}, audience={}",
-            oidc.issuer, oidc.audience
-        );
-        crate::set_oidc_config(oidc.clone());
-        enclave_os_common::oidc::set_global_oidc_config(oidc.clone());
-    } else {
-        enclave_log_info!("OIDC not configured — auth layer disabled");
-    }
+    configure_core(&config);
 
     let mut _module_count: u32 = 0;
-
-    // ── Core attestation servers ─────────────────────────────────────
-    // Format: [{"url": "https://…", "token": "…"}, …]
-    {
-        use enclave_os_common::protocol::AttestationServer;
-
-        let servers: Vec<AttestationServer> = config
-            .extra
-            .get("attestation_servers")
-            .map(|v| serde_json::from_value(v.clone()).unwrap_or_default())
-            .unwrap_or_default();
-
-        let (count, hash) = enclave_os_common::attestation_servers::init(servers);
-        if count > 0 {
-            let hash_hex = hash
-                .map(|h| hex_encode(&h))
-                .unwrap_or_default();
-            enclave_log_info!(
-                "Attestation servers: {} configured, hash={}",
-                count,
-                hash_hex,
-            );
-        }
-    }
 
     // ── Egress module (outbound HTTPS) ───────────────────────────────
     #[cfg(feature = "egress")]
@@ -578,9 +778,7 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
         feature = "fido2"
     )))]
     {
-        crate::modules::register_module(Box::new(
-            crate::modules::helloworld::HelloWorldModule,
-        ));
+        crate::modules::register_module(Box::new(crate::modules::helloworld::HelloWorldModule));
         _module_count += 1;
     }
 
@@ -595,13 +793,8 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
 
 #[no_mangle]
 pub extern "C" fn ecall_shutdown() -> i32 {
-    enclave_log_info!("Enclave shutting down");
+    enclave_log_info!("Pre-run/spare-TCS shutdown requested");
     crate::signal_shutdown();
-
-    // Clean up subsystems
-    if let Ok(mut st) = crate::state().lock() {
-        st.ingress_server = None;
-    }
     0
 }
 
@@ -633,8 +826,12 @@ pub struct EnclaveConfig {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-fn default_port() -> u16 { 443 }
-fn default_backlog() -> i32 { 128 }
+fn default_port() -> u16 {
+    443
+}
+fn default_backlog() -> i32 {
+    128
+}
 
 // ==========================================================================
 //  Unified sealed config resolution
@@ -661,34 +858,38 @@ fn resolve_sealed_config(config: &EnclaveConfig) -> Result<SealedConfig, String>
     let (ca_cert_der, ca_key_pkcs8) = if let (Some(cert_hex), Some(key_hex)) =
         (&config.ca_cert_hex, &config.ca_key_hex)
     {
-        let cert = hex_decode(cert_hex)
-            .ok_or_else(|| String::from("ca_cert_hex is not valid hex"))?;
-        let key = hex_decode(key_hex)
-            .ok_or_else(|| String::from("ca_key_hex is not valid hex"))?;
+        let cert =
+            hex_decode(cert_hex).ok_or_else(|| String::from("ca_cert_hex is not valid hex"))?;
+        let key = hex_decode(key_hex).ok_or_else(|| String::from("ca_key_hex is not valid hex"))?;
         // Validate the key material early
         CaContext::from_parts(cert.clone(), key.clone())?;
-        enclave_log_info!("CA loaded from config (cert={} B, key={} B)", cert.len(), key.len());
+        enclave_log_info!(
+            "CA loaded from config (cert={} B, key={} B)",
+            cert.len(),
+            key.len()
+        );
         (cert, key)
     } else if let Some(ref ex) = existing {
         enclave_log_info!("CA loaded from sealed config");
         (ex.ca_cert_der.clone(), ex.ca_key_pkcs8.clone())
     } else {
-        return Err(
-            "No CA material found on disk and none provided in config. \
+        return Err("No CA material found on disk and none provided in config. \
              Pass --ca-cert + --ca-key on first run."
-                .into(),
-        );
+            .into());
     };
 
     // ── Module data: preserve from existing sealed config ────────────
     let module_data = if let Some(ref ex) = existing {
-        enclave_log_info!("Loaded {} module data entries from sealed config", ex.module_data.len());
+        enclave_log_info!(
+            "Loaded {} module data entries from sealed config",
+            ex.module_data.len()
+        );
         ex.module_data.clone()
     } else {
         BTreeMap::new()
     };
 
-    //  Master encryption key: reuse existing or generate fresh 
+    //  Master encryption key: reuse existing or generate fresh
     let master_key: [u8; AEAD_KEY_SIZE] = if let Some(ref ex) = existing {
         enclave_log_info!("Master key loaded from sealed config");
         ex.master_key

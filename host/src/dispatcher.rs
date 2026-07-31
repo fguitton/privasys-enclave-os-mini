@@ -16,9 +16,9 @@
 //! When the enclave calls `ocall_notify()`, the host can optionally
 //! wake immediately, but spinning is fine for high-throughput workloads.
 
+use log::{debug, error, info, trace, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use log::{trace, debug, info, warn, error};
 
 use enclave_os_common::queue::{SpscConsumer, SpscProducer};
 use enclave_os_common::rpc::{self, RpcMethod};
@@ -28,6 +28,8 @@ use crate::net;
 
 /// RPC dispatcher that bridges enclave requests to host services.
 pub struct RpcDispatcher {
+    /// Stable role name for diagnostics and thread ownership evidence.
+    name: &'static str,
     /// Reads requests from the enclave.
     request_rx: SpscConsumer,
     /// Writes responses back to the enclave.
@@ -43,11 +45,13 @@ impl RpcDispatcher {
     /// The producers/consumers must be correctly paired to the shared-memory
     /// queues allocated for the enclave channel.
     pub fn new(
+        name: &'static str,
         request_rx: SpscConsumer,
         response_tx: SpscProducer,
         shutdown: Arc<AtomicBool>,
     ) -> Self {
         Self {
+            name,
             request_rx,
             response_tx,
             shutdown,
@@ -56,13 +60,13 @@ impl RpcDispatcher {
 
     /// Run the dispatcher loop. Blocks until shutdown is signalled.
     pub fn run(&self) {
-        info!("RPC dispatcher started");
+        info!("{} RPC dispatcher started", self.name);
 
         let mut backoff = Backoff::new();
 
         loop {
             if self.shutdown.load(Ordering::Relaxed) {
-                info!("RPC dispatcher: shutdown requested");
+                info!("{} RPC dispatcher: shutdown requested", self.name);
                 break;
             }
 
@@ -77,7 +81,7 @@ impl RpcDispatcher {
             }
         }
 
-        info!("RPC dispatcher stopped");
+        info!("{} RPC dispatcher stopped", self.name);
     }
 
     /// Dispatch a single RPC request message.
@@ -85,12 +89,21 @@ impl RpcDispatcher {
         let (req_id, method, payload) = match rpc::decode_request(raw_msg) {
             Some(r) => r,
             None => {
-                error!("RPC dispatcher: malformed request ({} bytes)", raw_msg.len());
+                error!(
+                    "{} RPC dispatcher: malformed request ({} bytes)",
+                    self.name,
+                    raw_msg.len()
+                );
                 return;
             }
         };
 
-        trace!("RPC dispatch: req_id={} method={:?} payload_len={}", req_id, method, payload.len());
+        trace!(
+            "RPC dispatch: req_id={} method={:?} payload_len={}",
+            req_id,
+            method,
+            payload.len()
+        );
 
         let (status, response_payload) = match method {
             // ---- Network ----

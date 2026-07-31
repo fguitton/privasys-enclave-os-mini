@@ -136,6 +136,10 @@ impl SpscQueueHeader {
 pub struct SpscProducer {
     header: *const SpscQueueHeader,
     buf_ptr: *mut u8,
+    /// Trusted-at-construction snapshot. Enclave users validate the header and
+    /// backing range before calling `from_raw`; later host mutation cannot
+    /// redirect indexing beyond that validated range.
+    capacity: u64,
 }
 
 unsafe impl Send for SpscProducer {}
@@ -149,7 +153,12 @@ impl SpscProducer {
     /// - `buf_ptr` must point to a `[u8; header.capacity]` buffer
     /// - Only one producer may exist for a given queue
     pub unsafe fn from_raw(header: *const SpscQueueHeader, buf_ptr: *mut u8) -> Self {
-        Self { header, buf_ptr }
+        let capacity = core::ptr::read_volatile(core::ptr::addr_of!((*header).capacity));
+        Self {
+            header,
+            buf_ptr,
+            capacity,
+        }
     }
 
     /// Try to write a message. Returns `Ok(())` if written, `Err(())` if full.
@@ -164,7 +173,11 @@ impl SpscProducer {
         // Check available space
         let head = hdr.head.load(Ordering::Relaxed);
         let tail = hdr.tail.load(Ordering::Acquire);
-        let free = hdr.capacity - head.wrapping_sub(tail);
+        let used = head.wrapping_sub(tail);
+        if used > self.capacity {
+            return Err(());
+        }
+        let free = self.capacity - used;
 
         if free < total {
             return Err(()); // Queue is full
@@ -172,10 +185,10 @@ impl SpscProducer {
 
         // Write length header
         let len_bytes = (msg.len() as u32).to_le_bytes();
-        self.write_bytes(hdr, head, &len_bytes);
+        self.write_bytes(head, &len_bytes);
 
         // Write payload
-        self.write_bytes(hdr, head + MSG_HEADER_SIZE as u64, msg);
+        self.write_bytes(head + MSG_HEADER_SIZE as u64, msg);
 
         // Publish: advance head with Release ordering
         hdr.head.store(head + total, Ordering::Release);
@@ -196,29 +209,21 @@ impl SpscProducer {
     }
 
     /// Write bytes into the ring buffer at the given offset, handling wrap-around.
-    fn write_bytes(&self, hdr: &SpscQueueHeader, offset: u64, data: &[u8]) {
-        let cap = hdr.capacity as usize;
-        let start = hdr.mask(offset);
+    fn write_bytes(&self, offset: u64, data: &[u8]) {
+        let cap = self.capacity as usize;
+        let start = (offset & (self.capacity - 1)) as usize;
         let end = start + data.len();
 
         if end <= cap {
             // No wrap
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    data.as_ptr(),
-                    self.buf_ptr.add(start),
-                    data.len(),
-                );
+                core::ptr::copy_nonoverlapping(data.as_ptr(), self.buf_ptr.add(start), data.len());
             }
         } else {
             // Wraps around
             let first_chunk = cap - start;
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    data.as_ptr(),
-                    self.buf_ptr.add(start),
-                    first_chunk,
-                );
+                core::ptr::copy_nonoverlapping(data.as_ptr(), self.buf_ptr.add(start), first_chunk);
                 core::ptr::copy_nonoverlapping(
                     data.as_ptr().add(first_chunk),
                     self.buf_ptr,
@@ -237,6 +242,8 @@ impl SpscProducer {
 pub struct SpscConsumer {
     header: *const SpscQueueHeader,
     buf_ptr: *const u8,
+    /// Trusted-at-construction capacity snapshot; see [`SpscProducer`].
+    capacity: u64,
 }
 
 unsafe impl Send for SpscConsumer {}
@@ -248,7 +255,12 @@ impl SpscConsumer {
     /// # Safety
     /// Same requirements as `SpscProducer::from_raw`.
     pub unsafe fn from_raw(header: *const SpscQueueHeader, buf_ptr: *const u8) -> Self {
-        Self { header, buf_ptr }
+        let capacity = core::ptr::read_volatile(core::ptr::addr_of!((*header).capacity));
+        Self {
+            header,
+            buf_ptr,
+            capacity,
+        }
     }
 
     /// Try to read a message. Returns `Some(Vec<u8>)` or `None` if empty.
@@ -259,29 +271,33 @@ impl SpscConsumer {
         let tail = hdr.tail.load(Ordering::Relaxed);
         let avail = head.wrapping_sub(tail);
 
+        if avail > self.capacity {
+            return None;
+        }
         if avail < MSG_HEADER_SIZE as u64 {
             return None; // Not enough data for a message header
         }
 
         // Read length header
         let mut len_bytes = [0u8; MSG_HEADER_SIZE];
-        self.read_bytes(hdr, tail, &mut len_bytes);
+        self.read_bytes(tail, &mut len_bytes);
         let msg_len = u32::from_le_bytes(len_bytes) as u64;
 
         if msg_len > MAX_MSG_SIZE as u64 {
             // Corrupted message – skip and advance tail past the header
-            hdr.tail.store(tail + MSG_HEADER_SIZE as u64, Ordering::Release);
+            hdr.tail
+                .store(tail + MSG_HEADER_SIZE as u64, Ordering::Release);
             return None;
         }
 
         let total = MSG_HEADER_SIZE as u64 + msg_len;
-        if avail < total {
+        if total > self.capacity || avail < total {
             return None; // Incomplete message (shouldn't happen with proper producer)
         }
 
         // Read payload
         let mut payload = vec![0u8; msg_len as usize];
-        self.read_bytes(hdr, tail + MSG_HEADER_SIZE as u64, &mut payload);
+        self.read_bytes(tail + MSG_HEADER_SIZE as u64, &mut payload);
 
         // Advance tail
         hdr.tail.store(tail + total, Ordering::Release);
@@ -300,9 +316,9 @@ impl SpscConsumer {
     }
 
     /// Read bytes from the ring buffer at the given offset, handling wrap-around.
-    fn read_bytes(&self, hdr: &SpscQueueHeader, offset: u64, out: &mut [u8]) {
-        let cap = hdr.capacity as usize;
-        let start = hdr.mask(offset);
+    fn read_bytes(&self, offset: u64, out: &mut [u8]) {
+        let cap = self.capacity as usize;
+        let start = (offset & (self.capacity - 1)) as usize;
         let end = start + out.len();
 
         if end <= cap {
@@ -403,6 +419,25 @@ mod tests {
     }
 
     #[test]
+    fn capacity_is_snapshotted_before_untrusted_header_mutation() {
+        let header = Box::into_raw(Box::new(SpscQueueHeader::new(4096)));
+        let buffer = vec![0u8; 4096];
+        let buf_ptr = Box::into_raw(buffer.into_boxed_slice()) as *mut u8;
+        let (producer, consumer) = unsafe {
+            (
+                SpscProducer::from_raw(header, buf_ptr),
+                SpscConsumer::from_raw(header, buf_ptr),
+            )
+        };
+
+        unsafe {
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*header).capacity), 1 << 30);
+        }
+        producer.try_send(b"bounded").unwrap();
+        assert_eq!(consumer.try_recv().unwrap(), b"bounded");
+    }
+
+    #[test]
     fn test_multiple_messages() {
         let (producer, consumer) = alloc_test_queue(4096);
 
@@ -425,7 +460,7 @@ mod tests {
         // Fill and drain multiple times to force wrap-around
         for round in 0..10 {
             let msg = vec![round as u8; 500]; // 500 bytes + 4 header = 504 per msg
-            // Write ~7 messages to nearly fill 4096
+                                              // Write ~7 messages to nearly fill 4096
             for _ in 0..7 {
                 producer.try_send(&msg).unwrap();
             }
@@ -445,7 +480,9 @@ mod tests {
         let mut count = 0;
         while producer.try_send(&msg).is_ok() {
             count += 1;
-            if count > 100 { panic!("should have filled by now"); }
+            if count > 100 {
+                panic!("should have filled by now");
+            }
         }
         assert!(count > 0);
 
@@ -637,7 +674,9 @@ mod tests {
     #[test]
     fn test_variable_size_messages() {
         let (producer, consumer) = alloc_test_queue(1 << 16); // 64 KiB
-        let sizes = [0, 1, 7, 15, 16, 31, 32, 63, 64, 127, 128, 255, 256, 500, 1000, 4000];
+        let sizes = [
+            0, 1, 7, 15, 16, 31, 32, 63, 64, 127, 128, 255, 256, 500, 1000, 4000,
+        ];
         for &size in &sizes {
             let msg: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
             producer.try_send(&msg).unwrap();

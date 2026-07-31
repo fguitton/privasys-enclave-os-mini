@@ -6,10 +6,13 @@
  * SIMPLIFIED DESIGN: Instead of many individual OCALLs/ECALLs, we use
  * shared-memory SPSC queues for all communication. The EDL only defines:
  *
- *   1. ecall_init_channel  – host passes shared queue pointers to enclave
- *   2. ecall_run           – main enclave entry point (runs the event loop)
- *   3. ecall_shutdown      – graceful stop
- *   4. ocall_notify        – enclave nudges host when a message is enqueued
+ *   1. ecall_init_control_channel   – control RPC pair
+ *   2. ecall_init_execution_channel – execution RPC pair
+ *   3. ecall_init_data_channel      – ingress data pair
+ *   4. ecall_run                    – long-lived control TCS
+ *   5. ecall_execution_worker       – long-lived execution TCS
+ *   6. ecall_shutdown               – pre-run/future spare-TCS only
+ *   7. ocall_notify                 – queue notification
  *
  * All actual RPC (network I/O, KV store, logging, etc.) flows through the
  * lock-free SPSC ring buffers in host memory. The enclave writes requests,
@@ -42,7 +45,16 @@ enclave {
          * host_to_enc_header / host_to_enc_buf : host → enclave queue
          * capacity : size of each ring buffer (must be power of 2)
          */
-        public int ecall_init_channel(
+        public int ecall_init_control_channel(
+            [user_check] void* enc_to_host_header,
+            [user_check] void* enc_to_host_buf,
+            [user_check] void* host_to_enc_header,
+            [user_check] void* host_to_enc_buf,
+            uint64_t capacity
+        );
+
+        /* A physically distinct RPC pair owned by execution worker zero. */
+        public int ecall_init_execution_channel(
             [user_check] void* enc_to_host_header,
             [user_check] void* enc_to_host_buf,
             [user_check] void* host_to_enc_header,
@@ -87,11 +99,15 @@ enclave {
             uint64_t config_len
         );
 
+        /* The only supported worker is zero. It occupies the second TCS. */
+        public int ecall_execution_worker(uint32_t worker_id);
+
         /* ================================================================
          *  Shutdown
          * ================================================================
          *
-         * Signals the enclave to stop its event loop and clean up.
+         * Pre-run/future spare-TCS fallback. Steady-state shutdown is in-band
+         * through the existing ingress/control path.
          */
         public int ecall_shutdown();
     };

@@ -36,6 +36,8 @@ function(rust_build_host CRATE_DIR OUTPUT_NAME)
             "SGX_SDK_PATH=${SGX_SDK_PATH}"
             "RUSTUP_TOOLCHAIN=${RUST_ENCLAVE_TOOLCHAIN}"
             "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}"
+            "CC=${CMAKE_C_COMPILER}"
+            "CXX=${CMAKE_CXX_COMPILER}"
             ${CARGO_EXECUTABLE} build
                 ${CARGO_BUILD_TYPE}
                 --locked
@@ -51,7 +53,7 @@ function(rust_build_host CRATE_DIR OUTPUT_NAME)
 endfunction()
 
 # ---------------------------------------------------------------------------
-# rust_build_enclave(CRATE_DIR OUTPUT_NAME [FEATURES])
+# rust_build_enclave(CRATE_DIR OUTPUT_NAME FEATURES [TARGET_DIR])
 #   Build an enclave-side Rust crate (staticlib) with the SGX sysroot.
 #   Requires the sgx_sysroot target to have been built first (from the
 #   Teaclave fork's CMakeLists.txt).
@@ -61,9 +63,8 @@ endfunction()
 #     so that the caller controls exactly which modules are compiled in.
 #     When empty, default features are used.
 # ---------------------------------------------------------------------------
-function(rust_build_enclave CRATE_DIR OUTPUT_NAME)
-    # Optional 3rd argument: features
-    set(_FEATURES "${ARGN}")
+function(rust_build_enclave CRATE_DIR OUTPUT_NAME FEATURES)
+    set(_FEATURES "${FEATURES}")
 
     if(NOT TEACLAVE_CHECKOUT)
         message(FATAL_ERROR "TEACLAVE_CHECKOUT not set. Run resolve_teaclave() first.")
@@ -76,8 +77,12 @@ function(rust_build_enclave CRATE_DIR OUTPUT_NAME)
     if(_FEATURES)
         set(_FEATURES_ARGS --no-default-features --features "sgx,default-ecall,${_FEATURES}")
     endif()
-    set(_ENCLAVE_TARGET_DIR
-        "${CMAKE_SOURCE_DIR}/target/cmake-enclave-${_FEATURES}-${SOURCE_DATE_EPOCH}")
+    if(ARGC GREATER 3)
+        get_filename_component(_ENCLAVE_TARGET_DIR "${ARGV3}" ABSOLUTE)
+    else()
+        set(_ENCLAVE_TARGET_DIR
+            "${CMAKE_SOURCE_DIR}/target/cmake-enclave-${_FEATURES}-${SOURCE_DATE_EPOCH}")
+    endif()
 
     set(_BUILD_COMMENT "Building enclave Rust crate: ${OUTPUT_NAME}")
     if(_FEATURES)

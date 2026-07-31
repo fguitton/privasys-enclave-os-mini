@@ -10,27 +10,36 @@
 //! - Implement the single OCALL: `ocall_notify()`
 //! - Provide the CLI entry point
 
-mod dispatcher;
-mod enclave;
-mod ocall_impl;
-mod net;
-mod kvstore;
-mod tcp_proxy;
 #[cfg(target_os = "linux")]
 mod dcap;
+mod dispatcher;
+mod enclave;
+mod kvstore;
+mod net;
+mod ocall_impl;
+mod tcp_proxy;
 
 use anyhow::Result;
-use clap::Parser;
-use log::{info, error};
-use std::sync::Arc;
+use clap::{Parser, ValueEnum};
+use log::{error, info};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 
 use enclave::SharedChannel;
 use enclave_os_common::queue::DEFAULT_QUEUE_CAPACITY;
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum EcallStartOrder {
+    WorkerFirst,
+    ControlFirst,
+}
+
 #[derive(Parser, Debug)]
-#[command(name = "enclave-os-host", about = "Host for enclave-os-mini SGX application")]
+#[command(
+    name = "enclave-os-host",
+    about = "Host for enclave-os-mini SGX application"
+)]
 struct Cli {
     /// Path to the signed enclave binary (.signed.so)
     #[arg(short, long, default_value = "enclave.signed.so")]
@@ -93,6 +102,43 @@ struct Cli {
     /// Enable debug logging
     #[arg(short, long)]
     debug: bool,
+
+    /// Long-ECALL entry order. Both orders are supported by the enclave-owned
+    /// CorePhase barrier.
+    #[arg(long, value_enum, default_value_t = EcallStartOrder::WorkerFirst)]
+    ecall_start_order: EcallStartOrder,
+
+    /// S1.2 test-only synthetic worker budget. Ignored by legacy compositions.
+    #[arg(long)]
+    s1_2_synthetic_work_units: Option<u64>,
+}
+
+fn spawn_control_ecall(enclave_id: u64, config_bytes: Vec<u8>) -> Result<thread::JoinHandle<i32>> {
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+    let handle = thread::Builder::new()
+        .name("enclave-control".into())
+        .spawn(move || {
+            let _ = entered_tx.send(());
+            enclave::call_ecall_run(enclave_id, &config_bytes)
+        })?;
+    entered_rx
+        .recv()
+        .map_err(|_| anyhow::anyhow!("Control ECALL thread failed before entry"))?;
+    Ok(handle)
+}
+
+fn spawn_execution_ecall(enclave_id: u64) -> Result<thread::JoinHandle<i32>> {
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+    let handle = thread::Builder::new()
+        .name("enclave-execution-worker".into())
+        .spawn(move || {
+            let _ = entered_tx.send(());
+            enclave::call_ecall_execution_worker(enclave_id, 0)
+        })?;
+    entered_rx
+        .recv()
+        .map_err(|_| anyhow::anyhow!("Execution ECALL thread failed before entry"))?;
+    Ok(handle)
 }
 
 fn main() -> Result<()> {
@@ -100,8 +146,7 @@ fn main() -> Result<()> {
 
     // Initialise logging
     let log_level = if cli.debug { "debug" } else { "info" };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level))
-        .init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
 
     info!("enclave-os-host starting");
     info!("Enclave path : {}", cli.enclave_path);
@@ -115,29 +160,57 @@ fn main() -> Result<()> {
     let enclave_id = enclave::create_enclave(&cli.enclave_path)?;
     info!("Enclave created, id = {}", enclave_id);
 
-    // Allocate shared-memory SPSC queues for RPC channel
-    let channel = SharedChannel::new(DEFAULT_QUEUE_CAPACITY);
-    info!("RPC channel allocated (capacity = {} bytes per queue)", DEFAULT_QUEUE_CAPACITY);
+    // Allocate physically distinct shared-memory RPC pairs. Their endpoints
+    // have disjoint SPSC owners for the lifetime of the enclave.
+    let control_channel = SharedChannel::new(DEFAULT_QUEUE_CAPACITY);
+    info!(
+        "Control RPC channel allocated (capacity = {} bytes per queue)",
+        DEFAULT_QUEUE_CAPACITY
+    );
+
+    let execution_channel = SharedChannel::new(DEFAULT_QUEUE_CAPACITY);
+    info!(
+        "Execution RPC channel allocated (capacity = {} bytes per queue)",
+        DEFAULT_QUEUE_CAPACITY
+    );
 
     // Allocate shared-memory SPSC queues for data channel (TCP proxy ↔ enclave)
     let data_channel = SharedChannel::new(DEFAULT_QUEUE_CAPACITY);
-    info!("Data channel allocated (capacity = {} bytes per queue)", DEFAULT_QUEUE_CAPACITY);
+    info!(
+        "Data channel allocated (capacity = {} bytes per queue)",
+        DEFAULT_QUEUE_CAPACITY
+    );
 
-    // Pass RPC queue pointers to the enclave
-    let ret = enclave::call_ecall_init_channel(
+    // Initialise every channel before either long-lived ECALL may enter.
+    let ret = enclave::call_ecall_init_control_channel(
         enclave_id,
-        channel.enc_to_host_header as *mut u8,
-        channel.enc_to_host_buf,
-        channel.host_to_enc_header as *mut u8,
-        channel.host_to_enc_buf,
-        channel.capacity,
+        control_channel.enc_to_host_header as *mut u8,
+        control_channel.enc_to_host_buf,
+        control_channel.host_to_enc_header as *mut u8,
+        control_channel.host_to_enc_buf,
+        control_channel.capacity,
     );
     if ret != 0 {
-        error!("ecall_init_channel failed: {}", ret);
+        error!("ecall_init_control_channel failed: {}", ret);
         enclave::destroy_enclave(enclave_id);
-        anyhow::bail!("Failed to initialise enclave RPC channel");
+        anyhow::bail!("Failed to initialise enclave control RPC channel");
     }
-    info!("Enclave RPC channel initialised");
+    info!("Enclave control RPC channel initialised");
+
+    let ret = enclave::call_ecall_init_execution_channel(
+        enclave_id,
+        execution_channel.enc_to_host_header as *mut u8,
+        execution_channel.enc_to_host_buf,
+        execution_channel.host_to_enc_header as *mut u8,
+        execution_channel.host_to_enc_buf,
+        execution_channel.capacity,
+    );
+    if ret != 0 {
+        error!("ecall_init_execution_channel failed: {}", ret);
+        enclave::destroy_enclave(enclave_id);
+        anyhow::bail!("Failed to initialise enclave execution RPC channel");
+    }
+    info!("Enclave execution RPC channel initialised");
 
     // Pass data channel queue pointers to the enclave
     let ret = enclave::call_ecall_init_data_channel(
@@ -156,7 +229,9 @@ fn main() -> Result<()> {
     info!("Enclave data channel initialised");
 
     // Create host-side queue endpoints (consumer for requests, producer for responses)
-    let (request_rx, response_tx) = unsafe { channel.host_endpoints() };
+    let (control_request_rx, control_response_tx) = unsafe { control_channel.host_endpoints() };
+    let (execution_request_rx, execution_response_tx) =
+        unsafe { execution_channel.host_endpoints() };
 
     // Create host-side data channel endpoints
     // For data channel: host writes to host_to_enc (raw TCP → enclave),
@@ -169,19 +244,34 @@ fn main() -> Result<()> {
     // Store notify flag for the OCALL handler
     ocall_impl::set_notify_flag(shutdown.clone());
 
-    // Spawn the RPC dispatcher thread
+    // Spawn one named dispatcher per RPC pair.
     let shutdown_clone = shutdown.clone();
-    let dispatcher_handle = thread::Builder::new()
-        .name("rpc-dispatcher".into())
+    let control_dispatcher_handle = thread::Builder::new()
+        .name("control-rpc-dispatcher".into())
         .spawn(move || {
             let dispatcher = dispatcher::RpcDispatcher::new(
-                request_rx,
-                response_tx,
+                "control",
+                control_request_rx,
+                control_response_tx,
                 shutdown_clone,
             );
             dispatcher.run();
         })?;
-    info!("RPC dispatcher thread started");
+    info!("Control RPC dispatcher thread started");
+
+    let shutdown_clone = shutdown.clone();
+    let execution_dispatcher_handle = thread::Builder::new()
+        .name("execution-rpc-dispatcher".into())
+        .spawn(move || {
+            let dispatcher = dispatcher::RpcDispatcher::new(
+                "execution",
+                execution_request_rx,
+                execution_response_tx,
+                shutdown_clone,
+            );
+            dispatcher.run();
+        })?;
+    info!("Execution RPC dispatcher thread started");
 
     // Spawn the TCP proxy thread
     let proxy_port = cli.port;
@@ -217,7 +307,11 @@ fn main() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("Failed to read CA cert '{}': {}", cert_path, e))?;
         let key_der = read_pem_or_der(key_path, "PRIVATE KEY")
             .map_err(|e| anyhow::anyhow!("Failed to read CA key '{}': {}", key_path, e))?;
-        info!("CA cert: {} bytes (DER), CA key: {} bytes (DER)", cert_der.len(), key_der.len());
+        info!(
+            "CA cert: {} bytes (DER), CA key: {} bytes (DER)",
+            cert_der.len(),
+            key_der.len()
+        );
         config["ca_cert_hex"] = serde_json::Value::String(hex::encode(&cert_der));
         config["ca_key_hex"] = serde_json::Value::String(hex::encode(&key_der));
     } else if cli.ca_cert.is_some() || cli.ca_key.is_some() {
@@ -226,9 +320,14 @@ fn main() -> Result<()> {
 
     // If an egress CA bundle is provided, read it and hex-encode for the enclave
     if let Some(ref bundle_path) = cli.egress_ca_bundle {
-        let pem_bytes = std::fs::read(bundle_path)
-            .map_err(|e| anyhow::anyhow!("Failed to read egress CA bundle '{}': {}", bundle_path, e))?;
-        info!("Egress CA bundle: {} bytes from {}", pem_bytes.len(), bundle_path);
+        let pem_bytes = std::fs::read(bundle_path).map_err(|e| {
+            anyhow::anyhow!("Failed to read egress CA bundle '{}': {}", bundle_path, e)
+        })?;
+        info!(
+            "Egress CA bundle: {} bytes from {}",
+            pem_bytes.len(),
+            bundle_path
+        );
         config["egress_ca_bundle_hex"] = serde_json::Value::String(hex::encode(&pem_bytes));
     }
 
@@ -241,7 +340,9 @@ fn main() -> Result<()> {
         let token: Option<String> = match cli.attestation_token_file {
             Some(ref path) => {
                 let t = std::fs::read_to_string(path)
-                    .map_err(|e| anyhow::anyhow!("Failed to read attestation token file '{}': {}", path, e))?
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to read attestation token file '{}': {}", path, e)
+                    })?
                     .trim()
                     .to_string();
                 if t.is_empty() {
@@ -267,8 +368,9 @@ fn main() -> Result<()> {
 
     // OIDC configuration
     if let Some(ref issuer) = cli.oidc_issuer {
-        let audience = cli.oidc_audience.as_deref()
-            .ok_or_else(|| anyhow::anyhow!("--oidc-audience is required when --oidc-issuer is set"))?;
+        let audience = cli.oidc_audience.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("--oidc-audience is required when --oidc-issuer is set")
+        })?;
         info!("OIDC enabled: issuer={}, audience={}", issuer, audience);
         config["oidc"] = serde_json::json!({
             "issuer": issuer,
@@ -278,29 +380,58 @@ fn main() -> Result<()> {
         anyhow::bail!("--oidc-issuer is required when --oidc-audience is set");
     }
 
+    if let Some(work_units) = cli.s1_2_synthetic_work_units {
+        config["s1_2_synthetic_work_units"] = serde_json::Value::from(work_units);
+    }
+
     let config_bytes = serde_json::to_vec(&config)?;
 
-    // Enter the enclave (blocks until enclave returns)
-    info!("Calling ecall_run (Ctrl+C to stop)...");
-    let ret = enclave::call_ecall_run(enclave_id, &config_bytes);
-    if ret != 0 {
-        error!("ecall_run returned: {}", ret);
+    let (control_handle, execution_handle) = match cli.ecall_start_order {
+        EcallStartOrder::WorkerFirst => {
+            let execution = spawn_execution_ecall(enclave_id)?;
+            info!("Execution worker ECALL entered first");
+            let control = spawn_control_ecall(enclave_id, config_bytes)?;
+            (control, execution)
+        }
+        EcallStartOrder::ControlFirst => {
+            let control = spawn_control_ecall(enclave_id, config_bytes)?;
+            info!("Control ECALL entered first");
+            let execution = spawn_execution_ecall(enclave_id)?;
+            (control, execution)
+        }
+    };
+    info!("Both long-lived ECALLs entered (in-band ingress shutdown to stop)");
+
+    let control_ret = control_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("Control ECALL host thread panicked"))?;
+    if control_ret != 0 {
+        error!("ecall_run returned: {}", control_ret);
+    }
+
+    let execution_ret = execution_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("Execution ECALL host thread panicked"))?;
+    if execution_ret != 0 {
+        error!("ecall_execution_worker returned: {}", execution_ret);
     }
 
     // Signal dispatcher and proxy to stop
     shutdown.store(true, Ordering::Relaxed);
 
-    // Graceful shutdown
-    let _ = enclave::call_ecall_shutdown(enclave_id);
-    info!("Waiting for dispatcher thread...");
-    let _ = dispatcher_handle.join();
+    // Both long-lived ECALLs have returned through the in-band lifecycle.
+    info!("Waiting for control dispatcher thread...");
+    let _ = control_dispatcher_handle.join();
+    info!("Waiting for execution dispatcher thread...");
+    let _ = execution_dispatcher_handle.join();
     info!("Waiting for TCP proxy thread...");
     let _ = proxy_handle.join();
     enclave::destroy_enclave(enclave_id);
     info!("Enclave destroyed. Goodbye.");
 
     // Keep channels alive until after enclave is destroyed
-    drop(channel);
+    drop(control_channel);
+    drop(execution_channel);
     drop(data_channel);
 
     Ok(())
@@ -390,9 +521,8 @@ fn wrap_ec_sec1_in_pkcs8(sec1_der: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&outer_len_bytes);
     out.extend_from_slice(&[0x02, 0x01, 0x00]); // version = 0
     out.extend_from_slice(&[
-        0x30, 0x13,
-        0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,
-        0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07,
+        0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86,
+        0x48, 0xce, 0x3d, 0x03, 0x01, 0x07,
     ]);
     out.push(0x04); // OCTET STRING tag
     out.extend_from_slice(&octet_len_bytes);

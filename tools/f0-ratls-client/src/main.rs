@@ -44,6 +44,7 @@ struct Args {
     health_attempts: usize,
     retry_delay: Duration,
     health_only: bool,
+    shutdown_after_health: bool,
 }
 
 fn sockets() -> &'static Mutex<HashMap<i32, TcpStream>> {
@@ -178,6 +179,7 @@ fn parse_args() -> Result<Args, String> {
     let mut health_attempts = 12_usize;
     let mut retry_delay = Duration::from_secs(5);
     let mut health_only = false;
+    let mut shutdown_after_health = false;
 
     while let Some(flag) = values.next() {
         match flag.as_str() {
@@ -214,6 +216,7 @@ fn parse_args() -> Result<Args, String> {
                 );
             }
             "--health-only" => health_only = true,
+            "--shutdown-after-health" => shutdown_after_health = true,
             _ => return Err(format!("unknown argument: {flag}")),
         }
     }
@@ -230,6 +233,7 @@ fn parse_args() -> Result<Args, String> {
         health_attempts,
         retry_delay,
         health_only,
+        shutdown_after_health,
     })
 }
 
@@ -316,6 +320,18 @@ fn run() -> Result<(), String> {
     let cwasm = fs::read(&args.cwasm).map_err(|error| format!("failed to read cwasm: {error}"))?;
 
     await_health(&args)?;
+    if args.shutdown_after_health {
+        let status_body = request(&args, "GET", "/status", None)?;
+        let status: Value = serde_json::from_slice(&status_body)
+            .map_err(|_| "status returned invalid JSON".to_string())?;
+        if !status.is_array() {
+            return Err("status returned a non-array JSON value".into());
+        }
+        let _shutdown = parse_object(
+            &request(&args, "POST", "/shutdown", Some(b"{}"))?,
+            "shutdown",
+        )?;
+    }
     if args.health_only {
         println!(
             "F0 RA-TLS HEALTH PASS: assurance=sgx_hardware \

@@ -5,15 +5,15 @@
 //!
 //! With the SPSC queue architecture, the host:
 //! 1. Creates the enclave
-//! 2. Allocates two shared-memory SPSC queues (enc_to_host, host_to_enc)
-//! 3. Calls `ecall_init_channel` to pass queue pointers to enclave
-//! 4. Starts the RPC dispatcher thread
-//! 5. Calls `ecall_run` (blocks in the enclave event loop)
-//! 6. On shutdown, calls `ecall_shutdown` and joins dispatcher
+//! 2. Allocates distinct control, execution and data channel pairs
+//! 3. Initialises all channels before entering either long-lived ECALL
+//! 4. Starts one dispatcher per RPC pair
+//! 5. Runs `ecall_run` and `ecall_execution_worker` on separate host threads
+//! 6. Uses in-band shutdown, joins both ECALLs, then joins host dispatchers
 
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 
-use enclave_os_common::queue::{SpscQueueHeader, SpscConsumer, SpscProducer};
+use enclave_os_common::queue::{SpscConsumer, SpscProducer, SpscQueueHeader};
 
 // ---------------------------------------------------------------------------
 //  Shared channel allocation
@@ -105,7 +105,17 @@ mod sgx {
     static ENCLAVE: OnceLock<SgxEnclave> = OnceLock::new();
 
     extern "C" {
-        fn ecall_init_channel(
+        fn ecall_init_control_channel(
+            eid: EnclaveId,
+            retval: *mut i32,
+            enc_to_host_header: *mut u8,
+            enc_to_host_buf: *mut u8,
+            host_to_enc_header: *mut u8,
+            host_to_enc_buf: *mut u8,
+            capacity: u64,
+        ) -> SgxStatus;
+
+        fn ecall_init_execution_channel(
             eid: EnclaveId,
             retval: *mut i32,
             enc_to_host_header: *mut u8,
@@ -132,10 +142,7 @@ mod sgx {
             config_len: u64,
         ) -> SgxStatus;
 
-        fn ecall_shutdown(
-            eid: EnclaveId,
-            retval: *mut i32,
-        ) -> SgxStatus;
+        fn ecall_execution_worker(eid: EnclaveId, retval: *mut i32, worker_id: u32) -> SgxStatus;
     }
 
     pub fn create_enclave(path: &str) -> anyhow::Result<u64> {
@@ -151,7 +158,7 @@ mod sgx {
         // SgxEnclave's Drop will call sgx_destroy_enclave
     }
 
-    pub fn call_ecall_init_channel(
+    pub fn call_ecall_init_control_channel(
         eid: u64,
         enc_to_host_header: *mut u8,
         enc_to_host_buf: *mut u8,
@@ -161,15 +168,45 @@ mod sgx {
     ) -> i32 {
         let mut retval: i32 = -1;
         let status = unsafe {
-            ecall_init_channel(
-                eid, &mut retval,
-                enc_to_host_header, enc_to_host_buf,
-                host_to_enc_header, host_to_enc_buf,
+            ecall_init_control_channel(
+                eid,
+                &mut retval,
+                enc_to_host_header,
+                enc_to_host_buf,
+                host_to_enc_header,
+                host_to_enc_buf,
                 capacity,
             )
         };
         if status != SgxStatus::Success {
-            log::error!("ecall_init_channel SGX status: {:?}", status);
+            log::error!("ecall_init_control_channel SGX status: {:?}", status);
+            return -1;
+        }
+        retval
+    }
+
+    pub fn call_ecall_init_execution_channel(
+        eid: u64,
+        enc_to_host_header: *mut u8,
+        enc_to_host_buf: *mut u8,
+        host_to_enc_header: *mut u8,
+        host_to_enc_buf: *mut u8,
+        capacity: u64,
+    ) -> i32 {
+        let mut retval: i32 = -1;
+        let status = unsafe {
+            ecall_init_execution_channel(
+                eid,
+                &mut retval,
+                enc_to_host_header,
+                enc_to_host_buf,
+                host_to_enc_header,
+                host_to_enc_buf,
+                capacity,
+            )
+        };
+        if status != SgxStatus::Success {
+            log::error!("ecall_init_execution_channel SGX status: {:?}", status);
             return -1;
         }
         retval
@@ -186,9 +223,12 @@ mod sgx {
         let mut retval: i32 = -1;
         let status = unsafe {
             ecall_init_data_channel(
-                eid, &mut retval,
-                enc_to_host_header, enc_to_host_buf,
-                host_to_enc_header, host_to_enc_buf,
+                eid,
+                &mut retval,
+                enc_to_host_header,
+                enc_to_host_buf,
+                host_to_enc_header,
+                host_to_enc_buf,
                 capacity,
             )
         };
@@ -203,8 +243,10 @@ mod sgx {
         let mut retval: i32 = -1;
         let status = unsafe {
             ecall_run(
-                eid, &mut retval,
-                config_json.as_ptr(), config_json.len() as u64,
+                eid,
+                &mut retval,
+                config_json.as_ptr(),
+                config_json.len() as u64,
             )
         };
         if status != SgxStatus::Success {
@@ -214,11 +256,11 @@ mod sgx {
         retval
     }
 
-    pub fn call_ecall_shutdown(eid: u64) -> i32 {
+    pub fn call_ecall_execution_worker(eid: u64, worker_id: u32) -> i32 {
         let mut retval: i32 = -1;
-        let status = unsafe { ecall_shutdown(eid, &mut retval) };
+        let status = unsafe { ecall_execution_worker(eid, &mut retval, worker_id) };
         if status != SgxStatus::Success {
-            log::error!("ecall_shutdown SGX status: {:?}", status);
+            log::error!("ecall_execution_worker SGX status: {:?}", status);
             return -1;
         }
         retval
@@ -246,7 +288,7 @@ mod sgx {
         info!("[MOCK] destroy_enclave({})", eid);
     }
 
-    pub fn call_ecall_init_channel(
+    pub fn call_ecall_init_control_channel(
         _eid: u64,
         _enc_to_host_header: *mut u8,
         _enc_to_host_buf: *mut u8,
@@ -254,7 +296,19 @@ mod sgx {
         _host_to_enc_buf: *mut u8,
         _capacity: u64,
     ) -> i32 {
-        info!("[MOCK] ecall_init_channel");
+        info!("[MOCK] ecall_init_control_channel");
+        0
+    }
+
+    pub fn call_ecall_init_execution_channel(
+        _eid: u64,
+        _enc_to_host_header: *mut u8,
+        _enc_to_host_buf: *mut u8,
+        _host_to_enc_header: *mut u8,
+        _host_to_enc_buf: *mut u8,
+        _capacity: u64,
+    ) -> i32 {
+        info!("[MOCK] ecall_init_execution_channel");
         0
     }
 
@@ -276,8 +330,8 @@ mod sgx {
         0
     }
 
-    pub fn call_ecall_shutdown(_eid: u64) -> i32 {
-        info!("[MOCK] ecall_shutdown");
+    pub fn call_ecall_execution_worker(_eid: u64, worker_id: u32) -> i32 {
+        info!("[MOCK] ecall_execution_worker({})", worker_id);
         0
     }
 }

@@ -10,6 +10,10 @@ members = [
 ]
 exclude = [
     "enclave",
+    "crates/enclave-os-app-auth",
+    "crates/enclave-os-egress",
+    "crates/enclave-os-fido2",
+    "crates/enclave-os-kvstore",
     "tools",
 ]
 # The enclave crate is built separately with a different target;
