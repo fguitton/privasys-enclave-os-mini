@@ -84,9 +84,6 @@ time = { version = "0.3", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Pin transitive deps that shipped edition2024 (requires Rust 1.85+)
-time-core = ">=0.1, <0.1.8"
-
 # ── Optional module crate dependencies (gated by features above) ────────
 enclave-os-egress  = { path = "../crates/enclave-os-egress", optional = true }
 enclave-os-kvstore = { path = "../crates/enclave-os-kvstore", optional = true }
@@ -104,4 +101,3 @@ strip = "symbols"       # strip debug symbols from .a
 
 [build-dependencies]
 cc = "1"
-
