@@ -41,8 +41,6 @@ if(NOT CUSTOM_ENCLAVE_DIR STREQUAL "")
     get_filename_component(_dir_name "${CUSTOM_ENCLAVE_DIR}" NAME)
     string(REPLACE "-" "_" _ENCLAVE_CRATE_NAME "${_dir_name}")
     set(_ENCLAVE_FEATURES "")
-    set(_ENCLAVE_TARGET_DIR
-        "${CMAKE_BINARY_DIR}/cargo/${_ENCLAVE_CRATE_NAME}")
     message(STATUS "Custom enclave crate — building ${_ENCLAVE_CRATE_DIR} (${_ENCLAVE_CRATE_NAME})")
 else()
     # Default: build enclave-os-enclave with composable features
@@ -77,20 +75,14 @@ else()
     endif()
 endif()
 
-if(NOT CUSTOM_ENCLAVE_DIR STREQUAL "")
-    rust_build_enclave(
-        "${_ENCLAVE_CRATE_DIR}"
-        ${_ENCLAVE_CRATE_NAME}
-        "${_ENCLAVE_FEATURES}"
-        "${_ENCLAVE_TARGET_DIR}"
-    )
-else()
-    rust_build_enclave(
-        "${_ENCLAVE_CRATE_DIR}"
-        ${_ENCLAVE_CRATE_NAME}
-        "${_ENCLAVE_FEATURES}"
-    )
-endif()
+set(_ENCLAVE_TARGET_DIR
+    "${CMAKE_BINARY_DIR}/cargo/${_ENCLAVE_CRATE_NAME}")
+rust_build_enclave(
+    "${_ENCLAVE_CRATE_DIR}"
+    ${_ENCLAVE_CRATE_NAME}
+    "${_ENCLAVE_FEATURES}"
+    "${_ENCLAVE_TARGET_DIR}"
+)
 add_dependencies(${_ENCLAVE_CRATE_NAME} sgx_sysroot)
 set(ENCLAVE_STATIC_LIB "${${_ENCLAVE_CRATE_NAME}_STATIC_LIB}")
 
