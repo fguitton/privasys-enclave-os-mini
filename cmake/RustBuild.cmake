@@ -15,6 +15,9 @@ set(RUST_ENCLAVE_TARGET "x86_64-unknown-linux-sgx" CACHE STRING
 set(RUST_ENCLAVE_TOOLCHAIN "nightly-2026-06-21" CACHE STRING
     "Rustup toolchain name for enclave builds")
 
+set(RUST_ENCLAVE_SOURCE_ROOT "${CMAKE_SOURCE_DIR}" CACHE PATH
+    "Source root remapped to /workspace in enclave compiler output")
+
 # Build type mapping
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
     set(CARGO_BUILD_TYPE "--release")
@@ -83,6 +86,12 @@ function(rust_build_enclave CRATE_DIR OUTPUT_NAME FEATURES)
         set(_ENCLAVE_TARGET_DIR
             "${CMAKE_SOURCE_DIR}/target/cmake-enclave-${_FEATURES}-${SOURCE_DATE_EPOCH}")
     endif()
+    get_filename_component(_ENCLAVE_SOURCE_ROOT
+        "${RUST_ENCLAVE_SOURCE_ROOT}" ABSOLUTE)
+    string(CONCAT _ENCLAVE_RUSTFLAGS
+        "--sysroot ${SGX_SYSROOT_DIR} -C target-feature=+rdrand"
+        " --remap-path-prefix ${_ENCLAVE_SOURCE_ROOT}=/workspace"
+        " --remap-path-prefix ${_ENCLAVE_TARGET_DIR}=/cargo-target")
 
     set(_BUILD_COMMENT "Building enclave Rust crate: ${OUTPUT_NAME}")
     if(_FEATURES)
@@ -97,7 +106,7 @@ function(rust_build_enclave CRATE_DIR OUTPUT_NAME FEATURES)
             "CARGO_TARGET_DIR=${_ENCLAVE_TARGET_DIR}"
             "CC=${CMAKE_C_COMPILER}"
             "CXX=${CMAKE_CXX_COMPILER}"
-            "RUSTFLAGS=--sysroot ${SGX_SYSROOT_DIR} -C target-feature=+rdrand"
+            "RUSTFLAGS=${_ENCLAVE_RUSTFLAGS}"
             ${CARGO_EXECUTABLE} build
                 ${CARGO_BUILD_TYPE}
                 -Zjson-target-spec
