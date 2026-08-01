@@ -140,6 +140,13 @@ impl WasmEngine {
             .set_fuel(fuel)
             .map_err(|e| format!("WASM fuel installation failed: {}", e))?;
 
+        // The shared authenticated profile enables epoch interruption, for
+        // which Wasmtime deliberately gives every new Store an already
+        // elapsed deadline. Mini does not currently own an epoch-tick source;
+        // fuel is its deterministic execution bound. Arm a distant deadline
+        // so trial instantiation and ordinary calls do not trap immediately.
+        store.set_epoch_deadline(u64::MAX / 2);
+
         Ok(store)
     }
 

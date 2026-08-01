@@ -95,6 +95,7 @@ use crate::protocol::{
     AppPermissions, FunctionPolicy, Payer, WasmCall, WasmEnvelope, WasmManagementResult, WasmParam,
     WasmResult, WasmSchemaRequest,
 };
+#[cfg(feature = "app-auth")]
 use crate::protocol::{AppRolesAction, AppRolesResult, UserRoles};
 use crate::registry::AppRegistry;
 
@@ -620,11 +621,7 @@ impl WasmModule {
     ///   - `role` → require a valid token with at least one matching role.
     ///
     /// The app-level bearer token is taken from `call.app_auth`.
-    fn check_app_permissions(
-        &self,
-        call: &WasmCall,
-        ctx: &RequestContext,
-    ) -> Result<Option<AuthResult>, Response> {
+    fn check_app_permissions(&self, call: &WasmCall) -> Result<Option<AuthResult>, Response> {
         // Look up the app's permissions policy.
         let registry = self.registry.lock().map_err(|_| {
             Response::Data(serialize_or_error(&WasmResult::Error {
@@ -1637,7 +1634,7 @@ impl EnclaveModule for WasmModule {
 
         // 1. wasm_call — execute a function (app-level permissions)
         if let Some(ref call) = envelope.wasm_call {
-            let auth = match self.check_app_permissions(call, ctx) {
+            let auth = match self.check_app_permissions(call) {
                 Ok(a) => a,
                 Err(response) => return Some(response),
             };
@@ -2025,7 +2022,7 @@ impl EnclaveModule for WasmModule {
                 }
             };
             // Re-use the same permission + dispatch path as wasm_call.
-            let auth = match self.check_app_permissions(&wasm_call, ctx) {
+            let auth = match self.check_app_permissions(&wasm_call) {
                 Ok(a) => a,
                 Err(response) => return Some(response),
             };
@@ -2457,6 +2454,7 @@ fn auth_methods_description(permissions: &crate::protocol::AppPermissions) -> St
 }
 
 /// Check if a token looks like a FIDO2 session token (64 hex chars).
+#[cfg(feature = "fido2")]
 fn is_fido2_session_token(token: &str) -> bool {
     token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit())
 }

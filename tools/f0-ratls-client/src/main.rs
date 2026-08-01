@@ -461,7 +461,9 @@ fn run() -> Result<(), String> {
     if load.get("status") != Some(&Value::String("loaded".into()))
         || load.pointer("/app/name") != Some(&Value::String(APP_NAME.into()))
     {
-        return Err("wasm_load did not admit the expected F0 app".into());
+        return Err(format!(
+            "wasm_load did not admit the expected F0 app: {load}"
+        ));
     }
 
     let call_body = serde_json::to_vec(&json!({
