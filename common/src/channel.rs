@@ -222,11 +222,7 @@ pub fn encode_tcp_connect_failed(request_id: u64, reason: TcpConnectFailure) -> 
     let mut payload = Vec::with_capacity(CONNECT_REQUEST_ID_BYTES + 1);
     payload.extend_from_slice(&request_id.to_le_bytes());
     payload.push(reason as u8);
-    encode_channel_msg(
-        ChannelMsgType::TcpConnectFailed,
-        0,
-        &payload,
-    )
+    encode_channel_msg(ChannelMsgType::TcpConnectFailed, 0, &payload)
 }
 
 /// Decode a `TcpConnect` payload into its correlation ID and literal endpoint.
@@ -309,10 +305,7 @@ mod tests {
         let (typ, conn_id, payload) = decode_channel_msg(&request).unwrap();
         assert_eq!(typ, ChannelMsgType::TcpConnect);
         assert_eq!(conn_id, 0);
-        assert_eq!(
-            decode_tcp_connect(payload),
-            Some((91, "127.0.0.1:8443"))
-        );
+        assert_eq!(decode_tcp_connect(payload), Some((91, "127.0.0.1:8443")));
 
         let connected = encode_tcp_connected(91, 77);
         let (typ, conn_id, payload) = decode_channel_msg(&connected).unwrap();

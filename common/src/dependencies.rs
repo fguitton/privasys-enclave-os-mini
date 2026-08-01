@@ -106,7 +106,8 @@ impl DependencySet {
     fn normalised(&self) -> DependencySet {
         let mut out = self.clone();
         for e in out.entries.iter_mut() {
-            e.measurements.sort_by(|a, b| a.canonical().cmp(&b.canonical()));
+            e.measurements
+                .sort_by(|a, b| a.canonical().cmp(&b.canonical()));
             e.required_oids
                 .sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
         }
@@ -308,7 +309,10 @@ mod tests {
 
     #[test]
     fn encoding_matches_go_sdk() {
-        assert_eq!(crate::hex::hex_encode(&encode_dependency_set(&sample())), GO_ENCODE_HEX);
+        assert_eq!(
+            crate::hex::hex_encode(&encode_dependency_set(&sample())),
+            GO_ENCODE_HEX
+        );
     }
 
     #[test]
@@ -346,6 +350,9 @@ mod tests {
     #[test]
     fn canonicalize_is_idempotent_and_matches_vector() {
         let enc = encode_dependency_set(&sample());
-        assert_eq!(crate::hex::hex_encode(&canonicalize_encoded(&enc).unwrap()), GO_ENCODE_HEX);
+        assert_eq!(
+            crate::hex::hex_encode(&canonicalize_encoded(&enc).unwrap()),
+            GO_ENCODE_HEX
+        );
     }
 }

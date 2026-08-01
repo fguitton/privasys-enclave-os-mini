@@ -13,17 +13,15 @@
 //! These tests reproduce the Merkle tree + X.509 extension logic
 //! and verify that per-app identities are correctly isolated.
 
-use ring::digest;
 use rcgen::{
-    CertificateParams, CustomExtension, DnType, DnValue, IsCa, KeyPair,
-    PKCS_ECDSA_P256_SHA256,
+    CertificateParams, CustomExtension, DnType, DnValue, IsCa, KeyPair, PKCS_ECDSA_P256_SHA256,
 };
+use ring::digest;
 use x509_parser::prelude::*;
 
 use enclave_os_common::oids::{
-    APP_CODE_HASH_OID, APP_CODE_HASH_OID_STR,
-    APP_CONFIG_MERKLE_ROOT_OID, APP_CONFIG_MERKLE_ROOT_OID_STR,
-    APP_KEY_SOURCE_OID, APP_KEY_SOURCE_OID_STR,
+    APP_CODE_HASH_OID, APP_CODE_HASH_OID_STR, APP_CONFIG_MERKLE_ROOT_OID,
+    APP_CONFIG_MERKLE_ROOT_OID_STR, APP_KEY_SOURCE_OID, APP_KEY_SOURCE_OID_STR,
 };
 
 // ---------------------------------------------------------------------------
@@ -70,8 +68,7 @@ fn app_merkle_root(code_hash: &[u8; 32], key_source: &str) -> [u8; 32] {
 
 /// Generate a self-signed ECDSA P-256 CA certificate.
 fn generate_ca(cn: &str) -> (Vec<u8>, Vec<u8>) {
-    let mut params =
-        CertificateParams::new(Vec::<String>::new()).expect("CA params");
+    let mut params = CertificateParams::new(Vec::<String>::new()).expect("CA params");
     params
         .distinguished_name
         .push(DnType::CommonName, DnValue::Utf8String(cn.into()));
@@ -99,53 +96,46 @@ fn build_app_leaf_cert(
 ) -> Vec<u8> {
     use rustls_pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
-    let leaf_key =
-        KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("leaf keygen");
+    let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("leaf keygen");
 
-    let mut leaf_params =
-        CertificateParams::new(Vec::<String>::new()).expect("leaf params");
-    leaf_params.distinguished_name.push(
-        DnType::CommonName,
-        DnValue::Utf8String(hostname.into()),
-    );
+    let mut leaf_params = CertificateParams::new(Vec::<String>::new()).expect("leaf params");
+    leaf_params
+        .distinguished_name
+        .push(DnType::CommonName, DnValue::Utf8String(hostname.into()));
     leaf_params.not_before = rcgen::date_time_ymd(2024, 1, 1);
     leaf_params.not_after = rcgen::date_time_ymd(2030, 12, 31);
     leaf_params.is_ca = IsCa::NoCa;
 
     // Per-app Merkle root extension
-    leaf_params.custom_extensions.push(
-        CustomExtension::from_oid_content(
+    leaf_params
+        .custom_extensions
+        .push(CustomExtension::from_oid_content(
             APP_CONFIG_MERKLE_ROOT_OID,
             merkle_root.to_vec(),
-        ),
-    );
+        ));
 
     // Per-app code hash extension
-    leaf_params.custom_extensions.push(
-        CustomExtension::from_oid_content(
+    leaf_params
+        .custom_extensions
+        .push(CustomExtension::from_oid_content(
             APP_CODE_HASH_OID,
             code_hash.to_vec(),
-        ),
-    );
+        ));
 
     // Per-app key source extension
-    leaf_params.custom_extensions.push(
-        CustomExtension::from_oid_content(
+    leaf_params
+        .custom_extensions
+        .push(CustomExtension::from_oid_content(
             APP_KEY_SOURCE_OID,
             key_source.as_bytes().to_vec(),
-        ),
-    );
+        ));
 
     // Sign with the CA
     let ca_pkcs8 = PrivatePkcs8KeyDer::from(ca_key_pkcs8.to_vec());
-    let ca_key = KeyPair::from_pkcs8_der_and_sign_algo(
-        &ca_pkcs8,
-        &PKCS_ECDSA_P256_SHA256,
-    )
-    .expect("CA key parse");
+    let ca_key = KeyPair::from_pkcs8_der_and_sign_algo(&ca_pkcs8, &PKCS_ECDSA_P256_SHA256)
+        .expect("CA key parse");
     let ca_der = CertificateDer::from(ca_cert_der);
-    let ca_params =
-        CertificateParams::from_ca_cert_der(&ca_der).expect("CA cert parse");
+    let ca_params = CertificateParams::from_ca_cert_der(&ca_der).expect("CA cert parse");
     let ca_cert = ca_params.self_signed(&ca_key).expect("CA re-sign");
 
     let leaf_cert = leaf_params
@@ -169,7 +159,8 @@ fn extract_extension(cert_der: &[u8], oid_str: &str) -> Option<Vec<u8>> {
 /// Extract the Subject CN from a DER certificate.
 fn extract_cn(cert_der: &[u8]) -> Option<String> {
     let (_, cert) = X509Certificate::from_der(cert_der).expect("parse X.509");
-    let result = cert.subject()
+    let result = cert
+        .subject()
         .iter_common_name()
         .next()
         .and_then(|cn| cn.as_str().ok())
@@ -219,7 +210,10 @@ fn same_config_produces_same_merkle_root() {
     let root_a = app_merkle_root(&code_hash, "byok:abc123");
     let root_b = app_merkle_root(&code_hash, "byok:abc123");
 
-    assert_eq!(root_a, root_b, "Identical config must produce identical roots");
+    assert_eq!(
+        root_a, root_b,
+        "Identical config must produce identical roots"
+    );
 }
 
 /// Empty config entries → zero root.
@@ -268,9 +262,12 @@ fn app_leaf_cert_contains_expected_extensions() {
     let root = app_merkle_root(&code_hash, "generated");
 
     let leaf = build_app_leaf_cert(
-        &ca_der, &ca_key,
+        &ca_der,
+        &ca_key,
         "hello.enclave.local",
-        &root, &code_hash, "generated",
+        &root,
+        &code_hash,
+        "generated",
     );
 
     let ext_root = extract_extension(&leaf, APP_CONFIG_MERKLE_ROOT_OID_STR)
@@ -293,9 +290,12 @@ fn app_leaf_cert_has_hostname_as_cn() {
     let root = app_merkle_root(&code_hash, "byok:abc123");
 
     let leaf = build_app_leaf_cert(
-        &ca_der, &ca_key,
+        &ca_der,
+        &ca_key,
         "payments.example.com",
-        &root, &code_hash, "byok:abc123",
+        &root,
+        &code_hash,
+        "byok:abc123",
     );
 
     let cn = extract_cn(&leaf).expect("Subject CN missing");
@@ -310,26 +310,45 @@ fn different_apps_get_different_certs() {
     let hash_a = entry_hash(b"app-a.wasm");
     let root_a = app_merkle_root(&hash_a, "generated");
     let leaf_a = build_app_leaf_cert(
-        &ca_der, &ca_key, "app-a.enclave.local", &root_a, &hash_a, "generated",
+        &ca_der,
+        &ca_key,
+        "app-a.enclave.local",
+        &root_a,
+        &hash_a,
+        "generated",
     );
 
     let hash_b = entry_hash(b"app-b.wasm");
     let root_b = app_merkle_root(&hash_b, "byok:def456");
     let leaf_b = build_app_leaf_cert(
-        &ca_der, &ca_key, "app-b.enclave.local", &root_b, &hash_b, "byok:def456",
+        &ca_der,
+        &ca_key,
+        "app-b.enclave.local",
+        &root_b,
+        &hash_b,
+        "byok:def456",
     );
 
     let ext_root_a = extract_extension(&leaf_a, APP_CONFIG_MERKLE_ROOT_OID_STR).unwrap();
     let ext_root_b = extract_extension(&leaf_b, APP_CONFIG_MERKLE_ROOT_OID_STR).unwrap();
-    assert_ne!(ext_root_a, ext_root_b, "Different apps must have different Merkle roots");
+    assert_ne!(
+        ext_root_a, ext_root_b,
+        "Different apps must have different Merkle roots"
+    );
 
     let ext_hash_a = extract_extension(&leaf_a, APP_CODE_HASH_OID_STR).unwrap();
     let ext_hash_b = extract_extension(&leaf_b, APP_CODE_HASH_OID_STR).unwrap();
-    assert_ne!(ext_hash_a, ext_hash_b, "Different apps must have different code hashes");
+    assert_ne!(
+        ext_hash_a, ext_hash_b,
+        "Different apps must have different code hashes"
+    );
 
     let ext_ks_a = extract_extension(&leaf_a, APP_KEY_SOURCE_OID_STR).unwrap();
     let ext_ks_b = extract_extension(&leaf_b, APP_KEY_SOURCE_OID_STR).unwrap();
-    assert_ne!(ext_ks_a, ext_ks_b, "Different apps must have different key sources");
+    assert_ne!(
+        ext_ks_a, ext_ks_b,
+        "Different apps must have different key sources"
+    );
 
     let cn_a = extract_cn(&leaf_a).unwrap();
     let cn_b = extract_cn(&leaf_b).unwrap();
@@ -347,16 +366,29 @@ fn key_source_change_affects_only_merkle_root() {
     let root_byok = app_merkle_root(&code_hash, "byok:abc123");
 
     let leaf_gen = build_app_leaf_cert(
-        &ca_der, &ca_key, "app.local", &root_gen, &code_hash, "generated",
+        &ca_der,
+        &ca_key,
+        "app.local",
+        &root_gen,
+        &code_hash,
+        "generated",
     );
     let leaf_byok = build_app_leaf_cert(
-        &ca_der, &ca_key, "app.local", &root_byok, &code_hash, "byok:abc123",
+        &ca_der,
+        &ca_key,
+        "app.local",
+        &root_byok,
+        &code_hash,
+        "byok:abc123",
     );
 
     // Merkle roots differ
     let ext_root_gen = extract_extension(&leaf_gen, APP_CONFIG_MERKLE_ROOT_OID_STR).unwrap();
     let ext_root_byok = extract_extension(&leaf_byok, APP_CONFIG_MERKLE_ROOT_OID_STR).unwrap();
-    assert_ne!(ext_root_gen, ext_root_byok, "Key source change must affect Merkle root");
+    assert_ne!(
+        ext_root_gen, ext_root_byok,
+        "Key source change must affect Merkle root"
+    );
 
     // Code hashes are the same
     let ext_hash_gen = extract_extension(&leaf_gen, APP_CODE_HASH_OID_STR).unwrap();
@@ -367,7 +399,10 @@ fn key_source_change_affects_only_merkle_root() {
     let ext_ks_gen = extract_extension(&leaf_gen, APP_KEY_SOURCE_OID_STR).unwrap();
     let ext_ks_byok = extract_extension(&leaf_byok, APP_KEY_SOURCE_OID_STR).unwrap();
     assert_eq!(ext_ks_gen.as_slice(), b"generated");
-    assert!(ext_ks_byok.starts_with(b"byok:"), "BYOK key source must start with byok:");
+    assert!(
+        ext_ks_byok.starts_with(b"byok:"),
+        "BYOK key source must start with byok:"
+    );
     assert_ne!(ext_ks_gen, ext_ks_byok, "Key source extensions must differ");
 }
 
@@ -380,7 +415,12 @@ fn per_app_extensions_are_32_bytes() {
     let root = app_merkle_root(&code_hash, "generated");
 
     let leaf = build_app_leaf_cert(
-        &ca_der, &ca_key, "check.local", &root, &code_hash, "generated",
+        &ca_der,
+        &ca_key,
+        "check.local",
+        &root,
+        &code_hash,
+        "generated",
     );
 
     let ext_root = extract_extension(&leaf, APP_CONFIG_MERKLE_ROOT_OID_STR).unwrap();
@@ -389,7 +429,11 @@ fn per_app_extensions_are_32_bytes() {
 
     assert_eq!(ext_root.len(), 32, "Merkle root extension must be 32 bytes");
     assert_eq!(ext_hash.len(), 32, "Code hash extension must be 32 bytes");
-    assert_eq!(ext_ks.as_slice(), b"generated", "Key source must be \"generated\"");
+    assert_eq!(
+        ext_ks.as_slice(),
+        b"generated",
+        "Key source must be \"generated\""
+    );
 }
 
 /// A cert without per-app extensions (simulating the enclave-wide cert)
@@ -400,10 +444,8 @@ fn enclave_wide_cert_lacks_per_app_extensions() {
 
     // Build a leaf cert WITHOUT per-app extensions (enclave-wide)
     use rustls_pki_types::{CertificateDer, PrivatePkcs8KeyDer};
-    let leaf_key =
-        KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("keygen");
-    let mut params =
-        CertificateParams::new(Vec::<String>::new()).expect("params");
+    let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("keygen");
+    let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
     params.distinguished_name.push(
         DnType::CommonName,
         DnValue::Utf8String("enclave-wide".into()),
@@ -411,19 +453,12 @@ fn enclave_wide_cert_lacks_per_app_extensions() {
     params.is_ca = IsCa::NoCa;
 
     let ca_pkcs8 = PrivatePkcs8KeyDer::from(ca_key.clone());
-    let ca_kp = KeyPair::from_pkcs8_der_and_sign_algo(
-        &ca_pkcs8,
-        &PKCS_ECDSA_P256_SHA256,
-    )
-    .unwrap();
+    let ca_kp = KeyPair::from_pkcs8_der_and_sign_algo(&ca_pkcs8, &PKCS_ECDSA_P256_SHA256).unwrap();
     let ca_cert_der = CertificateDer::from(ca_der.as_slice());
-    let ca_params =
-        CertificateParams::from_ca_cert_der(&ca_cert_der).unwrap();
+    let ca_params = CertificateParams::from_ca_cert_der(&ca_cert_der).unwrap();
     let ca_cert = ca_params.self_signed(&ca_kp).unwrap();
 
-    let leaf = params
-        .signed_by(&leaf_key, &ca_cert, &ca_kp)
-        .unwrap();
+    let leaf = params.signed_by(&leaf_key, &ca_cert, &ca_kp).unwrap();
 
     let leaf_der = leaf.der().to_vec();
 

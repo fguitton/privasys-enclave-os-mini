@@ -57,10 +57,9 @@ pub use rustls::RootCertStore;
 
 // Re-export the dotted-string OIDs for callers building `ExpectedOid` values.
 pub use enclave_os_common::oids::{
-    CONFIG_MERKLE_ROOT_OID_STR as OID_CONFIG_MERKLE_ROOT,
-    EGRESS_CA_HASH_OID_STR as OID_EGRESS_CA_HASH,
-    WASM_APPS_HASH_OID_STR as OID_WASM_APPS_HASH,
     ATTESTATION_SERVERS_HASH_OID_STR as OID_ATTESTATION_SERVERS_HASH,
+    CONFIG_MERKLE_ROOT_OID_STR as OID_CONFIG_MERKLE_ROOT,
+    EGRESS_CA_HASH_OID_STR as OID_EGRESS_CA_HASH, WASM_APPS_HASH_OID_STR as OID_WASM_APPS_HASH,
 };
 
 // =========================================================================
@@ -490,12 +489,12 @@ fn build_client_config(
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(verifier));
         let mut cfg = match &policy.client_identity {
-            Some(identity) => wants_client_cert.with_client_cert_resolver(Arc::new(
-                ChallengeBoundClientAuth {
+            Some(identity) => {
+                wants_client_cert.with_client_cert_resolver(Arc::new(ChallengeBoundClientAuth {
                     identity: identity.clone(),
                     provider: provider.clone(),
-                },
-            )),
+                }))
+            }
             None => wants_client_cert.with_no_client_auth(),
         };
 
@@ -556,8 +555,7 @@ impl ServerCertVerifier for RaTlsVerifier {
         ) {
             Ok(_) => {}
             Err(Error::InvalidCertificate(
-                CertificateError::NotValidForName
-                | CertificateError::NotValidForNameContext { .. },
+                CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. },
             )) => {}
             Err(e) => return Err(e),
         }
@@ -605,10 +603,7 @@ struct VerifiedRaTlsCertificate {
     quote: Vec<u8>,
 }
 
-fn verify_ratls_cert(
-    der: &[u8],
-    policy: &RaTlsPolicy,
-) -> Result<VerifiedRaTlsCertificate, String> {
+fn verify_ratls_cert(der: &[u8], policy: &RaTlsPolicy) -> Result<VerifiedRaTlsCertificate, String> {
     let (_, cert) = X509Certificate::from_der(der)
         .map_err(|_| "RA-TLS: failed to parse leaf certificate DER".to_string())?;
 
@@ -711,12 +706,7 @@ fn verify_expected_oids(
             .extensions()
             .iter()
             .find(|e| e.oid.to_id_string() == exp.oid)
-            .ok_or_else(|| {
-                format!(
-                    "RA-TLS: expected OID {} not found in certificate",
-                    exp.oid
-                )
-            })?;
+            .ok_or_else(|| format!("RA-TLS: expected OID {} not found in certificate", exp.oid))?;
 
         if ext.value != exp.expected_value.as_slice() {
             return Err(format!(
@@ -997,10 +987,7 @@ fn verify_tdx_report_data(
 /// co-located, or unbound quote fails, because it cannot commit to this
 /// session's binder. Deterministic mode cannot channel-bind (cached quote); it
 /// is fully verified in the cert-verifier callback, so this is a no-op there.
-fn verify_channel_binding(
-    tls_conn: &ClientConnection,
-    policy: &RaTlsPolicy,
-) -> Result<(), String> {
+fn verify_channel_binding(tls_conn: &ClientConnection, policy: &RaTlsPolicy) -> Result<(), String> {
     let certs = tls_conn
         .peer_certificates()
         .ok_or_else(|| "RA-TLS: no peer certificate for channel-binding check".to_string())?;

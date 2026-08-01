@@ -41,8 +41,8 @@ impl AeadCipher {
         let mut nonce_bytes = [0u8; AEAD_NONCE_SIZE];
         rng.fill(&mut nonce_bytes).map_err(|_| "RNG failed")?;
 
-        let unbound_key = UnboundKey::new(&AES_256_GCM, &self.key_bytes)
-            .map_err(|_| "Invalid key")?;
+        let unbound_key =
+            UnboundKey::new(&AES_256_GCM, &self.key_bytes).map_err(|_| "Invalid key")?;
         let key = LessSafeKey::new(unbound_key);
 
         let nonce = Nonce::assume_unique_for_key(nonce_bytes);
@@ -68,8 +68,8 @@ impl AeadCipher {
             .map_err(|_| "Invalid nonce")?;
         let encrypted = &ciphertext[AEAD_NONCE_SIZE..];
 
-        let unbound_key = UnboundKey::new(&AES_256_GCM, &self.key_bytes)
-            .map_err(|_| "Invalid key")?;
+        let unbound_key =
+            UnboundKey::new(&AES_256_GCM, &self.key_bytes).map_err(|_| "Invalid key")?;
         let key = LessSafeKey::new(unbound_key);
         let nonce = Nonce::assume_unique_for_key(nonce_bytes);
 

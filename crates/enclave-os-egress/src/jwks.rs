@@ -59,8 +59,8 @@ fn discover_jwks_uri(issuer: &str) -> Result<String, String> {
         ));
     }
 
-    let doc: serde_json::Value = serde_json::from_slice(&resp.body)
-        .map_err(|e| format!("OIDC discovery JSON: {e}"))?;
+    let doc: serde_json::Value =
+        serde_json::from_slice(&resp.body).map_err(|e| format!("OIDC discovery JSON: {e}"))?;
 
     doc.get("jwks_uri")
         .and_then(|v| v.as_str())

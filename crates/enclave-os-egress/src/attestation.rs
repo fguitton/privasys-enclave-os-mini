@@ -140,10 +140,7 @@ pub struct VerifyResponse {
 /// let servers = enclave_os_common::attestation_servers::server_urls();
 /// attestation::verify_quote(&raw_quote_bytes, &servers)?;
 /// ```
-pub fn verify_quote(
-    evidence: &[u8],
-    attestation_servers: &[String],
-) -> Result<(), String> {
+pub fn verify_quote(evidence: &[u8], attestation_servers: &[String]) -> Result<(), String> {
     // Nothing to verify when no servers are configured.
     if attestation_servers.is_empty() {
         return Ok(());
@@ -173,9 +170,7 @@ pub fn verify_quote(
             format!("Bearer {}", t)
         });
 
-        let mut headers = vec![
-            ("Content-Type".to_string(), "application/json".to_string()),
-        ];
+        let mut headers = vec![("Content-Type".to_string(), "application/json".to_string())];
         if let Some(auth) = auth_header.as_deref() {
             headers.push(("Authorization".to_string(), auth.to_string()));
         }
@@ -188,20 +183,14 @@ pub fn verify_quote(
             store,
             None, // Standard HTTPS — the attestation server is not behind RA-TLS.
         )
-        .map_err(|e| {
+        .map_err(|e| format!("attestation server request to {} failed: {}", server_url, e))?;
+
+        let result: VerifyResponse = serde_json::from_slice(&resp.body).map_err(|e| {
             format!(
-                "attestation server request to {} failed: {}",
+                "invalid JSON response from attestation server {}: {}",
                 server_url, e
             )
         })?;
-
-        let result: VerifyResponse =
-            serde_json::from_slice(&resp.body).map_err(|e| {
-                format!(
-                    "invalid JSON response from attestation server {}: {}",
-                    server_url, e
-                )
-            })?;
 
         if !result.success {
             return Err(format!(

@@ -79,7 +79,9 @@ pub fn create_challenge(
         user_name,
     };
 
-    let mut guard = CHALLENGE_STORE.lock().map_err(|_| "challenge store lock poisoned")?;
+    let mut guard = CHALLENGE_STORE
+        .lock()
+        .map_err(|_| "challenge store lock poisoned")?;
     let store = guard.as_mut().ok_or("challenge store not initialised")?;
 
     // Evict expired entries if at capacity
@@ -111,7 +113,9 @@ pub fn consume_challenge(
     now: u64,
     expected_ceremony: Ceremony,
 ) -> Result<ConsumedChallenge, String> {
-    let mut guard = CHALLENGE_STORE.lock().map_err(|_| "challenge store lock poisoned")?;
+    let mut guard = CHALLENGE_STORE
+        .lock()
+        .map_err(|_| "challenge store lock poisoned")?;
     let store = guard.as_mut().ok_or("challenge store not initialised")?;
 
     let entry = store

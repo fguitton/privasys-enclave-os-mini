@@ -44,8 +44,8 @@ pub fn parse_client_data(
         .decode(client_data_json_b64)
         .map_err(|e| format!("clientDataJSON base64: {e}"))?;
 
-    let cd: ClientData = serde_json::from_slice(&raw)
-        .map_err(|e| format!("clientDataJSON parse: {e}"))?;
+    let cd: ClientData =
+        serde_json::from_slice(&raw).map_err(|e| format!("clientDataJSON parse: {e}"))?;
 
     if cd.ceremony_type != expected_type {
         return Err(format!(
@@ -175,8 +175,8 @@ pub fn parse_authenticator_data(data: &[u8]) -> Result<AuthenticatorData, String
 /// Extract a P-256 uncompressed public key (65 bytes: 0x04 || x || y)
 /// from a CBOR-encoded COSE_Key.
 pub fn extract_p256_public_key(cose_cbor: &[u8]) -> Result<Vec<u8>, String> {
-    let value: ciborium::Value = ciborium::from_reader(cose_cbor)
-        .map_err(|e| format!("COSE key CBOR parse: {e}"))?;
+    let value: ciborium::Value =
+        ciborium::from_reader(cose_cbor).map_err(|e| format!("COSE key CBOR parse: {e}"))?;
 
     let map = match value {
         ciborium::Value::Map(m) => m,
@@ -198,7 +198,9 @@ pub fn extract_p256_public_key(cose_cbor: &[u8]) -> Result<Vec<u8>, String> {
         })
         .ok_or("COSE key missing kty")?;
     if kty != COSE_KTY_EC2 {
-        return Err(format!("unsupported COSE key type: {kty}, expected EC2 (2)"));
+        return Err(format!(
+            "unsupported COSE key type: {kty}, expected EC2 (2)"
+        ));
     }
 
     // Verify curve = P-256 (1)
@@ -220,7 +222,10 @@ pub fn extract_p256_public_key(cose_cbor: &[u8]) -> Result<Vec<u8>, String> {
         })
         .ok_or("COSE key missing x coordinate")?;
     if x.len() != 32 {
-        return Err(format!("x coordinate wrong length: {}, expected 32", x.len()));
+        return Err(format!(
+            "x coordinate wrong length: {}, expected 32",
+            x.len()
+        ));
     }
 
     // Extract y coordinate (32 bytes)
@@ -231,7 +236,10 @@ pub fn extract_p256_public_key(cose_cbor: &[u8]) -> Result<Vec<u8>, String> {
         })
         .ok_or("COSE key missing y coordinate")?;
     if y.len() != 32 {
-        return Err(format!("y coordinate wrong length: {}, expected 32", y.len()));
+        return Err(format!(
+            "y coordinate wrong length: {}, expected 32",
+            y.len()
+        ));
     }
 
     // Uncompressed point: 0x04 || x || y
@@ -253,8 +261,8 @@ pub fn extract_p256_public_key(cose_cbor: &[u8]) -> Result<Vec<u8>, String> {
 /// We extract `authData` (raw bytes) and ignore `fmt` / `attStmt`
 /// because we trust our authenticator via AAGUID enforcement.
 pub fn parse_attestation_object(cbor_bytes: &[u8]) -> Result<Vec<u8>, String> {
-    let value: ciborium::Value = ciborium::from_reader(cbor_bytes)
-        .map_err(|e| format!("attestation object CBOR: {e}"))?;
+    let value: ciborium::Value =
+        ciborium::from_reader(cbor_bytes).map_err(|e| format!("attestation object CBOR: {e}"))?;
 
     let map = match value {
         ciborium::Value::Map(m) => m,
@@ -285,15 +293,9 @@ pub fn parse_attestation_object(cbor_bytes: &[u8]) -> Result<Vec<u8>, String> {
 /// `signed_data` is the concatenation of `authenticator_data || SHA-256(clientDataJSON)`.
 /// `signature` is the DER-encoded ECDSA signature.
 /// `public_key` is the uncompressed P-256 point (65 bytes).
-pub fn verify_signature(
-    public_key: &[u8],
-    signed_data: &[u8],
-    sig: &[u8],
-) -> Result<(), String> {
-    let peer_public_key = signature::UnparsedPublicKey::new(
-        &signature::ECDSA_P256_SHA256_ASN1,
-        public_key,
-    );
+pub fn verify_signature(public_key: &[u8], signed_data: &[u8], sig: &[u8]) -> Result<(), String> {
+    let peer_public_key =
+        signature::UnparsedPublicKey::new(&signature::ECDSA_P256_SHA256_ASN1, public_key);
     peer_public_key
         .verify(signed_data, sig)
         .map_err(|_| "ECDSA signature verification failed".to_string())

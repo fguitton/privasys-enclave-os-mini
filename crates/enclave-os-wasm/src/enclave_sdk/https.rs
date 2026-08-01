@@ -189,10 +189,14 @@ impl wit::Host for AppContext {
         // Inject the app's runtime-owned attested-dependency set (from sealed
         // metadata, never the app request) so a connection to a declared
         // dependency is verified fail-closed against its pinned identity.
-        let ratls_policy = req.ratls.map(build_ratls_policy).transpose()?.map(|mut pol| {
-            pol.dependencies = self.pinned_dependencies.clone();
-            pol
-        });
+        let ratls_policy = req
+            .ratls
+            .map(build_ratls_policy)
+            .transpose()?
+            .map(|mut pol| {
+                pol.dependencies = self.pinned_dependencies.clone();
+                pol
+            });
         let custom_store = build_custom_root_store(req.ca_roots_der)?;
 
         let root_store: &RootCertStore = match &custom_store {

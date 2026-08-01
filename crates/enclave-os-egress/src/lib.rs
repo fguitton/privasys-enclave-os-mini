@@ -49,31 +49,20 @@
 //! finalize_and_run(&config, &sealed_cfg);
 //! ```
 
-pub mod client;
 pub mod attestation;
+pub mod client;
 pub mod jwks;
 
 // Re-export RA-TLS verification types for convenience.
 pub use client::{
-    ExpectedOid, HttpResponse, IncrementalTlsClient, RaTlsPolicy,
-    ReportDataBinding, SgxPeerCertificateEvidence, TeeType,
-    locally_verify_sgx_peer_certificate,
+    enclave_attestation_quote, enclave_self_mrenclave, https_fetch, https_fetch_interruptible,
+    locally_verify_sgx_peer_certificate, mozilla_root_store, register_enclave_attestation_provider,
+    register_enclave_client_cert_signer, root_store_from_der, BoundedHttpsRequest,
+    ClientCertIdentity, EnclaveAttestationProvider, EnclaveClientCertSigner, ExpectedOid,
+    HttpResponse, IncrementalTlsClient, InterruptibleBlockingNetIo, RaTlsPolicy, ReportDataBinding,
+    SgxPeerCertificateEvidence, TeeType, MAX_REQUEST_BODY, MAX_REQUEST_HEADERS,
+    MAX_REQUEST_HEADER_BYTES, MAX_RESPONSE_BODY, OID_ATTESTATION_SERVERS_HASH,
     OID_CONFIG_MERKLE_ROOT, OID_EGRESS_CA_HASH, OID_WASM_APPS_HASH,
-    OID_ATTESTATION_SERVERS_HASH,
-    MAX_RESPONSE_BODY,
-    ClientCertIdentity,
-    EnclaveClientCertSigner,
-    register_enclave_client_cert_signer,
-    EnclaveAttestationProvider,
-    register_enclave_attestation_provider,
-    enclave_attestation_quote,
-    enclave_self_mrenclave,
-    BoundedHttpsRequest,
-    InterruptibleBlockingNetIo,
-    MAX_REQUEST_BODY, MAX_REQUEST_HEADERS, MAX_REQUEST_HEADER_BYTES,
-    https_fetch, https_fetch_interruptible,
-    mozilla_root_store,
-    root_store_from_der,
 };
 
 use std::sync::OnceLock;
@@ -142,7 +131,9 @@ impl EgressModule {
                 return Err("No valid certificates found in egress CA bundle".into());
             }
             for cert in certs {
-                store.add(cert).map_err(|e| format!("Bad root cert: {}", e))?;
+                store
+                    .add(cert)
+                    .map_err(|e| format!("Bad root cert: {}", e))?;
             }
             EGRESS_ROOT_STORE
                 .set(store)
@@ -152,7 +143,13 @@ impl EgressModule {
             0
         };
 
-        Ok((Self { ca_pem: pem, ca_hash }, cert_count))
+        Ok((
+            Self {
+                ca_pem: pem,
+                ca_hash,
+            },
+            cert_count,
+        ))
     }
 }
 

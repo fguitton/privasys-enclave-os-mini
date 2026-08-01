@@ -44,10 +44,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::string::String;
 use std::vec::Vec;
 
+use crate::wasmtime;
 use ring::digest;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
-use crate::wasmtime;
 use wasmtime::component::{Component, Func, Val};
 use wasmtime::Store;
 
@@ -783,7 +783,8 @@ impl AppRegistry {
         // secrets and must not be re-frozen.
         if let Some(ref f) = config_api_function {
             self.config_api.insert(name.to_string(), f.clone());
-            self.configured.insert(name.to_string(), meta.config_complete);
+            self.configured
+                .insert(name.to_string(), meta.config_complete);
         }
 
         self.loaded.insert(
@@ -821,7 +822,8 @@ impl AppRegistry {
         // in which case there is no AppMeta here at all) re-arms frozen.
         if let Some(ref f) = meta.config_api_function {
             self.config_api.insert(meta.name.clone(), f.clone());
-            self.configured.insert(meta.name.clone(), meta.config_complete);
+            self.configured
+                .insert(meta.name.clone(), meta.config_complete);
         }
         self.known.insert(meta.name.clone(), meta);
     }
@@ -1073,7 +1075,11 @@ impl AppRegistry {
     /// Set (or clear, when `dependencies` is `None`) an app's attested
     /// cross-enclave dependency set (the canonical OID 6.1 encoding). Returns the
     /// updated meta so the caller can persist it and re-register the identity.
-    pub fn set_dependencies(&mut self, name: &str, dependencies: Option<Vec<u8>>) -> Option<AppMeta> {
+    pub fn set_dependencies(
+        &mut self,
+        name: &str,
+        dependencies: Option<Vec<u8>>,
+    ) -> Option<AppMeta> {
         let meta = self.known.get_mut(name)?;
         meta.dependencies = dependencies;
         Some(meta.clone())
@@ -1237,7 +1243,10 @@ impl AppRegistry {
 
         // The app's runtime-owned attested-dependency set, injected into the
         // per-call context so outbound RA-TLS enforces it fail-closed.
-        let pinned_dependencies = self.known.get(app_name).and_then(|m| m.dependencies.clone());
+        let pinned_dependencies = self
+            .known
+            .get(app_name)
+            .and_then(|m| m.dependencies.clone());
 
         // ── Look up app ────────────────────────────────────────────
         let app = match self.loaded.get(app_name) {

@@ -39,7 +39,12 @@ pub fn store_credential(record: &CredentialRecord, credential_id_b64: &str) -> R
     store.put(&cred_key(credential_id_b64), &json)?;
 
     // Update user→credential index
-    add_to_user_index(&store, &record.rp_id, &record.user_handle, credential_id_b64)?;
+    add_to_user_index(
+        &store,
+        &record.rp_id,
+        &record.user_handle,
+        credential_id_b64,
+    )?;
 
     Ok(())
 }
@@ -69,9 +74,7 @@ pub fn update_credential(
     let store = kv.lock().map_err(|_| "kv store lock poisoned")?;
 
     let key = cred_key(credential_id_b64);
-    let bytes = store
-        .get(&key)?
-        .ok_or("credential not found")?;
+    let bytes = store.get(&key)?.ok_or("credential not found")?;
 
     let mut record: CredentialRecord =
         serde_json::from_slice(&bytes).map_err(|e| format!("deserialise credential: {e}"))?;
@@ -107,8 +110,7 @@ pub fn list_credentials(rp_id: &str, user_handle: &str) -> Result<Vec<String>, S
 
 /// Privasys Wallet AAGUID: f47ac10b-58cc-4372-a567-0e02b2c3d479
 pub const PRIVASYS_WALLET_AAGUID: [u8; 16] = [
-    0xf4, 0x7a, 0xc1, 0x0b, 0x58, 0xcc, 0x43, 0x72,
-    0xa5, 0x67, 0x0e, 0x02, 0xb2, 0xc3, 0xd4, 0x79,
+    0xf4, 0x7a, 0xc1, 0x0b, 0x58, 0xcc, 0x43, 0x72, 0xa5, 0x67, 0x0e, 0x02, 0xb2, 0xc3, 0xd4, 0x79,
 ];
 
 /// Privasys Wallet AAGUID as a hex string.
@@ -124,8 +126,7 @@ pub fn init_aaguid_allowlist(explicit: Option<&[String]>) -> Result<(), String> 
     let store = kv.lock().map_err(|_| "kv store lock poisoned")?;
 
     if let Some(list) = explicit {
-        let json =
-            serde_json::to_vec(list).map_err(|e| format!("serialise aaguid list: {e}"))?;
+        let json = serde_json::to_vec(list).map_err(|e| format!("serialise aaguid list: {e}"))?;
         return store.put(AAGUID_ALLOW_KEY, &json);
     }
 
@@ -215,8 +216,8 @@ mod tests {
 
     const PRIVASYS_AAGUID: [u8; 16] = PRIVASYS_WALLET_AAGUID;
     const WINDOWS_HELLO_AAGUID: [u8; 16] = [
-        0x08, 0x98, 0x70, 0x58, 0xca, 0xdc, 0x4b, 0x81,
-        0xb6, 0xe1, 0x30, 0xde, 0x50, 0xdc, 0xbe, 0x96,
+        0x08, 0x98, 0x70, 0x58, 0xca, 0xdc, 0x4b, 0x81, 0xb6, 0xe1, 0x30, 0xde, 0x50, 0xdc, 0xbe,
+        0x96,
     ];
     const ZERO_AAGUID: [u8; 16] = [0u8; 16];
 
@@ -277,6 +278,9 @@ mod tests {
 
     #[test]
     fn aaguid_constant_matches_hex_constant() {
-        assert_eq!(hex_encode(&PRIVASYS_WALLET_AAGUID), PRIVASYS_WALLET_AAGUID_HEX);
+        assert_eq!(
+            hex_encode(&PRIVASYS_WALLET_AAGUID),
+            PRIVASYS_WALLET_AAGUID_HEX
+        );
     }
 }

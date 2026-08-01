@@ -60,7 +60,8 @@ impl SealedKvStore {
     /// being sent to the host.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<(), String> {
         let enc_key = self.encrypt_key(key)?;
-        let enc_val = self.cipher
+        let enc_val = self
+            .cipher
             .encrypt(value, AAD_VALUE)
             .map_err(|e| format!("Value encryption failed: {}", e))?;
 
@@ -74,7 +75,8 @@ impl SealedKvStore {
 
         match ocall::kv_store_get(&self.table, &enc_key) {
             Ok(Some(enc_val)) => {
-                let plaintext = self.cipher
+                let plaintext = self
+                    .cipher
                     .decrypt(&enc_val, AAD_VALUE)
                     .map_err(|e| format!("Value decryption failed: {}", e))?;
                 Ok(Some(plaintext))

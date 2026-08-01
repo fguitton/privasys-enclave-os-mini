@@ -17,17 +17,16 @@
 //! the Merkle root in the X.509 leaf**, proving that RA-TLS clients can
 //! detect configuration drift by comparing the extension value.
 
-use ring::digest;
 use rcgen::{
-    CertificateParams, CustomExtension, DnType, DnValue, IsCa, KeyPair,
-    PKCS_ECDSA_P256_SHA256,
+    CertificateParams, CustomExtension, DnType, DnValue, IsCa, KeyPair, PKCS_ECDSA_P256_SHA256,
 };
+use ring::digest;
 use x509_parser::prelude::*;
 
 // OIDs imported from common — single source of truth.
 use enclave_os_common::oids::{
-    CONFIG_MERKLE_ROOT_OID, CONFIG_MERKLE_ROOT_OID_STR,
-    ATTESTATION_SERVERS_HASH_OID, ATTESTATION_SERVERS_HASH_OID_STR,
+    ATTESTATION_SERVERS_HASH_OID, ATTESTATION_SERVERS_HASH_OID_STR, CONFIG_MERKLE_ROOT_OID,
+    CONFIG_MERKLE_ROOT_OID_STR,
 };
 
 // ---------------------------------------------------------------------------
@@ -64,8 +63,7 @@ fn merkle_root(leaf_hashes: &[[u8; 32]]) -> [u8; 32] {
 /// Generate a self-signed ECDSA P-256 CA certificate, returning
 /// `(der_cert, pkcs8_key)`.
 fn generate_ca(cn: &str) -> (Vec<u8>, Vec<u8>) {
-    let mut params = CertificateParams::new(Vec::<String>::new())
-        .expect("CA params");
+    let mut params = CertificateParams::new(Vec::<String>::new()).expect("CA params");
     params
         .distinguished_name
         .push(DnType::CommonName, DnValue::Utf8String(cn.into()));
@@ -89,11 +87,9 @@ fn build_leaf_cert_with_root(
     use rustls_pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
     // Generate a fresh leaf key
-    let leaf_key =
-        KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("leaf keygen");
+    let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("leaf keygen");
 
-    let mut leaf_params = CertificateParams::new(Vec::<String>::new())
-        .expect("leaf params");
+    let mut leaf_params = CertificateParams::new(Vec::<String>::new()).expect("leaf params");
     leaf_params.distinguished_name.push(
         DnType::CommonName,
         DnValue::Utf8String("RA-TLS Leaf (test)".into()),
@@ -103,23 +99,17 @@ fn build_leaf_cert_with_root(
     leaf_params.is_ca = IsCa::NoCa;
 
     // Embed the config Merkle root as a custom extension.
-    let merkle_ext = CustomExtension::from_oid_content(
-        CONFIG_MERKLE_ROOT_OID,
-        merkle_root.to_vec(),
-    );
+    let merkle_ext =
+        CustomExtension::from_oid_content(CONFIG_MERKLE_ROOT_OID, merkle_root.to_vec());
     leaf_params.custom_extensions.push(merkle_ext);
 
     // Sign with the intermediary CA
     let ca_pkcs8 = PrivatePkcs8KeyDer::from(ca_key_pkcs8.to_vec());
-    let ca_key = KeyPair::from_pkcs8_der_and_sign_algo(
-        &ca_pkcs8,
-        &PKCS_ECDSA_P256_SHA256,
-    )
-    .expect("CA key parse");
+    let ca_key = KeyPair::from_pkcs8_der_and_sign_algo(&ca_pkcs8, &PKCS_ECDSA_P256_SHA256)
+        .expect("CA key parse");
 
     let ca_der = CertificateDer::from(ca_cert_der);
-    let ca_params = CertificateParams::from_ca_cert_der(&ca_der)
-        .expect("CA cert parse");
+    let ca_params = CertificateParams::from_ca_cert_der(&ca_der).expect("CA cert parse");
     let ca_cert = ca_params.self_signed(&ca_key).expect("CA re-sign");
 
     let leaf_cert = leaf_params
@@ -223,18 +213,23 @@ fn x509_merkle_root_changes_after_ca_update() {
     let leaf_b = build_leaf_cert_with_root(&ca_b_der, &ca_b_key, &root_b);
 
     // --- Extract the Merkle root extension from each leaf ---
-    let ext_a = extract_merkle_root_extension(&leaf_a)
-        .expect("Merkle root extension missing from leaf A");
-    let ext_b = extract_merkle_root_extension(&leaf_b)
-        .expect("Merkle root extension missing from leaf B");
+    let ext_a =
+        extract_merkle_root_extension(&leaf_a).expect("Merkle root extension missing from leaf A");
+    let ext_b =
+        extract_merkle_root_extension(&leaf_b).expect("Merkle root extension missing from leaf B");
 
     // --- Core assertion: X.509 extension values reflect the tree roots ---
-    assert_eq!(ext_a.as_slice(), root_a.as_slice(),
-        "Leaf A extension must match root A");
-    assert_eq!(ext_b.as_slice(), root_b.as_slice(),
-        "Leaf B extension must match root B");
-    assert_ne!(ext_a, ext_b,
-        "Extensions must differ after CA update");
+    assert_eq!(
+        ext_a.as_slice(),
+        root_a.as_slice(),
+        "Leaf A extension must match root A"
+    );
+    assert_eq!(
+        ext_b.as_slice(),
+        root_b.as_slice(),
+        "Leaf B extension must match root B"
+    );
+    assert_ne!(ext_a, ext_b, "Extensions must differ after CA update");
 }
 
 /// Replacing only the intermediary CA (same egress bundle, same WASM
@@ -264,8 +259,10 @@ fn x509_merkle_root_changes_in_multi_leaf_tree() {
 
     assert_eq!(ext_a.len(), 32, "Extension value must be 32 bytes");
     assert_eq!(ext_b.len(), 32, "Extension value must be 32 bytes");
-    assert_ne!(ext_a, ext_b,
-        "Multi-leaf root must change when only the CA leaf changes");
+    assert_ne!(
+        ext_a, ext_b,
+        "Multi-leaf root must change when only the CA leaf changes"
+    );
 }
 
 /// Verify the extension is correctly encoded and parseable as exactly 32 bytes.
@@ -301,19 +298,21 @@ fn attestation_servers_leaf_changes_root() {
     let egress_hash = leaf_hash(Some(b"egress CA bundle"));
 
     // Tree with one attestation server
-    let as_hash_a = leaf_hash(Some(
-        &attestation_servers_hash(&["https://as.privasys.org/verify"]),
-    ));
+    let as_hash_a = leaf_hash(Some(&attestation_servers_hash(&[
+        "https://as.privasys.org/verify",
+    ])));
     let root_a = merkle_root(&[ca_hash, egress_hash, as_hash_a]);
 
     // Tree with a different attestation server
-    let as_hash_b = leaf_hash(Some(
-        &attestation_servers_hash(&["https://as.customer-corp.com/verify"]),
-    ));
+    let as_hash_b = leaf_hash(Some(&attestation_servers_hash(&[
+        "https://as.customer-corp.com/verify",
+    ])));
     let root_b = merkle_root(&[ca_hash, egress_hash, as_hash_b]);
 
-    assert_ne!(root_a, root_b,
-        "Different attestation server URLs must produce different roots");
+    assert_ne!(
+        root_a, root_b,
+        "Different attestation server URLs must produce different roots"
+    );
 }
 
 /// The canonical form is order-independent: sorted before hashing.
@@ -327,17 +326,21 @@ fn attestation_servers_hash_is_order_independent() {
         "https://as.customer-corp.com/verify",
         "https://as.privasys.org/verify",
     ]);
-    assert_eq!(hash_ab, hash_ba,
-        "URL order must not affect the canonical hash");
+    assert_eq!(
+        hash_ab, hash_ba,
+        "URL order must not affect the canonical hash"
+    );
 }
 
 /// Empty attestation server list produces a zero leaf hash (absent data).
 #[test]
 fn empty_attestation_servers_is_absent_leaf() {
     let h = leaf_hash(None); // absent
-    let non_empty = leaf_hash(Some(
-        &attestation_servers_hash(&["https://as.privasys.org/verify"]),
-    ));
-    assert_ne!(h, non_empty,
-        "Absent attestation servers must differ from a configured server");
+    let non_empty = leaf_hash(Some(&attestation_servers_hash(&[
+        "https://as.privasys.org/verify",
+    ])));
+    assert_ne!(
+        h, non_empty,
+        "Absent attestation servers must differ from a configured server"
+    );
 }

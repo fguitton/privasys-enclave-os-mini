@@ -31,9 +31,9 @@
 //! ```
 
 #[cfg(feature = "sgx")]
-use alloc::{string::String, vec::Vec, format};
+use alloc::{format, string::String, vec::Vec};
 #[cfg(not(feature = "sgx"))]
-use std::{string::String, vec::Vec, format};
+use std::{format, string::String, vec::Vec};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -119,8 +119,7 @@ impl JwtVerifier {
         jwt: &[u8],
     ) -> Result<T, String> {
         let (payload_bytes, _header_raw) = self.verify(jwt)?;
-        serde_json::from_slice(&payload_bytes)
-            .map_err(|e| format!("jwt payload json: {e}"))
+        serde_json::from_slice(&payload_bytes).map_err(|e| format!("jwt payload json: {e}"))
     }
 
     /// Verify the JWT and return the raw payload bytes (without deserializing).
@@ -128,8 +127,7 @@ impl JwtVerifier {
     /// Also returns the raw header bytes for callers that need to inspect `kid`
     /// or other header fields.
     pub fn verify(&self, jwt: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
-        let jwt_str = core::str::from_utf8(jwt)
-            .map_err(|e| format!("jwt not utf8: {e}"))?;
+        let jwt_str = core::str::from_utf8(jwt).map_err(|e| format!("jwt not utf8: {e}"))?;
 
         // Split into exactly 3 segments
         let mut parts = jwt_str.splitn(3, '.');
@@ -142,8 +140,8 @@ impl JwtVerifier {
             .decode(header_b64)
             .map_err(|e| format!("jwt header base64: {e}"))?;
 
-        let header: JwtHeader = serde_json::from_slice(&header_bytes)
-            .map_err(|e| format!("jwt header json: {e}"))?;
+        let header: JwtHeader =
+            serde_json::from_slice(&header_bytes).map_err(|e| format!("jwt header json: {e}"))?;
 
         // Verify the algorithm matches the key type
         match self {
@@ -200,10 +198,10 @@ pub fn encode_jwt<T: serde::Serialize>(
 ) -> Result<Vec<u8>, String> {
     let header = match kid {
         Some(k) => format!(r#"{{"alg":"ES256","typ":"JWT","kid":"{k}"}}"#),
-        None    => r#"{"alg":"ES256","typ":"JWT"}"#.to_string(),
+        None => r#"{"alg":"ES256","typ":"JWT"}"#.to_string(),
     };
-    let payload_json = serde_json::to_vec(payload)
-        .map_err(|e| format!("payload serialisation: {e}"))?;
+    let payload_json =
+        serde_json::to_vec(payload).map_err(|e| format!("payload serialisation: {e}"))?;
 
     let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
     let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
@@ -228,11 +226,8 @@ pub fn encode_jwt<T: serde::Serialize>(
 ///
 /// **WARNING**: Only use this for debugging / in contexts where the JWT
 /// has already been verified or where verification is not required.
-pub fn decode_payload_unverified<T: serde::de::DeserializeOwned>(
-    jwt: &[u8],
-) -> Result<T, String> {
-    let jwt_str = core::str::from_utf8(jwt)
-        .map_err(|e| format!("jwt not utf8: {e}"))?;
+pub fn decode_payload_unverified<T: serde::de::DeserializeOwned>(jwt: &[u8]) -> Result<T, String> {
+    let jwt_str = core::str::from_utf8(jwt).map_err(|e| format!("jwt not utf8: {e}"))?;
 
     let mut parts = jwt_str.splitn(3, '.');
     let _header = parts.next().ok_or("missing header")?;
@@ -242,8 +237,7 @@ pub fn decode_payload_unverified<T: serde::de::DeserializeOwned>(
         .decode(payload_b64)
         .map_err(|e| format!("jwt payload base64: {e}"))?;
 
-    serde_json::from_slice(&payload_bytes)
-        .map_err(|e| format!("jwt payload json: {e}"))
+    serde_json::from_slice(&payload_bytes).map_err(|e| format!("jwt payload json: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -286,17 +280,9 @@ mod tests {
 
     fn generate_key_pair() -> (EcdsaKeyPair, Vec<u8>) {
         let rng = SystemRandom::new();
-        let pkcs8 = EcdsaKeyPair::generate_pkcs8(
-            &ECDSA_P256_SHA256_FIXED_SIGNING,
-            &rng,
-        )
-        .unwrap();
-        let kp = EcdsaKeyPair::from_pkcs8(
-            &ECDSA_P256_SHA256_FIXED_SIGNING,
-            pkcs8.as_ref(),
-            &rng,
-        )
-        .unwrap();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        let kp = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
+            .unwrap();
         let pub_key = kp.public_key().as_ref().to_vec();
         (kp, pub_key)
     }
@@ -355,13 +341,13 @@ mod tests {
 
         // Tamper with the payload segment
         let parts: Vec<&str> = jwt_str.splitn(3, '.').collect();
-        let tampered_payload = URL_SAFE_NO_PAD.encode(
-            br#"{"sub":"eve","data":999}"#,
-        );
+        let tampered_payload = URL_SAFE_NO_PAD.encode(br#"{"sub":"eve","data":999}"#);
         let tampered = format!("{}.{}.{}", parts[0], tampered_payload, parts[2]);
 
         let verifier = JwtVerifier::from_public_key_bytes(&pub_bytes).unwrap();
-        assert!(verifier.verify_and_decode::<TestClaims>(tampered.as_bytes()).is_err());
+        assert!(verifier
+            .verify_and_decode::<TestClaims>(tampered.as_bytes())
+            .is_err());
     }
 
     #[test]
@@ -375,7 +361,10 @@ mod tests {
         let (_, pub_bytes) = generate_key_pair();
         let verifier = JwtVerifier::from_public_key_bytes(&pub_bytes).unwrap();
         let err = verifier.verify(jwt.as_bytes()).unwrap_err();
-        assert!(err.contains("does not match"), "expected alg mismatch error, got: {err}");
+        assert!(
+            err.contains("does not match"),
+            "expected alg mismatch error, got: {err}"
+        );
     }
 
     #[test]
@@ -409,5 +398,4 @@ mod tests {
         let decoded = hex_decode(hex).unwrap();
         assert_eq!(decoded, original);
     }
-
 }

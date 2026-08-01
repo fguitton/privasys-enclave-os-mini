@@ -11,12 +11,6 @@
 pub mod roles;
 
 pub use roles::{
-    get_default_roles,
-    get_user_roles,
-    get_user_roles_with_bootstrap,
-    is_first_user,
-    list_users,
-    remove_user_roles,
-    set_default_roles,
-    set_user_roles,
+    get_default_roles, get_user_roles, get_user_roles_with_bootstrap, is_first_user, list_users,
+    remove_user_roles, set_default_roles, set_user_roles,
 };

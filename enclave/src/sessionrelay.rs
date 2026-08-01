@@ -58,9 +58,7 @@ impl SessionError {
     pub fn http_status(&self) -> u16 {
         match self {
             SessionError::UnknownSession => 401,
-            SessionError::Replay
-            | SessionError::BadEnvelope
-            | SessionError::InvalidPubKey => 400,
+            SessionError::Replay | SessionError::BadEnvelope | SessionError::InvalidPubKey => 400,
             SessionError::Crypto | SessionError::Internal => 500,
         }
     }
@@ -113,7 +111,9 @@ fn identity_keypair() -> Result<EcKeyPair, SessionError> {
 /// byte-equality check.
 pub fn identity_pub_sec1() -> Result<[u8; 65], SessionError> {
     let kp = identity_keypair()?;
-    Ok(crate::encauth::ec256_pubkey_to_sec1(&kp.public_key().public_key()))
+    Ok(crate::encauth::ec256_pubkey_to_sec1(
+        &kp.public_key().public_key(),
+    ))
 }
 
 fn with_table<R>(f: impl FnOnce(&mut BTreeMap<String, SessionEntry>) -> R) -> R {
@@ -180,8 +180,7 @@ pub fn bootstrap(sdk_pub: &[u8], now: u64) -> Result<Bootstrap, SessionError> {
     // every bootstrap so EncAuth vouchers can pin `enc_pub`. IPP
     // validates the peer point during the computation.
     let keypair = identity_keypair()?;
-    let peer = crate::encauth::sec1_to_ec256_pubkey(sdk_pub)
-        .ok_or(SessionError::InvalidPubKey)?;
+    let peer = crate::encauth::sec1_to_ec256_pubkey(sdk_pub).ok_or(SessionError::InvalidPubKey)?;
     let share = keypair
         .shared_key(&peer)
         .map_err(|_| SessionError::InvalidPubKey)?;
@@ -191,10 +190,8 @@ pub fn bootstrap(sdk_pub: &[u8], now: u64) -> Result<Bootstrap, SessionError> {
     let mut shared = share.shared_key().s.to_vec();
     shared.reverse();
 
-    let server_pub = crate::encauth::ec256_pubkey_to_sec1(
-        &keypair.public_key().public_key(),
-    )
-    .to_vec();
+    let server_pub =
+        crate::encauth::ec256_pubkey_to_sec1(&keypair.public_key().public_key()).to_vec();
 
     // Generate 16 random bytes; session_id is the base64url (no-padding)
     // encoding of those bytes. The HKDF salt MUST be the raw 16 bytes,
@@ -334,9 +331,7 @@ fn cbor_take_uint(buf: &[u8], p: &mut usize) -> Result<u64, SessionError> {
             if *p + 4 > buf.len() {
                 return Err(SessionError::BadEnvelope);
             }
-            let v = u32::from_be_bytes([
-                buf[*p], buf[*p + 1], buf[*p + 2], buf[*p + 3],
-            ]) as u64;
+            let v = u32::from_be_bytes([buf[*p], buf[*p + 1], buf[*p + 2], buf[*p + 3]]) as u64;
             *p += 4;
             v
         }
@@ -345,8 +340,14 @@ fn cbor_take_uint(buf: &[u8], p: &mut usize) -> Result<u64, SessionError> {
                 return Err(SessionError::BadEnvelope);
             }
             let v = u64::from_be_bytes([
-                buf[*p], buf[*p + 1], buf[*p + 2], buf[*p + 3],
-                buf[*p + 4], buf[*p + 5], buf[*p + 6], buf[*p + 7],
+                buf[*p],
+                buf[*p + 1],
+                buf[*p + 2],
+                buf[*p + 3],
+                buf[*p + 4],
+                buf[*p + 5],
+                buf[*p + 6],
+                buf[*p + 7],
             ]);
             *p += 8;
             v
@@ -369,26 +370,45 @@ fn cbor_take_bytes(buf: &[u8], p: &mut usize) -> Result<Vec<u8>, SessionError> {
     let len = match info {
         n @ 0..=23 => n as usize,
         24 => {
-            if *p >= buf.len() { return Err(SessionError::BadEnvelope); }
-            let n = buf[*p] as usize; *p += 1; n
+            if *p >= buf.len() {
+                return Err(SessionError::BadEnvelope);
+            }
+            let n = buf[*p] as usize;
+            *p += 1;
+            n
         }
         25 => {
-            if *p + 2 > buf.len() { return Err(SessionError::BadEnvelope); }
-            let n = u16::from_be_bytes([buf[*p], buf[*p+1]]) as usize;
-            *p += 2; n
+            if *p + 2 > buf.len() {
+                return Err(SessionError::BadEnvelope);
+            }
+            let n = u16::from_be_bytes([buf[*p], buf[*p + 1]]) as usize;
+            *p += 2;
+            n
         }
         26 => {
-            if *p + 4 > buf.len() { return Err(SessionError::BadEnvelope); }
-            let n = u32::from_be_bytes([buf[*p], buf[*p+1], buf[*p+2], buf[*p+3]]) as usize;
-            *p += 4; n
+            if *p + 4 > buf.len() {
+                return Err(SessionError::BadEnvelope);
+            }
+            let n = u32::from_be_bytes([buf[*p], buf[*p + 1], buf[*p + 2], buf[*p + 3]]) as usize;
+            *p += 4;
+            n
         }
         27 => {
-            if *p + 8 > buf.len() { return Err(SessionError::BadEnvelope); }
+            if *p + 8 > buf.len() {
+                return Err(SessionError::BadEnvelope);
+            }
             let n = u64::from_be_bytes([
-                buf[*p], buf[*p+1], buf[*p+2], buf[*p+3],
-                buf[*p+4], buf[*p+5], buf[*p+6], buf[*p+7],
+                buf[*p],
+                buf[*p + 1],
+                buf[*p + 2],
+                buf[*p + 3],
+                buf[*p + 4],
+                buf[*p + 5],
+                buf[*p + 6],
+                buf[*p + 7],
             ]) as usize;
-            *p += 8; n
+            *p += 8;
+            n
         }
         _ => return Err(SessionError::BadEnvelope),
     };
@@ -476,8 +496,8 @@ pub fn open_request(
             return Err(SessionError::Replay);
         }
 
-        let unbound = UnboundKey::new(&AES_256_GCM, &entry.aead_key)
-            .map_err(|_| SessionError::Crypto)?;
+        let unbound =
+            UnboundKey::new(&AES_256_GCM, &entry.aead_key).map_err(|_| SessionError::Crypto)?;
         let key = LessSafeKey::new(unbound);
 
         let mut nonce_bytes = [0u8; 12];
@@ -518,10 +538,13 @@ pub fn seal_response(
             return Err(SessionError::UnknownSession);
         }
         let ctr = entry.s2c_next;
-        entry.s2c_next = entry.s2c_next.checked_add(1).ok_or(SessionError::Internal)?;
+        entry.s2c_next = entry
+            .s2c_next
+            .checked_add(1)
+            .ok_or(SessionError::Internal)?;
 
-        let unbound = UnboundKey::new(&AES_256_GCM, &entry.aead_key)
-            .map_err(|_| SessionError::Crypto)?;
+        let unbound =
+            UnboundKey::new(&AES_256_GCM, &entry.aead_key).map_err(|_| SessionError::Crypto)?;
         let key = LessSafeKey::new(unbound);
 
         let mut nonce_bytes = [0u8; 12];
@@ -576,8 +599,7 @@ pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
 
 /// Encode bytes as URL-safe base64 without padding.
 pub fn b64url_encode(bytes: &[u8]) -> String {
-    const ALPHA: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity((bytes.len() * 4 + 2) / 3);
     let chunks = bytes.chunks_exact(3);
     let rem = chunks.remainder();
@@ -607,11 +629,9 @@ pub fn b64url_encode(bytes: &[u8]) -> String {
 
 /// True if a session id is currently registered and not expired.
 pub fn is_known_session(session_id: &str, now: u64) -> bool {
-    with_table(|t| {
-        match t.get(session_id) {
-            Some(e) if e.expires_at > now => true,
-            _ => false,
-        }
+    with_table(|t| match t.get(session_id) {
+        Some(e) if e.expires_at > now => true,
+        _ => false,
     })
 }
 
@@ -653,9 +673,18 @@ mod tests {
         let shared = hex_to_bytes(KAT_SHARED_X_HEX);
         let sid_raw = hex_to_bytes(KAT_SID_RAW_HEX);
         let prk = hkdf_extract(&sid_raw, &shared);
-        assert_eq!(hkdf_expand(&prk, KEY_INFO, 32), hex_to_bytes(KAT_AEAD_KEY_HEX));
-        assert_eq!(hkdf_expand(&prk, C2S_INFO, 4), hex_to_bytes(KAT_C2S_PREFIX_HEX));
-        assert_eq!(hkdf_expand(&prk, S2C_INFO, 4), hex_to_bytes(KAT_S2C_PREFIX_HEX));
+        assert_eq!(
+            hkdf_expand(&prk, KEY_INFO, 32),
+            hex_to_bytes(KAT_AEAD_KEY_HEX)
+        );
+        assert_eq!(
+            hkdf_expand(&prk, C2S_INFO, 4),
+            hex_to_bytes(KAT_C2S_PREFIX_HEX)
+        );
+        assert_eq!(
+            hkdf_expand(&prk, S2C_INFO, 4),
+            hex_to_bytes(KAT_S2C_PREFIX_HEX)
+        );
     }
 
     #[test]

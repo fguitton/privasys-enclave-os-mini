@@ -79,8 +79,7 @@ fn wasm_load_without_encryption_key() {
 
     assert_eq!(parsed["name"], "my-app");
     assert!(
-        parsed.get("encryption_key").is_none()
-            || parsed["encryption_key"].is_null(),
+        parsed.get("encryption_key").is_none() || parsed["encryption_key"].is_null(),
         "encryption_key should be absent for generated-key mode"
     );
 }
@@ -111,7 +110,10 @@ fn app_info_key_source_values() {
         "key_source": "byok:abc123",
         "exports": []
     });
-    assert!(info_byok["key_source"].as_str().unwrap().starts_with("byok:"));
+    assert!(info_byok["key_source"]
+        .as_str()
+        .unwrap()
+        .starts_with("byok:"));
 
     let info_gen = serde_json::json!({
         "name": "app-b",
@@ -139,17 +141,13 @@ fn wasm_load_envelope_roundtrip() {
     });
 
     let serialized = serde_json::to_vec(&envelope).unwrap();
-    let deserialized: serde_json::Value =
-        serde_json::from_slice(&serialized).unwrap();
+    let deserialized: serde_json::Value = serde_json::from_slice(&serialized).unwrap();
 
+    assert_eq!(deserialized["wasm_load"]["name"], "secure-app");
+    assert_eq!(deserialized["wasm_load"]["encryption_key"], hex_key);
     assert_eq!(
-        deserialized["wasm_load"]["name"], "secure-app"
-    );
-    assert_eq!(
-        deserialized["wasm_load"]["encryption_key"], hex_key
-    );
-    assert_eq!(
-        deserialized["wasm_load"]["hostname"], "secure.enclave.local"
+        deserialized["wasm_load"]["hostname"],
+        "secure.enclave.local"
     );
 }
 
@@ -244,10 +242,11 @@ fn empty_hex_decodes_to_empty() {
 /// Hex encoding is case-insensitive.
 #[test]
 fn hex_decode_is_case_insensitive() {
-    let key = [0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89,
-               0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89,
-               0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89,
-               0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89];
+    let key = [
+        0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67,
+        0x89, 0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45,
+        0x67, 0x89,
+    ];
     let lower = hex_encode(&key);
     let upper = lower.to_uppercase();
 
@@ -295,10 +294,9 @@ fn generated_keys_are_unique() {
 #[test]
 fn byok_key_is_preserved_exactly() {
     let byok: [u8; AEAD_KEY_SIZE] = [
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-        0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
-        0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
-        0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20,
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E,
+        0x1F, 0x20,
     ];
     let hex = hex_encode(&byok);
     let decoded = hex_decode(&hex).unwrap();
@@ -345,15 +343,9 @@ fn key_source_leaf_affects_attestation() {
         h
     };
 
-    let root_generated = per_app_merkle_root(&[
-        &code_hash_bytes,
-        b"generated",
-    ]);
+    let root_generated = per_app_merkle_root(&[&code_hash_bytes, b"generated"]);
 
-    let root_byok = per_app_merkle_root(&[
-        &code_hash_bytes,
-        b"byok:abc123",
-    ]);
+    let root_byok = per_app_merkle_root(&[&code_hash_bytes, b"byok:abc123"]);
 
     assert_ne!(
         root_generated, root_byok,

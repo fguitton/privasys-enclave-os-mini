@@ -48,10 +48,10 @@
 //! trait method. The core never needs to know about module-specific
 //! config — it just appends whatever leaves each module declares.
 
+use ring::digest;
 use std::string::String;
 use std::sync::OnceLock;
 use std::vec::Vec;
-use ring::digest;
 
 use enclave_os_common::modules::ConfigLeaf;
 

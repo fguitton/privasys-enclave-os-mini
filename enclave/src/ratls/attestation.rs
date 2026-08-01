@@ -24,16 +24,14 @@
 //! `creation_time` that was not recoverable from the cert, which forced
 //! verifiers to skip the SGX deterministic key-to-quote check entirely.)
 
-use std::string::String;
-use std::vec::Vec;
 use ring::digest;
 use ring::rand::SystemRandom;
 use ring::signature::{self, EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+use std::string::String;
+use std::vec::Vec;
 use time::OffsetDateTime;
 
-use enclave_os_common::oids::{
-    SGX_QUOTE_OID, CONFIG_MERKLE_ROOT_OID, APP_CONFIG_MERKLE_ROOT_OID,
-};
+use enclave_os_common::oids::{APP_CONFIG_MERKLE_ROOT_OID, CONFIG_MERKLE_ROOT_OID, SGX_QUOTE_OID};
 
 use crate::ratls::cert_store::AppCertData;
 
@@ -57,7 +55,10 @@ pub enum CertMode {
     /// (`SHA-512(SHA-256(SPKI) || nonce || binder)`) and marks the leaf with
     /// the RA-TLS Channel Binding OID (2.9), pinning the quote to this TLS
     /// session. `None` reproduces the legacy nonce-only preimage.
-    Challenge { nonce: Vec<u8>, binder: Option<[u8; 32]> },
+    Challenge {
+        nonce: Vec<u8>,
+        binder: Option<[u8; 32]>,
+    },
     /// Deterministic: binding = the minute-truncated `creation_time` formatted
     /// as `"YYYY-MM-DDTHH:MMZ"`. The leaf's `NotBefore` is set to the same
     /// minute so a verifier reproduces the binding from the cert. Valid 24 h,
@@ -90,12 +91,8 @@ impl CaContext {
     pub fn from_parts(ca_cert_der: Vec<u8>, ca_key_pkcs8: Vec<u8>) -> Result<Self, String> {
         // Validate that the key can be loaded
         let rng = SystemRandom::new();
-        let _ = EcdsaKeyPair::from_pkcs8(
-            &ECDSA_P256_SHA256_ASN1_SIGNING,
-            &ca_key_pkcs8,
-            &rng,
-        )
-        .map_err(|_| String::from("CA key is not valid ECDSA P-256 PKCS#8"))?;
+        let _ = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &ca_key_pkcs8, &rng)
+            .map_err(|_| String::from("CA key is not valid ECDSA P-256 PKCS#8"))?;
 
         Ok(Self {
             ca_cert_der,
@@ -171,7 +168,10 @@ pub fn generate_ratls_certificate(
     }
     // Core OID: attestation servers hash (queried fresh — reflects runtime updates)
     if let Some(h) = enclave_os_common::attestation_servers::hash() {
-        extensions.push((enclave_os_common::oids::ATTESTATION_SERVERS_HASH_OID, h.to_vec()));
+        extensions.push((
+            enclave_os_common::oids::ATTESTATION_SERVERS_HASH_OID,
+            h.to_vec(),
+        ));
     }
     for oid in &crate::modules::collect_module_oids() {
         extensions.push((oid.oid, oid.value.clone()));
@@ -186,8 +186,14 @@ pub fn generate_ratls_certificate(
     };
 
     let leaf_der = build_leaf_cert(
-        &ctx.pkcs8_bytes, &ctx.quote, ctx.not_before, ctx.not_after, ca,
-        "Enclave OS RA-TLS", server_name, &extensions,
+        &ctx.pkcs8_bytes,
+        &ctx.quote,
+        ctx.not_before,
+        ctx.not_after,
+        ca,
+        "Enclave OS RA-TLS",
+        server_name,
+        &extensions,
     )?;
 
     Ok(CertGenerationResult {
@@ -263,8 +269,14 @@ pub fn generate_app_certificate(
     };
 
     let leaf_der = build_leaf_cert(
-        &ctx.pkcs8_bytes, &ctx.quote, ctx.not_before, ctx.not_after, ca,
-        &app.hostname, Some(&app.hostname), &extensions,
+        &ctx.pkcs8_bytes,
+        &ctx.quote,
+        ctx.not_before,
+        ctx.not_after,
+        ca,
+        &app.hostname,
+        Some(&app.hostname),
+        &extensions,
     )?;
 
     Ok(CertGenerationResult {
@@ -332,12 +344,8 @@ pub fn generate_keypair() -> Result<(Vec<u8>, EcdsaKeyPair), &'static str> {
     let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)
         .map_err(|_| "Key generation failed")?;
     let pkcs8_bytes = pkcs8.as_ref().to_vec();
-    let key_pair = EcdsaKeyPair::from_pkcs8(
-        &ECDSA_P256_SHA256_ASN1_SIGNING,
-        &pkcs8_bytes,
-        &rng,
-    )
-    .map_err(|_| "Failed to parse generated key")?;
+    let key_pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &pkcs8_bytes, &rng)
+        .map_err(|_| "Failed to parse generated key")?;
     Ok((pkcs8_bytes, key_pair))
 }
 
@@ -376,12 +384,8 @@ fn prepare_attestation(mode: &CertMode) -> Result<AttestationContext, String> {
         .map_err(|_| String::from("Key generation failed"))?;
     let pkcs8_bytes = pkcs8.as_ref().to_vec();
 
-    let key_pair = EcdsaKeyPair::from_pkcs8(
-        &ECDSA_P256_SHA256_ASN1_SIGNING,
-        &pkcs8_bytes,
-        &rng,
-    )
-    .map_err(|_| String::from("Failed to parse generated key"))?;
+    let key_pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &pkcs8_bytes, &rng)
+        .map_err(|_| String::from("Failed to parse generated key"))?;
 
     // Build the full SPKI DER (91 bytes) from the raw EC point (65 bytes).
     // This matches what Go's x509.MarshalPKIXPublicKey and standard X.509
@@ -418,17 +422,21 @@ fn prepare_attestation(mode: &CertMode) -> Result<AttestationContext, String> {
             let minute = creation_time - (creation_time % 60);
             let nb = OffsetDateTime::from_unix_timestamp(minute as i64)
                 .map_err(|e| format!("creation_time out of range: {e}"))?;
-            let na = OffsetDateTime::from_unix_timestamp(
-                (minute + DETERMINISTIC_VALIDITY_SECS) as i64,
-            )
-            .map_err(|e| format!("not_after out of range: {e}"))?;
+            let na =
+                OffsetDateTime::from_unix_timestamp((minute + DETERMINISTIC_VALIDITY_SECS) as i64)
+                    .map_err(|e| format!("not_after out of range: {e}"))?;
             let binding = format_ratls_time(&nb);
             (compute_report_data(&spki_der, binding.as_bytes()), nb, na)
         }
     };
 
     let quote = generate_sgx_quote(&report_data)?;
-    Ok(AttestationContext { pkcs8_bytes, quote, not_before, not_after })
+    Ok(AttestationContext {
+        pkcs8_bytes,
+        quote,
+        not_before,
+        not_after,
+    })
 }
 
 /// Format an `OffsetDateTime` as the deterministic binding string
@@ -466,7 +474,8 @@ fn generate_sgx_quote(report_data: &[u8; 64]) -> Result<Vec<u8>, String> {
     let rpc = crate::rpc_client_ref();
 
     // Phase 1: Get QE target info from the host (via DCAP QL)
-    let target_info_bytes = rpc.qe_get_target_info()
+    let target_info_bytes = rpc
+        .qe_get_target_info()
         .map_err(|e| format!("QeGetTargetInfo RPC failed: status={}", e))?;
 
     if target_info_bytes.len() != core::mem::size_of::<TargetInfo>() {
@@ -477,16 +486,16 @@ fn generate_sgx_quote(report_data: &[u8; 64]) -> Result<Vec<u8>, String> {
         ));
     }
 
-    let target_info: TargetInfo = unsafe {
-        core::ptr::read_unaligned(target_info_bytes.as_ptr() as *const TargetInfo)
-    };
+    let target_info: TargetInfo =
+        unsafe { core::ptr::read_unaligned(target_info_bytes.as_ptr() as *const TargetInfo) };
 
     // Phase 2: Create SGX report targeting the QE
     let mut rd = ReportData::default();
     rd.d.copy_from_slice(report_data);
 
-    let report = <sgx_types::types::Report as sgx_tse::EnclaveReport>::for_target(&target_info, &rd)
-        .map_err(|e| format!("sgx_create_report failed: {:?}", e))?;
+    let report =
+        <sgx_types::types::Report as sgx_tse::EnclaveReport>::for_target(&target_info, &rd)
+            .map_err(|e| format!("sgx_create_report failed: {:?}", e))?;
 
     let report_bytes = unsafe {
         core::slice::from_raw_parts(
@@ -496,7 +505,8 @@ fn generate_sgx_quote(report_data: &[u8; 64]) -> Result<Vec<u8>, String> {
     };
 
     // Phase 3: Ask the host to get a DCAP Quote v3 from the QE
-    let quote = rpc.qe_get_quote(report_bytes)
+    let quote = rpc
+        .qe_get_quote(report_bytes)
         .map_err(|e| format!("QeGetQuote RPC failed: status={}", e))?;
 
     Ok(quote)
@@ -538,7 +548,8 @@ pub fn self_mrenclave() -> Result<[u8; 32], String> {
     use sgx_types::types::{ReportData, TargetInfo};
 
     let rpc = crate::rpc_client_ref();
-    let target_info_bytes = rpc.qe_get_target_info()
+    let target_info_bytes = rpc
+        .qe_get_target_info()
         .map_err(|e| format!("QeGetTargetInfo RPC failed: status={}", e))?;
     if target_info_bytes.len() != core::mem::size_of::<TargetInfo>() {
         return Err(format!(
@@ -547,12 +558,12 @@ pub fn self_mrenclave() -> Result<[u8; 32], String> {
             core::mem::size_of::<TargetInfo>()
         ));
     }
-    let target_info: TargetInfo = unsafe {
-        core::ptr::read_unaligned(target_info_bytes.as_ptr() as *const TargetInfo)
-    };
+    let target_info: TargetInfo =
+        unsafe { core::ptr::read_unaligned(target_info_bytes.as_ptr() as *const TargetInfo) };
     let rd = ReportData::default();
-    let report = <sgx_types::types::Report as sgx_tse::EnclaveReport>::for_target(&target_info, &rd)
-        .map_err(|e| format!("sgx_create_report failed: {:?}", e))?;
+    let report =
+        <sgx_types::types::Report as sgx_tse::EnclaveReport>::for_target(&target_info, &rd)
+            .map_err(|e| format!("sgx_create_report failed: {:?}", e))?;
     let report_bytes = unsafe {
         core::slice::from_raw_parts(
             &report as *const sgx_types::types::Report as *const u8,
@@ -561,7 +572,10 @@ pub fn self_mrenclave() -> Result<[u8; 32], String> {
     };
     const MRENCLAVE_OFFSET: usize = 64;
     if report_bytes.len() < MRENCLAVE_OFFSET + 32 {
-        return Err(format!("self report too short: {} bytes", report_bytes.len()));
+        return Err(format!(
+            "self report too short: {} bytes",
+            report_bytes.len()
+        ));
     }
     let mut out = [0u8; 32];
     out.copy_from_slice(&report_bytes[MRENCLAVE_OFFSET..MRENCLAVE_OFFSET + 32]);
@@ -594,8 +608,7 @@ fn build_leaf_cert(
     extensions: &[(&'static [u64], Vec<u8>)],
 ) -> Result<Vec<u8>, String> {
     use rcgen::{
-        CertificateParams, CustomExtension, DnType, DnValue, IsCa, KeyPair,
-        PKCS_ECDSA_P256_SHA256,
+        CertificateParams, CustomExtension, DnType, DnValue, IsCa, KeyPair, PKCS_ECDSA_P256_SHA256,
     };
     use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
@@ -605,11 +618,8 @@ fn build_leaf_cert(
 
     // --- Leaf key pair ---
     let leaf_pkcs8_der = PrivatePkcs8KeyDer::from(leaf_pkcs8.to_vec());
-    let leaf_key = KeyPair::from_pkcs8_der_and_sign_algo(
-        &leaf_pkcs8_der,
-        &PKCS_ECDSA_P256_SHA256,
-    )
-    .map_err(|e| format!("leaf key: {}", e))?;
+    let leaf_key = KeyPair::from_pkcs8_der_and_sign_algo(&leaf_pkcs8_der, &PKCS_ECDSA_P256_SHA256)
+        .map_err(|e| format!("leaf key: {}", e))?;
 
     // --- Leaf params ---
     // WebPKI does not fall back to Subject CN. Bind the leaf to an admitted DNS
@@ -618,14 +628,13 @@ fn build_leaf_cert(
     let subject_alt_names = server_name
         .map(|name| vec![name.to_string()])
         .unwrap_or_default();
-    let mut leaf_params = CertificateParams::new(subject_alt_names)
-        .map_err(|e| format!("leaf params: {}", e))?;
+    let mut leaf_params =
+        CertificateParams::new(subject_alt_names).map_err(|e| format!("leaf params: {}", e))?;
 
     // CN is always the app hostname (or enclave-wide fallback name).
-    leaf_params.distinguished_name.push(
-        DnType::CommonName,
-        DnValue::Utf8String(common_name.into()),
-    );
+    leaf_params
+        .distinguished_name
+        .push(DnType::CommonName, DnValue::Utf8String(common_name.into()));
 
     // Copy C, ST, L, O, OU from the intermediate CA so the leaf's
     // subject matches the issuer's organisation fields.
@@ -637,7 +646,9 @@ fn build_leaf_cert(
         DnType::OrganizationalUnitName,
     ] {
         if let Some(value) = ca_params.distinguished_name.get(dn_type) {
-            leaf_params.distinguished_name.push(dn_type.clone(), value.clone());
+            leaf_params
+                .distinguished_name
+                .push(dn_type.clone(), value.clone());
         }
     }
 
@@ -661,13 +672,11 @@ fn build_leaf_cert(
 
     // --- CA key pair + certificate ---
     let ca_pkcs8_der = PrivatePkcs8KeyDer::from(ca.ca_key_pkcs8.clone());
-    let ca_key = KeyPair::from_pkcs8_der_and_sign_algo(
-        &ca_pkcs8_der,
-        &PKCS_ECDSA_P256_SHA256,
-    )
-    .map_err(|e| format!("CA key: {}", e))?;
+    let ca_key = KeyPair::from_pkcs8_der_and_sign_algo(&ca_pkcs8_der, &PKCS_ECDSA_P256_SHA256)
+        .map_err(|e| format!("CA key: {}", e))?;
 
-    let ca_cert = ca_params.self_signed(&ca_key)
+    let ca_cert = ca_params
+        .self_signed(&ca_key)
         .map_err(|e| format!("CA cert reconstruct: {}", e))?;
 
     // --- Sign leaf with CA ---
@@ -984,8 +993,8 @@ mod tests {
         let nonce = b"my_nonce";
         let exts: &[(u16, &[u8])] = &[
             (0x0000, b"\x00\x0e\x00\x00\x0bexample.com"), // SNI
-            (0x000D, b"\x00\x04\x04\x03\x08\x04"),         // signature_algorithms
-            (0xFFBB, nonce),                                 // our extension
+            (0x000D, b"\x00\x04\x04\x03\x08\x04"),        // signature_algorithms
+            (0xFFBB, nonce),                              // our extension
         ];
         let ch = build_client_hello(exts);
         let info = parse_client_hello(&ch);
@@ -1007,10 +1016,10 @@ mod tests {
 
         let mut ch_body = Vec::new();
         ch_body.extend_from_slice(&[0x03, 0x03]); // version
-        ch_body.extend_from_slice(&[0u8; 32]);     // random
-        ch_body.push(0);                            // session_id_length
+        ch_body.extend_from_slice(&[0u8; 32]); // random
+        ch_body.push(0); // session_id_length
         ch_body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]); // cipher suites
-        ch_body.extend_from_slice(&[0x01, 0x00]);  // compression
+        ch_body.extend_from_slice(&[0x01, 0x00]); // compression
 
         let mut ext = Vec::new();
         ext.extend_from_slice(&0xFFBBu16.to_be_bytes());

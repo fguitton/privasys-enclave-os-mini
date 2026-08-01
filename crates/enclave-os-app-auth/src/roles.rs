@@ -33,8 +33,9 @@ fn user_key(user_handle: &str) -> Vec<u8> {
 /// Returns an empty vec if the user has no roles stored.
 pub fn get_user_roles(store: &SealedKvStore, user_handle: &str) -> Result<Vec<String>, String> {
     match store.get(&user_key(user_handle))? {
-        Some(bytes) => serde_json::from_slice(&bytes)
-            .map_err(|e| format!("roles deserialization failed: {e}")),
+        Some(bytes) => {
+            serde_json::from_slice(&bytes).map_err(|e| format!("roles deserialization failed: {e}"))
+        }
         None => Ok(Vec::new()),
     }
 }
@@ -79,8 +80,8 @@ pub fn set_user_roles(
     user_handle: &str,
     roles: &[String],
 ) -> Result<(), String> {
-    let value = serde_json::to_vec(roles)
-        .map_err(|e| format!("roles serialization failed: {e}"))?;
+    let value =
+        serde_json::to_vec(roles).map_err(|e| format!("roles serialization failed: {e}"))?;
     store.put(&user_key(user_handle), &value)?;
 
     // Ensure user is in manifest.

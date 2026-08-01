@@ -25,11 +25,11 @@
 //!     [4 bytes: key_len (LE u32)] [key UTF-8]
 //!     [4 bytes: val_len (LE u32)] [value]
 
+use crate::crypto::sealing;
+use enclave_os_common::types::AEAD_KEY_SIZE;
 use std::collections::BTreeMap;
 use std::string::String;
 use std::vec::Vec;
-use crate::crypto::sealing;
-use enclave_os_common::types::AEAD_KEY_SIZE;
 
 const FORMAT_VERSION: u32 = 3;
 
@@ -119,9 +119,7 @@ impl SealedConfig {
         if data.len() < pos + 4 {
             return Err("Too short for version");
         }
-        let version = u32::from_le_bytes(
-            data[pos..pos + 4].try_into().map_err(|_| "bad version")?,
-        );
+        let version = u32::from_le_bytes(data[pos..pos + 4].try_into().map_err(|_| "bad version")?);
         if version != FORMAT_VERSION {
             return Err("Unknown SealedConfig version");
         }
@@ -140,7 +138,9 @@ impl SealedConfig {
             return Err("Too short for ca_cert_len");
         }
         let ca_cert_len = u32::from_le_bytes(
-            data[pos..pos + 4].try_into().map_err(|_| "bad ca_cert_len")?,
+            data[pos..pos + 4]
+                .try_into()
+                .map_err(|_| "bad ca_cert_len")?,
         ) as usize;
         pos += 4;
         if data.len() < pos + ca_cert_len {
@@ -154,7 +154,9 @@ impl SealedConfig {
             return Err("Too short for ca_key_len");
         }
         let ca_key_len = u32::from_le_bytes(
-            data[pos..pos + 4].try_into().map_err(|_| "bad ca_key_len")?,
+            data[pos..pos + 4]
+                .try_into()
+                .map_err(|_| "bad ca_key_len")?,
         ) as usize;
         pos += 4;
         if data.len() < pos + ca_key_len {
@@ -168,7 +170,9 @@ impl SealedConfig {
             return Err("Too short for num_entries");
         }
         let num_entries = u32::from_le_bytes(
-            data[pos..pos + 4].try_into().map_err(|_| "bad num_entries")?,
+            data[pos..pos + 4]
+                .try_into()
+                .map_err(|_| "bad num_entries")?,
         ) as usize;
         pos += 4;
 
@@ -178,9 +182,9 @@ impl SealedConfig {
             if data.len() < pos + 4 {
                 return Err("Too short for module key_len");
             }
-            let key_len = u32::from_le_bytes(
-                data[pos..pos + 4].try_into().map_err(|_| "bad key_len")?,
-            ) as usize;
+            let key_len =
+                u32::from_le_bytes(data[pos..pos + 4].try_into().map_err(|_| "bad key_len")?)
+                    as usize;
             pos += 4;
             if data.len() < pos + key_len {
                 return Err("Truncated module key");
@@ -194,9 +198,9 @@ impl SealedConfig {
             if data.len() < pos + 4 {
                 return Err("Too short for module val_len");
             }
-            let val_len = u32::from_le_bytes(
-                data[pos..pos + 4].try_into().map_err(|_| "bad val_len")?,
-            ) as usize;
+            let val_len =
+                u32::from_le_bytes(data[pos..pos + 4].try_into().map_err(|_| "bad val_len")?)
+                    as usize;
             pos += 4;
             if data.len() < pos + val_len {
                 return Err("Truncated module value");
@@ -237,8 +241,7 @@ impl SealedConfig {
         let (plaintext, _aad) = sealing::unseal_with_mrenclave(&sealed_blob)
             .map_err(|e| format!("SealedConfig unseal failed: {}", e))?;
 
-        Self::deserialize(&plaintext)
-            .map_err(|e| format!("SealedConfig deserialize failed: {}", e))
+        Self::deserialize(&plaintext).map_err(|e| format!("SealedConfig deserialize failed: {}", e))
     }
 }
 

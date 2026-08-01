@@ -12,9 +12,9 @@
 //! - Decouples TLS logic from transport (testable, composable)
 //! - Supports future multi-threading (sessions are `Send`)
 
-use std::vec::Vec;
 use crate::enclave_log_error;
 use enclave_os_common::protocol;
+use std::vec::Vec;
 
 /// A TLS session backed by a rustls `ServerConnection`.
 ///
@@ -123,14 +123,10 @@ impl RaTlsSession {
             match self.tls_conn.read_tls(&mut cursor) {
                 Ok(0) => break,
                 Ok(_) => {
-                    self.tls_conn
-                        .process_new_packets()
-                        .map_err(|e| {
-                            enclave_log_error!(
-                                "process_new_packets error: {:?}", e
-                            );
-                            "TLS process_new_packets failed"
-                        })?;
+                    self.tls_conn.process_new_packets().map_err(|e| {
+                        enclave_log_error!("process_new_packets error: {:?}", e);
+                        "TLS process_new_packets failed"
+                    })?;
 
                     // Drain decrypted plaintext into read_buf after each
                     // record to prevent the internal rustls plaintext
@@ -180,9 +176,7 @@ impl RaTlsSession {
     /// - `Ok(Some(request))` — a complete HTTP request is available
     /// - `Ok(None)` — more data needed (partial request)
     /// - `Err` — fatal TLS or parse error
-    pub fn recv_http_request(
-        &mut self,
-    ) -> Result<Option<protocol::HttpRequest>, &'static str> {
+    pub fn recv_http_request(&mut self) -> Result<Option<protocol::HttpRequest>, &'static str> {
         // Drain any available decrypted plaintext into read_buf
         self.drain_plaintext()?;
 
@@ -192,12 +186,8 @@ impl RaTlsSession {
                 Ok(Some(request))
             }
             Err(protocol::HttpParseError::Incomplete) => Ok(None),
-            Err(protocol::HttpParseError::TooManyHeaders) => {
-                Err("HTTP: too many headers")
-            }
-            Err(protocol::HttpParseError::BodyTooLarge) => {
-                Err("HTTP body too large")
-            }
+            Err(protocol::HttpParseError::TooManyHeaders) => Err("HTTP: too many headers"),
+            Err(protocol::HttpParseError::BodyTooLarge) => Err("HTTP body too large"),
             Err(_) => Err("malformed HTTP request"),
         }
     }
@@ -270,9 +260,7 @@ impl RaTlsSession {
                 Ok(n) => self.read_buf.extend_from_slice(&buf[..n]),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) => {
-                    enclave_log_error!(
-                        "reader.read error: kind={:?} msg={}", e.kind(), e
-                    );
+                    enclave_log_error!("reader.read error: kind={:?} msg={}", e.kind(), e);
                     return Err("TLS read failed");
                 }
             }
@@ -302,7 +290,9 @@ impl RaTlsSession {
                 writer.write(&data[offset..]).map_err(|e| {
                     enclave_log_error!(
                         "writer.write failed ({}B remaining): kind={:?} msg={}",
-                        data.len() - offset, e.kind(), e
+                        data.len() - offset,
+                        e.kind(),
+                        e
                     );
                     "TLS write failed"
                 })?
@@ -316,7 +306,8 @@ impl RaTlsSession {
                     // an infinite loop.
                     enclave_log_error!(
                         "write_plaintext_chunked: no progress at offset {}/{}",
-                        offset, data.len()
+                        offset,
+                        data.len()
                     );
                     return Err("TLS write stalled: no progress");
                 }

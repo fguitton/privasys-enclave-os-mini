@@ -40,11 +40,7 @@ extern "C" {
     fn sgx_qe_get_quote_size(p_quote_size: *mut u32) -> u32;
 
     /// Generate a DCAP Quote v3 from an SGX report.
-    fn sgx_qe_get_quote(
-        p_app_report: *const u8,
-        quote_size: u32,
-        p_quote: *mut u8,
-    ) -> u32;
+    fn sgx_qe_get_quote(p_app_report: *const u8, quote_size: u32, p_quote: *mut u8) -> u32;
 }
 
 // ---------------------------------------------------------------------------
@@ -61,7 +57,10 @@ pub fn qe_get_target_info() -> Result<Vec<u8>, String> {
         error!("sgx_qe_get_target_info failed: 0x{:04x}", ret);
         return Err(format!("sgx_qe_get_target_info failed: 0x{:04x}", ret));
     }
-    debug!("sgx_qe_get_target_info: OK ({} bytes)", SGX_TARGET_INFO_SIZE);
+    debug!(
+        "sgx_qe_get_target_info: OK ({} bytes)",
+        SGX_TARGET_INFO_SIZE
+    );
     Ok(target_info)
 }
 
@@ -88,13 +87,7 @@ pub fn qe_get_quote(report_bytes: &[u8]) -> Result<Vec<u8>, String> {
 
     // 2. Allocate buffer and generate the quote
     let mut quote = vec![0u8; quote_size as usize];
-    let ret = unsafe {
-        sgx_qe_get_quote(
-            report_bytes.as_ptr(),
-            quote_size,
-            quote.as_mut_ptr(),
-        )
-    };
+    let ret = unsafe { sgx_qe_get_quote(report_bytes.as_ptr(), quote_size, quote.as_mut_ptr()) };
     if ret != SGX_QL_SUCCESS {
         error!("sgx_qe_get_quote failed: 0x{:04x}", ret);
         return Err(format!("sgx_qe_get_quote failed: 0x{:04x}", ret));

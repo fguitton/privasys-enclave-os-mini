@@ -11,11 +11,11 @@
 //! Body encoding: `Content-Length` only (no chunked transfer-encoding).
 
 #[cfg(feature = "sgx")]
+use alloc::format;
+#[cfg(feature = "sgx")]
 use alloc::string::String;
 #[cfg(feature = "sgx")]
 use alloc::vec::Vec;
-#[cfg(feature = "sgx")]
-use alloc::format;
 #[cfg(not(feature = "sgx"))]
 use std::string::String;
 #[cfg(not(feature = "sgx"))]
@@ -73,10 +73,7 @@ pub enum Response {
     /// Healthz reply — always `{"status":"ok"}`.
     Healthz { status: String },
     /// Readyz reply.
-    Readyz {
-        status: String,
-        modules: usize,
-    },
+    Readyz { status: String, modules: usize },
     /// Status reply with per-module info.
     StatusReport(Vec<ModuleStatus>),
     /// Metrics reply with enclave counters.
@@ -355,10 +352,12 @@ pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseE
 
     for h in req.headers.iter() {
         if h.name.eq_ignore_ascii_case("content-length") {
-            let val = core::str::from_utf8(h.value)
-                .map_err(|_| HttpParseError::InvalidContentLength)?;
+            let val =
+                core::str::from_utf8(h.value).map_err(|_| HttpParseError::InvalidContentLength)?;
             content_length = Some(
-                val.trim().parse().map_err(|_| HttpParseError::InvalidContentLength)?,
+                val.trim()
+                    .parse()
+                    .map_err(|_| HttpParseError::InvalidContentLength)?,
             );
         } else if h.name.eq_ignore_ascii_case("authorization") {
             if let Ok(val) = core::str::from_utf8(h.value) {
@@ -489,7 +488,12 @@ pub fn format_http_response_with_headers(
 
     let header = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}{}\r\n",
-        status, reason, content_type, body.len(), extras, conn_header,
+        status,
+        reason,
+        content_type,
+        body.len(),
+        extras,
+        conn_header,
     );
 
     let mut resp = header.into_bytes();
@@ -536,7 +540,9 @@ mod tests {
 
     #[test]
     fn test_response_healthz_serde() {
-        let resp = Response::Healthz { status: "ok".into() };
+        let resp = Response::Healthz {
+            status: "ok".into(),
+        };
         let json = serde_json::to_vec(&resp).unwrap();
         let back: Response = serde_json::from_slice(&json).unwrap();
         assert!(matches!(back, Response::Healthz { .. }));
@@ -673,7 +679,8 @@ mod tests {
 
     #[test]
     fn test_parse_case_insensitive_headers() {
-        let raw = b"POST /data HTTP/1.1\r\ncONTENT-LENGTH: 2\r\nAUTHORIZATION: Bearer abc\r\n\r\nhi";
+        let raw =
+            b"POST /data HTTP/1.1\r\ncONTENT-LENGTH: 2\r\nAUTHORIZATION: Bearer abc\r\n\r\nhi";
         let (req, _) = parse_http_request(raw).unwrap();
         assert_eq!(req.body, b"hi");
         assert_eq!(req.authorization.as_deref(), Some("abc"));

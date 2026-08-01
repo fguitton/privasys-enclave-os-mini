@@ -241,7 +241,11 @@ impl Fido2Module {
         // 3. Parse attestation object → extract authData
         let att_obj_bytes = match URL_SAFE_NO_PAD.decode(attestation_object_b64) {
             Ok(b) => b,
-            Err(e) => return Fido2Response::Error { error: format!("attestation_object base64: {e}") },
+            Err(e) => {
+                return Fido2Response::Error {
+                    error: format!("attestation_object base64: {e}"),
+                }
+            }
         };
 
         let auth_data_bytes = match webauthn::parse_attestation_object(&att_obj_bytes) {
@@ -257,22 +261,32 @@ impl Fido2Module {
 
         // 5. Verify flags: UP and UV must be set
         if !auth_data.user_present() {
-            return Fido2Response::Error { error: "user not present".into() };
+            return Fido2Response::Error {
+                error: "user not present".into(),
+            };
         }
         if !auth_data.user_verified() {
-            return Fido2Response::Error { error: "user not verified".into() };
+            return Fido2Response::Error {
+                error: "user not verified".into(),
+            };
         }
 
         // 6. Extract attested credential data
         let attested = match auth_data.attested_credential {
             Some(ref ac) => ac,
-            None => return Fido2Response::Error { error: "missing attested credential data".into() },
+            None => {
+                return Fido2Response::Error {
+                    error: "missing attested credential data".into(),
+                }
+            }
         };
 
         // 7. Verify rpIdHash
         let expected_rp_hash = webauthn::sha256(self.rp_id.as_bytes());
         if auth_data.rp_id_hash[..] != expected_rp_hash[..] {
-            return Fido2Response::Error { error: "rpIdHash mismatch".into() };
+            return Fido2Response::Error {
+                error: "rpIdHash mismatch".into(),
+            };
         }
 
         // 8. Check AAGUID against allowlist
@@ -288,18 +302,25 @@ impl Fido2Module {
         }
 
         // 9. Extract P-256 public key from COSE key
-        let public_key_raw = match webauthn::extract_p256_public_key(&attested.credential_public_key_cbor) {
-            Ok(pk) => pk,
-            Err(e) => return Fido2Response::Error { error: e },
-        };
+        let public_key_raw =
+            match webauthn::extract_p256_public_key(&attested.credential_public_key_cbor) {
+                Ok(pk) => pk,
+                Err(e) => return Fido2Response::Error { error: e },
+            };
 
         // 10. Verify credential ID matches what the client reported
         let reported_cred_id = match URL_SAFE_NO_PAD.decode(credential_id_b64) {
             Ok(b) => b,
-            Err(e) => return Fido2Response::Error { error: format!("credential_id base64: {e}") },
+            Err(e) => {
+                return Fido2Response::Error {
+                    error: format!("credential_id base64: {e}"),
+                }
+            }
         };
         if attested.credential_id != reported_cred_id {
-            return Fido2Response::Error { error: "credential ID mismatch".into() };
+            return Fido2Response::Error {
+                error: "credential ID mismatch".into(),
+            };
         }
 
         // 11. Store credential
@@ -407,14 +428,22 @@ impl Fido2Module {
         // 3. Load the stored credential
         let record = match credentials::load_credential(credential_id_b64) {
             Ok(Some(r)) => r,
-            Ok(None) => return Fido2Response::Error { error: "unknown credential".into() },
+            Ok(None) => {
+                return Fido2Response::Error {
+                    error: "unknown credential".into(),
+                }
+            }
             Err(e) => return Fido2Response::Error { error: e },
         };
 
         // 4. Decode authenticator data
         let auth_data_bytes = match URL_SAFE_NO_PAD.decode(authenticator_data_b64) {
             Ok(b) => b,
-            Err(e) => return Fido2Response::Error { error: format!("authenticator_data base64: {e}") },
+            Err(e) => {
+                return Fido2Response::Error {
+                    error: format!("authenticator_data base64: {e}"),
+                }
+            }
         };
 
         let auth_data = match webauthn::parse_authenticator_data(&auth_data_bytes) {
@@ -424,16 +453,22 @@ impl Fido2Module {
 
         // 5. Verify flags
         if !auth_data.user_present() {
-            return Fido2Response::Error { error: "user not present".into() };
+            return Fido2Response::Error {
+                error: "user not present".into(),
+            };
         }
         if !auth_data.user_verified() {
-            return Fido2Response::Error { error: "user not verified".into() };
+            return Fido2Response::Error {
+                error: "user not verified".into(),
+            };
         }
 
         // 6. Verify rpIdHash
         let expected_rp_hash = webauthn::sha256(self.rp_id.as_bytes());
         if auth_data.rp_id_hash[..] != expected_rp_hash[..] {
-            return Fido2Response::Error { error: "rpIdHash mismatch".into() };
+            return Fido2Response::Error {
+                error: "rpIdHash mismatch".into(),
+            };
         }
 
         // 7. Verify sign count (strict clone detection per WebAuthn §7.2 step 17)
@@ -456,12 +491,20 @@ impl Fido2Module {
 
         let sig_bytes = match URL_SAFE_NO_PAD.decode(signature_b64) {
             Ok(b) => b,
-            Err(e) => return Fido2Response::Error { error: format!("signature base64: {e}") },
+            Err(e) => {
+                return Fido2Response::Error {
+                    error: format!("signature base64: {e}"),
+                }
+            }
         };
 
         let public_key_bytes = match URL_SAFE_NO_PAD.decode(&record.public_key_raw) {
             Ok(b) => b,
-            Err(e) => return Fido2Response::Error { error: format!("stored public key base64: {e}") },
+            Err(e) => {
+                return Fido2Response::Error {
+                    error: format!("stored public key base64: {e}"),
+                }
+            }
         };
 
         if let Err(e) = webauthn::verify_signature(&public_key_bytes, &signed_data, &sig_bytes) {
@@ -469,7 +512,9 @@ impl Fido2Module {
         }
 
         // 9. Update sign count
-        if let Err(e) = credentials::update_credential(credential_id_b64, auth_data.sign_count, None) {
+        if let Err(e) =
+            credentials::update_credential(credential_id_b64, auth_data.sign_count, None)
+        {
             // Log but don't fail — the auth succeeded
             let _ = e;
         }

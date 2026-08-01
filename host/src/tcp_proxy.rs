@@ -18,16 +18,14 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use enclave_os_common::channel::{
-    self, ChannelMsgType, TcpConnectFailure, CHANNEL_MSG_HEADER,
-};
-use enclave_os_common::queue::{SpscProducer, SpscConsumer};
+use enclave_os_common::channel::{self, ChannelMsgType, TcpConnectFailure, CHANNEL_MSG_HEADER};
+use enclave_os_common::queue::{SpscConsumer, SpscProducer};
 
-use log::{info, warn, error, debug};
+use log::{debug, error, info, warn};
 
 /// Maximum bytes to read from a TCP socket in one call.
 const TCP_READ_BUF: usize = 32_768;
@@ -71,10 +69,7 @@ struct ConnState {
 
 enum ConnectionOrigin {
     Inbound,
-    OutboundConnecting {
-        request_id: u64,
-        endpoint: String,
-    },
+    OutboundConnecting { request_id: u64, endpoint: String },
     Outbound,
 }
 
@@ -228,7 +223,12 @@ impl TcpProxy {
                     }
 
                     let peer_addr = addr.to_string();
-                    info!("Accepted conn_id={} from {} (active={})", conn_id, peer_addr, self.connections.len() + 1);
+                    info!(
+                        "Accepted conn_id={} from {} (active={})",
+                        conn_id,
+                        peer_addr,
+                        self.connections.len() + 1
+                    );
 
                     // Send TcpNew to enclave
                     let msg = channel::encode_tcp_new(conn_id, &peer_addr);
@@ -363,10 +363,7 @@ impl TcpProxy {
                             }
                         }
                         Some((ChannelMsgType::TcpNew, conn_id, _)) => {
-                            warn!(
-                                "Unexpected TcpNew from enclave for conn_id={}",
-                                conn_id
-                            );
+                            warn!("Unexpected TcpNew from enclave for conn_id={}", conn_id);
                         }
                         Some((
                             ChannelMsgType::TcpConnected | ChannelMsgType::TcpConnectFailed,
@@ -398,7 +395,10 @@ impl TcpProxy {
         let mut close = false;
         if let Some(conn) = self.connections.get_mut(&conn_id) {
             if matches!(conn.origin, ConnectionOrigin::OutboundConnecting { .. }) {
-                warn!("Write before outbound connect completed for conn_id={}", conn_id);
+                warn!(
+                    "Write before outbound connect completed for conn_id={}",
+                    conn_id
+                );
                 return;
             }
             let pending = conn.write_buffer.len().saturating_sub(conn.write_offset);
@@ -662,11 +662,7 @@ impl TcpProxy {
         if self.pending_to_enclave.is_empty() && self.data_tx.try_send(&message).is_ok() {
             return;
         }
-        if self
-            .pending_to_enclave_bytes
-            .saturating_add(message.len())
-            > MAX_PENDING_TO_ENCLAVE
-        {
+        if self.pending_to_enclave_bytes.saturating_add(message.len()) > MAX_PENDING_TO_ENCLAVE {
             error!(
                 "Host-to-enclave credit backlog exceeded {} bytes; shutting down proxy",
                 MAX_PENDING_TO_ENCLAVE
@@ -685,10 +681,7 @@ impl TcpProxy {
         if self.data_tx.try_send(message).is_err() {
             return false;
         }
-        let sent = self
-            .pending_to_enclave
-            .pop_front()
-            .expect("front existed");
+        let sent = self.pending_to_enclave.pop_front().expect("front existed");
         self.pending_to_enclave_bytes -= sent.len();
         true
     }
@@ -712,8 +705,7 @@ fn begin_nonblocking_connect(address: SocketAddr) -> io::Result<(TcpStream, bool
 }
 
 fn connect_is_in_progress(error: &io::Error) -> bool {
-    error.kind() == io::ErrorKind::WouldBlock
-        || matches!(error.raw_os_error(), Some(114 | 115))
+    error.kind() == io::ErrorKind::WouldBlock || matches!(error.raw_os_error(), Some(114 | 115))
 }
 
 /// Enable TCP keepalive on a stream with our standard parameters.
@@ -762,14 +754,8 @@ mod tests {
         let mut enclave_to_host = QueueMemory::new();
         let data_tx = host_to_enclave.producer();
         let data_rx = enclave_to_host.consumer();
-        let mut proxy = TcpProxy::new(
-            0,
-            1,
-            data_tx,
-            data_rx,
-            Arc::new(AtomicBool::new(false)),
-        )
-        .unwrap();
+        let mut proxy =
+            TcpProxy::new(0, 1, data_tx, data_rx, Arc::new(AtomicBool::new(false))).unwrap();
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();

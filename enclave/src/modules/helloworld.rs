@@ -9,7 +9,9 @@ use enclave_os_common::protocol::{Request, Response};
 pub struct HelloWorldModule;
 
 impl EnclaveModule for HelloWorldModule {
-    fn name(&self) -> &str { "helloworld" }
+    fn name(&self) -> &str {
+        "helloworld"
+    }
 
     fn handle(&self, req: &Request, _ctx: &RequestContext) -> Option<Response> {
         match req {

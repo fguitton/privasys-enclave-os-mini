@@ -74,11 +74,7 @@ fn main() {
     //  Step 4: Compile the generated untrusted bridge C code
     // -----------------------------------------------------------------------
     let u_c = out_dir.join("enclave_os_u.c");
-    assert!(
-        u_c.exists(),
-        "sgx_edger8r did not generate {:?}",
-        u_c
-    );
+    assert!(u_c.exists(), "sgx_edger8r did not generate {:?}", u_c);
 
     let mut build = cc::Build::new();
     build
@@ -119,11 +115,7 @@ fn find_edl_file() -> PathBuf {
     // manifest_dir = <workspace>/host → parent = <workspace>
     let workspace = manifest_dir.parent().expect("Cannot find workspace root");
     let edl = workspace.join("edl/enclave_os.edl");
-    assert!(
-        edl.exists(),
-        "Cannot find EDL file at {:?}",
-        edl
-    );
+    assert!(edl.exists(), "Cannot find EDL file at {:?}", edl);
     edl
 }
 

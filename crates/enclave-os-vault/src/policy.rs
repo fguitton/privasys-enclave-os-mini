@@ -137,7 +137,12 @@ pub fn resolve_caller(
     if let Some(peer_der) = ctx.peer_cert_der.as_deref() {
         for (i, p) in policy.principals.tees.iter().enumerate() {
             if let Principal::Tee(profile) = p {
-                if tee_matches(profile, peer_der, ctx.client_challenge_nonce.as_deref(), ctx.channel_binder.as_deref()) {
+                if tee_matches(
+                    profile,
+                    peer_der,
+                    ctx.client_challenge_nonce.as_deref(),
+                    ctx.channel_binder.as_deref(),
+                ) {
                     return Some((PrincipalRef::Tee(i as u32), CallerRole::Tee));
                 }
             }
@@ -269,9 +274,7 @@ fn measurement_matches(identity: &crate::quote::QuoteIdentity, allowed: &[Measur
                 Some(v) => v.to_lowercase(),
                 None => return false,
             };
-            mrtd.to_lowercase() == m
-                && rtmr1.to_lowercase() == r1
-                && rtmr2.to_lowercase() == r2
+            mrtd.to_lowercase() == m && rtmr1.to_lowercase() == r1 && rtmr2.to_lowercase() == r2
         }
         _ => false,
     })
@@ -379,7 +382,12 @@ fn evaluate_conditions(
                 let peer = ctx.peer_cert_der.as_deref().ok_or_else(|| {
                     "AttestationMatches: no peer RA-TLS cert in request".to_string()
                 })?;
-                if !tee_matches(profile, peer, ctx.client_challenge_nonce.as_deref(), ctx.channel_binder.as_deref()) {
+                if !tee_matches(
+                    profile,
+                    peer,
+                    ctx.client_challenge_nonce.as_deref(),
+                    ctx.channel_binder.as_deref(),
+                ) {
                     return Err(format!(
                         "AttestationMatches: peer does not match profile '{}'",
                         profile.name
@@ -735,7 +743,10 @@ mod measurement_match_tests {
 
     #[test]
     fn tdx_match_is_case_insensitive() {
-        assert!(measurement_matches(&tdx("aa", "bb", "cc"), &tdx_policy("AA", "BB", "CC")));
+        assert!(measurement_matches(
+            &tdx("aa", "bb", "cc"),
+            &tdx_policy("AA", "BB", "CC")
+        ));
     }
 
     #[test]
@@ -750,8 +761,16 @@ mod measurement_match_tests {
     fn or_across_allowed_builds_but_not_mixed() {
         // Promote window: old + new build both authorised.
         let pol = vec![
-            Measurement::Tdx { mrtd: "aa".into(), rtmr1: "b1".into(), rtmr2: "c1".into() },
-            Measurement::Tdx { mrtd: "aa".into(), rtmr1: "b2".into(), rtmr2: "c2".into() },
+            Measurement::Tdx {
+                mrtd: "aa".into(),
+                rtmr1: "b1".into(),
+                rtmr2: "c1".into(),
+            },
+            Measurement::Tdx {
+                mrtd: "aa".into(),
+                rtmr1: "b2".into(),
+                rtmr2: "c2".into(),
+            },
         ];
         assert!(measurement_matches(&tdx("aa", "b1", "c1"), &pol));
         assert!(measurement_matches(&tdx("aa", "b2", "c2"), &pol));

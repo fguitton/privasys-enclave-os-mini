@@ -48,7 +48,8 @@ impl JwksCache {
         let jwks: serde_json::Value = serde_json::from_slice(json_bytes)
             .map_err(|e| format!("JWKS JSON parse failed: {e}"))?;
 
-        let keys_arr = jwks.get("keys")
+        let keys_arr = jwks
+            .get("keys")
             .and_then(|v| v.as_array())
             .ok_or_else(|| "JWKS missing 'keys' array".to_string())?;
 
@@ -135,7 +136,9 @@ impl JwksCache {
     ///
     /// Returns `Err` if the `kid` is not found or the key is invalid.
     pub fn verifier(&self, kid: &str) -> Result<JwtVerifier, String> {
-        let key = self.keys.iter()
+        let key = self
+            .keys
+            .iter()
             .find(|(k, _)| k == kid)
             .map(|(_, v)| v)
             .ok_or_else(|| format!("JWKS key '{}' not found", kid))?;
@@ -146,7 +149,9 @@ impl JwksCache {
     /// Return a verifier for the first key, when there is only one key
     /// in the JWKS (or when the JWT has no `kid` header).
     pub fn first_verifier(&self) -> Result<JwtVerifier, String> {
-        let key = self.keys.first()
+        let key = self
+            .keys
+            .first()
             .map(|(_, v)| v)
             .ok_or_else(|| "JWKS is empty".to_string())?;
 
@@ -182,7 +187,8 @@ impl JwksCache {
 fn base64_url_decode(input: &str) -> Result<Vec<u8>, String> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
-    URL_SAFE_NO_PAD.decode(input)
+    URL_SAFE_NO_PAD
+        .decode(input)
         .map_err(|e| format!("base64url decode: {e}"))
 }
 
@@ -259,12 +265,14 @@ fn encode_der_length(buf: &mut Vec<u8>, len: usize) {
 /// This is used to look up the correct JWKS key before verification.
 /// Accepts both `ES256` and `RS256` algorithms. Rejects `alg:none`.
 pub fn extract_jwt_kid(token: &str) -> Result<Option<String>, String> {
-    let header_b64 = token.splitn(2, '.').next()
+    let header_b64 = token
+        .splitn(2, '.')
+        .next()
         .ok_or_else(|| "malformed JWT: no dot".to_string())?;
 
     let header_bytes = base64_url_decode(header_b64)?;
-    let header: serde_json::Value = serde_json::from_slice(&header_bytes)
-        .map_err(|e| format!("JWT header JSON: {e}"))?;
+    let header: serde_json::Value =
+        serde_json::from_slice(&header_bytes).map_err(|e| format!("JWT header JSON: {e}"))?;
 
     // Reject alg:none explicitly
     let alg = header.get("alg").and_then(|v| v.as_str()).unwrap_or("");
@@ -272,10 +280,16 @@ pub fn extract_jwt_kid(token: &str) -> Result<Option<String>, String> {
         return Err("JWT with alg:none is rejected".into());
     }
     if alg != "ES256" && alg != "RS256" {
-        return Err(format!("unsupported JWT algorithm '{}', expected 'ES256' or 'RS256'", alg));
+        return Err(format!(
+            "unsupported JWT algorithm '{}', expected 'ES256' or 'RS256'",
+            alg
+        ));
     }
 
-    Ok(header.get("kid").and_then(|v| v.as_str()).map(|s| s.to_string()))
+    Ok(header
+        .get("kid")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string()))
 }
 
 // ---------------------------------------------------------------------------

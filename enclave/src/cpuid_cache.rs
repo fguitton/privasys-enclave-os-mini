@@ -140,7 +140,12 @@ fn fetch_and_cache(leaf: u32, subleaf: u32) {
     let status = unsafe { sgx_oc_cpuidex(info.as_mut_ptr(), leaf as i32, subleaf as i32) };
     if status != 0 {
         // OCALL failed – leave the entry zeroed (better than crashing).
-        enclave_log_error!("ocall_cpuidex failed for leaf={:#x} sub={}: status={}", leaf, subleaf, status);
+        enclave_log_error!(
+            "ocall_cpuidex failed for leaf={:#x} sub={}: status={}",
+            leaf,
+            subleaf,
+            status
+        );
         return;
     }
 
@@ -247,10 +252,10 @@ pub fn init() {
         (0x04, 1),
         (0x04, 2),
         (0x04, 3),
-        (0x07, 0), // Extended features (SHA-NI, AVX2, AVX-512, BMI2, …)
-        (0x07, 1), // Extended features sub-1
-        (0x0D, 0), // XSAVE state size
-        (0x0D, 1), // XSAVE features
+        (0x07, 0),       // Extended features (SHA-NI, AVX2, AVX-512, BMI2, …)
+        (0x07, 1),       // Extended features sub-1
+        (0x0D, 0),       // XSAVE state size
+        (0x0D, 1),       // XSAVE features
         (0x80000000, 0), // Max extended leaf
         (0x80000001, 0), // Extended feature flags (LAHF, LZCNT, …)
     ];

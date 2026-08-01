@@ -82,8 +82,7 @@ pub fn get(table: &str, enc_key: &[u8]) -> Result<Option<Vec<u8>>> {
     let mut db = db();
     ensure_cf(&mut db, table);
     let cf = db.cf_handle(table).unwrap();
-    db.get_cf(&cf, enc_key)
-        .context("RocksDB get_cf failed")
+    db.get_cf(&cf, enc_key).context("RocksDB get_cf failed")
 }
 
 /// Delete an entry by encrypted key from the given table.
@@ -131,11 +130,7 @@ fn raft_ready_batch_key(prefix: &[u8], batch_id: u64) -> Vec<u8> {
     key
 }
 
-fn raft_ready_record_key(
-    prefix: &[u8],
-    kind: RaftReadyRecordKind,
-    record_key: &[u8],
-) -> Vec<u8> {
+fn raft_ready_record_key(prefix: &[u8], kind: RaftReadyRecordKind, record_key: &[u8]) -> Vec<u8> {
     let mut key = prefix.to_vec();
     key.extend_from_slice(b"record/");
     key.push(kind as u8);
@@ -151,12 +146,9 @@ fn read_durable_id(db: &DB, key: &[u8]) -> Result<u64> {
     if bytes.len() != 8 {
         anyhow::bail!("RocksDB Ready metadata has an invalid durable ID");
     }
-    Ok(u64::from_be_bytes(
-        bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("invalid Ready durable ID"))?,
-    ))
+    Ok(u64::from_be_bytes(bytes.as_slice().try_into().map_err(
+        |_| anyhow::anyhow!("invalid Ready durable ID"),
+    )?))
 }
 
 /// Persist one canonical encrypted/authenticated Ready batch with a single
@@ -346,9 +338,7 @@ mod tests {
 
     #[test]
     fn raft_ready_batch_is_atomic_idempotent_and_predecessor_bound() {
-        use enclave_os_common::rpc::{
-            PersistRaftReadyBatch, RaftReadyRecord, RaftReadyRecordKind,
-        };
+        use enclave_os_common::rpc::{PersistRaftReadyBatch, RaftReadyRecord, RaftReadyRecordKind};
 
         let (_tmp, db) = open_tmp();
         let first = PersistRaftReadyBatch {

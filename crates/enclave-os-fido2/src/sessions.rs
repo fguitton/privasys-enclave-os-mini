@@ -52,7 +52,9 @@ pub fn issue_token(
         expires_at: now + SESSION_TOKEN_TTL_SECS,
     };
 
-    let mut guard = TOKEN_STORE.lock().map_err(|_| "token store lock poisoned")?;
+    let mut guard = TOKEN_STORE
+        .lock()
+        .map_err(|_| "token store lock poisoned")?;
     let store = guard.as_mut().ok_or("token store not initialised")?;
 
     // Evict expired tokens if at capacity
@@ -70,7 +72,9 @@ pub fn issue_token(
 
 /// Validate a session token. Returns the entry if valid.
 pub fn validate_token(token: &str, now: u64) -> Result<SessionTokenEntry, String> {
-    let guard = TOKEN_STORE.lock().map_err(|_| "token store lock poisoned")?;
+    let guard = TOKEN_STORE
+        .lock()
+        .map_err(|_| "token store lock poisoned")?;
     let store = guard.as_ref().ok_or("token store not initialised")?;
 
     let entry = store.get(token).ok_or("invalid session token")?;
@@ -84,7 +88,9 @@ pub fn validate_token(token: &str, now: u64) -> Result<SessionTokenEntry, String
 
 /// Revoke a session token (explicit logout).
 pub fn revoke_token(token: &str) -> Result<(), String> {
-    let mut guard = TOKEN_STORE.lock().map_err(|_| "token store lock poisoned")?;
+    let mut guard = TOKEN_STORE
+        .lock()
+        .map_err(|_| "token store lock poisoned")?;
     let store = guard.as_mut().ok_or("token store not initialised")?;
     store.remove(token);
     Ok(())

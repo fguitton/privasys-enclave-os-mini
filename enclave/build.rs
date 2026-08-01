@@ -10,19 +10,13 @@ use std::path::PathBuf;
 fn main() {
     let edl_dir = env::var("ENCLAVE_EDL_DIR").unwrap_or_else(|_| {
         let out = env::var("OUT_DIR").unwrap();
-        let p = PathBuf::from(&out)
-            .ancestors()
-            .nth(4)
-            .unwrap()
-            .join("edl");
+        let p = PathBuf::from(&out).ancestors().nth(4).unwrap().join("edl");
         p.to_string_lossy().to_string()
     });
 
-    let sgx_sdk = env::var("SGX_SDK_PATH")
-        .unwrap_or_else(|_| "/opt/intel/sgxsdk".to_string());
+    let sgx_sdk = env::var("SGX_SDK_PATH").unwrap_or_else(|_| "/opt/intel/sgxsdk".to_string());
 
-    let teaclave = env::var("TEACLAVE_SGX_SDK")
-        .unwrap_or_else(|_| String::new());
+    let teaclave = env::var("TEACLAVE_SGX_SDK").unwrap_or_else(|_| String::new());
 
     let edl_t_c = PathBuf::from(&edl_dir).join("enclave_os_t.c");
 
@@ -40,7 +34,10 @@ fn main() {
 
         build.compile("enclave_os_t");
     } else {
-        eprintln!("cargo:warning=EDL trusted stubs not found at {:?}, skipping", edl_t_c);
+        eprintln!(
+            "cargo:warning=EDL trusted stubs not found at {:?}, skipping",
+            edl_t_c
+        );
     }
 
     // Compile the getrandom shim — provides syscall(SYS_getrandom) via

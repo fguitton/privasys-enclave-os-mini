@@ -48,10 +48,10 @@ use std::{string::String, vec::Vec};
 
 use serde::{Deserialize, Serialize};
 
-#[cfg(not(feature = "sgx"))]
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 #[cfg(feature = "sgx")]
 use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+#[cfg(not(feature = "sgx"))]
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 /// Global flag indicating whether OIDC has been configured.
 ///
@@ -81,7 +81,9 @@ pub fn set_global_oidc_config(config: OidcConfig) {
     );
     if prev.is_err() {
         // Another call already set it — free our copy.
-        unsafe { drop(Box::from_raw(ptr)); }
+        unsafe {
+            drop(Box::from_raw(ptr));
+        }
     }
     OIDC_CONFIGURED.store(true, Ordering::Release);
 }
@@ -212,8 +214,7 @@ impl OidcClaims {
     /// to empty; set them with [`OidcClaims::with_step_up`].
     pub fn from_raw(sub: String, roles: Vec<String>, config: &OidcConfig) -> Self {
         let is_manager = roles.iter().any(|r| r == &config.manager_role);
-        let is_monitoring =
-            is_manager || roles.iter().any(|r| r == &config.monitoring_role);
+        let is_monitoring = is_manager || roles.iter().any(|r| r == &config.monitoring_role);
         Self {
             sub,
             roles,
@@ -270,10 +271,7 @@ impl OidcClaims {
 /// returned strings are not interpreted: it is up to the caller (or
 /// [`OidcClaims::from_raw`]) to map them to platform booleans and to
 /// the per-resource policy of feature crates.
-pub fn extract_roles(
-    claims: &serde_json::Value,
-    config: &OidcConfig,
-) -> Vec<String> {
+pub fn extract_roles(claims: &serde_json::Value, config: &OidcConfig) -> Vec<String> {
     let mut roles: Vec<String> = Vec::new();
 
     // Path 1: configured role_claim

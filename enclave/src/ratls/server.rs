@@ -36,19 +36,21 @@ use crate::ocall;
 use crate::ratls::attestation::{self, CaContext, CertMode};
 use crate::ratls::cert_store;
 use crate::ratls::session::RaTlsSession;
-use crate::{enclave_log_info, enclave_log_error};
+use crate::{enclave_log_error, enclave_log_info};
 
 use enclave_os_common::channel::{self, ChannelMsgType};
 use enclave_os_common::queue::SpscProducer;
 
-use rustls::crypto::{verify_tls12_signature, verify_tls13_signature};
 use rustls::crypto::ring::default_provider;
+use rustls::crypto::{verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, UnixTime};
-use rustls::server::Acceptor;
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
-use rustls::{DigitallySignedStruct, DistinguishedName, Error as TlsError, ServerConfig, SignatureScheme};
+use rustls::server::Acceptor;
 use rustls::server::RaTlsBindCertificate;
 use rustls::sign::CertifiedKey;
+use rustls::{
+    DigitallySignedStruct, DistinguishedName, Error as TlsError, ServerConfig, SignatureScheme,
+};
 
 // ========================================================================
 //  Session states
@@ -137,24 +139,20 @@ impl IngressServer {
     ///
     /// Called from the enclave event loop for each message received on
     /// the `data_host_to_enc` queue.
-    pub fn handle_message(
-        &mut self,
-        msg_type: ChannelMsgType,
-        conn_id: u32,
-        payload: &[u8],
-    ) {
+    pub fn handle_message(&mut self, msg_type: ChannelMsgType, conn_id: u32, payload: &[u8]) {
         match msg_type {
             ChannelMsgType::TcpNew => {
                 let peer_addr = core::str::from_utf8(payload)
                     .unwrap_or("<invalid>")
                     .to_string();
-                enclave_log_info!(
-                    "New connection conn_id={} from {}", conn_id, peer_addr
+                enclave_log_info!("New connection conn_id={} from {}", conn_id, peer_addr);
+                self.sessions.insert(
+                    conn_id,
+                    SessionState::Pending {
+                        peer_addr,
+                        buffered: Vec::new(),
+                    },
                 );
-                self.sessions.insert(conn_id, SessionState::Pending {
-                    peer_addr,
-                    buffered: Vec::new(),
-                });
             }
 
             ChannelMsgType::TcpData => {
@@ -164,7 +162,7 @@ impl IngressServer {
             ChannelMsgType::TcpClose => {
                 if let Some(state) = self.sessions.remove(&conn_id) {
                     if let SessionState::Established(mut session)
-                        | SessionState::Handshaking(mut session) = state
+                    | SessionState::Handshaking(mut session) = state
                     {
                         let close_bytes = session.close_notify();
                         if !close_bytes.is_empty() {
@@ -182,10 +180,7 @@ impl IngressServer {
                 // TcpConnect is an enclave→host request.
             }
             ChannelMsgType::TcpConnected | ChannelMsgType::TcpConnectFailed => {
-                enclave_log_error!(
-                    "Unexpected outbound connection event conn_id={}",
-                    conn_id
-                );
+                enclave_log_error!("Unexpected outbound connection event conn_id={}", conn_id);
             }
         }
     }
@@ -228,15 +223,16 @@ impl IngressServer {
         let state = match self.sessions.remove(&conn_id) {
             Some(s) => s,
             None => {
-                enclave_log_error!(
-                    "TcpData for unknown conn_id={}", conn_id
-                );
+                enclave_log_error!("TcpData for unknown conn_id={}", conn_id);
                 return;
             }
         };
 
         match state {
-            SessionState::Pending { peer_addr, mut buffered } => {
+            SessionState::Pending {
+                peer_addr,
+                mut buffered,
+            } => {
                 // Accumulate TLS bytes until the ClientHello record is
                 // complete — it can arrive split across several TcpData
                 // chunks. Re-feeding the whole buffer to a fresh Acceptor
@@ -245,15 +241,11 @@ impl IngressServer {
                 match self.create_session(conn_id, &peer_addr, &buffered) {
                     Ok(Some(session)) => {
                         if session.is_handshaking() {
-                            self.sessions.insert(
-                                conn_id,
-                                SessionState::Handshaking(session),
-                            );
+                            self.sessions
+                                .insert(conn_id, SessionState::Handshaking(session));
                         } else {
-                            self.sessions.insert(
-                                conn_id,
-                                SessionState::Established(session),
-                            );
+                            self.sessions
+                                .insert(conn_id, SessionState::Established(session));
                         }
                     }
                     Ok(None) => {
@@ -264,20 +256,25 @@ impl IngressServer {
                         if buffered.len() > MAX_PENDING_CLIENTHELLO {
                             enclave_log_error!(
                                 "ClientHello exceeded {} bytes for conn_id={}, dropping",
-                                MAX_PENDING_CLIENTHELLO, conn_id
+                                MAX_PENDING_CLIENTHELLO,
+                                conn_id
                             );
                             self.send_close(conn_id);
                         } else {
                             self.sessions.insert(
                                 conn_id,
-                                SessionState::Pending { peer_addr, buffered },
+                                SessionState::Pending {
+                                    peer_addr,
+                                    buffered,
+                                },
                             );
                         }
                     }
                     Err(e) => {
                         enclave_log_error!(
                             "Session creation failed for conn_id={}: {}",
-                            conn_id, e
+                            conn_id,
+                            e
                         );
                         self.send_close(conn_id);
                     }
@@ -288,30 +285,21 @@ impl IngressServer {
                 match self.process_session_data(conn_id, &mut session, data) {
                     Ok(()) => {
                         if session.is_handshaking() {
-                            self.sessions.insert(
-                                conn_id,
-                                SessionState::Handshaking(session),
-                            );
+                            self.sessions
+                                .insert(conn_id, SessionState::Handshaking(session));
                         } else {
-                            enclave_log_info!(
-                                "TLS handshake complete for conn_id={}",
-                                conn_id
-                            );
+                            enclave_log_info!("TLS handshake complete for conn_id={}", conn_id);
                             // The client may have sent application data
                             // (e.g. an HTTP request) in the same TLS
                             // flight as the handshake Finished message.
                             // Dispatch any buffered requests now.
                             self.dispatch_requests(conn_id, &mut session);
-                            self.sessions.insert(
-                                conn_id,
-                                SessionState::Established(session),
-                            );
+                            self.sessions
+                                .insert(conn_id, SessionState::Established(session));
                         }
                     }
                     Err(e) => {
-                        enclave_log_error!(
-                            "Handshake error conn_id={}: {}", conn_id, e
-                        );
+                        enclave_log_error!("Handshake error conn_id={}: {}", conn_id, e);
                         self.send_close(conn_id);
                     }
                 }
@@ -322,15 +310,11 @@ impl IngressServer {
                     Ok(()) => {
                         // Dispatch any complete HTTP requests
                         self.dispatch_requests(conn_id, &mut session);
-                        self.sessions.insert(
-                            conn_id,
-                            SessionState::Established(session),
-                        );
+                        self.sessions
+                            .insert(conn_id, SessionState::Established(session));
                     }
                     Err(e) => {
-                        enclave_log_error!(
-                            "Session error conn_id={}: {}", conn_id, e
-                        );
+                        enclave_log_error!("Session error conn_id={}: {}", conn_id, e);
                         self.send_close(conn_id);
                     }
                 }
@@ -380,8 +364,7 @@ impl IngressServer {
 
                     // Send HTTP response
                     let send_close = close || result.shutdown;
-                    let ct = result.content_type.as_deref()
-                        .unwrap_or("application/json");
+                    let ct = result.content_type.as_deref().unwrap_or("application/json");
                     match session.send_http_response_with_headers(
                         result.status,
                         ct,
@@ -397,7 +380,8 @@ impl IngressServer {
                         Err(e) => {
                             enclave_log_error!(
                                 "send_http_response failed conn_id={}: {}",
-                                conn_id, e
+                                conn_id,
+                                e
                             );
                             self.send_close(conn_id);
                             return;
@@ -405,9 +389,7 @@ impl IngressServer {
                     }
 
                     if result.shutdown {
-                        enclave_log_info!(
-                            "Shutdown requested by conn_id={}", conn_id
-                        );
+                        enclave_log_info!("Shutdown requested by conn_id={}", conn_id);
                         self.shutdown = true;
                         self.send_close(conn_id);
                         return;
@@ -420,14 +402,10 @@ impl IngressServer {
                 }
                 Ok(None) => break, // no more complete requests
                 Err(e) => {
-                    enclave_log_error!(
-                        "recv_http_request error conn_id={}: {}", conn_id, e
-                    );
+                    enclave_log_error!("recv_http_request error conn_id={}: {}", conn_id, e);
                     // Send a 400 Bad Request before closing
                     let err_body = b"{\"error\":\"malformed request\"}";
-                    if let Ok(tls_bytes) =
-                        session.send_http_response(400, err_body, true)
-                    {
+                    if let Ok(tls_bytes) = session.send_http_response(400, err_body, true) {
                         if !tls_bytes.is_empty() {
                             self.send_to_proxy(conn_id, &tls_bytes);
                         }
@@ -467,9 +445,7 @@ impl IngressServer {
         {
             let mut cursor = std::io::Cursor::new(raw);
             if acceptor.read_tls(&mut cursor).is_err() {
-                return Err(format!(
-                    "Acceptor read_tls failed for conn_id={}", conn_id
-                ));
+                return Err(format!("Acceptor read_tls failed for conn_id={}", conn_id));
             }
         }
 
@@ -477,9 +453,7 @@ impl IngressServer {
             Ok(Some(a)) => a,
             Ok(None) => return Ok(None), // Incomplete — caller waits for more.
             Err(e) => {
-                return Err(format!(
-                    "Acceptor error for conn_id={}: {:?}", conn_id, e
-                ));
+                return Err(format!("Acceptor error for conn_id={}: {:?}", conn_id, e));
             }
         };
 
@@ -490,9 +464,7 @@ impl IngressServer {
         }
 
         // Build per-connection TLS config (includes client challenge nonce)
-        let tls_result = self.tls_config_for(
-            &hello.challenge_nonce, &hello.sni,
-        )?;
+        let tls_result = self.tls_config_for(&hello.challenge_nonce, &hello.sni)?;
 
         // Create the ServerConnection
         let server_conn = match accepted.into_connection(tls_result.config) {
@@ -514,7 +486,8 @@ impl IngressServer {
         );
 
         // Collect any initial handshake output (ServerHello, etc.)
-        let output = session.collect_tls_output()
+        let output = session
+            .collect_tls_output()
             .map_err(|e| format!("collect_tls_output: {}", e))?;
         if !output.is_empty() {
             self.send_to_proxy(conn_id, &output);
@@ -539,7 +512,8 @@ impl IngressServer {
         sni: &Option<String>,
     ) -> Result<TlsConfigResult, String> {
         // Resolve per-app identity from the global CertStore
-        let app_data = sni.as_deref()
+        let app_data = sni
+            .as_deref()
             .and_then(|h| cert_store::cert_store().resolve(h));
         let require_peer_client_auth =
             sni.as_deref() == Some(enclave_os_common::modules::HONEST_PEER_SNI);
@@ -548,7 +522,10 @@ impl IngressServer {
             // binder=None here: pre-handshake mint has no key schedule yet.
             // The channel binder is injected by the deferred mint hook (later
             // slice), which re-mints with the handshake secret available.
-            let mode = CertMode::Challenge { nonce: n.clone(), binder: None };
+            let mode = CertMode::Challenge {
+                nonce: n.clone(),
+                binder: None,
+            };
             return build_tls_config(
                 &self.ca,
                 mode,
@@ -568,9 +545,7 @@ impl IngressServer {
                 return Ok(TlsConfigResult {
                     config: cached.config.clone(),
                     client_challenge_nonce: None,
-                    attested_endpoint: app_data
-                        .as_ref()
-                        .and_then(|app| app.attested_endpoint),
+                    attested_endpoint: app_data.as_ref().and_then(|app| app.attested_endpoint),
                 });
             }
         }
@@ -584,11 +559,14 @@ impl IngressServer {
             require_peer_client_auth,
         )?;
 
-        self.cached_configs.insert(cache_key, CachedConfig {
-            config: tls_result.config.clone(),
-            expires_at: now + attestation::DETERMINISTIC_VALIDITY_SECS,
-            store_generation: current_gen,
-        });
+        self.cached_configs.insert(
+            cache_key,
+            CachedConfig {
+                config: tls_result.config.clone(),
+                expires_at: now + attestation::DETERMINISTIC_VALIDITY_SECS,
+                store_generation: current_gen,
+            },
+        );
         Ok(TlsConfigResult {
             config: tls_result.config,
             client_challenge_nonce: None, // deterministic mode: no nonce
@@ -649,7 +627,7 @@ impl Drop for IngressServer {
         for conn_id in conn_ids {
             if let Some(state) = self.sessions.remove(&conn_id) {
                 if let SessionState::Established(mut session)
-                    | SessionState::Handshaking(mut session) = state
+                | SessionState::Handshaking(mut session) = state
                 {
                     let close_bytes = session.close_notify();
                     if !close_bytes.is_empty() {
@@ -827,7 +805,8 @@ struct ChannelBindingMinter {
 impl core::fmt::Debug for ChannelBindingMinter {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         // Never print the captured CA key / nonce.
-        f.debug_struct("ChannelBindingMinter").finish_non_exhaustive()
+        f.debug_struct("ChannelBindingMinter")
+            .finish_non_exhaustive()
     }
 }
 
@@ -839,11 +818,9 @@ impl RaTlsBindCertificate for ChannelBindingMinter {
         };
         let result = match &self.app {
             Some(a) => attestation::generate_app_certificate(&self.ca, mode, a),
-            None => attestation::generate_ratls_certificate(
-                &self.ca,
-                mode,
-                self.server_name.as_deref(),
-            ),
+            None => {
+                attestation::generate_ratls_certificate(&self.ca, mode, self.server_name.as_deref())
+            }
         }
         .ok()?;
         let certs: Vec<CertificateDer<'static>> = result
@@ -878,7 +855,8 @@ fn build_tls_config(
         None => attestation::generate_ratls_certificate(ca, mode, server_name)?,
     };
 
-    let certs: Vec<CertificateDer<'static>> = result.cert_chain_der
+    let certs: Vec<CertificateDer<'static>> = result
+        .cert_chain_der
         .into_iter()
         .map(|der| CertificateDer::from(der).into_owned())
         .collect();
@@ -967,7 +945,8 @@ impl HttpHandleResult {
         }
     }
     fn with_header(mut self, name: &str, value: &str) -> Self {
-        self.extra_headers.push((name.to_string(), value.to_string()));
+        self.extra_headers
+            .push((name.to_string(), value.to_string()));
         self
     }
 }
@@ -1022,9 +1001,7 @@ fn handle_http_request(
 
     match (&http_req.method, http_req.path.as_str()) {
         // ── Healthz (no auth) ───────────────────────────────────────
-        (HttpMethod::Get, "/healthz") => {
-            HttpHandleResult::ok(b"{\"status\":\"ok\"}".to_vec())
-        }
+        (HttpMethod::Get, "/healthz") => HttpHandleResult::ok(b"{\"status\":\"ok\"}".to_vec()),
 
         // ── Readyz (monitoring+) ────────────────────────────────────
         (HttpMethod::Get, "/readyz") => {
@@ -1034,11 +1011,12 @@ fn handle_http_request(
                 return monitoring_required_error(http_req);
             }
             let module_count = modules::module_count();
-            let status = if module_count > 0 { "ready" } else { "not_ready" };
-            let body = format!(
-                "{{\"status\":\"{}\",\"modules\":{}}}",
-                status, module_count
-            );
+            let status = if module_count > 0 {
+                "ready"
+            } else {
+                "not_ready"
+            };
+            let body = format!("{{\"status\":\"{}\",\"modules\":{}}}", status, module_count);
             HttpHandleResult::ok(body.into_bytes())
         }
 
@@ -1073,9 +1051,7 @@ fn handle_http_request(
         }
 
         // ── Data / module dispatch ──────────────────────────────────
-        (HttpMethod::Post, "/data") => {
-            handle_data_request_http(http_req, base_ctx)
-        }
+        (HttpMethod::Post, "/data") => handle_data_request_http(http_req, base_ctx),
 
         // ── Shutdown (manager) ──────────────────────────────────────
         (HttpMethod::Post, "/shutdown") => {
@@ -1103,10 +1079,7 @@ fn handle_http_request(
         // Mirrors the public MCP-over-HTTP transport expected by
         // confidential-ai's `privasys_http` tool catalog. App is implicit:
         // the single loaded WASM app on this enclave.
-        (method, path)
-            if path == "/api/v1/mcp/tools"
-                || path.starts_with("/api/v1/mcp/tools/") =>
-        {
+        (method, path) if path == "/api/v1/mcp/tools" || path.starts_with("/api/v1/mcp/tools/") => {
             handle_mcp_tools_request(method, path, http_req, base_ctx)
         }
 
@@ -1119,15 +1092,16 @@ fn handle_http_request(
         }
 
         // ── Session-relay bootstrap (no auth required) ──────────────
-        (HttpMethod::Post, "/__privasys/session-bootstrap") => {
-            handle_session_bootstrap(http_req)
-        }
+        (HttpMethod::Post, "/__privasys/session-bootstrap") => handle_session_bootstrap(http_req),
 
         // ── Method mismatch on known paths ──────────────────────────
-        (_, "/healthz") | (_, "/readyz") | (_, "/status") | (_, "/metrics")
-        | (_, "/attestation-servers") | (_, "/data") | (_, "/shutdown") => {
-            HttpHandleResult::err(405, "method not allowed")
-        }
+        (_, "/healthz")
+        | (_, "/readyz")
+        | (_, "/status")
+        | (_, "/metrics")
+        | (_, "/attestation-servers")
+        | (_, "/data")
+        | (_, "/shutdown") => HttpHandleResult::err(405, "method not allowed"),
 
         // ── Unknown path ────────────────────────────────────────────
         _ => HttpHandleResult::err(404, "not found"),
@@ -1333,13 +1307,11 @@ fn verify_encauth_request(
     #[cfg(feature = "wasm")]
     {
         let config = crate::oidc_config().ok_or("oidc not configured")?;
-        let keys = enclave_os_wasm::jwks_fetcher::idp_ec_p256_keys(
-            &config.issuer,
-            &config.jwks_uri,
-        )
-        .map_err(|_| "idp jwks unavailable")?;
-        let enc_pub = crate::sessionrelay::identity_pub_sec1()
-            .map_err(|_| "identity key unavailable")?;
+        let keys =
+            enclave_os_wasm::jwks_fetcher::idp_ec_p256_keys(&config.issuer, &config.jwks_uri)
+                .map_err(|_| "idp jwks unavailable")?;
+        let enc_pub =
+            crate::sessionrelay::identity_pub_sec1().map_err(|_| "identity key unavailable")?;
         crate::encauth::verify_encauth(env, &keys, &enc_pub, None, now)
     }
     #[cfg(not(feature = "wasm"))]
@@ -1411,10 +1383,7 @@ fn handle_set_attestation_servers(
     let parsed: SetAttestationServersRequest = match serde_json::from_slice(&http_req.body) {
         Ok(p) => p,
         Err(e) => {
-            return HttpHandleResult::err(
-                400,
-                &format!("invalid request body: {e}"),
-            );
+            return HttpHandleResult::err(400, &format!("invalid request body: {e}"));
         }
     };
 
@@ -1425,10 +1394,7 @@ fn handle_set_attestation_servers(
     let hash_hex = hash
         .map(|h| enclave_os_common::hex::hex_encode(&h))
         .unwrap_or_default();
-    let body = format!(
-        "{{\"server_count\":{},\"hash\":\"{}\"}}",
-        count, hash_hex
-    );
+    let body = format!("{{\"server_count\":{},\"hash\":\"{}\"}}", count, hash_hex);
     HttpHandleResult::ok(body.into_bytes())
 }
 
@@ -1616,9 +1582,7 @@ fn handle_data_request_http(
             Response::Ok => HttpHandleResult::ok(b"{}".to_vec()),
             other => {
                 // Serialize any other response variant as JSON
-                HttpHandleResult::ok(
-                    serde_json::to_vec(&other).unwrap_or_default(),
-                )
+                HttpHandleResult::ok(serde_json::to_vec(&other).unwrap_or_default())
             }
         }
     } else if let Request::Data(inner) = req {
@@ -1707,16 +1671,14 @@ fn handle_rpc_request(
         match serde_json::from_slice(&http_req.body) {
             Ok(v) => v,
             Err(e) => {
-                return HttpHandleResult::err(
-                    400,
-                    &format!("invalid JSON body: {e}"),
-                );
+                return HttpHandleResult::err(400, &format!("invalid JSON body: {e}"));
             }
         }
     };
 
     // Build app_auth from the body's "app_auth" field if present.
-    let app_auth = body_value.get("app_auth")
+    let app_auth = body_value
+        .get("app_auth")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
@@ -1836,10 +1798,7 @@ fn handle_mcp_tools_request(
         return HttpHandleResult::err(400, "expected /api/v1/mcp/tools/<function>");
     }
     if *method != HttpMethod::Post {
-        return HttpHandleResult::err(
-            405,
-            "POST required for /api/v1/mcp/tools/<function>",
-        );
+        return HttpHandleResult::err(405, "POST required for /api/v1/mcp/tools/<function>");
     }
 
     let body_value: serde_json::Value = if http_req.body.is_empty() {
@@ -1848,10 +1807,7 @@ fn handle_mcp_tools_request(
         match serde_json::from_slice(&http_req.body) {
             Ok(v) => v,
             Err(e) => {
-                return HttpHandleResult::err(
-                    400,
-                    &format!("invalid JSON body: {e}"),
-                );
+                return HttpHandleResult::err(400, &format!("invalid JSON body: {e}"));
             }
         }
     };
@@ -1919,10 +1875,7 @@ fn transform_mcp_tools_response(result: HttpHandleResult) -> HttpHandleResult {
                     }
                     // McpTool serialises `input_schema` as `inputSchema`
                     // (MCP-spec). Rewrite to snake-case for the HTTP contract.
-                    if let Some(schema) = t
-                        .get("inputSchema")
-                        .or_else(|| t.get("input_schema"))
-                    {
+                    if let Some(schema) = t.get("inputSchema").or_else(|| t.get("input_schema")) {
                         obj.insert("input_schema".to_string(), schema.clone());
                     }
                     serde_json::Value::Object(obj)
@@ -1939,8 +1892,7 @@ fn transform_mcp_tools_response(result: HttpHandleResult) -> HttpHandleResult {
                 .unwrap_or("error");
             HttpHandleResult {
                 status: 400,
-                body: serde_json::to_vec(&serde_json::json!({"error": msg}))
-                    .unwrap_or_default(),
+                body: serde_json::to_vec(&serde_json::json!({"error": msg})).unwrap_or_default(),
                 shutdown: false,
                 content_type: None,
                 extra_headers: Vec::new(),
@@ -1981,11 +1933,7 @@ fn transform_mcp_call_response(result: HttpHandleResult) -> HttpHandleResult {
                 _ => serde_json::Value::Array(
                     returns
                         .into_iter()
-                        .map(|r| {
-                            r.get("value")
-                                .cloned()
-                                .unwrap_or(serde_json::Value::Null)
-                        })
+                        .map(|r| r.get("value").cloned().unwrap_or(serde_json::Value::Null))
                         .collect(),
                 ),
             };
@@ -1998,8 +1946,7 @@ fn transform_mcp_call_response(result: HttpHandleResult) -> HttpHandleResult {
                 .unwrap_or("error");
             HttpHandleResult {
                 status: 400,
-                body: serde_json::to_vec(&serde_json::json!({"error": msg}))
-                    .unwrap_or_default(),
+                body: serde_json::to_vec(&serde_json::json!({"error": msg})).unwrap_or_default(),
                 shutdown: false,
                 content_type: None,
                 extra_headers: Vec::new(),
@@ -2027,9 +1974,7 @@ fn dispatch_and_respond(
                 extra_headers: Vec::new(),
             },
             Response::Ok => HttpHandleResult::ok(b"{}".to_vec()),
-            other => HttpHandleResult::ok(
-                serde_json::to_vec(&other).unwrap_or_default(),
-            ),
+            other => HttpHandleResult::ok(serde_json::to_vec(&other).unwrap_or_default()),
         }
     } else {
         HttpHandleResult::err(404, "no module handled the request")
@@ -2046,8 +1991,7 @@ fn dispatch_and_respond(
 /// When running without egress, falls back to payload-only decoding over the
 /// RA-TLS channel (signature not verified cryptographically).
 fn verify_oidc_token(token: &str) -> Result<enclave_os_common::oidc::OidcClaims, String> {
-    let config = crate::oidc_config()
-        .ok_or_else(|| "OIDC not configured".to_string())?;
+    let config = crate::oidc_config().ok_or_else(|| "OIDC not configured".to_string())?;
 
     // ── Signature verification + payload decode ──────────────────────
     #[cfg(feature = "wasm")]
@@ -2066,28 +2010,36 @@ fn verify_oidc_token(token: &str) -> Result<enclave_os_common::oidc::OidcClaims,
         if parts.len() != 3 {
             return Err("malformed JWT: expected 3 dot-separated parts".into());
         }
-        let payload_bytes = base64_url_decode(parts[1])
-            .map_err(|e| format!("JWT payload base64: {e}"))?;
-        serde_json::from_slice(&payload_bytes)
-            .map_err(|e| format!("JWT payload JSON: {e}"))?
+        let payload_bytes =
+            base64_url_decode(parts[1]).map_err(|e| format!("JWT payload base64: {e}"))?;
+        serde_json::from_slice(&payload_bytes).map_err(|e| format!("JWT payload JSON: {e}"))?
     };
 
     // Validate issuer
-    let iss = claims.get("iss")
+    let iss = claims
+        .get("iss")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "JWT missing 'iss' claim".to_string())?;
     if iss != config.issuer {
-        return Err(format!("JWT issuer '{}' != expected '{}'", iss, config.issuer));
+        return Err(format!(
+            "JWT issuer '{}' != expected '{}'",
+            iss, config.issuer
+        ));
     }
 
     // Validate audience
     let aud_ok = match claims.get("aud") {
         Some(serde_json::Value::String(s)) => s == &config.audience,
-        Some(serde_json::Value::Array(arr)) => arr.iter().any(|v| v.as_str() == Some(&config.audience)),
+        Some(serde_json::Value::Array(arr)) => {
+            arr.iter().any(|v| v.as_str() == Some(&config.audience))
+        }
         _ => false,
     };
     if !aud_ok {
-        return Err(format!("JWT audience does not contain '{}'", config.audience));
+        return Err(format!(
+            "JWT audience does not contain '{}'",
+            config.audience
+        ));
     }
 
     // Validate expiry
@@ -2099,7 +2051,8 @@ fn verify_oidc_token(token: &str) -> Result<enclave_os_common::oidc::OidcClaims,
     }
 
     // Extract subject
-    let sub = claims.get("sub")
+    let sub = claims
+        .get("sub")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
@@ -2137,11 +2090,14 @@ fn verify_oidc_token(token: &str) -> Result<enclave_os_common::oidc::OidcClaims,
 #[cfg_attr(feature = "wasm", allow(dead_code))]
 fn base64_url_decode(input: &str) -> Result<Vec<u8>, String> {
     // Replace URL-safe chars with standard base64 chars
-    let standard: String = input.chars().map(|c| match c {
-        '-' => '+',
-        '_' => '/',
-        c => c,
-    }).collect();
+    let standard: String = input
+        .chars()
+        .map(|c| match c {
+            '-' => '+',
+            '_' => '/',
+            c => c,
+        })
+        .collect();
 
     // Add padding if needed
     let padded = match standard.len() % 4 {
@@ -2189,8 +2145,12 @@ fn base64_decode_standard(input: &str) -> Result<Vec<u8>, String> {
         let triple = ((a as u32) << 18) | ((b as u32) << 12) | ((c_val as u32) << 6) | (d as u32);
 
         out.push((triple >> 16) as u8);
-        if chunk[2] != b'=' { out.push((triple >> 8) as u8); }
-        if chunk[3] != b'=' { out.push(triple as u8); }
+        if chunk[2] != b'=' {
+            out.push((triple >> 8) as u8);
+        }
+        if chunk[3] != b'=' {
+            out.push(triple as u8);
+        }
     }
     Ok(out)
 }

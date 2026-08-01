@@ -93,8 +93,7 @@ use ring::digest;
 use crate::metrics::WasmMetricsStore;
 use crate::protocol::{
     AppPermissions, FunctionPolicy, Payer, WasmCall, WasmEnvelope, WasmManagementResult, WasmParam,
-    WasmResult,
-    WasmSchemaRequest,
+    WasmResult, WasmSchemaRequest,
 };
 use crate::protocol::{AppRolesAction, AppRolesResult, UserRoles};
 use crate::registry::AppRegistry;
@@ -344,7 +343,11 @@ impl WasmModule {
     /// the next RA-TLS handshake serves a leaf carrying the updated dependency
     /// set. Runtime-owned: reached only via the `wasm_set_dependencies` management
     /// command, never by the app.
-    pub fn set_dependencies(&self, name: &str, dependencies: Option<Vec<u8>>) -> Result<(), String> {
+    pub fn set_dependencies(
+        &self,
+        name: &str,
+        dependencies: Option<Vec<u8>>,
+    ) -> Result<(), String> {
         let updated_meta = {
             let mut reg = self
                 .registry
@@ -536,8 +539,7 @@ impl WasmModule {
                 // 15%), idempotent on call_id. Fee on success only; compute
                 // is metered to the owner regardless, below.
                 let fee = self.registry.lock().ok().and_then(|reg| {
-                    let (rule, sponsor_idx) =
-                        reg.price_context(&call.app, &call.function)?;
+                    let (rule, sponsor_idx) = reg.price_context(&call.app, &call.function)?;
                     match rule.payer {
                         Payer::Caller => {
                             if fee_wallet && rule.free_for.iter().any(|c| c == "wallet") {
@@ -554,9 +556,7 @@ impl WasmModule {
                         }
                         Payer::Sponsor => sponsor_idx
                             .and_then(|i| match call.params.get(i) {
-                                Some(WasmParam::String(s)) if !s.is_empty() => {
-                                    Some(s.clone())
-                                }
+                                Some(WasmParam::String(s)) if !s.is_empty() => Some(s.clone()),
                                 _ => None,
                             })
                             .map(|rp| (rule.credits, None, Some(rp))),
@@ -644,7 +644,13 @@ impl WasmModule {
             let role_store = build_app_role_store(&registry, &call.app);
             drop(registry);
             return self
-                .check_configure_authz(call, owners, app_id, permissions.as_ref(), role_store.as_ref())
+                .check_configure_authz(
+                    call,
+                    owners,
+                    app_id,
+                    permissions.as_ref(),
+                    role_store.as_ref(),
+                )
                 .map(Some);
         }
 
@@ -705,8 +711,7 @@ impl WasmModule {
         // (Authenticated semantics; a `free_for` class also needs the
         // token to prove the class). Sponsor-priced functions stay open —
         // the caller is never the payer.
-        let priced_caller =
-            matches!(&price_ctx, Some((rule, _)) if rule.payer == Payer::Caller);
+        let priced_caller = matches!(&price_ctx, Some((rule, _)) if rule.payer == Payer::Caller);
 
         // Public → no auth needed (unless caller-priced).
         if *policy == FunctionPolicy::Public && !priced_caller {
@@ -902,7 +907,8 @@ impl WasmModule {
         permissions: Option<&AppPermissions>,
         role_store: Option<&enclave_os_kvstore::SealedKvStore>,
     ) -> Result<AuthResult, Response> {
-        let deny = |message: String| Response::Data(serialize_or_error(&WasmResult::Error { message }));
+        let deny =
+            |message: String| Response::Data(serialize_or_error(&WasmResult::Error { message }));
 
         if app_id.is_none() && owners.is_empty() {
             enclave_os_common::enclave_log_info!(

@@ -8,8 +8,8 @@
 //! shared-memory enc_to_host queue. It serves as a lightweight wake-up
 //! signal for the host RPC dispatcher.
 
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::sync::OnceLock;
 
 static NOTIFY_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();

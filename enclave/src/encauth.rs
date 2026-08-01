@@ -106,8 +106,7 @@ pub fn verify_encauth(
     if env.v != 1 {
         return Err("unsupported version");
     }
-    let payload_bytes =
-        crate::sessionrelay::b64_decode(&env.payload).ok_or("payload b64")?;
+    let payload_bytes = crate::sessionrelay::b64_decode(&env.payload).ok_or("payload b64")?;
     let hw_sig_raw = crate::sessionrelay::b64_decode(&env.hw_sig).ok_or("hw_sig b64")?;
     let idp_sig_raw = crate::sessionrelay::b64_decode(&env.idp_sig).ok_or("idp_sig b64")?;
 
@@ -198,7 +197,13 @@ pub fn allow_rebind(sid: &str, now: u64) -> bool {
             w.count <= REBIND_RATE_LIMIT
         }
         _ => {
-            map.insert(sid.to_string(), RebindWindow { start: now, count: 1 });
+            map.insert(
+                sid.to_string(),
+                RebindWindow {
+                    start: now,
+                    count: 1,
+                },
+            );
             true
         }
     }
@@ -439,16 +444,26 @@ mod tests {
             buf.push(65);
             buf.extend_from_slice(&v);
         };
-        buf.push(0x01); buf.push(0x01); // 1: v = 1
-        buf.push(0x02); buf.extend_from_slice(&[0x63, b's', b'u', b'b']); // 2: "sub"
-        buf.push(0x03); buf.extend_from_slice(&[0x63, b's', b'i', b'd']); // 3: "sid"
-        buf.push(0x04); bstr32(&mut buf, 0xA1); // 4: workload_digest
-        buf.push(0x05); bstr32(&mut buf, 0xA2); // 5: enc_meas
-        buf.push(0x06); bstr65(&mut buf, 0xA3); // 6: enc_pub
-        buf.push(0x07); bstr32(&mut buf, 0xA4); // 7: quote_hash
-        buf.push(0x08); buf.extend_from_slice(&[0x1A, 0x65, 0x00, 0x00, 0x00]); // 8: not_before
-        buf.push(0x09); buf.extend_from_slice(&[0x1A, 0x66, 0x00, 0x00, 0x00]); // 9: not_after
-        buf.push(0x0A); bstr65(&mut buf, 0xA5); // 10: hw_pub
+        buf.push(0x01);
+        buf.push(0x01); // 1: v = 1
+        buf.push(0x02);
+        buf.extend_from_slice(&[0x63, b's', b'u', b'b']); // 2: "sub"
+        buf.push(0x03);
+        buf.extend_from_slice(&[0x63, b's', b'i', b'd']); // 3: "sid"
+        buf.push(0x04);
+        bstr32(&mut buf, 0xA1); // 4: workload_digest
+        buf.push(0x05);
+        bstr32(&mut buf, 0xA2); // 5: enc_meas
+        buf.push(0x06);
+        bstr65(&mut buf, 0xA3); // 6: enc_pub
+        buf.push(0x07);
+        bstr32(&mut buf, 0xA4); // 7: quote_hash
+        buf.push(0x08);
+        buf.extend_from_slice(&[0x1A, 0x65, 0x00, 0x00, 0x00]); // 8: not_before
+        buf.push(0x09);
+        buf.extend_from_slice(&[0x1A, 0x66, 0x00, 0x00, 0x00]); // 9: not_after
+        buf.push(0x0A);
+        bstr65(&mut buf, 0xA5); // 10: hw_pub
 
         let p = decode_encauth_payload(&buf).unwrap();
         assert_eq!(p.v, 1);
@@ -486,8 +501,10 @@ mod tests {
     const KAT_IDP_PUB_HEX: &str = "04a818bd9ebbbff1f75be3767981d0b80eac8f2398f0acb54acb621cf12d0f79951cc373bdcdabdff1abc828c47e2b3470f28cbcc24d37adb8913b7d8163560be2";
     const KAT_ENC_PUB_HEX: &str = "04dd511dcde3875568de732fde5634d8940b5bcfef668ace46f28bd813a27eb6af695e2fe52acb03f4d158a46335e0a726765540290c28614379953e1ab483d924";
     const KAT_PAYLOAD_B64: &str = "qgEBAmhrYXQtdXNlcgNna2F0LXNpZARYIKGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhBVgg4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eEGWEEE3VEdzeOHVWjecy_eVjTYlAtbz-9mis5G8ovYE6J-tq9pXi_lKssD9NFYpGM14KcmdlVAKQwoYUN5lT4atIPZJAdYILKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKyCBplU_EACRruaygAClhBBNuRe6MwWPKHvZyN8JI81MB3O5VpsUXLHk-N7_RXzfIh7WwH4HEkELLho3WJL94p40gFjUm5pANfE1C58syQdDY";
-    const KAT_HW_SIG_B64: &str = "KycpT_wNX3KiOcf1BM2c6pwEumKHRRHPw0g3GijHA4ixyE11NLXOWnH9-BKG4emlHi9sx_joU_vkRcy_qKp-rA";
-    const KAT_IDP_SIG_B64: &str = "YnNICq8sOff-c8cTKWtaywuhAT4cdE24nOGOJR6CdeRI8RpkD6RxBLTbMMlUBQ4kbX_fcBlIHvUbTJqqGunpYA";
+    const KAT_HW_SIG_B64: &str =
+        "KycpT_wNX3KiOcf1BM2c6pwEumKHRRHPw0g3GijHA4ixyE11NLXOWnH9-BKG4emlHi9sx_joU_vkRcy_qKp-rA";
+    const KAT_IDP_SIG_B64: &str =
+        "YnNICq8sOff-c8cTKWtaywuhAT4cdE24nOGOJR6CdeRI8RpkD6RxBLTbMMlUBQ4kbX_fcBlIHvUbTJqqGunpYA";
     const KAT_NOW: u64 = 1_700_000_100;
 
     fn kat_hex(hex: &str) -> Vec<u8> {
@@ -510,8 +527,7 @@ mod tests {
     /// expected fields (no IPP needed).
     #[test]
     fn encauth_fixture_payload_decodes() {
-        let payload_bytes =
-            crate::sessionrelay::b64_decode(KAT_PAYLOAD_B64).unwrap();
+        let payload_bytes = crate::sessionrelay::b64_decode(KAT_PAYLOAD_B64).unwrap();
         let p = decode_encauth_payload(&payload_bytes).unwrap();
         assert_eq!(p.v, 1);
         assert_eq!(p.sub, "kat-user");
@@ -538,8 +554,7 @@ mod tests {
         assert_eq!(p.sid, "kat-sid");
 
         // Tampered payload → hw_sig (or idp_sig) must fail.
-        let mut payload_bytes =
-            crate::sessionrelay::b64_decode(KAT_PAYLOAD_B64).unwrap();
+        let mut payload_bytes = crate::sessionrelay::b64_decode(KAT_PAYLOAD_B64).unwrap();
         let last = payload_bytes.len() - 1;
         payload_bytes[last] ^= 0x01;
         let mut bad = kat_envelope();

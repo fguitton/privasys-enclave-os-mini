@@ -20,9 +20,9 @@
 //! The version field is a little-endian `u16` at bytes 0–1.
 
 #[cfg(feature = "sgx")]
-use alloc::{string::String, vec::Vec, format};
+use alloc::{format, string::String, vec::Vec};
 #[cfg(not(feature = "sgx"))]
-use std::{string::String, vec::Vec, format};
+use std::{format, string::String, vec::Vec};
 
 use core::fmt::Write;
 
@@ -125,7 +125,9 @@ pub fn parse_quote(evidence: &[u8]) -> Result<QuoteIdentity, String> {
     match version {
         3 => parse_sgx_quote(evidence),
         4 => parse_tdx_quote(evidence),
-        v => Err(format!("unsupported quote version {v} (expected 3=SGX or 4=TDX)")),
+        v => Err(format!(
+            "unsupported quote version {v} (expected 3=SGX or 4=TDX)"
+        )),
     }
 }
 
@@ -208,7 +210,11 @@ pub fn extract_report_data(evidence: &[u8]) -> Result<[u8; 64], String> {
             }
             TDX_REPORT_DATA_OFFSET
         }
-        v => return Err(format!("unsupported quote version {v} (expected 3=SGX or 4=TDX)")),
+        v => {
+            return Err(format!(
+                "unsupported quote version {v} (expected 3=SGX or 4=TDX)"
+            ))
+        }
     };
 
     let mut rd = [0u8; 64];
