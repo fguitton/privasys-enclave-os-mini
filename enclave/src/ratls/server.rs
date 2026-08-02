@@ -1000,7 +1000,9 @@ fn handle_http_request(
             base_ctx,
         ) {
             HonestIngressRoute::Operational => {}
-            HonestIngressRoute::Peer | HonestIngressRoute::Proposal => {
+            HonestIngressRoute::Peer
+            | HonestIngressRoute::Bootstrap
+            | HonestIngressRoute::Proposal => {
                 return crate::dispatch_honest_ingress(http_req, base_ctx).map_or_else(
                     || HttpHandleResult::err(503, "honest ingress unavailable"),
                     |response| HttpHandleResult {

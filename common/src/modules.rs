@@ -15,6 +15,7 @@ use crate::protocol::{HttpMethod, Request, Response};
 
 pub const HONEST_PEER_SNI: &str = "peer.s1.invalid";
 pub const HONEST_PEER_ROUTE: &str = "/honest/v1/peer";
+pub const HONEST_BOOTSTRAP_ROUTE: &str = "/honest/v1/bootstrap";
 pub const HONEST_PROPOSAL_ROUTE: &str = "/honest/v1/proposals";
 
 // ---------------------------------------------------------------------------
@@ -159,6 +160,7 @@ pub struct RequestContext {
 pub enum HonestIngressRoute {
     Operational,
     Peer,
+    Bootstrap,
     Proposal,
     PeerAuthenticationRequired,
     Denied,
@@ -193,6 +195,11 @@ pub fn classify_honest_ingress(
             return HonestIngressRoute::PeerAuthenticationRequired;
         }
         return HonestIngressRoute::Peer;
+    }
+    if matches!((method, path), (HttpMethod::Post, HONEST_BOOTSTRAP_ROUTE))
+        && context.server_name.as_deref() != Some(HONEST_PEER_SNI)
+    {
+        return HonestIngressRoute::Bootstrap;
     }
     if matches!((method, path), (HttpMethod::Post, HONEST_PROPOSAL_ROUTE))
         && context.server_name.as_deref() != Some(HONEST_PEER_SNI)
@@ -242,8 +249,8 @@ pub trait EnclaveModule: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_honest_ingress, HonestIngressRoute, RequestContext, HONEST_PEER_ROUTE,
-        HONEST_PEER_SNI, HONEST_PROPOSAL_ROUTE,
+        classify_honest_ingress, HonestIngressRoute, RequestContext, HONEST_BOOTSTRAP_ROUTE,
+        HONEST_PEER_ROUTE, HONEST_PEER_SNI, HONEST_PROPOSAL_ROUTE,
     };
     use crate::protocol::HttpMethod;
 
@@ -283,6 +290,22 @@ mod tests {
             classify_honest_ingress(
                 &HttpMethod::Post,
                 HONEST_PROPOSAL_ROUTE,
+                &context(Some(HONEST_PEER_SNI), true),
+            ),
+            HonestIngressRoute::Denied
+        );
+        assert_eq!(
+            classify_honest_ingress(
+                &HttpMethod::Post,
+                HONEST_BOOTSTRAP_ROUTE,
+                &context(Some("enclave-os.invalid"), false),
+            ),
+            HonestIngressRoute::Bootstrap
+        );
+        assert_eq!(
+            classify_honest_ingress(
+                &HttpMethod::Post,
+                HONEST_BOOTSTRAP_ROUTE,
                 &context(Some(HONEST_PEER_SNI), true),
             ),
             HonestIngressRoute::Denied
