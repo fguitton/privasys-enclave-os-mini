@@ -127,9 +127,20 @@ pub struct RequestContext {
     /// handshake (mutual RA-TLS). `None` for regular browser clients.
     pub peer_cert_der: Option<Vec<u8>>,
 
+    /// DER-encoded leaf certificate actually served by this TLS session.
+    ///
+    /// This is captured at the channel-binding certificate-emission seam, so
+    /// it is the rebound leaf seen by the peer rather than the pre-handshake
+    /// placeholder certificate.
+    pub local_cert_der: Option<Vec<u8>>,
+
     /// Random nonce sent to the client via the TLS CertificateRequest
     /// extension `0xFFBB` for bidirectional challenge-response attestation.
     pub client_challenge_nonce: Option<Vec<u8>>,
+
+    /// Random nonce received in the client's ClientHello and committed by the
+    /// locally served challenge-mode certificate.
+    pub local_challenge_nonce: Option<Vec<u8>>,
 
     /// 32-byte RA-TLS channel binder for this TLS session (TLS 1.3), derived
     /// from the handshake key schedule. A mutual-auth verifier folds it into the
@@ -242,7 +253,9 @@ mod tests {
             server_name: server_name.map(str::to_owned),
             attested_endpoint: None,
             peer_cert_der: mutual.then(|| vec![1]),
+            local_cert_der: mutual.then(|| vec![4]),
             client_challenge_nonce: mutual.then(|| vec![2]),
+            local_challenge_nonce: mutual.then(|| vec![5]),
             channel_binder: mutual.then(|| vec![3]),
             oidc_claims: None,
         }

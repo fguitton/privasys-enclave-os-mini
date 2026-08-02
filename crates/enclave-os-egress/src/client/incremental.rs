@@ -8,7 +8,7 @@ use std::io::{Read, Write};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConnection, RootCertStore};
 
-use super::{build_client_config, verify_channel_binding, RaTlsPolicy};
+use super::{build_client_config, verify_channel_binding, RaTlsPolicy, SharedClientAuthCapture};
 
 /// Incrementally advanced TLS client for the control-TCS raw multiplexer.
 ///
@@ -21,6 +21,7 @@ pub struct IncrementalTlsClient {
     ratls: Option<RaTlsPolicy>,
     channel_verified: bool,
     plaintext: Vec<u8>,
+    client_auth_capture: Option<SharedClientAuthCapture>,
 }
 
 impl IncrementalTlsClient {
@@ -41,7 +42,16 @@ impl IncrementalTlsClient {
         {
             return Err("incremental TLS requires separately pumped quote appraisal".to_string());
         }
-        let config = build_client_config(root_store, ratls.as_ref()).map_err(str::to_string)?;
+        let client_auth_capture = ratls
+            .as_ref()
+            .and_then(|policy| policy.client_identity.as_ref())
+            .map(|_| SharedClientAuthCapture::default());
+        let config = build_client_config(
+            root_store,
+            ratls.as_ref(),
+            client_auth_capture.clone(),
+        )
+        .map_err(str::to_string)?;
         let server_name = ServerName::try_from(server_name.to_string())
             .map_err(|_| "invalid incremental TLS server name".to_string())?;
         let tls_conn = ClientConnection::new(config, server_name)
@@ -51,6 +61,7 @@ impl IncrementalTlsClient {
             ratls,
             channel_verified: false,
             plaintext: Vec::new(),
+            client_auth_capture,
         })
     }
 
@@ -125,6 +136,25 @@ impl IncrementalTlsClient {
             .peer_certificates()
             .and_then(|certificates| certificates.first())
             .map(|certificate| certificate.as_ref().to_vec())
+    }
+
+    /// Exact client leaf emitted for this TLS session, when mutual RA-TLS was
+    /// requested and the peer asked for a certificate.
+    #[must_use]
+    pub fn local_cert_der(&self) -> Option<Vec<u8>> {
+        self.client_auth_capture
+            .as_ref()
+            .and_then(|capture| capture.lock().ok())
+            .and_then(|capture| capture.certificate_der())
+    }
+
+    /// Server challenge committed by this session's client certificate.
+    #[must_use]
+    pub fn peer_challenge_nonce(&self) -> Option<Vec<u8>> {
+        self.client_auth_capture
+            .as_ref()
+            .and_then(|capture| capture.lock().ok())
+            .and_then(|capture| capture.challenge_nonce())
     }
 
     #[must_use]

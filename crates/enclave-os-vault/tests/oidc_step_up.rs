@@ -42,7 +42,9 @@ fn ctx_with_amr(sub: &str, amr: &[&str]) -> RequestContext {
         server_name: None,
         attested_endpoint: None,
         peer_cert_der: None,
+        local_cert_der: None,
         client_challenge_nonce: None,
+        local_challenge_nonce: None,
         channel_binder: None,
         oidc_claims: Some(OidcClaims {
             sub: sub.to_string(),
@@ -71,7 +73,9 @@ fn ctx_step_up(
         server_name: None,
         attested_endpoint: None,
         peer_cert_der: None,
+        local_cert_der: None,
         client_challenge_nonce: None,
+        local_challenge_nonce: None,
         channel_binder: None,
         oidc_claims: Some(OidcClaims {
             sub: sub.to_string(),

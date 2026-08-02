@@ -14,6 +14,7 @@
 
 use crate::enclave_log_error;
 use enclave_os_common::protocol;
+use std::sync::{Arc, Mutex};
 use std::vec::Vec;
 
 /// A TLS session backed by a rustls `ServerConnection`.
@@ -35,6 +36,10 @@ pub struct RaTlsSession {
     /// extension `0xFFBB` (challenge mode only).  The client binds it
     /// into its own attestation report_data.
     client_challenge_nonce: Option<Vec<u8>>,
+    /// ClientHello challenge committed by this session's served leaf.
+    local_challenge_nonce: Option<Vec<u8>>,
+    /// Exact leaf emitted after the TLS 1.3 channel binder became available.
+    local_cert_der: Arc<Mutex<Option<Vec<u8>>>>,
     /// Exact SNI selected before the TLS connection was constructed.
     server_name: Option<String>,
     /// Endpoint identity selected with the SNI leaf for this session.
@@ -74,6 +79,8 @@ impl RaTlsSession {
     pub fn new(
         tls_conn: rustls::ServerConnection,
         client_challenge_nonce: Option<Vec<u8>>,
+        local_challenge_nonce: Option<Vec<u8>>,
+        local_cert_der: Arc<Mutex<Option<Vec<u8>>>>,
         server_name: Option<String>,
         attested_endpoint: Option<enclave_os_common::modules::AttestedEndpointIdentity>,
     ) -> Self {
@@ -81,6 +88,8 @@ impl RaTlsSession {
             tls_conn,
             read_buf: Vec::new(),
             client_challenge_nonce,
+            local_challenge_nonce,
+            local_cert_der,
             server_name,
             attested_endpoint,
             fido2_identity: None,
@@ -342,6 +351,19 @@ impl RaTlsSession {
     /// extension `0xFFBB`.
     pub fn client_challenge_nonce(&self) -> Option<&Vec<u8>> {
         self.client_challenge_nonce.as_ref()
+    }
+
+    /// Return the ClientHello challenge committed by the served certificate.
+    pub fn local_challenge_nonce(&self) -> Option<&Vec<u8>> {
+        self.local_challenge_nonce.as_ref()
+    }
+
+    /// Return the exact channel-bound leaf served on this TLS session.
+    pub fn local_cert_der(&self) -> Option<Vec<u8>> {
+        self.local_cert_der
+            .lock()
+            .ok()
+            .and_then(|certificate| certificate.clone())
     }
 
     /// Return the exact SNI selected by the ClientHello.

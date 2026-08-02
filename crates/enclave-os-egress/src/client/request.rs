@@ -180,7 +180,7 @@ fn https_request_inner(
     root_store: &RootCertStore,
     ratls: Option<&RaTlsPolicy>,
 ) -> Result<HttpResponse, String> {
-    let tls_config = build_client_config(root_store, ratls).map_err(|e| e.to_string())?;
+    let tls_config = build_client_config(root_store, ratls, None).map_err(|e| e.to_string())?;
     let fd = io
         .tcp_connect(host, port)
         .map_err(|error| format!("TCP connect failed: {error}"))?;

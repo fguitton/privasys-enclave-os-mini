@@ -12,7 +12,7 @@
 //! custom headers, and optional RA-TLS verification.
 
 use std::string::String;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::vec::Vec;
 
 use core::mem;
@@ -423,6 +423,25 @@ pub fn enclave_self_mrenclave() -> Option<[u8; 32]> {
 struct ChallengeBoundClientAuth {
     identity: ClientCertIdentity,
     provider: Arc<CryptoProvider>,
+    capture: Option<SharedClientAuthCapture>,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct ClientAuthCapture {
+    certificate_der: Option<Vec<u8>>,
+    challenge_nonce: Option<Vec<u8>>,
+}
+
+pub(super) type SharedClientAuthCapture = Arc<Mutex<ClientAuthCapture>>;
+
+impl ClientAuthCapture {
+    pub(super) fn certificate_der(&self) -> Option<Vec<u8>> {
+        self.certificate_der.clone()
+    }
+
+    pub(super) fn challenge_nonce(&self) -> Option<Vec<u8>> {
+        self.challenge_nonce.clone()
+    }
 }
 
 impl ResolvesClientCert for ChallengeBoundClientAuth {
@@ -440,10 +459,16 @@ impl ResolvesClientCert for ChallengeBoundClientAuth {
         let challenge = ratls_challenge?;
         let signer = *CLIENT_CERT_SIGNER.get()?;
         let (chain_der, pkcs8) = signer.sign(challenge, ratls_channel_binder, &self.identity)?;
+        let leaf = chain_der.first()?.clone();
         let certs: Vec<CertificateDer<'static>> =
             chain_der.into_iter().map(CertificateDer::from).collect();
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8));
         let signing_key = self.provider.key_provider.load_private_key(key).ok()?;
+        if let Some(capture) = self.capture.as_ref() {
+            let mut capture = capture.lock().ok()?;
+            capture.certificate_der = Some(leaf);
+            capture.challenge_nonce = Some(challenge.to_vec());
+        }
         Some(Arc::new(CertifiedKey::new(certs, signing_key)))
     }
 
@@ -465,6 +490,7 @@ impl ResolvesClientCert for ChallengeBoundClientAuth {
 fn build_client_config(
     root_store: &RootCertStore,
     ratls: Option<&RaTlsPolicy>,
+    client_auth_capture: Option<SharedClientAuthCapture>,
 ) -> Result<Arc<ClientConfig>, &'static str> {
     let provider = Arc::new(default_provider());
 
@@ -493,6 +519,7 @@ fn build_client_config(
                 wants_client_cert.with_client_cert_resolver(Arc::new(ChallengeBoundClientAuth {
                     identity: identity.clone(),
                     provider: provider.clone(),
+                    capture: client_auth_capture.clone(),
                 }))
             }
             None => wants_client_cert.with_no_client_auth(),

@@ -28,7 +28,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::string::String;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::vec::Vec;
 
 use crate::modules;
@@ -110,6 +110,7 @@ pub struct IngressServer {
 /// A cached ServerConfig for deterministic (non-challenge) connections.
 struct CachedConfig {
     config: Arc<ServerConfig>,
+    local_cert_der: Arc<Mutex<Option<Vec<u8>>>>,
     expires_at: u64,
     /// CertStore generation at the time this config was created.
     /// Used to detect stale caches after app register/unregister.
@@ -351,7 +352,9 @@ impl IngressServer {
             server_name: session.server_name().map(str::to_owned),
             attested_endpoint: session.attested_endpoint(),
             peer_cert_der: session.peer_cert_der(),
+            local_cert_der: session.local_cert_der(),
             client_challenge_nonce: session.client_challenge_nonce().cloned(),
+            local_challenge_nonce: session.local_challenge_nonce().cloned(),
             channel_binder: session.ratls_channel_binder(),
             oidc_claims: None,
         };
@@ -481,6 +484,8 @@ impl IngressServer {
         let mut session = RaTlsSession::new(
             server_conn,
             tls_result.client_challenge_nonce,
+            hello.challenge_nonce,
+            tls_result.local_cert_der,
             hello.sni,
             tls_result.attested_endpoint,
         );
@@ -545,6 +550,7 @@ impl IngressServer {
                 return Ok(TlsConfigResult {
                     config: cached.config.clone(),
                     client_challenge_nonce: None,
+                    local_cert_der: cached.local_cert_der.clone(),
                     attested_endpoint: app_data.as_ref().and_then(|app| app.attested_endpoint),
                 });
             }
@@ -563,6 +569,7 @@ impl IngressServer {
             cache_key,
             CachedConfig {
                 config: tls_result.config.clone(),
+                local_cert_der: tls_result.local_cert_der.clone(),
                 expires_at: now + attestation::DETERMINISTIC_VALIDITY_SECS,
                 store_generation: current_gen,
             },
@@ -570,6 +577,7 @@ impl IngressServer {
         Ok(TlsConfigResult {
             config: tls_result.config,
             client_challenge_nonce: None, // deterministic mode: no nonce
+            local_cert_der: tls_result.local_cert_der,
             attested_endpoint: tls_result.attested_endpoint,
         })
     }
@@ -787,6 +795,8 @@ struct TlsConfigResult {
     config: Arc<ServerConfig>,
     /// Client challenge nonce (present only in challenge-response mode).
     client_challenge_nonce: Option<Vec<u8>>,
+    /// Exact leaf emitted for this config/session.
+    local_cert_der: Arc<Mutex<Option<Vec<u8>>>>,
     /// Endpoint identity selected with the per-SNI leaf.
     attested_endpoint: Option<enclave_os_common::modules::AttestedEndpointIdentity>,
 }
@@ -800,6 +810,7 @@ struct ChannelBindingMinter {
     nonce: Vec<u8>,
     app: Option<cert_store::AppCertData>,
     server_name: Option<String>,
+    local_cert_der: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 impl core::fmt::Debug for ChannelBindingMinter {
@@ -823,15 +834,16 @@ impl RaTlsBindCertificate for ChannelBindingMinter {
             }
         }
         .ok()?;
+        let leaf = result.cert_chain_der.first()?.clone();
         let certs: Vec<CertificateDer<'static>> = result
             .cert_chain_der
             .into_iter()
             .map(|der| CertificateDer::from(der).into_owned())
             .collect();
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(result.pkcs8_key));
-        CertifiedKey::from_der(certs, key, &default_provider())
-            .ok()
-            .map(Arc::new)
+        let certified = Arc::new(CertifiedKey::from_der(certs, key, &default_provider()).ok()?);
+        *self.local_cert_der.lock().ok()? = Some(leaf);
+        Some(certified)
     }
 }
 
@@ -855,6 +867,12 @@ fn build_tls_config(
         None => attestation::generate_ratls_certificate(ca, mode, server_name)?,
     };
 
+    let initial_leaf = result
+        .cert_chain_der
+        .first()
+        .cloned()
+        .ok_or_else(|| "RA-TLS certificate chain is empty".to_string())?;
+    let local_cert_der = Arc::new(Mutex::new(Some(initial_leaf)));
     let certs: Vec<CertificateDer<'static>> = result
         .cert_chain_der
         .into_iter()
@@ -891,12 +909,14 @@ fn build_tls_config(
             nonce,
             app: app.cloned(),
             server_name: server_name.map(str::to_owned),
+            local_cert_der: local_cert_der.clone(),
         }));
     }
 
     Ok(TlsConfigResult {
         config: Arc::new(config),
         client_challenge_nonce: result.client_challenge_nonce,
+        local_cert_der,
         attested_endpoint: app.and_then(|app| app.attested_endpoint),
     })
 }
@@ -1462,7 +1482,9 @@ fn handle_fido2_request(
         server_name: base_ctx.server_name.clone(),
         attested_endpoint: base_ctx.attested_endpoint,
         peer_cert_der: base_ctx.peer_cert_der.clone(),
+        local_cert_der: base_ctx.local_cert_der.clone(),
         client_challenge_nonce: base_ctx.client_challenge_nonce.clone(),
+        local_challenge_nonce: base_ctx.local_challenge_nonce.clone(),
         channel_binder: base_ctx.channel_binder.clone(),
         oidc_claims,
     };
@@ -1562,7 +1584,9 @@ fn handle_data_request_http(
         server_name: base_ctx.server_name.clone(),
         attested_endpoint: base_ctx.attested_endpoint,
         peer_cert_der: base_ctx.peer_cert_der.clone(),
+        local_cert_der: base_ctx.local_cert_der.clone(),
         client_challenge_nonce: base_ctx.client_challenge_nonce.clone(),
+        local_challenge_nonce: base_ctx.local_challenge_nonce.clone(),
         channel_binder: base_ctx.channel_binder.clone(),
         oidc_claims,
     };
@@ -1641,7 +1665,9 @@ fn handle_rpc_request(
         server_name: base_ctx.server_name.clone(),
         attested_endpoint: base_ctx.attested_endpoint,
         peer_cert_der: base_ctx.peer_cert_der.clone(),
+        local_cert_der: base_ctx.local_cert_der.clone(),
         client_challenge_nonce: base_ctx.client_challenge_nonce.clone(),
+        local_challenge_nonce: base_ctx.local_challenge_nonce.clone(),
         channel_binder: base_ctx.channel_binder.clone(),
         oidc_claims,
     };
@@ -1765,7 +1791,9 @@ fn handle_mcp_tools_request(
         server_name: base_ctx.server_name.clone(),
         attested_endpoint: base_ctx.attested_endpoint,
         peer_cert_der: base_ctx.peer_cert_der.clone(),
+        local_cert_der: base_ctx.local_cert_der.clone(),
         client_challenge_nonce: base_ctx.client_challenge_nonce.clone(),
+        local_challenge_nonce: base_ctx.local_challenge_nonce.clone(),
         channel_binder: base_ctx.channel_binder.clone(),
         oidc_claims,
     };
