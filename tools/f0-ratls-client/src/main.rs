@@ -37,7 +37,7 @@ static NEXT_FD: AtomicI32 = AtomicI32::new(10_000);
 
 #[derive(Debug)]
 struct Args {
-    cwasm: PathBuf,
+    cwasm: Option<PathBuf>,
     ca_cert: PathBuf,
     host: String,
     connect_host: String,
@@ -50,6 +50,9 @@ struct Args {
     health_only: bool,
     shutdown_after_health: bool,
     endpoint_join: bool,
+    raw_post_path: Option<String>,
+    raw_body_file: Option<PathBuf>,
+    expected_status: u16,
 }
 
 fn sockets() -> &'static Mutex<HashMap<i32, TcpStream>> {
@@ -186,6 +189,9 @@ fn parse_args() -> Result<Args, String> {
     let mut health_only = false;
     let mut shutdown_after_health = false;
     let mut endpoint_join = false;
+    let mut raw_post_path = None;
+    let mut raw_body_file = None;
+    let mut expected_status = 200_u16;
 
     while let Some(flag) = values.next() {
         match flag.as_str() {
@@ -224,12 +230,21 @@ fn parse_args() -> Result<Args, String> {
             "--health-only" => health_only = true,
             "--shutdown-after-health" => shutdown_after_health = true,
             "--endpoint-join" => endpoint_join = true,
+            "--raw-post-path" => raw_post_path = Some(take_value(&mut values, &flag)?),
+            "--raw-body-file" => {
+                raw_body_file = Some(PathBuf::from(take_value(&mut values, &flag)?));
+            }
+            "--expect-status" => {
+                expected_status = take_value(&mut values, &flag)?
+                    .parse()
+                    .map_err(|_| "invalid --expect-status".to_string())?;
+            }
             _ => return Err(format!("unknown argument: {flag}")),
         }
     }
 
     Ok(Args {
-        cwasm: cwasm.ok_or_else(|| "--cwasm is required".to_string())?,
+        cwasm,
         ca_cert: ca_cert.ok_or_else(|| "--ca-cert is required".to_string())?,
         host,
         connect_host,
@@ -242,6 +257,9 @@ fn parse_args() -> Result<Args, String> {
         health_only,
         shutdown_after_health,
         endpoint_join,
+        raw_post_path,
+        raw_body_file,
+        expected_status,
     })
 }
 
@@ -393,9 +411,29 @@ fn run() -> Result<(), String> {
     if count == 0 {
         return Err("CA certificate bundle was empty".into());
     }
-    let cwasm = fs::read(&args.cwasm).map_err(|error| format!("failed to read cwasm: {error}"))?;
-
     await_health(&args)?;
+    if let Some(path) = args.raw_post_path.as_deref() {
+        if !path.starts_with('/') || path.contains(['\r', '\n']) {
+            return Err("--raw-post-path must be one absolute HTTP path".into());
+        }
+        let body = args
+            .raw_body_file
+            .as_ref()
+            .map(fs::read)
+            .transpose()
+            .map_err(|error| format!("failed to read raw request body: {error}"))?
+            .unwrap_or_default();
+        let (status, response) = request_with_status(&args, "POST", path, Some(&body))?;
+        if status != args.expected_status {
+            return Err(format!(
+                "raw POST returned HTTP {status}, expected {}",
+                args.expected_status
+            ));
+        }
+        println!("RAW-POST-STATUS: {status}");
+        println!("RAW-POST-BODY: {}", String::from_utf8_lossy(&response));
+        return Ok(());
+    }
     if args.endpoint_join {
         let body = serde_json::to_vec(&json!({
             "endpoint_manifest_id": "41414141414141414141414141414141",
@@ -445,6 +483,12 @@ fn run() -> Result<(), String> {
         );
         return Ok(());
     }
+
+    let cwasm_path = args
+        .cwasm
+        .as_ref()
+        .ok_or_else(|| "--cwasm is required outside health and raw POST modes".to_string())?;
+    let cwasm = fs::read(cwasm_path).map_err(|error| format!("failed to read cwasm: {error}"))?;
 
     let load_body = serde_json::to_vec(&json!({
         "wasm_load": {
