@@ -121,6 +121,23 @@ struct Cli {
     /// Test-only literal IP:port for the incremental appraised peer probe.
     #[arg(long)]
     s1_peer_probe_endpoint: Option<String>,
+
+    /// Development-only physical-cluster node ID (1..=5).
+    #[arg(long)]
+    c3_development_node_id: Option<u64>,
+
+    /// Development-only fixed network ID as 32 hexadecimal characters.
+    #[arg(long)]
+    c3_development_network_id: Option<String>,
+
+    /// Five `node-id=IP:port` entries for the physical cluster.
+    #[arg(long, value_delimiter = ',')]
+    c3_development_peer_endpoints: Option<Vec<String>>,
+
+    /// File containing exactly two P-256 reviewer public keys, one hex key
+    /// per line. Private reviewer keys never enter the host configuration.
+    #[arg(long)]
+    c3_development_reviewer_keys_file: Option<String>,
 }
 
 fn spawn_control_ecall(enclave_id: u64, config_bytes: Vec<u8>) -> Result<thread::JoinHandle<i32>> {
@@ -398,6 +415,62 @@ fn main() -> Result<()> {
     }
     if let Some(endpoint) = cli.s1_peer_probe_endpoint {
         config["s1_peer_probe_endpoint"] = serde_json::Value::String(endpoint);
+    }
+
+    let c3_arguments = [
+        cli.c3_development_node_id.is_some(),
+        cli.c3_development_network_id.is_some(),
+        cli.c3_development_peer_endpoints.is_some(),
+        cli.c3_development_reviewer_keys_file.is_some(),
+    ];
+    if c3_arguments.iter().any(|present| *present) && !c3_arguments.iter().all(|present| *present) {
+        anyhow::bail!("all C3 development-cluster arguments are required together");
+    }
+    if let Some(node_id) = cli.c3_development_node_id {
+        if !(1..=5).contains(&node_id) {
+            anyhow::bail!("--c3-development-node-id must be in 1..=5");
+        }
+        let network_id = cli.c3_development_network_id.as_deref().unwrap_or_default();
+        if network_id.len() != 32 || !network_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            anyhow::bail!("--c3-development-network-id must contain 32 hexadecimal characters");
+        }
+        let endpoints = cli
+            .c3_development_peer_endpoints
+            .as_ref()
+            .expect("all C3 arguments checked");
+        if endpoints.len() != 5 {
+            anyhow::bail!("--c3-development-peer-endpoints requires exactly five entries");
+        }
+        let reviewer_path = cli
+            .c3_development_reviewer_keys_file
+            .as_deref()
+            .expect("all C3 arguments checked");
+        let reviewer_keys: Vec<String> = std::fs::read_to_string(reviewer_path)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to read reviewer key file '{}': {}",
+                    reviewer_path,
+                    error
+                )
+            })?
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if reviewer_keys.len() != 2
+            || reviewer_keys
+                .iter()
+                .any(|key| key.len() != 130 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            anyhow::bail!("reviewer key file must contain exactly two 130-character hex keys");
+        }
+        config["c3_development"] = serde_json::json!({
+            "node_id": node_id,
+            "network_id": network_id,
+            "peer_endpoints": endpoints,
+            "reviewer_public_keys": reviewer_keys,
+        });
     }
 
     let config_bytes = serde_json::to_vec(&config)?;

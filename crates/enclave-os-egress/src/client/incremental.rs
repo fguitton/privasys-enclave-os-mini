@@ -46,12 +46,8 @@ impl IncrementalTlsClient {
             .as_ref()
             .and_then(|policy| policy.client_identity.as_ref())
             .map(|_| SharedClientAuthCapture::default());
-        let config = build_client_config(
-            root_store,
-            ratls.as_ref(),
-            client_auth_capture.clone(),
-        )
-        .map_err(str::to_string)?;
+        let config = build_client_config(root_store, ratls.as_ref(), client_auth_capture.clone())
+            .map_err(str::to_string)?;
         let server_name = ServerName::try_from(server_name.to_string())
             .map_err(|_| "invalid incremental TLS server name".to_string())?;
         let tls_conn = ClientConnection::new(config, server_name)
