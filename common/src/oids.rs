@@ -205,3 +205,19 @@ pub const HONEST_ENDPOINT_ROUTE_DIGEST_OID_STR: &str = "1.3.6.1.4.1.65230.7.5";
 /// Endpoint activation epoch, unsigned big-endian — `1.3.6.1.4.1.65230.7.6`.
 pub const HONEST_ENDPOINT_ACTIVATION_EPOCH_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 7, 6];
 pub const HONEST_ENDPOINT_ACTIVATION_EPOCH_OID_STR: &str = "1.3.6.1.4.1.65230.7.6";
+
+/// Stable logical endpoint identity — `1.3.6.1.4.1.65230.7.7`.
+pub const HONEST_ENDPOINT_ID_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 7, 7];
+pub const HONEST_ENDPOINT_ID_OID_STR: &str = "1.3.6.1.4.1.65230.7.7";
+
+/// Manifest-scoped external operation identity — `1.3.6.1.4.1.65230.7.8`.
+pub const HONEST_OPERATION_ID_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 7, 8];
+pub const HONEST_OPERATION_ID_OID_STR: &str = "1.3.6.1.4.1.65230.7.8";
+
+/// Immutable M0 workflow-generation identity — `1.3.6.1.4.1.65230.7.9`.
+pub const HONEST_WORKFLOW_GENERATION_ID_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 7, 9];
+pub const HONEST_WORKFLOW_GENERATION_ID_OID_STR: &str = "1.3.6.1.4.1.65230.7.9";
+
+/// Operation entry-stage ID, unsigned big-endian — `1.3.6.1.4.1.65230.7.10`.
+pub const HONEST_ENTRY_STAGE_ID_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 7, 10];
+pub const HONEST_ENTRY_STAGE_ID_OID_STR: &str = "1.3.6.1.4.1.65230.7.10";

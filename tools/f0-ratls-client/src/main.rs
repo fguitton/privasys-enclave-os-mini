@@ -27,8 +27,12 @@ const APP_NAME: &str = "honest-f0-opaque";
 const EXPECTED_RESPONSE: &str = "honest-opaque-fixture/0.1.0";
 const M0_WORKFLOW_MANIFEST_DIGEST: &str =
     "953eff6856105cf5e1ab77b94b94ceaf7c8d4c45a84f9ea590f6a506636dd3bd";
+const M0_ENDPOINT_MANIFEST_ID: [u8; 16] = [
+    0xb9, 0x87, 0xc6, 0x95, 0xfb, 0x26, 0xa8, 0x94, 0xfe, 0x3e, 0xbc, 0x20, 0x30, 0xb0, 0xca,
+    0xa4,
+];
 const M0_ENDPOINT_MANIFEST_DIGEST: &str =
-    "bd712af1d1f77e78c165d382500c1ba0ccf9de80eb61bdc0aad1e4de841f4694";
+    "e8efa235f99af54f62df39e2930a89f85d57865bede204594dc6b4454917b8e3";
 
 static SOCKETS: OnceLock<Mutex<HashMap<i32, TcpStream>>> = OnceLock::new();
 static SOCKET_TIMEOUT: OnceLock<Duration> = OnceLock::new();
@@ -267,11 +271,27 @@ fn endpoint_expected_oids() -> Result<Vec<ExpectedOid>, String> {
     Ok(vec![
         ExpectedOid {
             oid: enclave_os_common::oids::HONEST_ENDPOINT_MANIFEST_ID_OID_STR.into(),
-            expected_value: vec![0x41; 16],
+            expected_value: M0_ENDPOINT_MANIFEST_ID.to_vec(),
         },
         ExpectedOid {
             oid: enclave_os_common::oids::HONEST_ENDPOINT_MANIFEST_DIGEST_OID_STR.into(),
             expected_value: decode_mrenclave(M0_ENDPOINT_MANIFEST_DIGEST)?.to_vec(),
+        },
+        ExpectedOid {
+            oid: enclave_os_common::oids::HONEST_ENDPOINT_ID_OID_STR.into(),
+            expected_value: vec![0x43; 16],
+        },
+        ExpectedOid {
+            oid: enclave_os_common::oids::HONEST_OPERATION_ID_OID_STR.into(),
+            expected_value: vec![0x45; 16],
+        },
+        ExpectedOid {
+            oid: enclave_os_common::oids::HONEST_WORKFLOW_GENERATION_ID_OID_STR.into(),
+            expected_value: vec![0x46; 16],
+        },
+        ExpectedOid {
+            oid: enclave_os_common::oids::HONEST_ENTRY_STAGE_ID_OID_STR.into(),
+            expected_value: 1_u32.to_be_bytes().to_vec(),
         },
         ExpectedOid {
             oid: enclave_os_common::oids::HONEST_WORKFLOW_ID_OID_STR.into(),
@@ -436,9 +456,12 @@ fn run() -> Result<(), String> {
     }
     if args.endpoint_join {
         let body = serde_json::to_vec(&json!({
-            "endpoint_manifest_id": "41414141414141414141414141414141",
+            "schema": "honest.document-28.proposal-identity-join.v1",
+            "endpoint_id": "43434343434343434343434343434343",
+            "endpoint_manifest_id": hex(&M0_ENDPOINT_MANIFEST_ID),
             "endpoint_manifest_digest": M0_ENDPOINT_MANIFEST_DIGEST,
-            "workflow_id": "40404040404040404040404040404040",
+            "operation_id": "45454545454545454545454545454545",
+            "workflow_generation_id": "46464646464646464646464646464646",
             "workflow_manifest_digest": M0_WORKFLOW_MANIFEST_DIGEST,
         }))
         .map_err(|error| format!("failed to encode endpoint request: {error}"))?;

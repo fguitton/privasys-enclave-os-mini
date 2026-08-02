@@ -213,9 +213,13 @@ impl CertStore {
         }
 
         if let Some(endpoint) = attested_endpoint {
-            let mut projection = Vec::with_capacity(136);
+            let mut projection = Vec::with_capacity(188);
             projection.extend_from_slice(&endpoint.endpoint_manifest_id);
             projection.extend_from_slice(&endpoint.endpoint_manifest_digest);
+            projection.extend_from_slice(&endpoint.endpoint_id);
+            projection.extend_from_slice(&endpoint.operation_id);
+            projection.extend_from_slice(&endpoint.workflow_generation_id);
+            projection.extend_from_slice(&endpoint.entry_stage_id.to_be_bytes());
             projection.extend_from_slice(&endpoint.workflow_id);
             projection.extend_from_slice(&endpoint.workflow_manifest_digest);
             projection.extend_from_slice(&endpoint.route_digest);
@@ -261,10 +265,14 @@ mod tests {
         let endpoint = AttestedEndpointIdentity {
             endpoint_manifest_id: [1; 16],
             endpoint_manifest_digest: [2; 32],
-            workflow_id: [3; 16],
-            workflow_manifest_digest: [4; 32],
-            route_digest: [5; 32],
-            activation_epoch: 6,
+            endpoint_id: [3; 16],
+            operation_id: [4; 16],
+            workflow_generation_id: [5; 16],
+            entry_stage_id: 6,
+            workflow_id: [7; 16],
+            workflow_manifest_digest: [8; 32],
+            route_digest: [9; 32],
+            activation_epoch: 10,
         };
         let without = CertStore::compute_app(&[], None);
         let with = CertStore::compute_app(&[], Some(endpoint));

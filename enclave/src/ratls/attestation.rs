@@ -242,6 +242,22 @@ pub fn generate_app_certificate(
                 endpoint.endpoint_manifest_digest.to_vec(),
             ),
             (
+                enclave_os_common::oids::HONEST_ENDPOINT_ID_OID,
+                endpoint.endpoint_id.to_vec(),
+            ),
+            (
+                enclave_os_common::oids::HONEST_OPERATION_ID_OID,
+                endpoint.operation_id.to_vec(),
+            ),
+            (
+                enclave_os_common::oids::HONEST_WORKFLOW_GENERATION_ID_OID,
+                endpoint.workflow_generation_id.to_vec(),
+            ),
+            (
+                enclave_os_common::oids::HONEST_ENTRY_STAGE_ID_OID,
+                endpoint.entry_stage_id.to_be_bytes().to_vec(),
+            ),
+            (
                 enclave_os_common::oids::HONEST_WORKFLOW_ID_OID,
                 endpoint.workflow_id.to_vec(),
             ),

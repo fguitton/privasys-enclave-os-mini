@@ -76,6 +76,10 @@ pub struct ConfigEntry {
 pub struct AttestedEndpointIdentity {
     pub endpoint_manifest_id: [u8; 16],
     pub endpoint_manifest_digest: [u8; 32],
+    pub endpoint_id: [u8; 16],
+    pub operation_id: [u8; 16],
+    pub workflow_generation_id: [u8; 16],
+    pub entry_stage_id: u32,
     pub workflow_id: [u8; 16],
     pub workflow_manifest_digest: [u8; 32],
     pub route_digest: [u8; 32],
