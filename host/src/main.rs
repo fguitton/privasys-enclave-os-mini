@@ -138,6 +138,12 @@ struct Cli {
     /// per line. Private reviewer keys never enter the host configuration.
     #[arg(long)]
     c3_development_reviewer_keys_file: Option<String>,
+
+    /// Development-only fault: change this node's post-WASM receipt vector.
+    /// This can only deny progress and is accepted only with the complete C3
+    /// development-cluster profile.
+    #[arg(long)]
+    c3_development_inject_divergent_receipt: bool,
 }
 
 fn spawn_control_ecall(enclave_id: u64, config_bytes: Vec<u8>) -> Result<thread::JoinHandle<i32>> {
@@ -426,6 +432,9 @@ fn main() -> Result<()> {
     if c3_arguments.iter().any(|present| *present) && !c3_arguments.iter().all(|present| *present) {
         anyhow::bail!("all C3 development-cluster arguments are required together");
     }
+    if cli.c3_development_inject_divergent_receipt && !c3_arguments.iter().all(|present| *present) {
+        anyhow::bail!("C3 divergent-receipt injection requires the complete development profile");
+    }
     if let Some(node_id) = cli.c3_development_node_id {
         if !(1..=5).contains(&node_id) {
             anyhow::bail!("--c3-development-node-id must be in 1..=5");
@@ -470,6 +479,7 @@ fn main() -> Result<()> {
             "network_id": network_id,
             "peer_endpoints": endpoints,
             "reviewer_public_keys": reviewer_keys,
+            "inject_divergent_receipt": cli.c3_development_inject_divergent_receipt,
         });
     }
 
