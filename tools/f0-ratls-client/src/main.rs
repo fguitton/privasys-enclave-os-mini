@@ -394,10 +394,13 @@ fn await_endpoint_result(args: &Args, body: &[u8]) -> Result<Value, String> {
             Ok((200, response)) => return parse_object(&response, "endpoint join"),
             Ok((202, response)) => {
                 let pending = parse_object(&response, "endpoint pending")?;
-                if pending.get("status") != Some(&Value::String("in-wasm-pending".into())) {
+                if !matches!(
+                    pending.get("status").and_then(Value::as_str),
+                    Some("in-wasm-pending" | "logchain-commit-pending")
+                ) {
                     return Err("endpoint returned an invalid pending response".into());
                 }
-                last_error = "in-WASM result remained pending".into();
+                last_error = "in-WASM/logchain result remained pending".into();
             }
             Ok((status, _)) => last_error = format!("endpoint returned HTTP {status}"),
             Err(error) => last_error = error,
@@ -483,7 +486,7 @@ fn run() -> Result<(), String> {
         }
         println!(
             "ENDPOINT-JOIN-001: PASS assurance=sgx_hardware \
-             path=https/challenge-ratls/sni/committed-endpoint/ticket/in-wasm"
+             path=https/challenge-ratls/sni/committed-endpoint/ticket/in-wasm/logchain"
         );
         return Ok(());
     }
