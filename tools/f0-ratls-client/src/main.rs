@@ -28,8 +28,7 @@ const EXPECTED_RESPONSE: &str = "honest-opaque-fixture/0.1.0";
 const M0_WORKFLOW_MANIFEST_DIGEST: &str =
     "953eff6856105cf5e1ab77b94b94ceaf7c8d4c45a84f9ea590f6a506636dd3bd";
 const M0_ENDPOINT_MANIFEST_ID: [u8; 16] = [
-    0xb9, 0x87, 0xc6, 0x95, 0xfb, 0x26, 0xa8, 0x94, 0xfe, 0x3e, 0xbc, 0x20, 0x30, 0xb0, 0xca,
-    0xa4,
+    0xb9, 0x87, 0xc6, 0x95, 0xfb, 0x26, 0xa8, 0x94, 0xfe, 0x3e, 0xbc, 0x20, 0x30, 0xb0, 0xca, 0xa4,
 ];
 const M0_ENDPOINT_MANIFEST_DIGEST: &str =
     "e8efa235f99af54f62df39e2930a89f85d57865bede204594dc6b4454917b8e3";
@@ -54,6 +53,7 @@ struct Args {
     health_only: bool,
     shutdown_after_health: bool,
     endpoint_join: bool,
+    endpoint_submit_only: bool,
     raw_post_path: Option<String>,
     raw_body_file: Option<PathBuf>,
     expected_status: u16,
@@ -193,6 +193,7 @@ fn parse_args() -> Result<Args, String> {
     let mut health_only = false;
     let mut shutdown_after_health = false;
     let mut endpoint_join = false;
+    let mut endpoint_submit_only = false;
     let mut raw_post_path = None;
     let mut raw_body_file = None;
     let mut expected_status = 200_u16;
@@ -234,6 +235,7 @@ fn parse_args() -> Result<Args, String> {
             "--health-only" => health_only = true,
             "--shutdown-after-health" => shutdown_after_health = true,
             "--endpoint-join" => endpoint_join = true,
+            "--endpoint-submit-only" => endpoint_submit_only = true,
             "--raw-post-path" => raw_post_path = Some(take_value(&mut values, &flag)?),
             "--raw-body-file" => {
                 raw_body_file = Some(PathBuf::from(take_value(&mut values, &flag)?));
@@ -247,6 +249,9 @@ fn parse_args() -> Result<Args, String> {
         }
     }
 
+    if endpoint_join && endpoint_submit_only {
+        return Err("--endpoint-join and --endpoint-submit-only are mutually exclusive".into());
+    }
     Ok(Args {
         cwasm,
         ca_cert: ca_cert.ok_or_else(|| "--ca-cert is required".to_string())?,
@@ -261,6 +266,7 @@ fn parse_args() -> Result<Args, String> {
         health_only,
         shutdown_after_health,
         endpoint_join,
+        endpoint_submit_only,
         raw_post_path,
         raw_body_file,
         expected_status,
@@ -330,7 +336,7 @@ fn request_with_status(
         report_data: ReportDataBinding::ChallengeResponse {
             nonce: nonce.to_vec(),
         },
-        expected_oids: if args.endpoint_join {
+        expected_oids: if args.endpoint_join || args.endpoint_submit_only {
             endpoint_expected_oids()?
         } else {
             Vec::new()
@@ -462,7 +468,7 @@ fn run() -> Result<(), String> {
         println!("RAW-POST-BODY: {}", String::from_utf8_lossy(&response));
         return Ok(());
     }
-    if args.endpoint_join {
+    if args.endpoint_join || args.endpoint_submit_only {
         let body = serde_json::to_vec(&json!({
             "schema": "honest.document-28.proposal-identity-join.v1",
             "endpoint_id": "43434343434343434343434343434343",
@@ -473,6 +479,26 @@ fn run() -> Result<(), String> {
             "workflow_manifest_digest": M0_WORKFLOW_MANIFEST_DIGEST,
         }))
         .map_err(|error| format!("failed to encode endpoint request: {error}"))?;
+        if args.endpoint_submit_only {
+            let (status, response) =
+                request_with_status(&args, "POST", "/honest/v1/proposals", Some(&body))?;
+            if status != 202 {
+                return Err(format!(
+                    "endpoint submit returned HTTP {status}, expected 202: {}",
+                    String::from_utf8_lossy(&response)
+                ));
+            }
+            let pending = parse_object(&response, "endpoint submit")?;
+            if pending.get("status").and_then(Value::as_str)
+                != Some("execution-or-agreement-pending")
+            {
+                return Err(format!(
+                    "endpoint submit returned invalid pending state: {pending}"
+                ));
+            }
+            println!("ENDPOINT-SUBMIT-001: PASS status=202 result=uncommitted");
+            return Ok(());
+        }
         let response = await_endpoint_result(&args, &body)?;
         let ticket_evidence = response
             .get("ticket_evidence_commitment")
