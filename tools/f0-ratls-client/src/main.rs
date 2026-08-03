@@ -396,7 +396,12 @@ fn await_endpoint_result(args: &Args, body: &[u8]) -> Result<Value, String> {
                 let pending = parse_object(&response, "endpoint pending")?;
                 if !matches!(
                     pending.get("status").and_then(Value::as_str),
-                    Some("in-wasm-pending" | "logchain-commit-pending")
+                    Some(
+                        "in-wasm-pending"
+                            | "logchain-commit-pending"
+                            | "execution-or-agreement-pending"
+                            | "retrying-after-membership-change"
+                    )
                 ) {
                     return Err("endpoint returned an invalid pending response".into());
                 }
