@@ -54,6 +54,7 @@ struct Args {
     shutdown_after_health: bool,
     endpoint_join: bool,
     endpoint_submit_only: bool,
+    work_id: [u8; 16],
     raw_post_path: Option<String>,
     raw_body_file: Option<PathBuf>,
     expected_status: u16,
@@ -178,6 +179,21 @@ fn decode_mrenclave(value: &str) -> Result<[u8; 32], String> {
     Ok(result)
 }
 
+fn decode_work_id(value: &str) -> Result<[u8; 16], String> {
+    if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("--work-id must be exactly 32 hexadecimal characters".into());
+    }
+    let mut result = [0_u8; 16];
+    for (index, byte) in result.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .map_err(|_| "invalid --work-id".to_string())?;
+    }
+    if result.iter().all(|byte| *byte == 0) {
+        return Err("--work-id cannot be zero".into());
+    }
+    Ok(result)
+}
+
 fn parse_args() -> Result<Args, String> {
     let mut values = env::args().skip(1);
     let mut cwasm = None;
@@ -194,6 +210,7 @@ fn parse_args() -> Result<Args, String> {
     let mut shutdown_after_health = false;
     let mut endpoint_join = false;
     let mut endpoint_submit_only = false;
+    let mut work_id = [0x4b; 16];
     let mut raw_post_path = None;
     let mut raw_body_file = None;
     let mut expected_status = 200_u16;
@@ -236,6 +253,7 @@ fn parse_args() -> Result<Args, String> {
             "--shutdown-after-health" => shutdown_after_health = true,
             "--endpoint-join" => endpoint_join = true,
             "--endpoint-submit-only" => endpoint_submit_only = true,
+            "--work-id" => work_id = decode_work_id(&take_value(&mut values, &flag)?)?,
             "--raw-post-path" => raw_post_path = Some(take_value(&mut values, &flag)?),
             "--raw-body-file" => {
                 raw_body_file = Some(PathBuf::from(take_value(&mut values, &flag)?));
@@ -267,6 +285,7 @@ fn parse_args() -> Result<Args, String> {
         shutdown_after_health,
         endpoint_join,
         endpoint_submit_only,
+        work_id,
         raw_post_path,
         raw_body_file,
         expected_status,
@@ -470,12 +489,14 @@ fn run() -> Result<(), String> {
     }
     if args.endpoint_join || args.endpoint_submit_only {
         let body = serde_json::to_vec(&json!({
-            "schema": "honest.document-28.proposal-identity-join.v1",
+            "schema": "honest.document-28.proposal-identity-join.v2",
+            "idempotency_id": hex(&args.work_id),
             "endpoint_id": "43434343434343434343434343434343",
             "endpoint_manifest_id": hex(&M0_ENDPOINT_MANIFEST_ID),
             "endpoint_manifest_digest": M0_ENDPOINT_MANIFEST_DIGEST,
             "operation_id": "45454545454545454545454545454545",
             "workflow_generation_id": "46464646464646464646464646464646",
+            "workflow_id": "40404040404040404040404040404040",
             "workflow_manifest_digest": M0_WORKFLOW_MANIFEST_DIGEST,
         }))
         .map_err(|error| format!("failed to encode endpoint request: {error}"))?;
