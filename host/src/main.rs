@@ -139,6 +139,16 @@ struct Cli {
     #[arg(long)]
     c3_development_reviewer_keys_file: Option<String>,
 
+    /// Optional development supplier identity as 32 hexadecimal characters.
+    /// It is accepted only together with its Ed25519 public key.
+    #[arg(long)]
+    c3_development_component_supplier_id: Option<String>,
+
+    /// Optional development supplier Ed25519 public key as 64 hexadecimal
+    /// characters. Private supplier material remains outside the node.
+    #[arg(long)]
+    c3_development_component_supplier_public_key: Option<String>,
+
     /// Development-only fault: change this node's post-WASM receipt vector.
     /// This can only deny progress and is accepted only with the complete C3
     /// development-cluster profile.
@@ -435,6 +445,16 @@ fn main() -> Result<()> {
     if cli.c3_development_inject_divergent_receipt && !c3_arguments.iter().all(|present| *present) {
         anyhow::bail!("C3 divergent-receipt injection requires the complete development profile");
     }
+    if cli.c3_development_component_supplier_id.is_some()
+        != cli.c3_development_component_supplier_public_key.is_some()
+    {
+        anyhow::bail!("component supplier ID and public key must be configured together");
+    }
+    if cli.c3_development_component_supplier_id.is_some()
+        && !c3_arguments.iter().all(|present| *present)
+    {
+        anyhow::bail!("component supplier configuration requires the complete C3 profile");
+    }
     if let Some(node_id) = cli.c3_development_node_id {
         if !(1..=5).contains(&node_id) {
             anyhow::bail!("--c3-development-node-id must be in 1..=5");
@@ -474,13 +494,44 @@ fn main() -> Result<()> {
         {
             anyhow::bail!("reviewer key file must contain exactly two 130-character hex keys");
         }
-        config["c3_development"] = serde_json::json!({
+        let supplier_id = cli
+            .c3_development_component_supplier_id
+            .as_deref()
+            .map(|value| {
+                if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    anyhow::bail!(
+                        "--c3-development-component-supplier-id must contain 32 hexadecimal characters"
+                    );
+                }
+                Ok(value)
+            })
+            .transpose()?;
+        let supplier_public_key = cli
+            .c3_development_component_supplier_public_key
+            .as_deref()
+            .map(|value| {
+                if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    anyhow::bail!(
+                        "--c3-development-component-supplier-public-key must contain 64 hexadecimal characters"
+                    );
+                }
+                Ok(value)
+            })
+            .transpose()?;
+        let mut development = serde_json::json!({
             "node_id": node_id,
             "network_id": network_id,
             "peer_endpoints": endpoints,
             "reviewer_public_keys": reviewer_keys,
             "inject_divergent_receipt": cli.c3_development_inject_divergent_receipt,
         });
+        if let (Some(supplier_id), Some(supplier_public_key)) = (supplier_id, supplier_public_key) {
+            development["component_supplier_id"] =
+                serde_json::Value::String(supplier_id.to_string());
+            development["component_supplier_public_key"] =
+                serde_json::Value::String(supplier_public_key.to_string());
+        }
+        config["c3_development"] = development;
     }
 
     let config_bytes = serde_json::to_vec(&config)?;

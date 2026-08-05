@@ -17,6 +17,7 @@ pub const HONEST_PEER_SNI: &str = "peer.s1.invalid";
 pub const HONEST_PEER_ROUTE: &str = "/honest/v1/peer";
 pub const HONEST_BOOTSTRAP_ROUTE: &str = "/honest/v1/bootstrap";
 pub const HONEST_PROPOSAL_ROUTE: &str = "/honest/v1/proposals";
+pub const HONEST_COMPONENT_STAGING_ROUTE: &str = "/honest/v1/components/staging";
 
 // ---------------------------------------------------------------------------
 //  Config Merkle leaf
@@ -166,6 +167,7 @@ pub enum HonestIngressRoute {
     Peer,
     Bootstrap,
     Proposal,
+    ComponentStaging,
     PeerAuthenticationRequired,
     Denied,
 }
@@ -209,6 +211,13 @@ pub fn classify_honest_ingress(
         && context.server_name.as_deref() != Some(HONEST_PEER_SNI)
     {
         return HonestIngressRoute::Proposal;
+    }
+    if matches!(
+        (method, path),
+        (HttpMethod::Post, HONEST_COMPONENT_STAGING_ROUTE)
+    ) && context.server_name.as_deref() != Some(HONEST_PEER_SNI)
+    {
+        return HonestIngressRoute::ComponentStaging;
     }
     HonestIngressRoute::Denied
 }
@@ -254,7 +263,7 @@ pub trait EnclaveModule: Send + Sync {
 mod tests {
     use super::{
         classify_honest_ingress, HonestIngressRoute, RequestContext, HONEST_BOOTSTRAP_ROUTE,
-        HONEST_PEER_ROUTE, HONEST_PEER_SNI, HONEST_PROPOSAL_ROUTE,
+        HONEST_COMPONENT_STAGING_ROUTE, HONEST_PEER_ROUTE, HONEST_PEER_SNI, HONEST_PROPOSAL_ROUTE,
     };
     use crate::protocol::HttpMethod;
 
@@ -287,6 +296,22 @@ mod tests {
                 &HttpMethod::Post,
                 HONEST_PEER_ROUTE,
                 &context(Some("client.invalid"), true),
+            ),
+            HonestIngressRoute::Denied
+        );
+        assert_eq!(
+            classify_honest_ingress(
+                &HttpMethod::Post,
+                HONEST_COMPONENT_STAGING_ROUTE,
+                &context(Some("enclave-os.invalid"), false),
+            ),
+            HonestIngressRoute::ComponentStaging
+        );
+        assert_eq!(
+            classify_honest_ingress(
+                &HttpMethod::Post,
+                HONEST_COMPONENT_STAGING_ROUTE,
+                &context(Some(HONEST_PEER_SNI), true),
             ),
             HonestIngressRoute::Denied
         );
