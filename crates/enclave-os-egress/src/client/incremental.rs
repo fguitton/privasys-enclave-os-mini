@@ -50,8 +50,12 @@ impl IncrementalTlsClient {
             .map_err(str::to_string)?;
         let server_name = ServerName::try_from(server_name.to_string())
             .map_err(|_| "invalid incremental TLS server name".to_string())?;
-        let tls_conn = ClientConnection::new(config, server_name)
+        let mut tls_conn = ClientConnection::new(config, server_name)
             .map_err(|error| format!("incremental TLS init failed: {error}"))?;
+        // Rustls's smaller default plaintext buffer would otherwise undercut
+        // the explicit request bound below. Keep the queue finite and aligned
+        // with the public incremental-client contract.
+        tls_conn.set_buffer_limit(Some(MAX_INCREMENTAL_REQUEST));
         Ok(Self {
             tls_conn,
             ratls,
@@ -193,3 +197,24 @@ const MAX_INCREMENTAL_TLS_FRAGMENT: usize = 1024 * 1024;
 const MAX_INCREMENTAL_TLS_OUTPUT: usize = 1024 * 1024;
 const MAX_INCREMENTAL_REQUEST: usize = 512 * 1024;
 const MAX_INCREMENTAL_PLAINTEXT: usize = 2 * 1024 * 1024;
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use rustls::RootCertStore;
+
+    use super::{IncrementalTlsClient, MAX_INCREMENTAL_REQUEST};
+
+    #[test]
+    fn rustls_buffer_does_not_undercut_the_declared_request_bound() {
+        let roots = RootCertStore::empty();
+        let mut client =
+            IncrementalTlsClient::new("bounded.invalid", &roots, None).expect("incremental client");
+        client
+            .tls_conn
+            .writer()
+            .write_all(&vec![0xa5; MAX_INCREMENTAL_REQUEST])
+            .expect("the declared request bound must fit the TLS plaintext buffer");
+    }
+}
