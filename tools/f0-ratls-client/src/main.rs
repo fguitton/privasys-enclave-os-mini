@@ -3,9 +3,12 @@
 
 use std::collections::HashMap;
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::TcpStream;
+#[cfg(test)]
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -57,6 +60,7 @@ struct Args {
     work_id: [u8; 16],
     raw_post_path: Option<String>,
     raw_body_file: Option<PathBuf>,
+    raw_response_file: Option<PathBuf>,
     expected_status: u16,
 }
 
@@ -213,6 +217,7 @@ fn parse_args() -> Result<Args, String> {
     let mut work_id = [0x4b; 16];
     let mut raw_post_path = None;
     let mut raw_body_file = None;
+    let mut raw_response_file = None;
     let mut expected_status = 200_u16;
 
     while let Some(flag) = values.next() {
@@ -258,6 +263,9 @@ fn parse_args() -> Result<Args, String> {
             "--raw-body-file" => {
                 raw_body_file = Some(PathBuf::from(take_value(&mut values, &flag)?));
             }
+            "--raw-response-file" => {
+                raw_response_file = Some(PathBuf::from(take_value(&mut values, &flag)?));
+            }
             "--expect-status" => {
                 expected_status = take_value(&mut values, &flag)?
                     .parse()
@@ -269,6 +277,9 @@ fn parse_args() -> Result<Args, String> {
 
     if endpoint_join && endpoint_submit_only {
         return Err("--endpoint-join and --endpoint-submit-only are mutually exclusive".into());
+    }
+    if raw_response_file.is_some() && raw_post_path.is_none() {
+        return Err("--raw-response-file requires --raw-post-path".into());
     }
     Ok(Args {
         cwasm,
@@ -288,6 +299,7 @@ fn parse_args() -> Result<Args, String> {
         work_id,
         raw_post_path,
         raw_body_file,
+        raw_response_file,
         expected_status,
     })
 }
@@ -449,6 +461,19 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn persist_raw_response(path: &PathBuf, response: &[u8]) -> Result<(), String> {
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|error| format!("failed to create raw response file: {error}"))?;
+    output
+        .write_all(response)
+        .and_then(|()| output.sync_all())
+        .map_err(|error| format!("failed to persist raw response file: {error}"))
+}
+
 fn run() -> Result<(), String> {
     let args = parse_args()?;
     SOCKET_TIMEOUT
@@ -484,7 +509,12 @@ fn run() -> Result<(), String> {
             ));
         }
         println!("RAW-POST-STATUS: {status}");
-        println!("RAW-POST-BODY: {}", String::from_utf8_lossy(&response));
+        if let Some(output_path) = args.raw_response_file.as_ref() {
+            persist_raw_response(output_path, &response)?;
+            println!("RAW-POST-BODY-FILE: {}", output_path.display());
+        } else {
+            println!("RAW-POST-BODY: {}", String::from_utf8_lossy(&response));
+        }
         return Ok(());
     }
     if args.endpoint_join || args.endpoint_submit_only {
@@ -626,5 +656,33 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("F0 FAIL: {error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_binary_response_is_private_and_never_overwritten() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock")
+            .as_nanos();
+        let path = env::temp_dir().join(format!(
+            "honest-ratls-response-{}-{nonce}.bin",
+            std::process::id()
+        ));
+        persist_raw_response(&path, b"\x00\xff\x81\x01").expect("first persistence");
+        assert_eq!(fs::read(&path).expect("response read"), b"\x00\xff\x81\x01");
+        assert_eq!(
+            fs::symlink_metadata(&path)
+                .expect("response metadata")
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(persist_raw_response(&path, b"replacement").is_err());
+        fs::remove_file(path).expect("response cleanup");
     }
 }
