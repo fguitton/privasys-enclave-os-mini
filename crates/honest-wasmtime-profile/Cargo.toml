@@ -13,6 +13,7 @@ description = "Shared Wasmtime role boundary for Honest enclave and AOT builds."
 
 [features]
 default = []
+descriptor = []
 runtime-sgx = ["wasmtime/sgx"]
 aot = ["wasmtime/cranelift", "wasmtime/parallel-compilation"]
 

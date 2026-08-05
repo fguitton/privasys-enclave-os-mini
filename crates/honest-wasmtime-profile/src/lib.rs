@@ -23,8 +23,8 @@ pub use wasmtime::*;
 #[cfg(all(feature = "runtime-sgx", feature = "aot"))]
 compile_error!("select exactly one Wasmtime role: runtime-sgx or aot");
 
-#[cfg(not(any(feature = "runtime-sgx", feature = "aot")))]
-compile_error!("select exactly one Wasmtime role: runtime-sgx or aot");
+#[cfg(not(any(feature = "runtime-sgx", feature = "aot", feature = "descriptor")))]
+compile_error!("select a Wasmtime role or the descriptor-only profile surface");
 
 /// Frozen semantic profile identity.
 pub const PROFILE_ID: &str = "honest-s2-x86_64-sgx-v1";
@@ -413,15 +413,23 @@ pub fn profile_digest() -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
-    use super::{profile_digest, ProfileDescriptor, Role, ROLE, WASM_FEATURE_BITS};
+    use super::{profile_digest, ProfileDescriptor, WASM_FEATURE_BITS};
+    #[cfg(any(feature = "runtime-sgx", feature = "aot"))]
+    use super::{Role, ROLE};
 
     #[test]
-    fn exactly_one_role_is_selected() {
+    fn selected_surface_is_explicit() {
         #[cfg(feature = "runtime-sgx")]
         assert_eq!(ROLE, Role::RuntimeSgx);
 
         #[cfg(feature = "aot")]
         assert_eq!(ROLE, Role::Aot);
+
+        #[cfg(all(
+            feature = "descriptor",
+            not(any(feature = "runtime-sgx", feature = "aot"))
+        ))]
+        assert_eq!(ProfileDescriptor::canonical().schema_version, 2);
     }
 
     #[test]
