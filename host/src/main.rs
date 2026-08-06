@@ -126,6 +126,11 @@ struct Cli {
     #[arg(long)]
     c3_development_node_id: Option<u64>,
 
+    /// Development-only node incarnation generation. Generation 1 is the
+    /// clean-install default; a replacement must declare its exact successor.
+    #[arg(long)]
+    c3_development_generation: Option<u64>,
+
     /// Development-only fixed network ID as 32 hexadecimal characters.
     #[arg(long)]
     c3_development_network_id: Option<String>,
@@ -445,6 +450,9 @@ fn main() -> Result<()> {
     if cli.c3_development_inject_divergent_receipt && !c3_arguments.iter().all(|present| *present) {
         anyhow::bail!("C3 divergent-receipt injection requires the complete development profile");
     }
+    if cli.c3_development_generation.is_some() && !c3_arguments.iter().all(|present| *present) {
+        anyhow::bail!("C3 generation requires the complete development profile");
+    }
     if cli.c3_development_component_supplier_id.is_some()
         != cli.c3_development_component_supplier_public_key.is_some()
     {
@@ -458,6 +466,10 @@ fn main() -> Result<()> {
     if let Some(node_id) = cli.c3_development_node_id {
         if !(1..=5).contains(&node_id) {
             anyhow::bail!("--c3-development-node-id must be in 1..=5");
+        }
+        let generation = cli.c3_development_generation.unwrap_or(1);
+        if generation == 0 {
+            anyhow::bail!("--c3-development-generation must be nonzero");
         }
         let network_id = cli.c3_development_network_id.as_deref().unwrap_or_default();
         if network_id.len() != 32 || !network_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -520,6 +532,7 @@ fn main() -> Result<()> {
             .transpose()?;
         let mut development = serde_json::json!({
             "node_id": node_id,
+            "generation": generation,
             "network_id": network_id,
             "peer_endpoints": endpoints,
             "reviewer_public_keys": reviewer_keys,
