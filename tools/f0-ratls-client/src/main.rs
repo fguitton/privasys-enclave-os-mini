@@ -304,15 +304,57 @@ fn parse_args() -> Result<Args, String> {
     })
 }
 
-fn endpoint_expected_oids() -> Result<Vec<ExpectedOid>, String> {
+fn endpoint_request_identity(args: &Args) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
+    endpoint_request_identity_from_path(args.raw_body_file.as_ref())
+}
+
+fn endpoint_request_identity_from_path(
+    path: Option<&PathBuf>,
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
+    let Some(path) = path else {
+        return Ok((
+            M0_ENDPOINT_MANIFEST_ID.to_vec(),
+            decode_mrenclave(M0_ENDPOINT_MANIFEST_DIGEST)?.to_vec(),
+            decode_mrenclave(M0_WORKFLOW_MANIFEST_DIGEST)?.to_vec(),
+        ));
+    };
+    let body: Value = serde_json::from_slice(
+        &fs::read(path).map_err(|error| format!("failed to read endpoint identity: {error}"))?,
+    )
+    .map_err(|_| "endpoint identity file is not JSON".to_string())?;
+    let fixed = |field: &str, bytes: usize| -> Result<Vec<u8>, String> {
+        let value = body
+            .get(field)
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("endpoint identity omitted {field}"))?;
+        if value.len() != bytes * 2 {
+            return Err(format!("endpoint identity {field} has the wrong length"));
+        }
+        (0..bytes)
+            .map(|index| {
+                u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+                    .map_err(|_| format!("endpoint identity {field} is not hexadecimal"))
+            })
+            .collect()
+    };
+    Ok((
+        fixed("endpoint_manifest_id", 16)?,
+        fixed("endpoint_manifest_digest", 32)?,
+        fixed("workflow_manifest_digest", 32)?,
+    ))
+}
+
+fn endpoint_expected_oids(args: &Args) -> Result<Vec<ExpectedOid>, String> {
+    let (endpoint_manifest_id, endpoint_manifest_digest, workflow_manifest_digest) =
+        endpoint_request_identity(args)?;
     Ok(vec![
         ExpectedOid {
             oid: enclave_os_common::oids::HONEST_ENDPOINT_MANIFEST_ID_OID_STR.into(),
-            expected_value: M0_ENDPOINT_MANIFEST_ID.to_vec(),
+            expected_value: endpoint_manifest_id,
         },
         ExpectedOid {
             oid: enclave_os_common::oids::HONEST_ENDPOINT_MANIFEST_DIGEST_OID_STR.into(),
-            expected_value: decode_mrenclave(M0_ENDPOINT_MANIFEST_DIGEST)?.to_vec(),
+            expected_value: endpoint_manifest_digest,
         },
         ExpectedOid {
             oid: enclave_os_common::oids::HONEST_ENDPOINT_ID_OID_STR.into(),
@@ -336,7 +378,7 @@ fn endpoint_expected_oids() -> Result<Vec<ExpectedOid>, String> {
         },
         ExpectedOid {
             oid: enclave_os_common::oids::HONEST_WORKFLOW_MANIFEST_DIGEST_OID_STR.into(),
-            expected_value: decode_mrenclave(M0_WORKFLOW_MANIFEST_DIGEST)?.to_vec(),
+            expected_value: workflow_manifest_digest,
         },
         ExpectedOid {
             oid: enclave_os_common::oids::HONEST_ENDPOINT_ROUTE_DIGEST_OID_STR.into(),
@@ -368,7 +410,7 @@ fn request_with_status(
             nonce: nonce.to_vec(),
         },
         expected_oids: if args.endpoint_join || args.endpoint_submit_only {
-            endpoint_expected_oids()?
+            endpoint_expected_oids(args)?
         } else {
             Vec::new()
         },
@@ -684,5 +726,37 @@ mod tests {
         );
         assert!(persist_raw_response(&path, b"replacement").is_err());
         fs::remove_file(path).expect("response cleanup");
+    }
+
+    #[test]
+    fn endpoint_oids_follow_the_exact_canonical_request_identity() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock")
+            .as_nanos();
+        let path = env::temp_dir().join(format!(
+            "honest-endpoint-identity-{}-{nonce}.json",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "endpoint_manifest_id": "71".repeat(16),
+                "endpoint_manifest_digest": "72".repeat(32),
+                "workflow_manifest_digest": "73".repeat(32),
+            }))
+            .expect("request encoding"),
+        )
+        .expect("request write");
+        let identity = endpoint_request_identity_from_path(Some(&path)).expect("exact identity");
+        assert_eq!(identity, (vec![0x71; 16], vec![0x72; 32], vec![0x73; 32]));
+
+        fs::write(
+            &path,
+            br#"{"endpoint_manifest_id":"71","endpoint_manifest_digest":"72","workflow_manifest_digest":"73"}"#,
+        )
+        .expect("mutated request write");
+        assert!(endpoint_request_identity_from_path(Some(&path)).is_err());
+        fs::remove_file(path).expect("request cleanup");
     }
 }
