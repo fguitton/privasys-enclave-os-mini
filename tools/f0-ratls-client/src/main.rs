@@ -61,6 +61,7 @@ struct Args {
     raw_post_path: Option<String>,
     raw_body_file: Option<PathBuf>,
     raw_response_file: Option<PathBuf>,
+    retain_unexpected_raw_response: bool,
     expected_status: u16,
 }
 
@@ -218,6 +219,7 @@ fn parse_args() -> Result<Args, String> {
     let mut raw_post_path = None;
     let mut raw_body_file = None;
     let mut raw_response_file = None;
+    let mut retain_unexpected_raw_response = false;
     let mut expected_status = 200_u16;
 
     while let Some(flag) = values.next() {
@@ -266,6 +268,7 @@ fn parse_args() -> Result<Args, String> {
             "--raw-response-file" => {
                 raw_response_file = Some(PathBuf::from(take_value(&mut values, &flag)?));
             }
+            "--retain-unexpected-raw-response" => retain_unexpected_raw_response = true,
             "--expect-status" => {
                 expected_status = take_value(&mut values, &flag)?
                     .parse()
@@ -280,6 +283,9 @@ fn parse_args() -> Result<Args, String> {
     }
     if raw_response_file.is_some() && raw_post_path.is_none() {
         return Err("--raw-response-file requires --raw-post-path".into());
+    }
+    if retain_unexpected_raw_response && raw_response_file.is_none() {
+        return Err("--retain-unexpected-raw-response requires --raw-response-file".into());
     }
     Ok(Args {
         cwasm,
@@ -300,6 +306,7 @@ fn parse_args() -> Result<Args, String> {
         raw_post_path,
         raw_body_file,
         raw_response_file,
+        retain_unexpected_raw_response,
         expected_status,
     })
 }
@@ -516,6 +523,10 @@ fn persist_raw_response(path: &PathBuf, response: &[u8]) -> Result<(), String> {
         .map_err(|error| format!("failed to persist raw response file: {error}"))
 }
 
+fn may_retain_raw_response(status: u16, expected_status: u16, retain_unexpected: bool) -> bool {
+    status == expected_status || retain_unexpected
+}
+
 fn run() -> Result<(), String> {
     let args = parse_args()?;
     SOCKET_TIMEOUT
@@ -544,7 +555,11 @@ fn run() -> Result<(), String> {
             .map_err(|error| format!("failed to read raw request body: {error}"))?
             .unwrap_or_default();
         let (status, response) = request_with_status(&args, "POST", path, Some(&body))?;
-        if status != args.expected_status {
+        if !may_retain_raw_response(
+            status,
+            args.expected_status,
+            args.retain_unexpected_raw_response,
+        ) {
             return Err(format!(
                 "raw POST returned HTTP {status}, expected {}",
                 args.expected_status
@@ -556,6 +571,12 @@ fn run() -> Result<(), String> {
             println!("RAW-POST-BODY-FILE: {}", output_path.display());
         } else {
             println!("RAW-POST-BODY: {}", String::from_utf8_lossy(&response));
+        }
+        if status != args.expected_status {
+            return Err(format!(
+                "raw POST returned HTTP {status}, expected {}",
+                args.expected_status
+            ));
         }
         return Ok(());
     }
@@ -726,6 +747,13 @@ mod tests {
         );
         assert!(persist_raw_response(&path, b"replacement").is_err());
         fs::remove_file(path).expect("response cleanup");
+    }
+
+    #[test]
+    fn unexpected_raw_response_requires_explicit_retention_authority() {
+        assert!(may_retain_raw_response(200, 200, false));
+        assert!(!may_retain_raw_response(409, 200, false));
+        assert!(may_retain_raw_response(409, 200, true));
     }
 
     #[test]
