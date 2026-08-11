@@ -65,6 +65,17 @@ struct Args {
     expected_status: u16,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EndpointRequestIdentity {
+    endpoint_manifest_id: Vec<u8>,
+    endpoint_manifest_digest: Vec<u8>,
+    endpoint_id: Vec<u8>,
+    operation_id: Vec<u8>,
+    workflow_generation_id: Vec<u8>,
+    workflow_id: Vec<u8>,
+    workflow_manifest_digest: Vec<u8>,
+}
+
 fn sockets() -> &'static Mutex<HashMap<i32, TcpStream>> {
     SOCKETS.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -311,19 +322,23 @@ fn parse_args() -> Result<Args, String> {
     })
 }
 
-fn endpoint_request_identity(args: &Args) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
+fn endpoint_request_identity(args: &Args) -> Result<EndpointRequestIdentity, String> {
     endpoint_request_identity_from_path(args.raw_body_file.as_ref())
 }
 
 fn endpoint_request_identity_from_path(
     path: Option<&PathBuf>,
-) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
+) -> Result<EndpointRequestIdentity, String> {
     let Some(path) = path else {
-        return Ok((
-            M0_ENDPOINT_MANIFEST_ID.to_vec(),
-            decode_mrenclave(M0_ENDPOINT_MANIFEST_DIGEST)?.to_vec(),
-            decode_mrenclave(M0_WORKFLOW_MANIFEST_DIGEST)?.to_vec(),
-        ));
+        return Ok(EndpointRequestIdentity {
+            endpoint_manifest_id: M0_ENDPOINT_MANIFEST_ID.to_vec(),
+            endpoint_manifest_digest: decode_mrenclave(M0_ENDPOINT_MANIFEST_DIGEST)?.to_vec(),
+            endpoint_id: vec![0x43; 16],
+            operation_id: vec![0x45; 16],
+            workflow_generation_id: vec![0x46; 16],
+            workflow_id: vec![0x40; 16],
+            workflow_manifest_digest: decode_mrenclave(M0_WORKFLOW_MANIFEST_DIGEST)?.to_vec(),
+        });
     };
     let body: Value = serde_json::from_slice(
         &fs::read(path).map_err(|error| format!("failed to read endpoint identity: {error}"))?,
@@ -344,36 +359,39 @@ fn endpoint_request_identity_from_path(
             })
             .collect()
     };
-    Ok((
-        fixed("endpoint_manifest_id", 16)?,
-        fixed("endpoint_manifest_digest", 32)?,
-        fixed("workflow_manifest_digest", 32)?,
-    ))
+    Ok(EndpointRequestIdentity {
+        endpoint_manifest_id: fixed("endpoint_manifest_id", 16)?,
+        endpoint_manifest_digest: fixed("endpoint_manifest_digest", 32)?,
+        endpoint_id: fixed("endpoint_id", 16)?,
+        operation_id: fixed("operation_id", 16)?,
+        workflow_generation_id: fixed("workflow_generation_id", 16)?,
+        workflow_id: fixed("workflow_id", 16)?,
+        workflow_manifest_digest: fixed("workflow_manifest_digest", 32)?,
+    })
 }
 
 fn endpoint_expected_oids(args: &Args) -> Result<Vec<ExpectedOid>, String> {
-    let (endpoint_manifest_id, endpoint_manifest_digest, workflow_manifest_digest) =
-        endpoint_request_identity(args)?;
+    let identity = endpoint_request_identity(args)?;
     Ok(vec![
         ExpectedOid {
             oid: enclave_os_common::oids::HONEST_ENDPOINT_MANIFEST_ID_OID_STR.into(),
-            expected_value: endpoint_manifest_id,
+            expected_value: identity.endpoint_manifest_id,
         },
         ExpectedOid {
             oid: enclave_os_common::oids::HONEST_ENDPOINT_MANIFEST_DIGEST_OID_STR.into(),
-            expected_value: endpoint_manifest_digest,
+            expected_value: identity.endpoint_manifest_digest,
         },
         ExpectedOid {
             oid: enclave_os_common::oids::HONEST_ENDPOINT_ID_OID_STR.into(),
-            expected_value: vec![0x43; 16],
+            expected_value: identity.endpoint_id,
         },
         ExpectedOid {
             oid: enclave_os_common::oids::HONEST_OPERATION_ID_OID_STR.into(),
-            expected_value: vec![0x45; 16],
+            expected_value: identity.operation_id,
         },
         ExpectedOid {
             oid: enclave_os_common::oids::HONEST_WORKFLOW_GENERATION_ID_OID_STR.into(),
-            expected_value: vec![0x46; 16],
+            expected_value: identity.workflow_generation_id,
         },
         ExpectedOid {
             oid: enclave_os_common::oids::HONEST_ENTRY_STAGE_ID_OID_STR.into(),
@@ -381,11 +399,11 @@ fn endpoint_expected_oids(args: &Args) -> Result<Vec<ExpectedOid>, String> {
         },
         ExpectedOid {
             oid: enclave_os_common::oids::HONEST_WORKFLOW_ID_OID_STR.into(),
-            expected_value: vec![0x40; 16],
+            expected_value: identity.workflow_id,
         },
         ExpectedOid {
             oid: enclave_os_common::oids::HONEST_WORKFLOW_MANIFEST_DIGEST_OID_STR.into(),
-            expected_value: workflow_manifest_digest,
+            expected_value: identity.workflow_manifest_digest,
         },
         ExpectedOid {
             oid: enclave_os_common::oids::HONEST_ENDPOINT_ROUTE_DIGEST_OID_STR.into(),
@@ -766,24 +784,105 @@ mod tests {
             "honest-endpoint-identity-{}-{nonce}.json",
             std::process::id()
         ));
+        let fields = [
+            ("endpoint_manifest_id", 0x71, 16),
+            ("endpoint_manifest_digest", 0x72, 32),
+            ("endpoint_id", 0x73, 16),
+            ("operation_id", 0x74, 16),
+            ("workflow_generation_id", 0x75, 16),
+            ("workflow_id", 0x76, 16),
+            ("workflow_manifest_digest", 0x77, 32),
+        ];
+        let request = fields
+            .iter()
+            .map(|(name, byte, bytes)| {
+                (
+                    (*name).to_string(),
+                    Value::String(format!("{byte:02x}").repeat(*bytes)),
+                )
+            })
+            .collect::<serde_json::Map<String, Value>>();
         fs::write(
             &path,
-            serde_json::to_vec(&json!({
-                "endpoint_manifest_id": "71".repeat(16),
-                "endpoint_manifest_digest": "72".repeat(32),
-                "workflow_manifest_digest": "73".repeat(32),
-            }))
-            .expect("request encoding"),
+            serde_json::to_vec(&request).expect("request encoding"),
         )
         .expect("request write");
         let identity = endpoint_request_identity_from_path(Some(&path)).expect("exact identity");
-        assert_eq!(identity, (vec![0x71; 16], vec![0x72; 32], vec![0x73; 32]));
+        assert_eq!(
+            identity,
+            EndpointRequestIdentity {
+                endpoint_manifest_id: vec![0x71; 16],
+                endpoint_manifest_digest: vec![0x72; 32],
+                endpoint_id: vec![0x73; 16],
+                operation_id: vec![0x74; 16],
+                workflow_generation_id: vec![0x75; 16],
+                workflow_id: vec![0x76; 16],
+                workflow_manifest_digest: vec![0x77; 32],
+            }
+        );
 
+        fn identity_values(value: &EndpointRequestIdentity) -> [&[u8]; 7] {
+            [
+                value.endpoint_manifest_id.as_slice(),
+                value.endpoint_manifest_digest.as_slice(),
+                value.endpoint_id.as_slice(),
+                value.operation_id.as_slice(),
+                value.workflow_generation_id.as_slice(),
+                value.workflow_id.as_slice(),
+                value.workflow_manifest_digest.as_slice(),
+            ]
+        }
+        for (name, _, bytes) in fields {
+            let mut valid_mutation = request.clone();
+            valid_mutation.insert(name.to_string(), Value::String("a5".repeat(bytes)));
+            fs::write(
+                &path,
+                serde_json::to_vec(&valid_mutation).expect("valid mutation encoding"),
+            )
+            .expect("valid mutation write");
+            let changed =
+                endpoint_request_identity_from_path(Some(&path)).expect("valid mutated identity");
+            assert_eq!(
+                identity_values(&identity)
+                    .iter()
+                    .zip(identity_values(&changed))
+                    .filter(|(before, after)| before != &after)
+                    .count(),
+                1,
+                "{name} mutation did not change exactly one expected OID value"
+            );
+
+            let mut mutation = request.clone();
+            mutation.insert(name.to_string(), Value::String("71".to_string()));
+            fs::write(
+                &path,
+                serde_json::to_vec(&mutation).expect("mutation encoding"),
+            )
+            .expect("mutated request write");
+            assert!(
+                endpoint_request_identity_from_path(Some(&path)).is_err(),
+                "malformed {name} was accepted"
+            );
+
+            let mut missing = request.clone();
+            missing.remove(name);
+            fs::write(
+                &path,
+                serde_json::to_vec(&missing).expect("missing-field encoding"),
+            )
+            .expect("missing-field request write");
+            assert!(
+                endpoint_request_identity_from_path(Some(&path)).is_err(),
+                "missing {name} was accepted"
+            );
+        }
+        let mut mutation = request;
+        mutation.insert("endpoint_id".to_string(), Value::String("zz".repeat(16)));
         fs::write(
             &path,
-            br#"{"endpoint_manifest_id":"71","endpoint_manifest_digest":"72","workflow_manifest_digest":"73"}"#,
+            serde_json::to_vec(&mutation).expect("non-hex mutation encoding"),
         )
-        .expect("mutated request write");
+        .expect("non-hex mutation write");
         assert!(endpoint_request_identity_from_path(Some(&path)).is_err());
         fs::remove_file(path).expect("request cleanup");
     }
