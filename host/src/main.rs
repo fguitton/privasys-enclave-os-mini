@@ -167,7 +167,13 @@ fn spawn_control_ecall(enclave_id: u64, config_bytes: Vec<u8>) -> Result<thread:
         .name("enclave-control".into())
         .spawn(move || {
             let _ = entered_tx.send(());
-            enclave::call_ecall_run(enclave_id, &config_bytes)
+            let result = enclave::call_ecall_run(enclave_id, &config_bytes);
+            if result == 0 {
+                info!("Control ECALL returned: code=0");
+            } else {
+                error!("Control ECALL returned: code={result}");
+            }
+            result
         })?;
     entered_rx
         .recv()
@@ -181,7 +187,13 @@ fn spawn_execution_ecall(enclave_id: u64) -> Result<thread::JoinHandle<i32>> {
         .name("enclave-execution-worker".into())
         .spawn(move || {
             let _ = entered_tx.send(());
-            enclave::call_ecall_execution_worker(enclave_id, 0)
+            let result = enclave::call_ecall_execution_worker(enclave_id, 0);
+            if result == 0 {
+                info!("Execution worker ECALL returned: code=0");
+            } else {
+                error!("Execution worker ECALL returned: code={result}");
+            }
+            result
         })?;
     entered_rx
         .recv()

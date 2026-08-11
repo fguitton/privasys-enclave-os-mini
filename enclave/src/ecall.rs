@@ -516,6 +516,7 @@ impl ControlLoopHook for NoopControlLoopHook {
 
 fn apply_control_action(action: ControlLoopAction) {
     if action == ControlLoopAction::Shutdown {
+        enclave_log_error!("MINI-CONTROL-SHUTDOWN: reason=AdopterHook");
         crate::signal_shutdown();
     }
 }
@@ -532,11 +533,13 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
         if let Ok(mut st) = crate::state().lock() {
             if let Some(ref mut srv) = st.ingress_server {
                 let _ = srv.progress_output();
-                if srv.is_shutdown() {
+                if let Some(reason) = srv.shutdown_reason() {
+                    enclave_log_error!("MINI-CONTROL-SHUTDOWN: reason=Ingress({:?})", reason);
                     crate::signal_shutdown();
                 }
             }
         } else {
+            enclave_log_error!("MINI-CONTROL-SHUTDOWN: reason=StateLockUnavailable");
             break;
         }
 
@@ -549,11 +552,20 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
                         if !hook.on_data_channel_message(msg_type, conn_id, payload) {
                             let mut st = match crate::state().lock() {
                                 Ok(st) => st,
-                                Err(_) => break,
+                                Err(_) => {
+                                    enclave_log_error!(
+                                        "MINI-CONTROL-SHUTDOWN: reason=StateLockUnavailable"
+                                    );
+                                    break;
+                                }
                             };
                             if let Some(ref mut srv) = st.ingress_server {
                                 srv.handle_message(msg_type, conn_id, payload);
-                                if srv.is_shutdown() {
+                                if let Some(reason) = srv.shutdown_reason() {
+                                    enclave_log_error!(
+                                        "MINI-CONTROL-SHUTDOWN: reason=Ingress({:?})",
+                                        reason
+                                    );
                                     crate::signal_shutdown();
                                 }
                             }

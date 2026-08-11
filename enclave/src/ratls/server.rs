@@ -80,6 +80,17 @@ enum SessionState {
 const MAX_PENDING_CLIENTHELLO: usize = 16 * 1024;
 const MAX_PENDING_ENCLAVE_OUTPUT: usize = 4 * 1024 * 1024;
 
+/// Closed reason why the ingress server requested a global enclave stop.
+///
+/// The reason is deliberately free of connection identifiers, request bytes,
+/// TLS material and host/runtime error strings so it is safe to retain in
+/// measured lifecycle evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IngressShutdownReasonV1 {
+    ExplicitHttpRequest,
+    OutputCreditBacklog,
+}
+
 /// Stable DNS identity for the enclave-wide endpoint. Per-app identities use
 /// their admitted CertStore hostname instead. Never reflect an arbitrary SNI
 /// into a CA-signed SAN.
@@ -188,7 +199,18 @@ impl IngressServer {
 
     /// Are we shutting down?
     pub fn is_shutdown(&self) -> bool {
-        self.shutdown || self.output_failed.get()
+        self.shutdown_reason().is_some()
+    }
+
+    /// Return the exact bounded reason for a requested global stop.
+    pub fn shutdown_reason(&self) -> Option<IngressShutdownReasonV1> {
+        if self.output_failed.get() {
+            Some(IngressShutdownReasonV1::OutputCreditBacklog)
+        } else if self.shutdown {
+            Some(IngressShutdownReasonV1::ExplicitHttpRequest)
+        } else {
+            None
+        }
     }
 
     /// Flush at most one queued enclave→host channel message.

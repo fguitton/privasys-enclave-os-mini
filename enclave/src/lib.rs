@@ -323,6 +323,10 @@ pub fn run_execution_worker(worker_id: u32) -> i32 {
     if let Some(hook) = EXECUTION_WORKER_HOOK.get() {
         let result = hook(worker_id);
         if CORE_PHASE.load() == CorePhase::Running {
+            enclave_os_common::enclave_log_error!(
+                "MINI-EXECUTION-WORKER-EXIT: reason=UnexpectedHookReturn code={}",
+                result
+            );
             signal_shutdown();
         }
         if CORE_PHASE.load() == CorePhase::ShuttingDown {
