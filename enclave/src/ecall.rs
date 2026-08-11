@@ -45,7 +45,7 @@ use crate::ratls::attestation::CaContext;
 use crate::ratls::server::IngressServer;
 use crate::rpc_client::RpcClient;
 use crate::sealed_config::SealedConfig;
-use crate::{enclave_log_error, enclave_log_info};
+use crate::{enclave_log_error, enclave_log_info, ShutdownOriginV1};
 use enclave_os_common::channel;
 use enclave_os_common::hex::{hex_decode, hex_encode};
 use enclave_os_common::queue::{SpscConsumer, SpscProducer, SpscQueueHeader};
@@ -517,7 +517,7 @@ impl ControlLoopHook for NoopControlLoopHook {
 fn apply_control_action(action: ControlLoopAction) {
     if action == ControlLoopAction::Shutdown {
         enclave_log_error!("MINI-CONTROL-SHUTDOWN: reason=AdopterHook");
-        crate::signal_shutdown();
+        crate::signal_shutdown_with_origin(ShutdownOriginV1::AdopterHook);
     }
 }
 
@@ -535,11 +535,20 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
                 let _ = srv.progress_output();
                 if let Some(reason) = srv.shutdown_reason() {
                     enclave_log_error!("MINI-CONTROL-SHUTDOWN: reason=Ingress({:?})", reason);
-                    crate::signal_shutdown();
+                    let origin = match reason {
+                        crate::ratls::server::IngressShutdownReasonV1::ExplicitHttpRequest => {
+                            ShutdownOriginV1::IngressExplicitHttpRequest
+                        }
+                        crate::ratls::server::IngressShutdownReasonV1::OutputCreditBacklog => {
+                            ShutdownOriginV1::IngressOutputCreditBacklog
+                        }
+                    };
+                    crate::signal_shutdown_with_origin(origin);
                 }
             }
         } else {
             enclave_log_error!("MINI-CONTROL-SHUTDOWN: reason=StateLockUnavailable");
+            crate::signal_shutdown_with_origin(ShutdownOriginV1::StateLockUnavailable);
             break;
         }
 
@@ -556,6 +565,9 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
                                     enclave_log_error!(
                                         "MINI-CONTROL-SHUTDOWN: reason=StateLockUnavailable"
                                     );
+                                    crate::signal_shutdown_with_origin(
+                                        ShutdownOriginV1::StateLockUnavailable,
+                                    );
                                     break;
                                 }
                             };
@@ -566,7 +578,15 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
                                         "MINI-CONTROL-SHUTDOWN: reason=Ingress({:?})",
                                         reason
                                     );
-                                    crate::signal_shutdown();
+                                    let origin = match reason {
+                                        crate::ratls::server::IngressShutdownReasonV1::ExplicitHttpRequest => {
+                                            ShutdownOriginV1::IngressExplicitHttpRequest
+                                        }
+                                        crate::ratls::server::IngressShutdownReasonV1::OutputCreditBacklog => {
+                                            ShutdownOriginV1::IngressOutputCreditBacklog
+                                        }
+                                    };
+                                    crate::signal_shutdown_with_origin(origin);
                                 }
                             }
                             drop(st);
@@ -598,7 +618,7 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
         }
     }
     enclave_log_info!("Event loop exited");
-    0
+    crate::shutdown_return_code()
 }
 
 /// Compatibility wrapper used by Mini's default composition.
@@ -836,7 +856,7 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
 #[no_mangle]
 pub extern "C" fn ecall_shutdown() -> i32 {
     enclave_log_info!("Pre-run/spare-TCS shutdown requested");
-    crate::signal_shutdown();
+    crate::signal_shutdown_with_origin(ShutdownOriginV1::ExternalEcall);
     0
 }
 
