@@ -13,6 +13,7 @@ use enclave_os_common::ocall;
 use ring::digest::{digest, SHA256};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
+use zeroize::{Zeroize, Zeroizing};
 
 use super::{build_client_config, verify_channel_binding, RaTlsPolicy};
 
@@ -215,6 +216,22 @@ impl fmt::Debug for BoundedHttpsRequest {
     }
 }
 
+impl Drop for BoundedHttpsRequest {
+    fn drop(&mut self) {
+        self.method.zeroize();
+        self.url.zeroize();
+        for (name, value) in &mut self.headers {
+            name.zeroize();
+            value.zeroize();
+        }
+        self.headers.clear();
+        if let Some(body) = self.body.as_mut() {
+            body.zeroize();
+        }
+        self.body = None;
+    }
+}
+
 impl BoundedHttpsRequest {
     /// Validate and own one bounded HTTPS request.
     pub fn new(
@@ -337,7 +354,7 @@ pub fn https_fetch_interruptible_detailed(
     }
     request_head.push_str("\r\n");
 
-    let mut request_bytes = request_head.into_bytes();
+    let mut request_bytes = Zeroizing::new(request_head.into_bytes());
     if let Some(body) = &request.body {
         request_bytes.extend_from_slice(body);
     }
