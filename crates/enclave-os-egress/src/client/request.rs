@@ -53,6 +53,7 @@ pub enum HttpsFetchFailurePhase {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HttpsFetchError {
     pub phase: HttpsFetchFailurePhase,
+    tls_peer: Option<TlsPeerCertificateEvidence>,
     detail: String,
 }
 
@@ -60,6 +61,24 @@ impl HttpsFetchError {
     fn new(phase: HttpsFetchFailurePhase, detail: impl Into<String>) -> Self {
         Self {
             phase,
+            tls_peer: None,
+            detail: detail.into(),
+        }
+    }
+
+    fn after_dispatch(
+        phase: HttpsFetchFailurePhase,
+        tls_peer: TlsPeerCertificateEvidence,
+        detail: impl Into<String>,
+    ) -> Self {
+        debug_assert!(matches!(
+            phase,
+            HttpsFetchFailurePhase::AmbiguousAfterDispatch
+                | HttpsFetchFailurePhase::InvalidResponseAfterDispatch
+        ));
+        Self {
+            phase,
+            tls_peer: Some(tls_peer),
             detail: detail.into(),
         }
     }
@@ -71,6 +90,11 @@ impl HttpsFetchError {
             HttpsFetchFailurePhase::AmbiguousAfterDispatch
                 | HttpsFetchFailurePhase::InvalidResponseAfterDispatch
         )
+    }
+
+    #[must_use]
+    pub const fn tls_peer(&self) -> Option<TlsPeerCertificateEvidence> {
+        self.tls_peer
     }
 }
 
@@ -317,14 +341,16 @@ fn https_request_connected(
 
     for chunk in request.chunks(16 * 1024) {
         tls_conn.writer().write_all(chunk).map_err(|error| {
-            HttpsFetchError::new(
+            HttpsFetchError::after_dispatch(
                 HttpsFetchFailurePhase::AmbiguousAfterDispatch,
+                tls_peer,
                 format!("write failed: {error}"),
             )
         })?;
         flush_tls(io, fd, &mut tls_conn).map_err(|_| {
-            HttpsFetchError::new(
+            HttpsFetchError::after_dispatch(
                 HttpsFetchFailurePhase::AmbiguousAfterDispatch,
+                tls_peer,
                 "flush failed",
             )
         })?;
@@ -345,8 +371,9 @@ fn https_request_connected(
                         Ok(0) => break,
                         Ok(_) => {
                             tls_conn.process_new_packets().map_err(|error| {
-                                HttpsFetchError::new(
+                                HttpsFetchError::after_dispatch(
                                     HttpsFetchFailurePhase::AmbiguousAfterDispatch,
+                                    tls_peer,
                                     format!("TLS error: {error:?}"),
                                 )
                             })?;
@@ -358,8 +385,9 @@ fn https_request_connected(
                                         if response_data.len()
                                             > MAX_RESPONSE_BODY + MAX_RESPONSE_HEADER_BYTES
                                         {
-                                            return Err(HttpsFetchError::new(
+                                            return Err(HttpsFetchError::after_dispatch(
                                                 HttpsFetchFailurePhase::InvalidResponseAfterDispatch,
+                                                tls_peer,
                                                 "HTTP response exceeds header/body bounds",
                                             ));
                                         }
@@ -370,8 +398,9 @@ fn https_request_connected(
                                         break
                                     }
                                     Err(error) => {
-                                        return Err(HttpsFetchError::new(
+                                        return Err(HttpsFetchError::after_dispatch(
                                             HttpsFetchFailurePhase::AmbiguousAfterDispatch,
+                                            tls_peer,
                                             format!("TLS plaintext read failed: {error}"),
                                         ))
                                     }
@@ -379,8 +408,9 @@ fn https_request_connected(
                             }
                         }
                         Err(error) => {
-                            return Err(HttpsFetchError::new(
+                            return Err(HttpsFetchError::after_dispatch(
                                 HttpsFetchFailurePhase::AmbiguousAfterDispatch,
+                                tls_peer,
                                 format!("read_tls error: {error:?}"),
                             ))
                         }
@@ -388,8 +418,9 @@ fn https_request_connected(
                 }
             }
             Err(error) => {
-                return Err(HttpsFetchError::new(
+                return Err(HttpsFetchError::after_dispatch(
                     HttpsFetchFailurePhase::AmbiguousAfterDispatch,
+                    tls_peer,
                     format!("network read failed: {error}"),
                 ))
             }
@@ -400,7 +431,11 @@ fn https_request_connected(
     let _ = flush_tls(io, fd, &mut tls_conn);
     let (status, headers, raw_header_section, body) =
         parse_http_response(&response_data).map_err(|error| {
-            HttpsFetchError::new(HttpsFetchFailurePhase::InvalidResponseAfterDispatch, error)
+            HttpsFetchError::after_dispatch(
+                HttpsFetchFailurePhase::InvalidResponseAfterDispatch,
+                tls_peer,
+                error,
+            )
         })?;
     Ok(HttpResponse {
         status,
