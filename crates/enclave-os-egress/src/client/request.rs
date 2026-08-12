@@ -139,12 +139,25 @@ pub trait InterruptibleBlockingNetIo {
 }
 
 /// Validated, owned HTTPS request for the injected-I/O path.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct BoundedHttpsRequest {
     method: String,
     url: String,
     headers: Vec<(String, String)>,
     body: Option<Vec<u8>>,
+}
+
+impl fmt::Debug for BoundedHttpsRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BoundedHttpsRequest")
+            .field("method", &self.method)
+            .field("url", &"<protected>")
+            .field("header_count", &self.headers.len())
+            .field("headers", &"<protected>")
+            .field("body", &"<protected>")
+            .finish()
+    }
 }
 
 impl BoundedHttpsRequest {
@@ -732,6 +745,22 @@ mod tests {
             None,
         )
         .is_err());
+    }
+
+    #[test]
+    fn bounded_request_debug_never_discloses_protected_material() {
+        let request = BoundedHttpsRequest::new(
+            "POST",
+            "https://private.fixture.test/patient/42",
+            vec![("Idempotency-Key".into(), "private-operation-key".into())],
+            Some(b"private-body".to_vec()),
+        )
+        .expect("bounded protected request");
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("private.fixture.test"));
+        assert!(!debug.contains("patient/42"));
+        assert!(!debug.contains("private-operation-key"));
+        assert!(!debug.contains("private-body"));
     }
 
     #[derive(Default)]
