@@ -43,9 +43,10 @@ mod request;
 
 pub use incremental::IncrementalTlsClient;
 pub use request::{
-    https_fetch, https_fetch_interruptible, BoundedHttpsRequest, HttpResponse,
+    https_fetch, https_fetch_interruptible, https_fetch_interruptible_detailed,
+    BoundedHttpsRequest, HttpResponse, HttpsFetchError, HttpsFetchFailurePhase,
     InterruptibleBlockingNetIo, MAX_REQUEST_BODY, MAX_REQUEST_HEADERS, MAX_REQUEST_HEADER_BYTES,
-    MAX_RESPONSE_BODY,
+    MAX_RESPONSE_BODY, MAX_RESPONSE_HEADERS, MAX_RESPONSE_HEADER_BYTES,
 };
 
 // Re-export shared quote primitives for callers building `RaTlsPolicy` values.

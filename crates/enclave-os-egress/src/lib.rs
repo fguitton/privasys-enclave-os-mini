@@ -56,13 +56,14 @@ pub mod jwks;
 // Re-export RA-TLS verification types for convenience.
 pub use client::{
     enclave_attestation_quote, enclave_self_mrenclave, https_fetch, https_fetch_interruptible,
-    locally_verify_sgx_peer_certificate, mozilla_root_store, register_enclave_attestation_provider,
-    register_enclave_client_cert_signer, root_store_from_der, BoundedHttpsRequest,
-    ClientCertIdentity, EnclaveAttestationProvider, EnclaveClientCertSigner, ExpectedOid,
-    HttpResponse, IncrementalTlsClient, InterruptibleBlockingNetIo, RaTlsPolicy, ReportDataBinding,
+    https_fetch_interruptible_detailed, locally_verify_sgx_peer_certificate, mozilla_root_store,
+    register_enclave_attestation_provider, register_enclave_client_cert_signer,
+    root_store_from_der, BoundedHttpsRequest, ClientCertIdentity, EnclaveAttestationProvider,
+    EnclaveClientCertSigner, ExpectedOid, HttpResponse, HttpsFetchError, HttpsFetchFailurePhase,
+    IncrementalTlsClient, InterruptibleBlockingNetIo, RaTlsPolicy, ReportDataBinding,
     SgxPeerCertificateEvidence, TeeType, MAX_REQUEST_BODY, MAX_REQUEST_HEADERS,
-    MAX_REQUEST_HEADER_BYTES, MAX_RESPONSE_BODY, OID_ATTESTATION_SERVERS_HASH,
-    OID_CONFIG_MERKLE_ROOT, OID_EGRESS_CA_HASH, OID_WASM_APPS_HASH,
+    MAX_REQUEST_HEADER_BYTES, MAX_RESPONSE_BODY, MAX_RESPONSE_HEADERS, MAX_RESPONSE_HEADER_BYTES,
+    OID_ATTESTATION_SERVERS_HASH, OID_CONFIG_MERKLE_ROOT, OID_EGRESS_CA_HASH, OID_WASM_APPS_HASH,
 };
 
 use std::sync::OnceLock;
