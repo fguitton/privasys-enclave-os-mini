@@ -13,6 +13,7 @@
 
 use std::string::String;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 use std::vec::Vec;
 
 use core::mem;
@@ -45,8 +46,10 @@ pub use incremental::IncrementalTlsClient;
 pub use request::{
     https_fetch, https_fetch_interruptible, https_fetch_interruptible_detailed,
     BoundedHttpsRequest, HttpResponse, HttpsFetchError, HttpsFetchFailurePhase,
-    InterruptibleBlockingNetIo, TlsPeerCertificateEvidence, MAX_REQUEST_BODY, MAX_REQUEST_HEADERS,
-    MAX_REQUEST_HEADER_BYTES, MAX_RESPONSE_BODY, MAX_RESPONSE_HEADERS, MAX_RESPONSE_HEADER_BYTES,
+    InterruptibleBlockingNetIo, TlsPeerCertificateChain, TlsPeerCertificateEvidence,
+    MAX_REQUEST_BODY, MAX_REQUEST_HEADERS, MAX_REQUEST_HEADER_BYTES, MAX_RESPONSE_BODY,
+    MAX_RESPONSE_HEADERS, MAX_RESPONSE_HEADER_BYTES, MAX_TLS_PEER_CERTIFICATES,
+    MAX_TLS_PEER_CERTIFICATE_BYTES, MAX_TLS_PEER_CHAIN_BYTES,
 };
 
 // Re-export shared quote primitives for callers building `RaTlsPolicy` values.
@@ -98,6 +101,53 @@ where
             .map_err(|e| format!("ca-roots-der[{}]: invalid root certificate: {}", i, e))?;
     }
     Ok(store)
+}
+
+/// Re-run standard WebPKI validation over one retained DER chain.
+///
+/// This is intentionally side-effect free: it performs no network revocation
+/// lookup and consumes only the exact caller-supplied trust store, policy,
+/// server name and committed validation time. An empty OCSP input is used
+/// until the transport exposes stapled OCSP/SCT material for retention. This
+/// helper deliberately does not claim to reproduce RA-TLS channel binding.
+pub fn verify_webpki_server_certificate_chain_at(
+    certificate_chain_der: &[Vec<u8>],
+    server_name: &str,
+    root_store: &RootCertStore,
+    verified_at_unix_seconds: u64,
+) -> Result<(), String> {
+    if certificate_chain_der.is_empty() || certificate_chain_der.len() > MAX_TLS_PEER_CERTIFICATES {
+        return Err("TLS peer certificate count is outside the retained profile".into());
+    }
+    let mut chain_bytes = 0usize;
+    for certificate in certificate_chain_der {
+        if certificate.is_empty() || certificate.len() > MAX_TLS_PEER_CERTIFICATE_BYTES {
+            return Err("TLS peer certificate is outside the retained profile".into());
+        }
+        chain_bytes = chain_bytes
+            .checked_add(certificate.len())
+            .ok_or_else(|| "TLS peer certificate chain length overflow".to_string())?;
+    }
+    if chain_bytes > MAX_TLS_PEER_CHAIN_BYTES {
+        return Err("TLS peer certificate chain is outside the retained profile".into());
+    }
+
+    let server_name = ServerName::try_from(server_name.to_string())
+        .map_err(|_| "invalid retained TLS server name".to_string())?;
+    let leaf = CertificateDer::from(certificate_chain_der[0].as_slice());
+    let intermediates: Vec<_> = certificate_chain_der[1..]
+        .iter()
+        .map(|certificate| CertificateDer::from(certificate.as_slice()))
+        .collect();
+    let provider = Arc::new(default_provider());
+    let inner = WebPkiServerVerifier::builder_with_provider(Arc::new(root_store.clone()), provider)
+        .build()
+        .map_err(|error| format!("WebPKI verifier build error: {error}"))?;
+    let now = UnixTime::since_unix_epoch(Duration::from_secs(verified_at_unix_seconds));
+    inner
+        .verify_server_cert(&leaf, &intermediates, &server_name, &[], now)
+        .map(|_| ())
+        .map_err(|error| format!("retained TLS peer validation failed: {error}"))
 }
 
 // =========================================================================
@@ -1092,7 +1142,10 @@ fn sha256_array(bytes: &[u8]) -> [u8; 32] {
 
 #[cfg(test)]
 mod peer_appraisal_tests {
-    use super::locally_verify_sgx_peer_certificate;
+    use super::{
+        locally_verify_sgx_peer_certificate, verify_webpki_server_certificate_chain_at,
+        RootCertStore, MAX_TLS_PEER_CERTIFICATES, MAX_TLS_PEER_CERTIFICATE_BYTES,
+    };
 
     #[test]
     fn strict_peer_appraisal_rejects_missing_or_malformed_live_bindings_first() {
@@ -1109,5 +1162,29 @@ mod peer_appraisal_tests {
                 .unwrap_err(),
             "RA-TLS peer: channel binder must be exactly 32 bytes"
         );
+    }
+
+    #[test]
+    fn retained_peer_chain_replay_rejects_empty_count_and_certificate_bounds_first() {
+        let roots = RootCertStore::empty();
+        assert!(verify_webpki_server_certificate_chain_at(&[], "example.test", &roots, 1)
+            .unwrap_err()
+            .contains("count"));
+        assert!(verify_webpki_server_certificate_chain_at(
+            &vec![vec![1]; MAX_TLS_PEER_CERTIFICATES + 1],
+            "example.test",
+            &roots,
+            1,
+        )
+        .unwrap_err()
+        .contains("count"));
+        assert!(verify_webpki_server_certificate_chain_at(
+            &[vec![1; MAX_TLS_PEER_CERTIFICATE_BYTES + 1]],
+            "example.test",
+            &roots,
+            1,
+        )
+        .unwrap_err()
+        .contains("certificate"));
     }
 }

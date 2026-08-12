@@ -36,6 +36,15 @@ pub const MAX_REQUEST_HEADERS: usize = 64;
 /// Maximum combined caller-supplied header bytes.
 pub const MAX_REQUEST_HEADER_BYTES: usize = 16 * 1024;
 
+/// Maximum number of certificates retained from one authenticated peer.
+pub const MAX_TLS_PEER_CERTIFICATES: usize = 16;
+
+/// Maximum DER length of one retained peer certificate.
+pub const MAX_TLS_PEER_CERTIFICATE_BYTES: usize = 64 * 1024;
+
+/// Maximum aggregate DER length of one retained peer chain.
+pub const MAX_TLS_PEER_CHAIN_BYTES: usize = 256 * 1024;
+
 /// Stable failure phase for finality-gated callers. Protocol logic branches
 /// on this closed enum rather than diagnostic strings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -54,6 +63,7 @@ pub enum HttpsFetchFailurePhase {
 pub struct HttpsFetchError {
     pub phase: HttpsFetchFailurePhase,
     tls_peer: Option<TlsPeerCertificateEvidence>,
+    tls_peer_chain: Option<TlsPeerCertificateChain>,
     detail: String,
 }
 
@@ -62,6 +72,7 @@ impl HttpsFetchError {
         Self {
             phase,
             tls_peer: None,
+            tls_peer_chain: None,
             detail: detail.into(),
         }
     }
@@ -69,6 +80,7 @@ impl HttpsFetchError {
     fn after_dispatch(
         phase: HttpsFetchFailurePhase,
         tls_peer: TlsPeerCertificateEvidence,
+        tls_peer_chain: &TlsPeerCertificateChain,
         detail: impl Into<String>,
     ) -> Self {
         debug_assert!(matches!(
@@ -79,6 +91,7 @@ impl HttpsFetchError {
         Self {
             phase,
             tls_peer: Some(tls_peer),
+            tls_peer_chain: Some(tls_peer_chain.clone()),
             detail: detail.into(),
         }
     }
@@ -95,6 +108,12 @@ impl HttpsFetchError {
     #[must_use]
     pub const fn tls_peer(&self) -> Option<TlsPeerCertificateEvidence> {
         self.tls_peer
+    }
+
+    /// Return the exact bounded DER sequence observed after TLS validation.
+    #[must_use]
+    pub fn tls_peer_chain(&self) -> Option<&TlsPeerCertificateChain> {
+        self.tls_peer_chain.as_ref()
     }
 }
 
@@ -115,6 +134,8 @@ pub struct HttpResponse {
     /// CRLFCRLF.
     pub raw_header_section: Vec<u8>,
     pub tls_peer: TlsPeerCertificateEvidence,
+    /// Exact bounded DER sequence validated on this connection.
+    pub tls_peer_chain: TlsPeerCertificateChain,
     pub body: Vec<u8>,
 }
 
@@ -124,6 +145,40 @@ pub struct TlsPeerCertificateEvidence {
     pub leaf_sha256: [u8; 32],
     pub chain_sha256: [u8; 32],
     pub certificate_count: u16,
+    pub chain_bytes: u64,
+}
+
+/// Exact peer certificate sequence observed by rustls, leaf first.
+///
+/// The bytes are evidence material rather than an authority. Debug output is
+/// deliberately redacted so a future private-PKI profile does not leak names
+/// or organisation metadata through diagnostics.
+#[derive(Clone, Eq, PartialEq)]
+pub struct TlsPeerCertificateChain {
+    certificates_der: Vec<Vec<u8>>,
+}
+
+impl TlsPeerCertificateChain {
+    #[must_use]
+    pub fn certificates_der(&self) -> &[Vec<u8>] {
+        &self.certificates_der
+    }
+
+    #[must_use]
+    pub fn total_bytes(&self) -> usize {
+        self.certificates_der.iter().map(Vec::len).sum()
+    }
+}
+
+impl fmt::Debug for TlsPeerCertificateChain {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TlsPeerCertificateChain")
+            .field("certificate_count", &self.certificates_der.len())
+            .field("chain_bytes", &self.total_bytes())
+            .field("certificates_der", &"<protected>")
+            .finish()
+    }
 }
 
 /// Explicit network capability injected by a role-owning composition.
@@ -350,13 +405,14 @@ fn https_request_connected(
             )
         })?;
     }
-    let tls_peer = tls_peer_certificate_evidence(&tls_conn)?;
+    let (tls_peer, tls_peer_chain) = tls_peer_certificate_evidence(&tls_conn)?;
 
     for chunk in request.chunks(16 * 1024) {
         tls_conn.writer().write_all(chunk).map_err(|error| {
             HttpsFetchError::after_dispatch(
                 HttpsFetchFailurePhase::AmbiguousAfterDispatch,
                 tls_peer,
+                &tls_peer_chain,
                 format!("write failed: {error}"),
             )
         })?;
@@ -364,6 +420,7 @@ fn https_request_connected(
             HttpsFetchError::after_dispatch(
                 HttpsFetchFailurePhase::AmbiguousAfterDispatch,
                 tls_peer,
+                &tls_peer_chain,
                 "flush failed",
             )
         })?;
@@ -387,6 +444,7 @@ fn https_request_connected(
                                 HttpsFetchError::after_dispatch(
                                     HttpsFetchFailurePhase::AmbiguousAfterDispatch,
                                     tls_peer,
+                                    &tls_peer_chain,
                                     format!("TLS error: {error:?}"),
                                 )
                             })?;
@@ -401,6 +459,7 @@ fn https_request_connected(
                                             return Err(HttpsFetchError::after_dispatch(
                                                 HttpsFetchFailurePhase::InvalidResponseAfterDispatch,
                                                 tls_peer,
+                                                &tls_peer_chain,
                                                 "HTTP response exceeds header/body bounds",
                                             ));
                                         }
@@ -414,6 +473,7 @@ fn https_request_connected(
                                         return Err(HttpsFetchError::after_dispatch(
                                             HttpsFetchFailurePhase::AmbiguousAfterDispatch,
                                             tls_peer,
+                                            &tls_peer_chain,
                                             format!("TLS plaintext read failed: {error}"),
                                         ))
                                     }
@@ -424,6 +484,7 @@ fn https_request_connected(
                             return Err(HttpsFetchError::after_dispatch(
                                 HttpsFetchFailurePhase::AmbiguousAfterDispatch,
                                 tls_peer,
+                                &tls_peer_chain,
                                 format!("read_tls error: {error:?}"),
                             ))
                         }
@@ -434,6 +495,7 @@ fn https_request_connected(
                 return Err(HttpsFetchError::after_dispatch(
                     HttpsFetchFailurePhase::AmbiguousAfterDispatch,
                     tls_peer,
+                    &tls_peer_chain,
                     format!("network read failed: {error}"),
                 ))
             }
@@ -447,6 +509,7 @@ fn https_request_connected(
             HttpsFetchError::after_dispatch(
                 HttpsFetchFailurePhase::InvalidResponseAfterDispatch,
                 tls_peer,
+                &tls_peer_chain,
                 error,
             )
         })?;
@@ -455,19 +518,26 @@ fn https_request_connected(
         headers,
         raw_header_section,
         tls_peer,
+        tls_peer_chain,
         body,
     })
 }
 
 fn tls_peer_certificate_evidence(
     connection: &ClientConnection,
-) -> Result<TlsPeerCertificateEvidence, HttpsFetchError> {
+) -> Result<(TlsPeerCertificateEvidence, TlsPeerCertificateChain), HttpsFetchError> {
     let certificates = connection.peer_certificates().ok_or_else(|| {
         HttpsFetchError::new(
             HttpsFetchFailurePhase::PeerVerificationBeforeDispatch,
             "TLS peer supplied no certificate chain",
         )
     })?;
+    if certificates.len() > MAX_TLS_PEER_CERTIFICATES {
+        return Err(HttpsFetchError::new(
+            HttpsFetchFailurePhase::PeerVerificationBeforeDispatch,
+            "TLS peer certificate count exceeds bound",
+        ));
+    }
     let leaf = certificates.first().ok_or_else(|| {
         HttpsFetchError::new(
             HttpsFetchFailurePhase::PeerVerificationBeforeDispatch,
@@ -479,7 +549,29 @@ fn tls_peer_certificate_evidence(
         .try_into()
         .expect("SHA-256 output is fixed width");
     let mut context = ring::digest::Context::new(&SHA256);
+    let mut chain_bytes = 0usize;
+    let mut certificates_der = Vec::with_capacity(certificates.len());
     for certificate in certificates {
+        if certificate.as_ref().len() > MAX_TLS_PEER_CERTIFICATE_BYTES {
+            return Err(HttpsFetchError::new(
+                HttpsFetchFailurePhase::PeerVerificationBeforeDispatch,
+                "TLS peer certificate exceeds byte bound",
+            ));
+        }
+        chain_bytes = chain_bytes
+            .checked_add(certificate.as_ref().len())
+            .ok_or_else(|| {
+                HttpsFetchError::new(
+                    HttpsFetchFailurePhase::PeerVerificationBeforeDispatch,
+                    "TLS peer certificate chain length overflow",
+                )
+            })?;
+        if chain_bytes > MAX_TLS_PEER_CHAIN_BYTES {
+            return Err(HttpsFetchError::new(
+                HttpsFetchFailurePhase::PeerVerificationBeforeDispatch,
+                "TLS peer certificate chain exceeds byte bound",
+            ));
+        }
         let length = u64::try_from(certificate.as_ref().len()).map_err(|_| {
             HttpsFetchError::new(
                 HttpsFetchFailurePhase::PeerVerificationBeforeDispatch,
@@ -488,22 +580,32 @@ fn tls_peer_certificate_evidence(
         })?;
         context.update(&length.to_be_bytes());
         context.update(certificate.as_ref());
+        certificates_der.push(certificate.as_ref().to_vec());
     }
     let chain_sha256 = context
         .finish()
         .as_ref()
         .try_into()
         .expect("SHA-256 output is fixed width");
-    Ok(TlsPeerCertificateEvidence {
-        leaf_sha256,
-        chain_sha256,
-        certificate_count: u16::try_from(certificates.len()).map_err(|_| {
-            HttpsFetchError::new(
-                HttpsFetchFailurePhase::PeerVerificationBeforeDispatch,
-                "TLS peer certificate chain is excessive",
-            )
-        })?,
-    })
+    Ok((
+        TlsPeerCertificateEvidence {
+            leaf_sha256,
+            chain_sha256,
+            certificate_count: u16::try_from(certificates.len()).map_err(|_| {
+                HttpsFetchError::new(
+                    HttpsFetchFailurePhase::PeerVerificationBeforeDispatch,
+                    "TLS peer certificate chain is excessive",
+                )
+            })?,
+            chain_bytes: u64::try_from(chain_bytes).map_err(|_| {
+                HttpsFetchError::new(
+                    HttpsFetchFailurePhase::PeerVerificationBeforeDispatch,
+                    "TLS peer certificate chain length is unrepresentable",
+                )
+            })?,
+        },
+        TlsPeerCertificateChain { certificates_der },
+    ))
 }
 
 fn tls_handshake(
