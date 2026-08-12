@@ -57,6 +57,9 @@ struct Args {
     shutdown_after_health: bool,
     endpoint_join: bool,
     endpoint_submit_only: bool,
+    endpoint_identity_file: Option<PathBuf>,
+    endpoint_route_digest: Option<[u8; 32]>,
+    endpoint_activation_epoch: Option<u64>,
     work_id: [u8; 16],
     raw_post_path: Option<String>,
     raw_body_file: Option<PathBuf>,
@@ -210,6 +213,15 @@ fn decode_work_id(value: &str) -> Result<[u8; 16], String> {
     Ok(result)
 }
 
+fn decode_endpoint_route_digest(value: &str) -> Result<[u8; 32], String> {
+    let digest = decode_mrenclave(value)
+        .map_err(|_| "--endpoint-route-digest must be exactly 64 hexadecimal characters")?;
+    if digest.iter().all(|byte| *byte == 0) {
+        return Err("--endpoint-route-digest cannot be zero".into());
+    }
+    Ok(digest)
+}
+
 fn parse_args() -> Result<Args, String> {
     let mut values = env::args().skip(1);
     let mut cwasm = None;
@@ -226,6 +238,9 @@ fn parse_args() -> Result<Args, String> {
     let mut shutdown_after_health = false;
     let mut endpoint_join = false;
     let mut endpoint_submit_only = false;
+    let mut endpoint_identity_file = None;
+    let mut endpoint_route_digest = None;
+    let mut endpoint_activation_epoch = None;
     let mut work_id = [0x4b; 16];
     let mut raw_post_path = None;
     let mut raw_body_file = None;
@@ -271,6 +286,24 @@ fn parse_args() -> Result<Args, String> {
             "--shutdown-after-health" => shutdown_after_health = true,
             "--endpoint-join" => endpoint_join = true,
             "--endpoint-submit-only" => endpoint_submit_only = true,
+            "--endpoint-identity-file" => {
+                endpoint_identity_file = Some(PathBuf::from(take_value(&mut values, &flag)?));
+            }
+            "--endpoint-route-digest" => {
+                endpoint_route_digest = Some(decode_endpoint_route_digest(&take_value(
+                    &mut values,
+                    &flag,
+                )?)?);
+            }
+            "--endpoint-activation-epoch" => {
+                let epoch = take_value(&mut values, &flag)?
+                    .parse::<u64>()
+                    .map_err(|_| "invalid --endpoint-activation-epoch".to_string())?;
+                if epoch == 0 {
+                    return Err("--endpoint-activation-epoch cannot be zero".into());
+                }
+                endpoint_activation_epoch = Some(epoch);
+            }
             "--work-id" => work_id = decode_work_id(&take_value(&mut values, &flag)?)?,
             "--raw-post-path" => raw_post_path = Some(take_value(&mut values, &flag)?),
             "--raw-body-file" => {
@@ -291,6 +324,22 @@ fn parse_args() -> Result<Args, String> {
 
     if endpoint_join && endpoint_submit_only {
         return Err("--endpoint-join and --endpoint-submit-only are mutually exclusive".into());
+    }
+    let endpoint_mode = endpoint_join || endpoint_submit_only;
+    if endpoint_mode && (endpoint_route_digest.is_none() || endpoint_activation_epoch.is_none()) {
+        return Err(
+            "endpoint appraisal requires --endpoint-route-digest and --endpoint-activation-epoch"
+                .into(),
+        );
+    }
+    if !endpoint_mode
+        && (endpoint_identity_file.is_some()
+            || endpoint_route_digest.is_some()
+            || endpoint_activation_epoch.is_some())
+    {
+        return Err(
+            "endpoint appraisal arguments require --endpoint-join or --endpoint-submit-only".into(),
+        );
     }
     if raw_response_file.is_some() && raw_post_path.is_none() {
         return Err("--raw-response-file requires --raw-post-path".into());
@@ -313,6 +362,9 @@ fn parse_args() -> Result<Args, String> {
         shutdown_after_health,
         endpoint_join,
         endpoint_submit_only,
+        endpoint_identity_file,
+        endpoint_route_digest,
+        endpoint_activation_epoch,
         work_id,
         raw_post_path,
         raw_body_file,
@@ -323,7 +375,11 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn endpoint_request_identity(args: &Args) -> Result<EndpointRequestIdentity, String> {
-    endpoint_request_identity_from_path(args.raw_body_file.as_ref())
+    endpoint_request_identity_from_path(
+        args.endpoint_identity_file
+            .as_ref()
+            .or(args.raw_body_file.as_ref()),
+    )
 }
 
 fn endpoint_request_identity_from_path(
@@ -372,26 +428,44 @@ fn endpoint_request_identity_from_path(
 
 fn endpoint_expected_oids(args: &Args) -> Result<Vec<ExpectedOid>, String> {
     let identity = endpoint_request_identity(args)?;
-    Ok(vec![
+    let route_digest = args
+        .endpoint_route_digest
+        .ok_or_else(|| "endpoint route digest expectation is unavailable".to_string())?;
+    let activation_epoch = args
+        .endpoint_activation_epoch
+        .ok_or_else(|| "endpoint activation epoch expectation is unavailable".to_string())?;
+    Ok(endpoint_expected_oids_for(
+        &identity,
+        route_digest,
+        activation_epoch,
+    ))
+}
+
+fn endpoint_expected_oids_for(
+    identity: &EndpointRequestIdentity,
+    route_digest: [u8; 32],
+    activation_epoch: u64,
+) -> Vec<ExpectedOid> {
+    vec![
         ExpectedOid {
             oid: enclave_os_common::oids::HONEST_ENDPOINT_MANIFEST_ID_OID_STR.into(),
-            expected_value: identity.endpoint_manifest_id,
+            expected_value: identity.endpoint_manifest_id.clone(),
         },
         ExpectedOid {
             oid: enclave_os_common::oids::HONEST_ENDPOINT_MANIFEST_DIGEST_OID_STR.into(),
-            expected_value: identity.endpoint_manifest_digest,
+            expected_value: identity.endpoint_manifest_digest.clone(),
         },
         ExpectedOid {
             oid: enclave_os_common::oids::HONEST_ENDPOINT_ID_OID_STR.into(),
-            expected_value: identity.endpoint_id,
+            expected_value: identity.endpoint_id.clone(),
         },
         ExpectedOid {
             oid: enclave_os_common::oids::HONEST_OPERATION_ID_OID_STR.into(),
-            expected_value: identity.operation_id,
+            expected_value: identity.operation_id.clone(),
         },
         ExpectedOid {
             oid: enclave_os_common::oids::HONEST_WORKFLOW_GENERATION_ID_OID_STR.into(),
-            expected_value: identity.workflow_generation_id,
+            expected_value: identity.workflow_generation_id.clone(),
         },
         ExpectedOid {
             oid: enclave_os_common::oids::HONEST_ENTRY_STAGE_ID_OID_STR.into(),
@@ -399,21 +473,21 @@ fn endpoint_expected_oids(args: &Args) -> Result<Vec<ExpectedOid>, String> {
         },
         ExpectedOid {
             oid: enclave_os_common::oids::HONEST_WORKFLOW_ID_OID_STR.into(),
-            expected_value: identity.workflow_id,
+            expected_value: identity.workflow_id.clone(),
         },
         ExpectedOid {
             oid: enclave_os_common::oids::HONEST_WORKFLOW_MANIFEST_DIGEST_OID_STR.into(),
-            expected_value: identity.workflow_manifest_digest,
+            expected_value: identity.workflow_manifest_digest.clone(),
         },
         ExpectedOid {
             oid: enclave_os_common::oids::HONEST_ENDPOINT_ROUTE_DIGEST_OID_STR.into(),
-            expected_value: vec![0x42; 32],
+            expected_value: route_digest.to_vec(),
         },
         ExpectedOid {
             oid: enclave_os_common::oids::HONEST_ENDPOINT_ACTIVATION_EPOCH_OID_STR.into(),
-            expected_value: 1_u64.to_be_bytes().to_vec(),
+            expected_value: activation_epoch.to_be_bytes().to_vec(),
         },
-    ])
+    ]
 }
 
 fn request_with_status(
@@ -885,5 +959,43 @@ mod tests {
         .expect("non-hex mutation write");
         assert!(endpoint_request_identity_from_path(Some(&path)).is_err());
         fs::remove_file(path).expect("request cleanup");
+    }
+
+    #[test]
+    fn endpoint_route_and_epoch_expectations_are_explicit_and_substitution_sensitive() {
+        let identity = EndpointRequestIdentity {
+            endpoint_manifest_id: vec![0x71; 16],
+            endpoint_manifest_digest: vec![0x72; 32],
+            endpoint_id: vec![0x73; 16],
+            operation_id: vec![0x74; 16],
+            workflow_generation_id: vec![0x75; 16],
+            workflow_id: vec![0x76; 16],
+            workflow_manifest_digest: vec![0x77; 32],
+        };
+        let expected = endpoint_expected_oids_for(&identity, [0x6c; 32], 5);
+        let route = expected
+            .iter()
+            .find(|entry| {
+                entry.oid == enclave_os_common::oids::HONEST_ENDPOINT_ROUTE_DIGEST_OID_STR
+            })
+            .expect("route expectation");
+        let epoch = expected
+            .iter()
+            .find(|entry| {
+                entry.oid == enclave_os_common::oids::HONEST_ENDPOINT_ACTIVATION_EPOCH_OID_STR
+            })
+            .expect("epoch expectation");
+        assert_eq!(route.expected_value, vec![0x6c; 32]);
+        assert_eq!(epoch.expected_value, 5_u64.to_be_bytes());
+
+        let substituted_route = endpoint_expected_oids_for(&identity, [0x42; 32], 5);
+        let substituted_epoch = endpoint_expected_oids_for(&identity, [0x6c; 32], 1);
+        assert_eq!(substituted_route[8].expected_value, vec![0x42; 32]);
+        assert_ne!(route.expected_value, substituted_route[8].expected_value);
+        assert_eq!(substituted_epoch[9].expected_value, 1_u64.to_be_bytes());
+        assert_ne!(epoch.expected_value, substituted_epoch[9].expected_value);
+        assert!(decode_endpoint_route_digest(&"6c".repeat(32)).is_ok());
+        assert!(decode_endpoint_route_digest(&"00".repeat(32)).is_err());
+        assert!(decode_endpoint_route_digest("6c").is_err());
     }
 }
