@@ -10,6 +10,7 @@ use std::vec::Vec;
 use std::{error::Error, fmt};
 
 use enclave_os_common::ocall;
+use ring::digest::{digest, SHA256};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 
@@ -89,7 +90,16 @@ pub struct HttpResponse {
     /// Exact received HTTP/1.1 status/header section including its terminal
     /// CRLFCRLF.
     pub raw_header_section: Vec<u8>,
+    pub tls_peer: TlsPeerCertificateEvidence,
     pub body: Vec<u8>,
+}
+
+/// Exact certificate evidence observed on the authenticated TLS connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TlsPeerCertificateEvidence {
+    pub leaf_sha256: [u8; 32],
+    pub chain_sha256: [u8; 32],
+    pub certificate_count: u16,
 }
 
 /// Explicit network capability injected by a role-owning composition.
@@ -303,6 +313,7 @@ fn https_request_connected(
             )
         })?;
     }
+    let tls_peer = tls_peer_certificate_evidence(&tls_conn)?;
 
     for chunk in request.chunks(16 * 1024) {
         tls_conn.writer().write_all(chunk).map_err(|error| {
@@ -395,7 +406,55 @@ fn https_request_connected(
         status,
         headers,
         raw_header_section,
+        tls_peer,
         body,
+    })
+}
+
+fn tls_peer_certificate_evidence(
+    connection: &ClientConnection,
+) -> Result<TlsPeerCertificateEvidence, HttpsFetchError> {
+    let certificates = connection.peer_certificates().ok_or_else(|| {
+        HttpsFetchError::new(
+            HttpsFetchFailurePhase::PeerVerificationBeforeDispatch,
+            "TLS peer supplied no certificate chain",
+        )
+    })?;
+    let leaf = certificates.first().ok_or_else(|| {
+        HttpsFetchError::new(
+            HttpsFetchFailurePhase::PeerVerificationBeforeDispatch,
+            "TLS peer supplied an empty certificate chain",
+        )
+    })?;
+    let leaf_sha256 = digest(&SHA256, leaf.as_ref())
+        .as_ref()
+        .try_into()
+        .expect("SHA-256 output is fixed width");
+    let mut context = ring::digest::Context::new(&SHA256);
+    for certificate in certificates {
+        let length = u64::try_from(certificate.as_ref().len()).map_err(|_| {
+            HttpsFetchError::new(
+                HttpsFetchFailurePhase::PeerVerificationBeforeDispatch,
+                "TLS peer certificate length is unrepresentable",
+            )
+        })?;
+        context.update(&length.to_be_bytes());
+        context.update(certificate.as_ref());
+    }
+    let chain_sha256 = context
+        .finish()
+        .as_ref()
+        .try_into()
+        .expect("SHA-256 output is fixed width");
+    Ok(TlsPeerCertificateEvidence {
+        leaf_sha256,
+        chain_sha256,
+        certificate_count: u16::try_from(certificates.len()).map_err(|_| {
+            HttpsFetchError::new(
+                HttpsFetchFailurePhase::PeerVerificationBeforeDispatch,
+                "TLS peer certificate chain is excessive",
+            )
+        })?,
     })
 }
 

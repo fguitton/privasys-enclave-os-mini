@@ -61,9 +61,10 @@ pub use client::{
     root_store_from_der, BoundedHttpsRequest, ClientCertIdentity, EnclaveAttestationProvider,
     EnclaveClientCertSigner, ExpectedOid, HttpResponse, HttpsFetchError, HttpsFetchFailurePhase,
     IncrementalTlsClient, InterruptibleBlockingNetIo, RaTlsPolicy, ReportDataBinding,
-    SgxPeerCertificateEvidence, TeeType, MAX_REQUEST_BODY, MAX_REQUEST_HEADERS,
-    MAX_REQUEST_HEADER_BYTES, MAX_RESPONSE_BODY, MAX_RESPONSE_HEADERS, MAX_RESPONSE_HEADER_BYTES,
-    OID_ATTESTATION_SERVERS_HASH, OID_CONFIG_MERKLE_ROOT, OID_EGRESS_CA_HASH, OID_WASM_APPS_HASH,
+    SgxPeerCertificateEvidence, TeeType, TlsPeerCertificateEvidence, MAX_REQUEST_BODY,
+    MAX_REQUEST_HEADERS, MAX_REQUEST_HEADER_BYTES, MAX_RESPONSE_BODY, MAX_RESPONSE_HEADERS,
+    MAX_RESPONSE_HEADER_BYTES, OID_ATTESTATION_SERVERS_HASH, OID_CONFIG_MERKLE_ROOT,
+    OID_EGRESS_CA_HASH, OID_WASM_APPS_HASH,
 };
 
 use std::sync::OnceLock;
