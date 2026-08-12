@@ -1167,9 +1167,11 @@ mod peer_appraisal_tests {
     #[test]
     fn retained_peer_chain_replay_rejects_empty_count_and_certificate_bounds_first() {
         let roots = RootCertStore::empty();
-        assert!(verify_webpki_server_certificate_chain_at(&[], "example.test", &roots, 1)
-            .unwrap_err()
-            .contains("count"));
+        assert!(
+            verify_webpki_server_certificate_chain_at(&[], "example.test", &roots, 1)
+                .unwrap_err()
+                .contains("count")
+        );
         assert!(verify_webpki_server_certificate_chain_at(
             &vec![vec![1]; MAX_TLS_PEER_CERTIFICATES + 1],
             "example.test",
