@@ -42,10 +42,7 @@ impl IncrementalTlsClient {
         {
             return Err("incremental TLS requires separately pumped quote appraisal".to_string());
         }
-        let client_auth_capture = ratls
-            .as_ref()
-            .and_then(|policy| policy.client_identity.as_ref())
-            .map(|_| SharedClientAuthCapture::default());
+        let client_auth_capture = ratls.as_ref().map(|_| SharedClientAuthCapture::default());
         let config = build_client_config(root_store, ratls.as_ref(), client_auth_capture.clone())
             .map_err(str::to_string)?;
         let server_name = ServerName::try_from(server_name.to_string())

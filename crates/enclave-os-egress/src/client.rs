@@ -477,6 +477,35 @@ struct ChallengeBoundClientAuth {
     capture: Option<SharedClientAuthCapture>,
 }
 
+/// Capture the server's RA-TLS challenge while deliberately declining to
+/// present a client certificate. Reviewer sessions authenticate at the
+/// application layer, but still bind their signatures to this TLS challenge.
+#[derive(Debug)]
+struct ChallengeCaptureClientAuth {
+    capture: SharedClientAuthCapture,
+}
+
+impl ResolvesClientCert for ChallengeCaptureClientAuth {
+    fn resolve(
+        &self,
+        _root_hint_subjects: &[&[u8]],
+        _sigschemes: &[SignatureScheme],
+        ratls_challenge: Option<&[u8]>,
+        _ratls_channel_binder: Option<&[u8]>,
+    ) -> Option<Arc<CertifiedKey>> {
+        if let Some(challenge) = ratls_challenge {
+            if let Ok(mut capture) = self.capture.lock() {
+                capture.challenge_nonce = Some(challenge.to_vec());
+            }
+        }
+        None
+    }
+
+    fn has_certs(&self) -> bool {
+        true
+    }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct ClientAuthCapture {
     certificate_der: Option<Vec<u8>>,
@@ -573,7 +602,12 @@ fn build_client_config(
                     capture: client_auth_capture.clone(),
                 }))
             }
-            None => wants_client_cert.with_no_client_auth(),
+            None => match client_auth_capture {
+                Some(capture) => wants_client_cert.with_client_cert_resolver(Arc::new(
+                    ChallengeCaptureClientAuth { capture },
+                )),
+                None => wants_client_cert.with_no_client_auth(),
+            },
         };
 
         // When the policy uses challenge-response attestation, inject the

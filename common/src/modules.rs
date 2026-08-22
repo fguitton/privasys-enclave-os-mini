@@ -14,6 +14,7 @@
 use crate::protocol::{HttpMethod, Request, Response};
 
 pub const HONEST_PEER_SNI: &str = "peer.s1.invalid";
+pub const HONEST_REVIEWER_SNI: &str = "reviewer.s1.invalid";
 pub const HONEST_PEER_ROUTE: &str = "/honest/v1/peer";
 pub const HONEST_BOOTSTRAP_ROUTE: &str = "/honest/v1/bootstrap";
 pub const HONEST_PROPOSAL_ROUTE: &str = "/honest/v1/proposals";
