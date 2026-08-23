@@ -876,10 +876,6 @@ pub struct EnclaveConfig {
     pub port: u16,
     #[serde(default = "default_backlog")]
     pub backlog: i32,
-    /// Hex-encoded DER of the intermediary CA certificate.
-    pub ca_cert_hex: Option<String>,
-    /// Hex-encoded PKCS#8 of the intermediary CA private key.
-    pub ca_key_hex: Option<String>,
     /// OIDC provider configuration.  When present, all operations except
     /// `Healthz` require a valid bearer token in the JSON `"auth"` field.
     pub oidc: Option<enclave_os_common::oidc::OidcConfig>,
@@ -902,42 +898,28 @@ fn default_backlog() -> i32 {
 /// Resolve the unified sealed configuration.
 ///
 /// 1. Try to unseal an existing `SealedConfig` from disk.
-/// 2. Override CA material if provided in the current config.
+/// 2. Generate CA material inside the enclave on first boot.
 /// 3. Preserve any existing `module_data` from the sealed blob.
 /// 4. Re-seal after modules have had a chance to update it
 ///    (done in [`finalize_and_run()`]).
 ///
 /// This ensures that:
-/// - First run requires `--ca-cert` + `--ca-key`.
+/// - First run generates the local CA inside the enclave.
 /// - Subsequent restarts unseal everything automatically.
 /// - Passing new config params on restart updates the sealed blob.
-fn resolve_sealed_config(config: &EnclaveConfig) -> Result<SealedConfig, String> {
+fn resolve_sealed_config(_config: &EnclaveConfig) -> Result<SealedConfig, String> {
     // Try to unseal existing config from disk
     let existing = SealedConfig::unseal_from_disk().ok();
     let is_fresh = existing.is_none();
 
-    // ── CA material: config params override sealed state ─────────────
-    let (ca_cert_der, ca_key_pkcs8) = if let (Some(cert_hex), Some(key_hex)) =
-        (&config.ca_cert_hex, &config.ca_key_hex)
-    {
-        let cert =
-            hex_decode(cert_hex).ok_or_else(|| String::from("ca_cert_hex is not valid hex"))?;
-        let key = hex_decode(key_hex).ok_or_else(|| String::from("ca_key_hex is not valid hex"))?;
-        // Validate the key material early
-        CaContext::from_parts(cert.clone(), key.clone())?;
-        enclave_log_info!(
-            "CA loaded from config (cert={} B, key={} B)",
-            cert.len(),
-            key.len()
-        );
-        (cert, key)
-    } else if let Some(ref ex) = existing {
+    // ── Enclave-owned CA material ────────────────────────────────────
+    let (ca_cert_der, ca_key_pkcs8) = if let Some(ref ex) = existing {
         enclave_log_info!("CA loaded from sealed config");
         (ex.ca_cert_der.clone(), ex.ca_key_pkcs8.clone())
     } else {
-        return Err("No CA material found on disk and none provided in config. \
-             Pass --ca-cert + --ca-key on first run."
-            .into());
+        let ca = CaContext::generate()?;
+        enclave_log_info!("Generated fresh enclave-owned local CA");
+        (ca.ca_cert_der, ca.ca_key_pkcs8)
     };
 
     // ── Module data: preserve from existing sealed config ────────────

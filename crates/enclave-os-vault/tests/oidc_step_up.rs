@@ -38,6 +38,7 @@ fn owner_policy(sub: &str, ops: Vec<Operation>) -> KeyPolicy {
 
 fn ctx_with_amr(sub: &str, amr: &[&str]) -> RequestContext {
     RequestContext {
+        ingress_class: enclave_os_common::modules::IngressClass::ExternalNetwork,
         connection_id: 0,
         server_name: None,
         attested_endpoint: None,
@@ -69,6 +70,7 @@ fn ctx_step_up(
     exp: u64,
 ) -> RequestContext {
     RequestContext {
+        ingress_class: enclave_os_common::modules::IngressClass::ExternalNetwork,
         connection_id: 0,
         server_name: None,
         attested_endpoint: None,

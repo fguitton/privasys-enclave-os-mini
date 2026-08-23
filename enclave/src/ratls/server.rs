@@ -104,6 +104,9 @@ const ENCLAVE_WIDE_SERVER_NAME: &str = "enclave-os.invalid";
 pub struct IngressServer {
     /// Per-connection state, keyed by conn_id from the TCP proxy.
     sessions: BTreeMap<u32, SessionState>,
+    /// Enclave-visible route class for each multiplexed TLS connection.
+    /// This remains routing metadata and never substitutes for authorization.
+    ingress_classes: BTreeMap<u32, enclave_os_common::modules::IngressClass>,
     /// Intermediary CA for certificate generation.
     ca: Arc<CaContext>,
     /// Producer for `data_enc_to_host` — sends TLS bytes to the TCP proxy.
@@ -137,6 +140,7 @@ impl IngressServer {
     pub fn new(ca: Arc<CaContext>, data_tx: &'static SpscProducer) -> Self {
         Self {
             sessions: BTreeMap::new(),
+            ingress_classes: BTreeMap::new(),
             ca,
             data_tx,
             shutdown: false,
@@ -153,11 +157,17 @@ impl IngressServer {
     /// the `data_host_to_enc` queue.
     pub fn handle_message(&mut self, msg_type: ChannelMsgType, conn_id: u32, payload: &[u8]) {
         match msg_type {
-            ChannelMsgType::TcpNew => {
+            ChannelMsgType::TcpNew | ChannelMsgType::LocalControlNew => {
                 let peer_addr = core::str::from_utf8(payload)
                     .unwrap_or("<invalid>")
                     .to_string();
+                let ingress_class = if msg_type == ChannelMsgType::LocalControlNew {
+                    enclave_os_common::modules::IngressClass::LocalControl
+                } else {
+                    enclave_os_common::modules::IngressClass::ExternalNetwork
+                };
                 enclave_log_info!("New connection conn_id={} from {}", conn_id, peer_addr);
+                self.ingress_classes.insert(conn_id, ingress_class);
                 self.sessions.insert(
                     conn_id,
                     SessionState::Pending {
@@ -172,6 +182,7 @@ impl IngressServer {
             }
 
             ChannelMsgType::TcpClose => {
+                self.ingress_classes.remove(&conn_id);
                 if let Some(state) = self.sessions.remove(&conn_id) {
                     if let SessionState::Established(mut session)
                     | SessionState::Handshaking(mut session) = state
@@ -370,6 +381,11 @@ impl IngressServer {
         // because different requests in the same session may carry
         // different tokens (or none — e.g. GET /healthz).
         let base_ctx = enclave_os_common::modules::RequestContext {
+            ingress_class: self
+                .ingress_classes
+                .get(&conn_id)
+                .copied()
+                .unwrap_or(enclave_os_common::modules::IngressClass::ExternalNetwork),
             connection_id: conn_id,
             server_name: session.server_name().map(str::to_owned),
             attested_endpoint: session.attested_endpoint(),
@@ -1503,6 +1519,7 @@ fn handle_fido2_request(
     };
 
     let ctx = enclave_os_common::modules::RequestContext {
+        ingress_class: base_ctx.ingress_class,
         connection_id: base_ctx.connection_id,
         server_name: base_ctx.server_name.clone(),
         attested_endpoint: base_ctx.attested_endpoint,
@@ -1605,6 +1622,7 @@ fn handle_data_request_http(
     };
 
     let ctx = enclave_os_common::modules::RequestContext {
+        ingress_class: base_ctx.ingress_class,
         connection_id: base_ctx.connection_id,
         server_name: base_ctx.server_name.clone(),
         attested_endpoint: base_ctx.attested_endpoint,
@@ -1686,6 +1704,7 @@ fn handle_rpc_request(
     };
 
     let ctx = enclave_os_common::modules::RequestContext {
+        ingress_class: base_ctx.ingress_class,
         connection_id: base_ctx.connection_id,
         server_name: base_ctx.server_name.clone(),
         attested_endpoint: base_ctx.attested_endpoint,
@@ -1812,6 +1831,7 @@ fn handle_mcp_tools_request(
     };
 
     let ctx = enclave_os_common::modules::RequestContext {
+        ingress_class: base_ctx.ingress_class,
         connection_id: base_ctx.connection_id,
         server_name: base_ctx.server_name.clone(),
         attested_endpoint: base_ctx.attested_endpoint,

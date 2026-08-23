@@ -22,6 +22,7 @@ mod tcp_proxy;
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use log::{error, info};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -54,19 +55,14 @@ struct Cli {
     #[arg(short, long, default_value_t = 128)]
     backlog: i32,
 
+    /// Internal Unix socket carrying TLS ciphertext for local control.
+    /// The enclave, not this host process, terminates the TLS session.
+    #[arg(long)]
+    local_control_socket: Option<PathBuf>,
+
     /// Path for the KV store data directory
     #[arg(short, long, default_value = "./kvdata")]
     kv_path: String,
-
-    /// Path to intermediary CA certificate (DER or PEM).
-    /// Required on first run; sealed to disk for subsequent restarts.
-    #[arg(long)]
-    ca_cert: Option<String>,
-
-    /// Path to intermediary CA private key (PKCS#8 DER or PEM).
-    /// Required on first run; sealed to disk for subsequent restarts.
-    #[arg(long)]
-    ca_key: Option<String>,
 
     /// Path to a PEM bundle of trusted root CAs for HTTPS egress.
     /// e.g. /etc/ssl/certs/ca-certificates.crt or a custom bundle.
@@ -336,13 +332,15 @@ fn main() -> Result<()> {
     // Spawn the TCP proxy thread
     let proxy_port = cli.port;
     let proxy_backlog = cli.backlog;
+    let local_control_socket = cli.local_control_socket.clone();
     let shutdown_clone = shutdown.clone();
     let proxy_handle = thread::Builder::new()
         .name("tcp-proxy".into())
         .spawn(move || {
-            match tcp_proxy::TcpProxy::new(
+            match tcp_proxy::TcpProxy::new_with_local_control(
                 proxy_port,
                 proxy_backlog,
+                local_control_socket,
                 data_to_enc_tx,
                 data_from_enc_rx,
                 shutdown_clone,
@@ -360,23 +358,6 @@ fn main() -> Result<()> {
         "port": cli.port,
         "backlog": cli.backlog,
     });
-
-    // If intermediary CA cert + key are provided, read them and add as hex
-    if let (Some(cert_path), Some(key_path)) = (&cli.ca_cert, &cli.ca_key) {
-        let cert_der = read_pem_or_der(cert_path, "CERTIFICATE")
-            .map_err(|e| anyhow::anyhow!("Failed to read CA cert '{}': {}", cert_path, e))?;
-        let key_der = read_pem_or_der(key_path, "PRIVATE KEY")
-            .map_err(|e| anyhow::anyhow!("Failed to read CA key '{}': {}", key_path, e))?;
-        info!(
-            "CA cert: {} bytes (DER), CA key: {} bytes (DER)",
-            cert_der.len(),
-            key_der.len()
-        );
-        config["ca_cert_hex"] = serde_json::Value::String(hex::encode(&cert_der));
-        config["ca_key_hex"] = serde_json::Value::String(hex::encode(&key_der));
-    } else if cli.ca_cert.is_some() || cli.ca_key.is_some() {
-        anyhow::bail!("Both --ca-cert and --ca-key must be specified together");
-    }
 
     // If an egress CA bundle is provided, read it and hex-encode for the enclave
     if let Some(ref bundle_path) = cli.egress_ca_bundle {
@@ -610,108 +591,4 @@ fn main() -> Result<()> {
     drop(data_channel);
 
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-//  Helpers
-// ---------------------------------------------------------------------------
-
-/// Read a file as DER. If the file contains PEM, extract the first block
-/// matching `expected_label` (e.g. "CERTIFICATE" or "PRIVATE KEY").
-///
-/// For key files, also accepts "EC PRIVATE KEY" (SEC1 format) and wraps
-/// it in PKCS#8 so the enclave always receives PKCS#8.
-fn read_pem_or_der(path: &str, expected_label: &str) -> Result<Vec<u8>> {
-    let data = std::fs::read(path)?;
-
-    // Try PEM first
-    if let Ok(text) = std::str::from_utf8(&data) {
-        if text.contains("-----BEGIN") {
-            // Try the exact label first, then fall back to "EC PRIVATE KEY"
-            let labels_to_try: Vec<&str> = if expected_label == "PRIVATE KEY" {
-                vec!["PRIVATE KEY", "EC PRIVATE KEY"]
-            } else {
-                vec![expected_label]
-            };
-
-            for label in &labels_to_try {
-                let begin = format!("-----BEGIN {}-----", label);
-                let end = format!("-----END {}-----", label);
-                if let Some(start_idx) = text.find(&begin) {
-                    let after_begin = start_idx + begin.len();
-                    if let Some(end_idx) = text[after_begin..].find(&end) {
-                        let b64: String = text[after_begin..after_begin + end_idx]
-                            .chars()
-                            .filter(|c| !c.is_whitespace())
-                            .collect();
-                        use base64::Engine;
-                        let der = base64::engine::general_purpose::STANDARD
-                            .decode(&b64)
-                            .map_err(|e| anyhow::anyhow!("PEM base64 decode: {}", e))?;
-
-                        // If SEC1 "EC PRIVATE KEY", wrap it in PKCS#8
-                        if *label == "EC PRIVATE KEY" {
-                            return Ok(wrap_ec_sec1_in_pkcs8(&der));
-                        }
-                        return Ok(der);
-                    }
-                }
-            }
-            anyhow::bail!("PEM file does not contain a '{}' block", expected_label);
-        }
-    }
-
-    // Not PEM → assume raw DER
-    Ok(data)
-}
-
-/// Wrap an SEC1 EC private key in a PKCS#8 envelope for P-256.
-///
-/// PKCS#8 structure:
-/// ```asn1
-/// PrivateKeyInfo ::= SEQUENCE {
-///   version       INTEGER (0),
-///   algorithm     AlgorithmIdentifier { SEQUENCE { OID ecPublicKey, OID prime256v1 } },
-///   privateKey    OCTET STRING (containing the SEC1 key)
-/// }
-/// ```
-fn wrap_ec_sec1_in_pkcs8(sec1_der: &[u8]) -> Vec<u8> {
-    // Fixed PKCS#8 header for P-256 (ecPublicKey + prime256v1)
-    //
-    // SEQUENCE (outer)
-    //   INTEGER version = 0
-    //   SEQUENCE (AlgorithmIdentifier)
-    //     OID 1.2.840.10045.2.1 (ecPublicKey)
-    //     OID 1.2.840.10045.3.1.7 (prime256v1)
-    //   OCTET STRING (SEC1 key)
-
-    // The OCTET STRING wrapping the SEC1 key
-    let sec1_len = sec1_der.len();
-    let octet_len_bytes = der_length_bytes(sec1_len);
-    let inner_len = 3 + 21 + 1 + octet_len_bytes.len() + sec1_len; // version + algid + octet tag + octet len + sec1
-    let outer_len_bytes = der_length_bytes(inner_len);
-
-    let mut out = Vec::with_capacity(1 + outer_len_bytes.len() + inner_len);
-    out.push(0x30); // SEQUENCE tag
-    out.extend_from_slice(&outer_len_bytes);
-    out.extend_from_slice(&[0x02, 0x01, 0x00]); // version = 0
-    out.extend_from_slice(&[
-        0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86,
-        0x48, 0xce, 0x3d, 0x03, 0x01, 0x07,
-    ]);
-    out.push(0x04); // OCTET STRING tag
-    out.extend_from_slice(&octet_len_bytes);
-    out.extend_from_slice(sec1_der);
-    out
-}
-
-/// Encode a length in DER format.
-fn der_length_bytes(len: usize) -> Vec<u8> {
-    if len < 0x80 {
-        vec![len as u8]
-    } else if len < 0x100 {
-        vec![0x81, len as u8]
-    } else {
-        vec![0x82, (len >> 8) as u8, (len & 0xff) as u8]
-    }
 }

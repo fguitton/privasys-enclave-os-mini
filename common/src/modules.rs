@@ -18,6 +18,7 @@ pub const HONEST_PEER_ROUTE: &str = "/honest/v1/peer";
 pub const HONEST_BOOTSTRAP_ROUTE: &str = "/honest/v1/bootstrap";
 pub const HONEST_PROPOSAL_ROUTE: &str = "/honest/v1/proposals";
 pub const HONEST_COMPONENT_STAGING_ROUTE: &str = "/honest/v1/components/staging";
+pub const HONEST_LOCAL_CONTROL_ROUTE: &str = "/honest/v1/control";
 
 // ---------------------------------------------------------------------------
 //  Config Merkle leaf
@@ -107,6 +108,13 @@ pub struct AppIdentity {
 ///
 /// Carries optional metadata extracted from the TLS session and OIDC auth.
 pub struct RequestContext {
+    /// Enclave-observed ingress class carried by the ciphertext multiplexer.
+    ///
+    /// This is route-selection metadata, not semantic authorization: the host
+    /// can lie about it. Local-control operations must independently verify
+    /// their bootstrap or governor proof inside the enclave.
+    pub ingress_class: IngressClass,
+
     /// Host-assigned connection correlation ID.
     ///
     /// This is routing metadata only and conveys no peer identity or
@@ -160,10 +168,18 @@ pub struct RequestContext {
     pub oidc_claims: Option<crate::oidc::OidcClaims>,
 }
 
+/// Closed ingress classes understood by the enclave TLS terminator.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IngressClass {
+    ExternalNetwork,
+    LocalControl,
+}
+
 /// Closed route classes for the adopter-owned Honest ingress profile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HonestIngressRoute {
     Operational,
+    LocalControl,
     Peer,
     Bootstrap,
     Proposal,
@@ -182,6 +198,16 @@ pub fn classify_honest_ingress(
     path: &str,
     context: &RequestContext,
 ) -> HonestIngressRoute {
+    if matches!(
+        (method, path),
+        (HttpMethod::Post, HONEST_LOCAL_CONTROL_ROUTE)
+    ) {
+        return if context.ingress_class == IngressClass::LocalControl {
+            HonestIngressRoute::LocalControl
+        } else {
+            HonestIngressRoute::Denied
+        };
+    }
     if matches!(
         (method, path),
         (HttpMethod::Get, "/healthz")
@@ -262,13 +288,15 @@ pub trait EnclaveModule: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_honest_ingress, HonestIngressRoute, RequestContext, HONEST_BOOTSTRAP_ROUTE,
-        HONEST_COMPONENT_STAGING_ROUTE, HONEST_PEER_ROUTE, HONEST_PEER_SNI, HONEST_PROPOSAL_ROUTE,
+        classify_honest_ingress, HonestIngressRoute, IngressClass, RequestContext,
+        HONEST_BOOTSTRAP_ROUTE, HONEST_COMPONENT_STAGING_ROUTE, HONEST_LOCAL_CONTROL_ROUTE,
+        HONEST_PEER_ROUTE, HONEST_PEER_SNI, HONEST_PROPOSAL_ROUTE,
     };
     use crate::protocol::HttpMethod;
 
     fn context(server_name: Option<&str>, mutual: bool) -> RequestContext {
         RequestContext {
+            ingress_class: super::IngressClass::ExternalNetwork,
             connection_id: 0,
             server_name: server_name.map(str::to_owned),
             attested_endpoint: None,
@@ -346,6 +374,24 @@ mod tests {
                 &context(Some(HONEST_PEER_SNI), false),
             ),
             HonestIngressRoute::PeerAuthenticationRequired
+        );
+    }
+
+    #[test]
+    fn local_control_route_is_not_reachable_from_the_network_class() {
+        let mut local = context(None, false);
+        local.ingress_class = IngressClass::LocalControl;
+        assert_eq!(
+            classify_honest_ingress(&HttpMethod::Post, HONEST_LOCAL_CONTROL_ROUTE, &local),
+            HonestIngressRoute::LocalControl
+        );
+        assert_eq!(
+            classify_honest_ingress(
+                &HttpMethod::Post,
+                HONEST_LOCAL_CONTROL_ROUTE,
+                &context(None, false),
+            ),
+            HonestIngressRoute::Denied
         );
     }
 }

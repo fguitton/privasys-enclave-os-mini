@@ -66,15 +66,13 @@ pub enum CertMode {
     Deterministic { creation_time: u64 },
 }
 
-/// Intermediary CA context provided to the enclave at startup.
+/// Intermediary CA context owned by the enclave.
 ///
 /// The enclave uses it to sign leaf RA-TLS certificates so that the
 /// trust chain is: `root / intermediary → leaf`.
 ///
-/// The CA material is **never** generated inside the enclave.  It must be
-/// provisioned externally (typically as part of the `EnclaveConfig`) and
-/// is then sealed to disk via SGX sealing so that subsequent restarts
-/// can unseal it without re-provisioning.
+/// The CA material is generated inside the enclave on first boot and sealed so
+/// subsequent restarts can unseal it without host provisioning.
 #[derive(Clone)]
 pub struct CaContext {
     /// DER-encoded X.509 certificate of the intermediary CA.
@@ -84,7 +82,7 @@ pub struct CaContext {
 }
 
 impl CaContext {
-    /// Construct from externally-provided DER cert and PKCS#8 key.
+    /// Construct from unsealed DER cert and PKCS#8 key.
     ///
     /// Performs a basic validation that the key material is usable
     /// (i.e. it can be parsed as an ECDSA P-256 key pair).
@@ -98,6 +96,30 @@ impl CaContext {
             ca_cert_der,
             ca_key_pkcs8,
         })
+    }
+
+    /// Generate a fresh enclave-owned intermediary CA for first boot.
+    pub fn generate() -> Result<Self, String> {
+        use rcgen::{
+            BasicConstraints, CertificateParams, DnType, DnValue, IsCa, KeyPair,
+            PKCS_ECDSA_P256_SHA256,
+        };
+
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
+            .map_err(|error| format!("CA key generation failed: {error}"))?;
+        let mut params = CertificateParams::new(Vec::<String>::new())
+            .map_err(|error| format!("CA parameters failed: {error}"))?;
+        params.distinguished_name.push(
+            DnType::CommonName,
+            DnValue::Utf8String("Honest enclave local CA".into()),
+        );
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.not_before = rcgen::date_time_ymd(2024, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2124, 1, 1);
+        let certificate = params
+            .self_signed(&key)
+            .map_err(|error| format!("CA certificate generation failed: {error}"))?;
+        Self::from_parts(certificate.der().to_vec(), key.serialize_der())
     }
 }
 
