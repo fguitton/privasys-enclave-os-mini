@@ -84,7 +84,8 @@ rust_build_enclave(
     "${_ENCLAVE_TARGET_DIR}"
 )
 add_dependencies(${_ENCLAVE_CRATE_NAME} sgx_sysroot)
-set(ENCLAVE_STATIC_LIB "${${_ENCLAVE_CRATE_NAME}_STATIC_LIB}")
+set(ENCLAVE_STATIC_LIB
+    "${_ENCLAVE_TARGET_DIR}/${RUST_ENCLAVE_TARGET}/${CARGO_OUT_DIR}/lib${_ENCLAVE_CRATE_NAME}.a")
 
 # -- Step 3+4: EDL stubs are built in edl/ --
 # EDL_TRUSTED_OBJ is set by edl/CMakeLists.txt

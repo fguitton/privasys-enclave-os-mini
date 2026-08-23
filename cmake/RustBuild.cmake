@@ -98,6 +98,9 @@ function(rust_build_enclave CRATE_DIR OUTPUT_NAME FEATURES)
         string(APPEND _BUILD_COMMENT " [${_FEATURES}]")
     endif()
 
+    set(_ENCLAVE_STATIC_LIB
+        "${_ENCLAVE_TARGET_DIR}/${RUST_ENCLAVE_TARGET}/${CARGO_OUT_DIR}/lib${OUTPUT_NAME}.a")
+
     add_custom_target(${OUTPUT_NAME} ALL
         COMMAND ${CMAKE_COMMAND} -E env
             "SGX_SDK_PATH=${SGX_SDK_PATH}"
@@ -114,12 +117,13 @@ function(rust_build_enclave CRATE_DIR OUTPUT_NAME FEATURES)
                 --manifest-path "${CRATE_DIR}/Cargo.toml"
                 --target "${TARGET_JSON}"
                 ${_FEATURES_ARGS}
+        BYPRODUCTS "${_ENCLAVE_STATIC_LIB}"
         WORKING_DIRECTORY "${CRATE_DIR}"
         COMMENT "${_BUILD_COMMENT}"
     )
 
     set(${OUTPUT_NAME}_STATIC_LIB
-        "${_ENCLAVE_TARGET_DIR}/${RUST_ENCLAVE_TARGET}/${CARGO_OUT_DIR}/lib${OUTPUT_NAME}.a"
+        "${_ENCLAVE_STATIC_LIB}"
         PARENT_SCOPE)
 endfunction()
 

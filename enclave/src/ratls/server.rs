@@ -1038,7 +1038,8 @@ fn handle_http_request(
             base_ctx,
         ) {
             HonestIngressRoute::Operational => {}
-            HonestIngressRoute::Peer
+            HonestIngressRoute::LocalControl
+            | HonestIngressRoute::Peer
             | HonestIngressRoute::Bootstrap
             | HonestIngressRoute::Proposal
             | HonestIngressRoute::ComponentStaging => {
