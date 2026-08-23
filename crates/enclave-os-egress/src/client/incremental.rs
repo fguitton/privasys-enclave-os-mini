@@ -8,7 +8,10 @@ use std::io::{Read, Write};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConnection, RootCertStore};
 
-use super::{build_client_config, verify_channel_binding, RaTlsPolicy, SharedClientAuthCapture};
+use super::{
+    build_attested_client_config, build_client_config, verify_channel_binding, RaTlsPolicy,
+    SharedClientAuthCapture,
+};
 
 /// Incrementally advanced TLS client for the control-TCS raw multiplexer.
 ///
@@ -59,6 +62,29 @@ impl IncrementalTlsClient {
         Ok(Self {
             tls_conn,
             ratls,
+            channel_verified: false,
+            plaintext: Vec::new(),
+            client_auth_capture,
+        })
+    }
+
+    /// Construct a TLS 1.3 client for an enclave-owned CA, authenticating the
+    /// leaf through appraised, measurement-pinned, channel-bound RA-TLS.
+    pub fn new_attested(server_name: &str, policy: RaTlsPolicy) -> Result<Self, String> {
+        let client_auth_capture = policy
+            .client_identity
+            .as_ref()
+            .map(|_| SharedClientAuthCapture::default());
+        let config = build_attested_client_config(&policy, client_auth_capture.clone())
+            .map_err(str::to_string)?;
+        let server_name = ServerName::try_from(server_name.to_string())
+            .map_err(|_| "invalid incremental TLS server name".to_string())?;
+        let mut tls_conn = ClientConnection::new(config, server_name)
+            .map_err(|error| format!("incremental TLS init failed: {error}"))?;
+        tls_conn.set_buffer_limit(Some(MAX_INCREMENTAL_REQUEST));
+        Ok(Self {
+            tls_conn,
+            ratls: Some(policy),
             channel_verified: false,
             plaintext: Vec::new(),
             client_auth_capture,
@@ -205,6 +231,7 @@ mod tests {
     use rustls::RootCertStore;
 
     use super::{IncrementalTlsClient, MAX_INCREMENTAL_REQUEST};
+    use crate::client::{RaTlsPolicy, ReportDataBinding, TeeType};
 
     #[test]
     fn rustls_buffer_does_not_undercut_the_declared_request_bound() {
@@ -216,5 +243,27 @@ mod tests {
             .writer()
             .write_all(&vec![0xa5; MAX_INCREMENTAL_REQUEST])
             .expect("the declared request bound must fit the TLS plaintext buffer");
+    }
+
+    #[cfg(not(feature = "mock"))]
+    #[test]
+    fn attested_only_client_requires_measurement_and_remote_appraisal() {
+        let policy = RaTlsPolicy {
+            tee: TeeType::Sgx,
+            mr_enclave: Some([7; 32]),
+            mr_signer: None,
+            mr_td: None,
+            report_data: ReportDataBinding::ChallengeResponse { nonce: vec![9; 32] },
+            expected_oids: Vec::new(),
+            attestation_servers: Vec::new(),
+            client_identity: None,
+            dependencies: None,
+        };
+        assert_eq!(
+            IncrementalTlsClient::new_attested("local-control.invalid", policy)
+                .err()
+                .as_deref(),
+            Some("attested-only TLS requires a quote-appraisal service")
+        );
     }
 }

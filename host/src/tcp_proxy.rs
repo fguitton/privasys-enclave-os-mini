@@ -18,6 +18,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -59,7 +62,7 @@ const KEEPALIVE_RETRIES: u32 = 3;
 
 /// Per-connection state tracked by the proxy.
 struct ConnState {
-    stream: TcpStream,
+    stream: ProxyStream,
     last_activity: Instant,
     origin: ConnectionOrigin,
     write_buffer: Vec<u8>,
@@ -69,14 +72,47 @@ struct ConnState {
 
 enum ConnectionOrigin {
     Inbound,
+    LocalControl,
     OutboundConnecting { request_id: u64, endpoint: String },
     Outbound,
+}
+
+enum ProxyStream {
+    Tcp(TcpStream),
+    Unix(UnixStream),
+}
+
+impl ProxyStream {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(stream) => stream.read(buffer),
+            Self::Unix(stream) => stream.read(buffer),
+        }
+    }
+
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(stream) => stream.write(buffer),
+            Self::Unix(stream) => stream.write(buffer),
+        }
+    }
+
+    fn tcp(&self) -> Option<&TcpStream> {
+        match self {
+            Self::Tcp(stream) => Some(stream),
+            Self::Unix(_) => None,
+        }
+    }
 }
 
 /// TCP proxy for enclave inbound connections.
 pub struct TcpProxy {
     /// TCP listener socket (non-blocking).
     listener: TcpListener,
+    /// Optional Unix listener for ciphertext-only local control.
+    local_control_listener: Option<UnixListener>,
+    /// Exact socket created by this process, removed on orderly shutdown.
+    local_control_path: Option<PathBuf>,
     /// Active connections: conn_id → state.
     connections: HashMap<u32, ConnState>,
     /// Next connection ID to assign.
@@ -105,13 +141,33 @@ impl TcpProxy {
         data_rx: SpscConsumer,
         shutdown: Arc<AtomicBool>,
     ) -> io::Result<Self> {
+        Self::new_with_local_control(port, _backlog, None, data_tx, data_rx, shutdown)
+    }
+
+    /// Create the shared ciphertext multiplexer with an optional Unix local
+    /// control listener. Both listener classes terminate TLS in the enclave.
+    pub fn new_with_local_control(
+        port: u16,
+        _backlog: i32,
+        local_control_path: Option<PathBuf>,
+        data_tx: SpscProducer,
+        data_rx: SpscConsumer,
+        shutdown: Arc<AtomicBool>,
+    ) -> io::Result<Self> {
         let addr = format!("0.0.0.0:{}", port);
         let listener = TcpListener::bind(&addr)?;
         listener.set_nonblocking(true)?;
         info!("TCP proxy listening on {}", addr);
 
+        let local_control_listener = local_control_path
+            .as_deref()
+            .map(bind_local_control)
+            .transpose()?;
+
         Ok(Self {
             listener,
+            local_control_listener,
+            local_control_path,
             connections: HashMap::new(),
             next_conn_id: 1,
             data_tx,
@@ -152,6 +208,7 @@ impl TcpProxy {
             if self.pending_to_enclave.is_empty() {
                 // 1. Accept new connections
                 did_work |= self.accept_connections();
+                did_work |= self.accept_local_control_connections();
 
                 // Advance every non-blocking outbound connect without delaying
                 // accepted connections or another peer's socket.
@@ -179,6 +236,7 @@ impl TcpProxy {
             debug!("Closing connection conn_id={} on shutdown", conn_id);
         }
         self.connections.clear();
+        self.remove_local_control_socket();
         info!("TCP proxy thread stopped");
     }
 
@@ -237,7 +295,7 @@ impl TcpProxy {
                     self.connections.insert(
                         conn_id,
                         ConnState {
-                            stream,
+                            stream: ProxyStream::Tcp(stream),
                             last_activity: Instant::now(),
                             origin: ConnectionOrigin::Inbound,
                             write_buffer: Vec::new(),
@@ -250,6 +308,56 @@ impl TcpProxy {
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => {
                     error!("Accept error: {}", e);
+                    break;
+                }
+            }
+        }
+        accepted
+    }
+
+    /// Accept Unix local-control connections into the same bounded
+    /// ciphertext multiplexer. Socket ownership is defense in depth only.
+    fn accept_local_control_connections(&mut self) -> bool {
+        let mut accepted = false;
+        for _ in 0..16 {
+            let result = match self.local_control_listener.as_ref() {
+                Some(listener) => listener.accept(),
+                None => break,
+            };
+            match result {
+                Ok((stream, _address)) => {
+                    if self.connections.len() >= MAX_CONNS {
+                        warn!("Connection cap reached, dropping local-control connection");
+                        continue;
+                    }
+                    let Some(conn_id) = self.allocate_conn_id() else {
+                        warn!("No free connection ID; dropping local-control connection");
+                        continue;
+                    };
+                    if let Err(error) = stream.set_nonblocking(true) {
+                        warn!(
+                            "set_nonblocking failed for local-control conn_id={}: {}",
+                            conn_id, error
+                        );
+                        continue;
+                    }
+                    self.send_to_enclave(channel::encode_local_control_new(conn_id));
+                    self.connections.insert(
+                        conn_id,
+                        ConnState {
+                            stream: ProxyStream::Unix(stream),
+                            last_activity: Instant::now(),
+                            origin: ConnectionOrigin::LocalControl,
+                            write_buffer: Vec::new(),
+                            write_offset: 0,
+                            close_after_write: false,
+                        },
+                    );
+                    accepted = true;
+                }
+                Err(ref error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => {
+                    error!("Local-control accept error: {}", error);
                     break;
                 }
             }
@@ -362,8 +470,15 @@ impl TcpProxy {
                                 self.begin_outbound_connection(payload);
                             }
                         }
-                        Some((ChannelMsgType::TcpNew, conn_id, _)) => {
-                            warn!("Unexpected TcpNew from enclave for conn_id={}", conn_id);
+                        Some((
+                            ChannelMsgType::TcpNew | ChannelMsgType::LocalControlNew,
+                            conn_id,
+                            _,
+                        )) => {
+                            warn!(
+                                "Unexpected new-connection message from enclave for conn_id={}",
+                                conn_id
+                            );
                         }
                         Some((
                             ChannelMsgType::TcpConnected | ChannelMsgType::TcpConnectFailed,
@@ -530,7 +645,7 @@ impl TcpProxy {
                 self.connections.insert(
                     conn_id,
                     ConnState {
-                        stream,
+                        stream: ProxyStream::Tcp(stream),
                         last_activity: Instant::now(),
                         origin,
                         write_buffer: Vec::new(),
@@ -566,7 +681,11 @@ impl TcpProxy {
             else {
                 continue;
             };
-            match conn.stream.take_error() {
+            let Some(stream) = conn.stream.tcp() else {
+                failed.push((conn_id, *request_id, endpoint.clone()));
+                continue;
+            };
+            match stream.take_error() {
                 Ok(Some(error)) => {
                     warn!(
                         "Outbound connect failed conn_id={} endpoint={}: {}",
@@ -574,7 +693,7 @@ impl TcpProxy {
                     );
                     failed.push((conn_id, *request_id, endpoint.clone()));
                 }
-                Ok(None) => match conn.stream.peer_addr() {
+                Ok(None) => match stream.peer_addr() {
                     Ok(_) => connected.push((conn_id, *request_id, endpoint.clone())),
                     Err(error)
                         if matches!(
@@ -685,6 +804,44 @@ impl TcpProxy {
         self.pending_to_enclave_bytes -= sent.len();
         true
     }
+
+    fn remove_local_control_socket(&mut self) {
+        self.local_control_listener.take();
+        if let Some(path) = self.local_control_path.take() {
+            if let Err(error) = std::fs::remove_file(&path) {
+                if error.kind() != io::ErrorKind::NotFound {
+                    warn!(
+                        "Failed to remove local-control socket {}: {}",
+                        path.display(),
+                        error
+                    );
+                }
+            }
+        }
+    }
+}
+
+impl Drop for TcpProxy {
+    fn drop(&mut self) {
+        self.remove_local_control_socket();
+    }
+}
+
+fn bind_local_control(path: &Path) -> io::Result<UnixListener> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "local-control socket path must be absolute",
+        ));
+    }
+    let listener = UnixListener::bind(path)?;
+    listener.set_nonblocking(true)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    info!(
+        "Local-control ciphertext relay listening on {}",
+        path.display()
+    );
+    Ok(listener)
 }
 
 fn begin_nonblocking_connect(address: SocketAddr) -> io::Result<(TcpStream, bool)> {
@@ -764,7 +921,7 @@ mod tests {
         proxy.connections.insert(
             7,
             ConnState {
-                stream: server,
+                stream: ProxyStream::Tcp(server),
                 last_activity: Instant::now(),
                 origin: ConnectionOrigin::Inbound,
                 write_buffer: Vec::new(),

@@ -26,6 +26,7 @@
 //! | `TcpNew`   | 0x01 | UTF-8 peer address | New TCP connection accepted |
 //! | `TcpData`  | 0x02 | raw bytes          | TCP segment(s) from client |
 //! | `TcpClose` | 0x03 | (empty)            | Connection closed by peer  |
+//! | `LocalControlNew` | 0x08 | UTF-8 local label | New Unix control connection |
 //!
 //! ## enclave → host (`data_enc_to_host` queue)
 //!
@@ -103,6 +104,10 @@ pub enum ChannelMsgType {
 
     /// A host-assigned outbound connection failed (host → enclave).
     TcpConnectFailed = 0x07,
+
+    /// New Unix-domain local-control connection (host → enclave).
+    /// The host-provided class is routing metadata only, never authority.
+    LocalControlNew = 0x08,
 }
 
 /// Bounded, non-sensitive reason for an asynchronous connect failure.
@@ -138,6 +143,7 @@ impl ChannelMsgType {
             0x05 => Some(Self::TcpConnect),
             0x06 => Some(Self::TcpConnected),
             0x07 => Some(Self::TcpConnectFailed),
+            0x08 => Some(Self::LocalControlNew),
             _ => None,
         }
     }
@@ -183,6 +189,16 @@ pub fn decode_channel_msg(data: &[u8]) -> Option<(ChannelMsgType, u32, &[u8])> {
 #[inline]
 pub fn encode_tcp_new(conn_id: u32, peer_addr: &str) -> Vec<u8> {
     encode_channel_msg(ChannelMsgType::TcpNew, conn_id, peer_addr.as_bytes())
+}
+
+/// Announce a Unix-domain local-control connection.
+#[inline]
+pub fn encode_local_control_new(conn_id: u32) -> Vec<u8> {
+    encode_channel_msg(
+        ChannelMsgType::LocalControlNew,
+        conn_id,
+        b"unix:local-control",
+    )
 }
 
 /// Convenience: encode a TcpData message.
@@ -266,6 +282,15 @@ mod tests {
         assert_eq!(typ, ChannelMsgType::TcpNew);
         assert_eq!(id, 42);
         assert_eq!(core::str::from_utf8(payload).unwrap(), "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_roundtrip_local_control_new_is_a_distinct_ingress_class() {
+        let msg = encode_local_control_new(43);
+        let (typ, id, payload) = decode_channel_msg(&msg).unwrap();
+        assert_eq!(typ, ChannelMsgType::LocalControlNew);
+        assert_eq!(id, 43);
+        assert_eq!(payload, b"unix:local-control");
     }
 
     #[test]
