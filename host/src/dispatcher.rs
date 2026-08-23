@@ -26,10 +26,6 @@ use enclave_os_common::rpc::{self, HonestRpcIdentity, RpcMethod, RpcRole};
 use crate::kvstore;
 use crate::net;
 
-fn legacy_role_allows_method(role: RpcRole, method: RpcMethod) -> bool {
-    method != RpcMethod::PersistRaftReadyBatch || role == RpcRole::Control
-}
-
 const fn role_name(role: RpcRole) -> &'static str {
     match role {
         RpcRole::Control => "control",
@@ -198,17 +194,6 @@ impl RpcDispatcher {
             payload.len()
         );
 
-        if !legacy_role_allows_method(self.role, method) {
-            warn!(
-                "{} RPC dispatcher denied method {:?} owned by another role",
-                role_name(self.role),
-                method
-            );
-            let response = rpc::encode_response(req_id, -13, &[]);
-            self.response_tx.send(&response);
-            return;
-        }
-
         let (status, response_payload) = self.dispatch_method(method, payload);
 
         // Send response back to legacy Mini callers.
@@ -231,7 +216,6 @@ impl RpcDispatcher {
             RpcMethod::KvGet => self.handle_kv_get(payload),
             RpcMethod::KvDelete => self.handle_kv_delete(payload),
             RpcMethod::KvListKeys => self.handle_kv_list_keys(payload),
-            RpcMethod::PersistRaftReadyBatch => self.handle_persist_raft_ready_batch(payload),
 
             // ---- Utility ----
             RpcMethod::GetCurrentTime => self.handle_get_current_time(),
@@ -407,36 +391,6 @@ impl RpcDispatcher {
         }
     }
 
-    fn handle_persist_raft_ready_batch(&self, payload: &[u8]) -> (i32, Vec<u8>) {
-        let request = match rpc::decode_persist_raft_ready_batch(payload) {
-            Ok(request) => request,
-            Err(error) => {
-                warn!(
-                    "PersistRaftReadyBatch rejected malformed payload: {:?}",
-                    error
-                );
-                return (-1, Vec::new());
-            }
-        };
-        match kvstore::persist_raft_ready_batch(&request) {
-            Ok(kvstore::RaftReadyPersistenceResult::Persisted {
-                batch_id,
-                durable_id,
-            }) => (
-                0,
-                rpc::encode_persisted_raft_ready_batch(rpc::PersistedRaftReadyBatch {
-                    batch_id,
-                    durable_id,
-                }),
-            ),
-            Ok(kvstore::RaftReadyPersistenceResult::Conflict) => (1, Vec::new()),
-            Err(error) => {
-                error!("PersistRaftReadyBatch failed: {}", error);
-                (-1, Vec::new())
-            }
-        }
-    }
-
     // ====================================================================
     //  Utility handlers
     // ====================================================================
@@ -548,7 +502,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
-    use super::{legacy_role_allows_method, RpcDispatcher};
+    use super::RpcDispatcher;
     use enclave_os_common::queue::{SpscConsumer, SpscProducer, SpscQueueHeader};
     use enclave_os_common::rpc::{
         self, honest_role_allows_method, HonestRpcIdentity, RpcMethod, RpcRole,
@@ -567,30 +521,6 @@ mod tests {
                 SpscConsumer::from_raw(header, buffer),
             )
         }
-    }
-
-    #[test]
-    fn ready_persistence_is_control_role_only() {
-        assert!(legacy_role_allows_method(
-            RpcRole::Control,
-            RpcMethod::PersistRaftReadyBatch
-        ));
-        assert!(!legacy_role_allows_method(
-            RpcRole::Execution,
-            RpcMethod::PersistRaftReadyBatch
-        ));
-        assert!(legacy_role_allows_method(
-            RpcRole::Execution,
-            RpcMethod::NetRecv
-        ));
-        assert!(!honest_role_allows_method(
-            RpcRole::Control,
-            RpcMethod::NetRecv
-        ));
-        assert!(honest_role_allows_method(
-            RpcRole::Execution,
-            RpcMethod::NetRecv
-        ));
     }
 
     #[test]

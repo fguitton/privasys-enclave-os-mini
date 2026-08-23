@@ -4,9 +4,8 @@
 //! Enclave-side RPC client.
 //!
 //! Wraps the SPSC queues to provide typed host calls. Legacy Mini services use
-//! the synchronous interface. Honest's control-plane Ready persistence uses a
-//! separate polled interface: submission performs one `try_send`, and each
-//! poll performs at most one `try_recv`.
+//! the synchronous interface; execution networking uses a bounded polled
+//! interface.
 //!
 //! This replaces all the individual OCALL wrappers with a single
 //! message-passing channel.
@@ -16,10 +15,7 @@ use std::string::String;
 use std::vec::Vec;
 
 use enclave_os_common::queue::{SpscConsumer, SpscProducer};
-use enclave_os_common::rpc::{
-    self, HonestRpcFrameError, HonestRpcIdentity, PersistRaftReadyBatch, PersistedRaftReadyBatch,
-    RaftReadyBatchCodecError, RpcMethod, RpcRole,
-};
+use enclave_os_common::rpc::{self, HonestRpcFrameError, HonestRpcIdentity, RpcMethod, RpcRole};
 
 // ---------------------------------------------------------------------------
 //  External: the single OCALL
@@ -65,16 +61,6 @@ pub struct RpcClient {
     in_flight_request_id: AtomicU64,
 }
 
-/// Token owned by the control scheduler while one Ready batch is in flight.
-///
-/// It deliberately exposes no request ID: callers can only return it to the
-/// same [`RpcClient`] for a bounded poll.
-#[derive(Debug)]
-pub struct PendingRaftReadyBatch {
-    identity: HonestRpcIdentity,
-    batch_id: u64,
-}
-
 /// Token owned by the execution worker while one host operation is in flight.
 ///
 /// Its complete framed identity is private; only the submitting client may
@@ -101,19 +87,6 @@ impl ExecutionRpcCompletion {
     pub fn payload(&self) -> &[u8] {
         &self.payload
     }
-}
-
-/// Fail-closed errors from the polled Ready persistence interface.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PolledRaftReadyError {
-    InvalidRequest(RaftReadyBatchCodecError),
-    Busy,
-    OperationIdExhausted,
-    QueueFull,
-    NotPending,
-    MalformedResponse,
-    UnexpectedResponse,
-    HostStatus(i32),
 }
 
 /// Fail-closed errors from the role-owned execution submit/poll interface.
@@ -170,81 +143,6 @@ impl RpcClient {
             Ordering::AcqRel,
             Ordering::Acquire,
         );
-    }
-
-    // ====================================================================
-    //  Polled control-plane persistence
-    // ====================================================================
-
-    /// Try to submit one atomic Raft Ready batch without waiting for queue
-    /// capacity or a host response.
-    pub fn try_persist_raft_ready_batch(
-        &self,
-        batch: &PersistRaftReadyBatch,
-    ) -> Result<PendingRaftReadyBatch, PolledRaftReadyError> {
-        let payload = rpc::encode_persist_raft_ready_batch(batch)
-            .map_err(PolledRaftReadyError::InvalidRequest)?;
-        let request_id = self.try_reserve_request().map_err(|error| match error {
-            RequestReserveError::Busy => PolledRaftReadyError::Busy,
-            RequestReserveError::OperationIdExhausted => PolledRaftReadyError::OperationIdExhausted,
-        })?;
-        let identity = HonestRpcIdentity {
-            role: RpcRole::Control,
-            node_id: batch.node_id,
-            node_generation: batch.node_generation,
-            operation_id: request_id,
-            method: RpcMethod::PersistRaftReadyBatch,
-        };
-        let message = rpc::encode_honest_request(identity, &payload).map_err(|_| {
-            self.release_request(request_id);
-            PolledRaftReadyError::InvalidRequest(RaftReadyBatchCodecError::BatchBound)
-        })?;
-        if self.request_tx.try_send(&message).is_err() {
-            self.release_request(request_id);
-            return Err(PolledRaftReadyError::QueueFull);
-        }
-        notify_host();
-        Ok(PendingRaftReadyBatch {
-            identity,
-            batch_id: batch.batch_id,
-        })
-    }
-
-    /// Poll one submitted Ready batch.
-    ///
-    /// `Ok(None)` means the host has not replied. Every call consumes at most
-    /// one response frame and never waits. A malformed, stale, mismatched or
-    /// negative response terminates the operation fail-closed.
-    pub fn poll_persist_raft_ready_batch(
-        &self,
-        pending: &PendingRaftReadyBatch,
-    ) -> Result<Option<PersistedRaftReadyBatch>, PolledRaftReadyError> {
-        if self.in_flight_request_id.load(Ordering::Acquire) != pending.identity.operation_id {
-            return Err(PolledRaftReadyError::NotPending);
-        }
-        let Some(raw_response) = self.response_rx.try_recv() else {
-            return Ok(None);
-        };
-        self.release_request(pending.identity.operation_id);
-
-        let response =
-            rpc::decode_honest_response_for(&raw_response, pending.identity).map_err(|error| {
-                match error {
-                    HonestRpcFrameError::UnexpectedIdentity => {
-                        PolledRaftReadyError::UnexpectedResponse
-                    }
-                    _ => PolledRaftReadyError::MalformedResponse,
-                }
-            })?;
-        if response.status != 0 {
-            return Err(PolledRaftReadyError::HostStatus(response.status));
-        }
-        let persisted = rpc::decode_persisted_raft_ready_batch(response.payload)
-            .ok_or(PolledRaftReadyError::MalformedResponse)?;
-        if persisted.batch_id != pending.batch_id || persisted.durable_id != pending.batch_id {
-            return Err(PolledRaftReadyError::UnexpectedResponse);
-        }
-        Ok(Some(persisted))
     }
 
     // ====================================================================

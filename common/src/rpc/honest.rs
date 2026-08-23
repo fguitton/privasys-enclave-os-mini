@@ -248,7 +248,7 @@ pub fn decode_honest_response_for(
 #[must_use]
 pub fn honest_role_allows_method(role: RpcRole, method: RpcMethod) -> bool {
     match role {
-        RpcRole::Control => method == RpcMethod::PersistRaftReadyBatch,
+        RpcRole::Control => false,
         RpcRole::Execution => matches!(
             method,
             RpcMethod::NetTcpConnect
