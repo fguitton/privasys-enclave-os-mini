@@ -26,6 +26,9 @@ sgx = []
 default-ecall = []
 # Mock mode for development/testing on platforms without SGX
 mock = ["enclave-os-egress?/mock", "enclave-os-vault?/mock"]
+# Test-only SGX SDK simulation evidence. This is distinct from `mock`: the
+# enclave still executes through the SDK simulation runtime and sealing code.
+sgx-sim-attestation = ["enclave-os-egress?/sgx-sim-attestation"]
 
 # ── Composable module features ──────────────────────────────────────────
 # Enable any combination — they are NOT mutually exclusive.

@@ -36,7 +36,9 @@ use x509_parser::prelude::*;
 // sgx_types is provided by the Teaclave sysroot — gives us Quote3, Quote4,
 // ReportBody, Report2Body with typed field access.
 extern crate sgx_types;
-use sgx_types::types::{Quote3, Quote4};
+#[cfg(not(feature = "sgx-sim-attestation"))]
+use sgx_types::types::Quote3;
+use sgx_types::types::Quote4;
 
 use enclave_os_common::oids;
 
@@ -666,7 +668,7 @@ fn build_attested_client_config(
     if policy.mr_enclave.is_none() && policy.mr_td.is_none() {
         return Err("attested-only TLS requires an expected enclave measurement");
     }
-    #[cfg(not(feature = "mock"))]
+    #[cfg(all(not(feature = "mock"), not(feature = "sgx-sim-attestation")))]
     if policy.attestation_servers.is_empty() {
         return Err("attested-only TLS requires a quote-appraisal service");
     }
@@ -849,6 +851,12 @@ fn verify_ratls_cert(der: &[u8], policy: &RaTlsPolicy) -> Result<VerifiedRaTlsCe
         .map_err(|_| "RA-TLS: failed to parse leaf certificate DER".to_string())?;
 
     // --- Find the expected attestation extension ---
+    #[cfg(feature = "sgx-sim-attestation")]
+    let expected_oid = match policy.tee {
+        TeeType::Sgx => oids::SGX_SIM_REPORT_OID_STR,
+        TeeType::Tdx => return Err("SGX simulation appraisal cannot verify TDX evidence".into()),
+    };
+    #[cfg(not(feature = "sgx-sim-attestation"))]
     let expected_oid = match policy.tee {
         TeeType::Sgx => oids::SGX_QUOTE_OID_STR,
         TeeType::Tdx => oids::TDX_QUOTE_OID_STR,
@@ -878,9 +886,25 @@ fn verify_ratls_cert(der: &[u8], policy: &RaTlsPolicy) -> Result<VerifiedRaTlsCe
     let is_mock = false;
 
     // Peer measurement registers, captured for the attested-dependency check.
+    #[cfg(not(feature = "sgx-sim-attestation"))]
     let mut peer_mrenclave: Option<[u8; 32]> = None;
+    #[cfg(not(feature = "sgx-sim-attestation"))]
     let mut peer_mrtd: Option<[u8; 48]> = None;
 
+    #[cfg(feature = "sgx-sim-attestation")]
+    let (peer_mrenclave, peer_mrtd) = {
+        let (measurement, report_data) = enclave_os_common::quote::parse_sgx_sim_report(quote)?;
+        if policy
+            .mr_enclave
+            .is_some_and(|expected| expected != measurement)
+        {
+            return Err("RA-TLS: simulated MRENCLAVE mismatch".into());
+        }
+        verify_sim_report_data(&report_data, &cert, policy)?;
+        (Some(measurement), None)
+    };
+
+    #[cfg(not(feature = "sgx-sim-attestation"))]
     if !is_mock {
         match policy.tee {
             TeeType::Sgx => {
@@ -967,6 +991,7 @@ fn verify_expected_oids(
 // =========================================================================
 
 /// Parse raw bytes into an SGX DCAP v3 `Quote3` (QuoteHeader + ReportBody).
+#[cfg(not(feature = "sgx-sim-attestation"))]
 fn parse_quote3(data: &[u8]) -> Result<Quote3, String> {
     if data.len() < mem::size_of::<Quote3>() {
         return Err(format!(
@@ -1103,6 +1128,7 @@ fn entry_pins_app_id(
     matches!(enclave_os_common::hex::hex_decode(&undashed), Some(b) if b == peer_app_id)
 }
 
+#[cfg(not(feature = "sgx-sim-attestation"))]
 fn verify_sgx_measurements(quote: &Quote3, policy: &RaTlsPolicy) -> Result<(), String> {
     if let Some(expected) = &policy.mr_enclave {
         if quote.report_body.mr_enclave.m != *expected {
@@ -1118,6 +1144,7 @@ fn verify_sgx_measurements(quote: &Quote3, policy: &RaTlsPolicy) -> Result<(), S
 }
 
 /// Verify TDX measurements (MRTD) from the parsed `Quote4`.
+#[cfg(not(feature = "sgx-sim-attestation"))]
 fn verify_tdx_measurements(quote: &Quote4, policy: &RaTlsPolicy) -> Result<(), String> {
     if let Some(expected) = &policy.mr_td {
         if quote.report_body.mr_td.m != *expected {
@@ -1137,6 +1164,7 @@ fn verify_tdx_measurements(quote: &Quote4, policy: &RaTlsPolicy) -> Result<(), S
 /// |------|--------|---------|
 /// | ChallengeResponse | SPKI DER (91 B) | client nonce |
 /// | Deterministic | SPKI DER (91 B) | `NotBefore` as `"YYYY-MM-DDTHH:MMZ"` |
+#[cfg(not(feature = "sgx-sim-attestation"))]
 fn verify_sgx_report_data(
     quote: &Quote3,
     cert: &X509Certificate<'_>,
@@ -1177,12 +1205,43 @@ fn verify_sgx_report_data(
     Ok(())
 }
 
+#[cfg(feature = "sgx-sim-attestation")]
+fn verify_sim_report_data(
+    report_data: &[u8; 64],
+    cert: &X509Certificate<'_>,
+    policy: &RaTlsPolicy,
+) -> Result<(), String> {
+    if matches!(
+        policy.report_data,
+        ReportDataBinding::ChallengeResponse { .. }
+    ) {
+        return Ok(());
+    }
+    let ec_point = cert.public_key().subject_public_key.as_ref();
+    let spki_der = enclave_os_common::quote::build_p256_spki_der(ec_point);
+    let not_before = cert.validity().not_before.to_datetime();
+    let binding = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}Z",
+        not_before.year(),
+        not_before.month() as u8,
+        not_before.day(),
+        not_before.hour(),
+        not_before.minute(),
+    );
+    let expected = compute_report_data_hash(&spki_der, binding.as_bytes());
+    if *report_data != expected.as_ref() {
+        return Err("RA-TLS: simulation ReportData mismatch (deterministic)".into());
+    }
+    Ok(())
+}
+
 /// Verify the TDX quote's ReportData field.
 ///
 /// | Mode | pubkey | binding |
 /// |------|--------|---------|
 /// | Deterministic | SPKI DER (91 B) | `NotBefore` as `"YYYY-MM-DDTHH:MMZ"` |
 /// | ChallengeResponse | SPKI DER (91 B) | client nonce |
+#[cfg(not(feature = "sgx-sim-attestation"))]
 fn verify_tdx_report_data(
     quote: &Quote4,
     cert: &X509Certificate<'_>,
@@ -1274,9 +1333,20 @@ fn verify_certificate_channel_binding(
 
     match policy.tee {
         TeeType::Sgx => {
-            let q = parse_quote3(quote_ext.value)?;
-            if q.report_body.report_data.d != expected.as_ref() {
-                return Err("RA-TLS: channel-binding mismatch (SGX) — quote does not commit to this TLS session".into());
+            #[cfg(feature = "sgx-sim-attestation")]
+            {
+                let (_, report_data) =
+                    enclave_os_common::quote::parse_sgx_sim_report(quote_ext.value)?;
+                if report_data != expected.as_ref() {
+                    return Err("RA-TLS: channel-binding mismatch (SGX simulation)".into());
+                }
+            }
+            #[cfg(not(feature = "sgx-sim-attestation"))]
+            {
+                let q = parse_quote3(quote_ext.value)?;
+                if q.report_body.report_data.d != expected.as_ref() {
+                    return Err("RA-TLS: channel-binding mismatch (SGX) — quote does not commit to this TLS session".into());
+                }
             }
         }
         TeeType::Tdx => {

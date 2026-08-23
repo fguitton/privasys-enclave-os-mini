@@ -8,6 +8,16 @@ project(enclave-os-mini LANGUAGES C CXX)
 # enclave measurement. Deliberate identity rolls may override this cache value.
 set(SOURCE_DATE_EPOCH "0" CACHE STRING "Epoch for reproducible Rust artifacts")
 
+if(NOT DEFINED SGX_MODE)
+    if(DEFINED ENV{SGX_MODE})
+        set(SGX_MODE "$ENV{SGX_MODE}")
+    else()
+        set(SGX_MODE "HW")
+    endif()
+endif()
+set(SGX_MODE "${SGX_MODE}" CACHE STRING "Intel SGX execution mode: HW or SIM")
+set_property(CACHE SGX_MODE PROPERTY STRINGS HW SIM)
+
 # =============================================================================
 # Options
 # =============================================================================
@@ -63,27 +73,35 @@ message(STATUS "Teaclave SDK: ${TEACLAVE_CHECKOUT}")
 set(TEACLAVE_EDL_DIR  "${TEACLAVE_CHECKOUT}/sgx_edl/edl")
 set(TEACLAVE_INC_DIR  "${TEACLAVE_CHECKOUT}/common/inc")
 set(TEACLAVE_TLIBC    "${TEACLAVE_CHECKOUT}/common/inc/tlibc")
-set(SGX_SYSROOT_DIR   "${CMAKE_SOURCE_DIR}/sysroot")
+if(SGX_MODE STREQUAL "SIM")
+    set(SGX_SYSROOT_DIR "${CMAKE_BINARY_DIR}/sgx-sysroot")
+else()
+    set(SGX_SYSROOT_DIR "${CMAKE_SOURCE_DIR}/sysroot")
+endif()
 
 # =============================================================================
 # Step 1: Build SGX sysroot (via the fork's CMake sgx_sysroot target)
 # =============================================================================
 if(BUILD_ENCLAVE)
-    set(SYSROOT_BUILD_DIR "${TEACLAVE_CHECKOUT}/build_sysroot")
+    if(SGX_MODE STREQUAL "SIM")
+        set(SYSROOT_BUILD_DIR "${CMAKE_BINARY_DIR}/teaclave-sysroot-build")
+    else()
+        set(SYSROOT_BUILD_DIR "${TEACLAVE_CHECKOUT}/build_sysroot")
+    endif()
 
     # ExternalProject-like: configure + build the fork's sysroot target
     set(SYSROOT_STAMP "${CMAKE_BINARY_DIR}/sysroot.stamp")
     add_custom_command(
         OUTPUT "${SYSROOT_STAMP}"
         COMMENT "Building SGX sysroot via Teaclave fork CMake..."
-        COMMAND ${CMAKE_COMMAND}
+        COMMAND ${CMAKE_COMMAND} -E env "SGX_MODE=${SGX_MODE}" ${CMAKE_COMMAND}
             -S "${TEACLAVE_CHECKOUT}"
             -B "${SYSROOT_BUILD_DIR}"
             -DBUILD_SYSROOT=ON
             -DBUILD_URTS=OFF
             -DSGX_SYSROOT_OUTPUT=${SGX_SYSROOT_DIR}
             -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
-        COMMAND ${CMAKE_COMMAND}
+        COMMAND ${CMAKE_COMMAND} -E env "SGX_MODE=${SGX_MODE}" ${CMAKE_COMMAND}
             --build "${SYSROOT_BUILD_DIR}"
             --target sgx_sysroot
         COMMAND ${CMAKE_COMMAND} -E touch "${SYSROOT_STAMP}"
@@ -112,6 +130,7 @@ message(STATUS "  BUILD_HOST      = ${BUILD_HOST}")
 message(STATUS "  BUILD_ENCLAVE   = ${BUILD_ENCLAVE}")
 message(STATUS "  CMAKE_BUILD_TYPE= ${CMAKE_BUILD_TYPE}")
 message(STATUS "  SGX_SDK_PATH    = ${SGX_SDK_PATH}")
+message(STATUS "  SGX_MODE        = ${SGX_MODE}")
 message(STATUS "  TEACLAVE        = ${TEACLAVE_CHECKOUT}")
 message(STATUS "  SYSROOT         = ${SGX_SYSROOT_DIR}")
 message(STATUS "-------------------------------------")

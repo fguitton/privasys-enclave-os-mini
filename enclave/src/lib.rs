@@ -44,6 +44,9 @@
 //! (including third-party deps like rustls) resolve `std` to `sgx_tstd`.
 //! No `#![no_std]` or `extern crate sgx_tstd as std` is needed.
 
+#[cfg(all(feature = "mock", feature = "sgx-sim-attestation"))]
+compile_error!("mock and sgx-sim-attestation are mutually exclusive");
+
 // sgx_types is provided by the sysroot (as a dependency of std/sgx_tstd).
 // We access it via `extern crate` rather than a Cargo.toml dep to avoid
 // having two copies of the same crate (sysroot vs. git).

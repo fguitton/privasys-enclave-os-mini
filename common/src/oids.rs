@@ -22,6 +22,14 @@ pub const SGX_QUOTE_OID: &[u64] = &[1, 2, 840, 113741, 1, 13, 1, 0];
 /// SGX DCAP Quote (dotted-string).
 pub const SGX_QUOTE_OID_STR: &str = "1.2.840.113741.1.13.1.0";
 
+/// SGX SDK simulation report — `1.3.6.1.4.1.65230.2.10`.
+///
+/// This OID is deliberately distinct from genuine DCAP evidence. Production
+/// verifiers do not accept it.
+pub const SGX_SIM_REPORT_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 2, 10];
+/// SGX SDK simulation report (dotted-string).
+pub const SGX_SIM_REPORT_OID_STR: &str = "1.3.6.1.4.1.65230.2.10";
+
 /// TDX DCAP Quote — `1.2.840.113741.1.5.5.1.6`
 pub const TDX_QUOTE_OID: &[u64] = &[1, 2, 840, 113741, 1, 5, 5, 1, 6];
 /// TDX DCAP Quote (dotted-string).

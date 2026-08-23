@@ -141,6 +141,16 @@ pub struct VerifyResponse {
 /// attestation::verify_quote(&raw_quote_bytes, &servers)?;
 /// ```
 pub fn verify_quote(evidence: &[u8], attestation_servers: &[String]) -> Result<(), String> {
+    #[cfg(feature = "sgx-sim-attestation")]
+    if evidence.starts_with(enclave_os_common::quote::SGX_SIM_REPORT_PREFIX) {
+        enclave_os_common::quote::parse_sgx_sim_report(evidence)?;
+        return if attestation_servers.is_empty() {
+            Ok(())
+        } else {
+            Err("SGX simulation evidence cannot be sent to a hardware appraisal service".into())
+        };
+    }
+
     // Nothing to verify when no servers are configured.
     if attestation_servers.is_empty() {
         return Ok(());
@@ -201,4 +211,23 @@ pub fn verify_quote(evidence: &[u8], attestation_servers: &[String]) -> Result<(
     }
 
     Ok(())
+}
+
+#[cfg(all(test, feature = "sgx-sim-attestation"))]
+mod simulation_tests {
+    use super::verify_quote;
+    use enclave_os_common::quote::SGX_SIM_REPORT_PREFIX;
+
+    #[test]
+    fn typed_simulation_evidence_stays_local() {
+        let mut evidence = SGX_SIM_REPORT_PREFIX.to_vec();
+        evidence.extend_from_slice(&[7; 32]);
+        evidence.extend_from_slice(&[9; 64]);
+        assert!(verify_quote(&evidence, &[]).is_ok());
+        assert!(
+            verify_quote(&evidence, &["https://appraiser.invalid".into()])
+                .unwrap_err()
+                .contains("cannot be sent")
+        );
+    }
 }

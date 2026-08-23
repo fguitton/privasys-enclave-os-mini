@@ -31,7 +31,11 @@ use std::string::String;
 use std::vec::Vec;
 use time::OffsetDateTime;
 
-use enclave_os_common::oids::{APP_CONFIG_MERKLE_ROOT_OID, CONFIG_MERKLE_ROOT_OID, SGX_QUOTE_OID};
+use enclave_os_common::oids::{APP_CONFIG_MERKLE_ROOT_OID, CONFIG_MERKLE_ROOT_OID};
+#[cfg(not(feature = "sgx-sim-attestation"))]
+use enclave_os_common::oids::SGX_QUOTE_OID;
+#[cfg(feature = "sgx-sim-attestation")]
+use enclave_os_common::oids::SGX_SIM_REPORT_OID;
 
 use crate::ratls::cert_store::AppCertData;
 
@@ -505,7 +509,7 @@ fn format_ratls_time(t: &OffsetDateTime) -> String {
 ///      `sgx_qe_get_quote()` → returns the full DCAP Quote v3
 ///
 /// In mock mode this returns a deterministic dummy quote.
-#[cfg(not(feature = "mock"))]
+#[cfg(all(not(feature = "mock"), not(feature = "sgx-sim-attestation")))]
 fn generate_sgx_quote(report_data: &[u8; 64]) -> Result<Vec<u8>, String> {
     use sgx_types::types::{ReportData, TargetInfo};
 
@@ -550,12 +554,30 @@ fn generate_sgx_quote(report_data: &[u8; 64]) -> Result<Vec<u8>, String> {
     Ok(quote)
 }
 
-#[cfg(feature = "mock")]
+#[cfg(all(feature = "mock", not(feature = "sgx-sim-attestation")))]
 fn generate_sgx_quote(report_data: &[u8; 64]) -> Result<Vec<u8>, String> {
     let mut quote = Vec::with_capacity(11 + 64);
     quote.extend_from_slice(b"MOCK_QUOTE:");
     quote.extend_from_slice(report_data);
     Ok(quote)
+}
+
+#[cfg(feature = "sgx-sim-attestation")]
+fn generate_sgx_quote(report_data: &[u8; 64]) -> Result<Vec<u8>, String> {
+    use sgx_tse::{EnclaveReport, EnclaveTarget};
+    use sgx_types::types::{Report, ReportData, TargetInfo};
+
+    let target = TargetInfo::for_self()
+        .map_err(|error| format!("SGX simulation target failed: {error:?}"))?;
+    let mut data = ReportData::default();
+    data.d.copy_from_slice(report_data);
+    let report = Report::for_target(&target, &data)
+        .map_err(|error| format!("SGX simulation report failed: {error:?}"))?;
+    let mut evidence = Vec::with_capacity(enclave_os_common::quote::SGX_SIM_REPORT_SIZE);
+    evidence.extend_from_slice(enclave_os_common::quote::SGX_SIM_REPORT_PREFIX);
+    evidence.extend_from_slice(&report.body.mr_enclave.m);
+    evidence.extend_from_slice(&report.body.report_data.d);
+    Ok(evidence)
 }
 
 /// Produce a DCAP quote binding `nonce` into ReportData, for authenticating this
@@ -632,7 +654,8 @@ pub fn self_mrenclave() -> Result<[u8; 32], String> {
 
 /// Build a leaf certificate signed by the intermediary CA.
 ///
-/// The SGX quote goes into [`SGX_QUOTE_OID`]. Additional X.509 extensions
+/// The typed SGX evidence goes into the mode-specific evidence OID. Additional
+/// X.509 extensions
 /// (config Merkle roots, module OIDs, per-app OIDs) are passed via
 /// `extensions`. The `common_name` is set as the Subject CN.
 fn build_leaf_cert(
@@ -697,7 +720,11 @@ fn build_leaf_cert(
     leaf_params.not_after = not_after;
 
     // SGX quote
-    let quote_ext = CustomExtension::from_oid_content(SGX_QUOTE_OID, quote.to_vec());
+    #[cfg(feature = "sgx-sim-attestation")]
+    let evidence_oid = SGX_SIM_REPORT_OID;
+    #[cfg(not(feature = "sgx-sim-attestation"))]
+    let evidence_oid = SGX_QUOTE_OID;
+    let quote_ext = CustomExtension::from_oid_content(evidence_oid, quote.to_vec());
     leaf_params.custom_extensions.push(quote_ext);
 
     // Caller-supplied extensions (Merkle roots, module OIDs, per-app OIDs)

@@ -32,6 +32,8 @@ option(ENABLE_FIDO2   "Include the FIDO2/WebAuthn authentication module (implies
 set(CUSTOM_ENCLAVE_DIR "" CACHE PATH
     "Path to an external composition crate with a custom ecall_run. \
      When set, all ENABLE_* flags are ignored and this crate is built instead.")
+set(CUSTOM_ENCLAVE_FEATURES "" CACHE STRING
+    "Comma-separated Cargo features for a custom composition crate")
 
 # ── Resolve crate directory and feature list ────────────────────────────
 if(NOT CUSTOM_ENCLAVE_DIR STREQUAL "")
@@ -40,7 +42,7 @@ if(NOT CUSTOM_ENCLAVE_DIR STREQUAL "")
     # Derive the crate name from the directory (convention: last component)
     get_filename_component(_dir_name "${CUSTOM_ENCLAVE_DIR}" NAME)
     string(REPLACE "-" "_" _ENCLAVE_CRATE_NAME "${_dir_name}")
-    set(_ENCLAVE_FEATURES "")
+    set(_ENCLAVE_FEATURES "${CUSTOM_ENCLAVE_FEATURES}")
     message(STATUS "Custom enclave crate — building ${_ENCLAVE_CRATE_DIR} (${_ENCLAVE_CRATE_NAME})")
 else()
     # Default: build enclave-os-enclave with composable features
@@ -77,12 +79,22 @@ endif()
 
 set(_ENCLAVE_TARGET_DIR
     "${CMAKE_BINARY_DIR}/cargo/${_ENCLAVE_CRATE_NAME}")
-rust_build_enclave(
-    "${_ENCLAVE_CRATE_DIR}"
-    ${_ENCLAVE_CRATE_NAME}
-    "${_ENCLAVE_FEATURES}"
-    "${_ENCLAVE_TARGET_DIR}"
-)
+if(NOT CUSTOM_ENCLAVE_DIR STREQUAL "")
+    rust_build_enclave(
+        "${_ENCLAVE_CRATE_DIR}"
+        ${_ENCLAVE_CRATE_NAME}
+        "${_ENCLAVE_FEATURES}"
+        "${_ENCLAVE_TARGET_DIR}"
+        EXACT_FEATURES
+    )
+else()
+    rust_build_enclave(
+        "${_ENCLAVE_CRATE_DIR}"
+        ${_ENCLAVE_CRATE_NAME}
+        "${_ENCLAVE_FEATURES}"
+        "${_ENCLAVE_TARGET_DIR}"
+    )
+endif()
 add_dependencies(${_ENCLAVE_CRATE_NAME} sgx_sysroot)
 set(ENCLAVE_STATIC_LIB
     "${_ENCLAVE_TARGET_DIR}/${RUST_ENCLAVE_TARGET}/${CARGO_OUT_DIR}/lib${_ENCLAVE_CRATE_NAME}.a")

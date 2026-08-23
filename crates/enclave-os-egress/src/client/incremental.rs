@@ -245,7 +245,7 @@ mod tests {
             .expect("the declared request bound must fit the TLS plaintext buffer");
     }
 
-    #[cfg(not(feature = "mock"))]
+    #[cfg(all(not(feature = "mock"), not(feature = "sgx-sim-attestation")))]
     #[test]
     fn attested_only_client_requires_measurement_and_remote_appraisal() {
         let policy = RaTlsPolicy {
@@ -265,5 +265,22 @@ mod tests {
                 .as_deref(),
             Some("attested-only TLS requires a quote-appraisal service")
         );
+    }
+
+    #[cfg(feature = "sgx-sim-attestation")]
+    #[test]
+    fn simulation_client_accepts_local_typed_appraisal_without_remote_service() {
+        let policy = RaTlsPolicy {
+            tee: TeeType::Sgx,
+            mr_enclave: Some([7; 32]),
+            mr_signer: None,
+            mr_td: None,
+            report_data: ReportDataBinding::ChallengeResponse { nonce: vec![9; 32] },
+            expected_oids: Vec::new(),
+            attestation_servers: Vec::new(),
+            client_identity: None,
+            dependencies: None,
+        };
+        assert!(IncrementalTlsClient::new_attested("local-control.invalid", policy).is_ok());
     }
 }

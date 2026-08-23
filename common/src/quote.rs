@@ -71,6 +71,27 @@ pub const TDX_REPORT_DATA_OFFSET: usize = 568;
 /// Size of the report data field (same for SGX and TDX).
 pub const REPORT_DATA_SIZE: usize = 64;
 
+/// Prefix and exact field sizes for test-only SDK simulation evidence.
+pub const SGX_SIM_REPORT_PREFIX: &[u8] = b"HONEST_SGX_SIM_REPORT_V1:";
+pub const SGX_SIM_REPORT_SIZE: usize =
+    SGX_SIM_REPORT_PREFIX.len() + SGX_MRENCLAVE_SIZE + REPORT_DATA_SIZE;
+
+/// Parse the distinctly typed SDK simulation evidence fields.
+pub fn parse_sgx_sim_report(evidence: &[u8]) -> Result<([u8; 32], [u8; 64]), String> {
+    if evidence.len() != SGX_SIM_REPORT_SIZE || !evidence.starts_with(SGX_SIM_REPORT_PREFIX) {
+        return Err("SGX simulation report has invalid type or length".into());
+    }
+    let start = SGX_SIM_REPORT_PREFIX.len();
+    let mut measurement = [0_u8; SGX_MRENCLAVE_SIZE];
+    measurement.copy_from_slice(&evidence[start..start + SGX_MRENCLAVE_SIZE]);
+    let mut report_data = [0_u8; REPORT_DATA_SIZE];
+    report_data.copy_from_slice(&evidence[start + SGX_MRENCLAVE_SIZE..]);
+    if measurement == [0; SGX_MRENCLAVE_SIZE] {
+        return Err("SGX simulation report has a zero measurement".into());
+    }
+    Ok((measurement, report_data))
+}
+
 /// Minimum quote size needed to extract ReportData from a TDX v4 quote.
 /// = TDX_REPORT_DATA_OFFSET + REPORT_DATA_SIZE = 568 + 64 = 632.
 pub const TDX_REPORT_DATA_MIN_SIZE: usize = TDX_REPORT_DATA_OFFSET + REPORT_DATA_SIZE;
@@ -327,4 +348,24 @@ pub fn compute_report_data_hash(pubkey_bytes: &[u8], binding: &[u8]) -> ring::di
     preimage.extend_from_slice(pk_hash.as_ref());
     preimage.extend_from_slice(binding);
     ring::digest::digest(&ring::digest::SHA512, &preimage)
+}
+
+#[cfg(test)]
+mod simulation_tests {
+    use super::{parse_sgx_sim_report, SGX_SIM_REPORT_PREFIX};
+
+    #[test]
+    fn typed_simulation_report_is_exact_and_mutation_sensitive() {
+        let mut evidence = SGX_SIM_REPORT_PREFIX.to_vec();
+        evidence.extend_from_slice(&[7; 32]);
+        evidence.extend_from_slice(&[9; 64]);
+        assert_eq!(parse_sgx_sim_report(&evidence).unwrap(), ([7; 32], [9; 64]));
+        evidence.push(0);
+        assert!(parse_sgx_sim_report(&evidence).is_err());
+
+        let mut zero = SGX_SIM_REPORT_PREFIX.to_vec();
+        zero.extend_from_slice(&[0; 32]);
+        zero.extend_from_slice(&[9; 64]);
+        assert!(parse_sgx_sim_report(&zero).is_err());
+    }
 }

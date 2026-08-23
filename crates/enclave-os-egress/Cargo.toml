@@ -15,6 +15,9 @@ name = "enclave_os_egress"
 # Mock mode — accepts MOCK_QUOTE: prefixed quotes without verification.
 # Only enable for development/testing on platforms without SGX hardware.
 mock = []
+# Accept the distinctly typed report emitted by an enclave executing through
+# Intel SGX SDK simulation. Never enabled by default or by release packaging.
+sgx-sim-attestation = []
 # Host-side RA-TLS clients need the quote layout types as a normal Cargo
 # dependency. Enclave builds leave this disabled because `sgx_types` is
 # supplied by the Teaclave sysroot there.

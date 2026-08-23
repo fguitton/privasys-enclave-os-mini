@@ -20,6 +20,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=SGX_SDK");
     println!("cargo:rerun-if-env-changed=SGX_SDK_PATH");
+    println!("cargo:rerun-if-env-changed=SGX_MODE");
     println!("cargo:rerun-if-env-changed=TEACLAVE_SGX_SDK");
 
     // No SGX linking needed on non-Linux / mock mode
@@ -99,10 +100,16 @@ fn main() {
     //  Step 5: Link SGX SDK untrusted libraries
     // -----------------------------------------------------------------------
     println!("cargo:rustc-link-search=native={}/lib64", sgx_sdk);
-    println!("cargo:rustc-link-lib=sgx_urts");
-    // DCAP Quoting Library — provides sgx_qe_get_target_info / sgx_qe_get_quote.
-    // The library is installed by the libsgx-dcap-ql package.
-    println!("cargo:rustc-link-lib=dylib=sgx_dcap_ql");
+    match env::var("SGX_MODE").as_deref().unwrap_or("HW") {
+        "SIM" => println!("cargo:rustc-link-lib=sgx_urts_sim"),
+        "HW" => {
+            println!("cargo:rustc-link-lib=sgx_urts");
+            // DCAP Quoting Library — provides sgx_qe_get_target_info / sgx_qe_get_quote.
+            // The library is installed by the libsgx-dcap-ql package.
+            println!("cargo:rustc-link-lib=dylib=sgx_dcap_ql");
+        }
+        _ => panic!("SGX_MODE must be exactly HW or SIM"),
+    }
 }
 
 // ---------------------------------------------------------------------------

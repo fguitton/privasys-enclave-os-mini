@@ -4,6 +4,12 @@
 # cmake/SgxConfig.cmake
 # Detect and configure the Intel SGX SDK paths and compiler flags.
 
+string(TOUPPER "${SGX_MODE}" SGX_MODE)
+if(NOT SGX_MODE STREQUAL "HW" AND NOT SGX_MODE STREQUAL "SIM")
+    message(FATAL_ERROR "SGX_MODE must be exactly HW or SIM")
+endif()
+set(SGX_MODE "${SGX_MODE}" CACHE STRING "Intel SGX execution mode: HW or SIM" FORCE)
+
 # ---- Auto-detect SGX SDK ----
 if(NOT SGX_SDK_PATH)
     if(EXISTS "/opt/intel/sgxsdk")
@@ -31,3 +37,4 @@ set(ENCLAVE_C_FLAGS
     -fno-strict-overflow -fno-delete-null-pointer-checks -m64)
 
 message(STATUS "SGX SDK: ${SGX_SDK_PATH}")
+message(STATUS "SGX mode: ${SGX_MODE}")
