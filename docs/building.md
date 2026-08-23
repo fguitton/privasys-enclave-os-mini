@@ -88,8 +88,11 @@ cargo build --manifest-path host/Cargo.toml
 ### Running tests
 
 ```bash
-cargo test --workspace
+CXXFLAGS='-include cstdint' cargo test --workspace
 ```
+
+The explicit C++ include keeps the bundled RocksDB build portable with the
+current GCC toolchain.
 
 ---
 
@@ -172,12 +175,6 @@ wasmtime compile target/wasm32-wasip1/release/wasm_example.wasm -o wasm_example.
 ```
 
 ### 3. Load into the enclave
-
-Using the test script:
-
-```bash
-python tests/test_wasm_functions.py wasm_example.cwasm
-```
 
 Or programmatically via any [RA-TLS client](https://github.com/Privasys/ra-tls-clients):
 
