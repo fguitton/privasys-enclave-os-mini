@@ -25,6 +25,7 @@ use rustls::client::{ResolvesClientCert, WebPkiServerVerifier};
 use rustls::crypto::ring::default_provider;
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use rustls::server::WebPkiClientVerifier;
 use rustls::sign::CertifiedKey;
 use rustls::{
     CertificateError, ClientConfig, ClientConnection, DigitallySignedStruct, Error, SignatureScheme,
@@ -148,6 +149,54 @@ pub fn verify_webpki_server_certificate_chain_at(
         .verify_server_cert(&leaf, &intermediates, &server_name, &[], now)
         .map(|_| ())
         .map_err(|error| format!("retained TLS peer validation failed: {error}"))
+}
+
+/// Re-run standard WebPKI client-certificate validation over retained DER.
+///
+/// This is the certificate-role counterpart to
+/// [`verify_webpki_server_certificate_chain_at`]. It performs no network
+/// revocation lookup and makes no real-world identity or ownership claim; it
+/// establishes only that the supplied chain is valid for client
+/// authentication under the exact trust store and time.
+pub fn verify_webpki_client_certificate_chain_at(
+    certificate_chain_der: &[Vec<u8>],
+    root_store: &RootCertStore,
+    verified_at_unix_seconds: u64,
+) -> Result<(), String> {
+    validate_retained_certificate_chain(certificate_chain_der)?;
+    let leaf = CertificateDer::from(certificate_chain_der[0].as_slice());
+    let intermediates: Vec<_> = certificate_chain_der[1..]
+        .iter()
+        .map(|certificate| CertificateDer::from(certificate.as_slice()))
+        .collect();
+    let provider = Arc::new(default_provider());
+    let inner = WebPkiClientVerifier::builder_with_provider(Arc::new(root_store.clone()), provider)
+        .build()
+        .map_err(|error| format!("WebPKI client verifier build error: {error}"))?;
+    let now = UnixTime::since_unix_epoch(Duration::from_secs(verified_at_unix_seconds));
+    inner
+        .verify_client_cert(&leaf, &intermediates, now)
+        .map(|_| ())
+        .map_err(|error| format!("retained TLS client validation failed: {error}"))
+}
+
+fn validate_retained_certificate_chain(certificate_chain_der: &[Vec<u8>]) -> Result<(), String> {
+    if certificate_chain_der.is_empty() || certificate_chain_der.len() > MAX_TLS_PEER_CERTIFICATES {
+        return Err("TLS peer certificate count is outside the retained profile".into());
+    }
+    let mut chain_bytes = 0usize;
+    for certificate in certificate_chain_der {
+        if certificate.is_empty() || certificate.len() > MAX_TLS_PEER_CERTIFICATE_BYTES {
+            return Err("TLS peer certificate is outside the retained profile".into());
+        }
+        chain_bytes = chain_bytes
+            .checked_add(certificate.len())
+            .ok_or_else(|| "TLS peer certificate chain length overflow".to_string())?;
+    }
+    if chain_bytes > MAX_TLS_PEER_CHAIN_BYTES {
+        return Err("TLS peer certificate chain is outside the retained profile".into());
+    }
+    Ok(())
 }
 
 // =========================================================================
@@ -1257,8 +1306,9 @@ fn sha256_array(bytes: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod peer_appraisal_tests {
     use super::{
-        locally_verify_sgx_peer_certificate, verify_webpki_server_certificate_chain_at,
-        RootCertStore, MAX_TLS_PEER_CERTIFICATES, MAX_TLS_PEER_CERTIFICATE_BYTES,
+        locally_verify_sgx_peer_certificate, verify_webpki_client_certificate_chain_at,
+        verify_webpki_server_certificate_chain_at, RootCertStore, MAX_TLS_PEER_CERTIFICATES,
+        MAX_TLS_PEER_CERTIFICATE_BYTES,
     };
 
     #[test]
@@ -1286,6 +1336,9 @@ mod peer_appraisal_tests {
                 .unwrap_err()
                 .contains("count")
         );
+        assert!(verify_webpki_client_certificate_chain_at(&[], &roots, 1)
+            .unwrap_err()
+            .contains("count"));
         assert!(verify_webpki_server_certificate_chain_at(
             &vec![vec![1]; MAX_TLS_PEER_CERTIFICATES + 1],
             "example.test",
