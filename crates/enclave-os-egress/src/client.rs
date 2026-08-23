@@ -23,7 +23,7 @@ use ring::digest;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::{ResolvesClientCert, WebPkiServerVerifier};
 use rustls::crypto::ring::default_provider;
-use rustls::crypto::CryptoProvider;
+use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::sign::CertifiedKey;
 use rustls::{
@@ -596,6 +596,57 @@ fn build_client_config(
     Ok(Arc::new(config))
 }
 
+/// Build a TLS 1.3 client config whose certificate identity is the appraised
+/// RA-TLS quote instead of a host-provisioned WebPKI root.
+///
+/// This mode is intended for a local operator connecting to a freshly
+/// initialised enclave whose CA was generated inside that enclave. It still
+/// verifies the TLS CertificateVerify signature with the leaf public key and
+/// requires challenge/handshake-exporter binding. Production callers must
+/// provide at least one quote-appraisal service.
+fn build_attested_client_config(
+    policy: &RaTlsPolicy,
+    client_auth_capture: Option<SharedClientAuthCapture>,
+) -> Result<Arc<ClientConfig>, &'static str> {
+    let ReportDataBinding::ChallengeResponse { nonce } = &policy.report_data else {
+        return Err("attested-only TLS requires challenge-response report data");
+    };
+    if nonce.len() != 32 {
+        return Err("attested-only TLS challenge must be exactly 32 bytes");
+    }
+    if policy.mr_enclave.is_none() && policy.mr_td.is_none() {
+        return Err("attested-only TLS requires an expected enclave measurement");
+    }
+    #[cfg(not(feature = "mock"))]
+    if policy.attestation_servers.is_empty() {
+        return Err("attested-only TLS requires a quote-appraisal service");
+    }
+
+    let provider = Arc::new(default_provider());
+    let verifier = AttestedRaTlsVerifier {
+        provider: provider.clone(),
+        policy: policy.clone(),
+    };
+    let wants_client_cert = ClientConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|_| "TLS config error")?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier));
+    let mut config = match &policy.client_identity {
+        Some(identity) => {
+            wants_client_cert.with_client_cert_resolver(Arc::new(ChallengeBoundClientAuth {
+                identity: identity.clone(),
+                provider,
+                capture: client_auth_capture,
+            }))
+        }
+        None => wants_client_cert.with_no_client_auth(),
+    };
+    config.ratls_challenge = Some(nonce.clone());
+    config.alpn_protocols = vec![b"honest-local-control/1".to_vec()];
+    Ok(Arc::new(config))
+}
+
 // =========================================================================
 //  RA-TLS custom certificate verifier
 // =========================================================================
@@ -608,6 +659,69 @@ struct RaTlsVerifier {
     inner: Arc<WebPkiServerVerifier>,
     /// Caller-provided attestation expectations.
     policy: RaTlsPolicy,
+}
+
+/// RA-TLS verifier for an enclave-owned, non-WebPKI CA.
+///
+/// The quote authenticates the exact leaf key and expected measurement; the
+/// TLS handshake proves possession of that key. No unauthenticated chain or
+/// host routing label is treated as authority.
+#[derive(Debug)]
+struct AttestedRaTlsVerifier {
+    provider: Arc<CryptoProvider>,
+    policy: RaTlsPolicy,
+}
+
+impl ServerCertVerifier for AttestedRaTlsVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, Error> {
+        if end_entity.as_ref().is_empty() {
+            return Err(Error::General("RA-TLS leaf certificate is empty".into()));
+        }
+        verify_ratls_cert(end_entity.as_ref(), &self.policy)
+            .map(|_| ServerCertVerified::assertion())
+            .map_err(Error::General)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }
 
 impl ServerCertVerifier for RaTlsVerifier {
