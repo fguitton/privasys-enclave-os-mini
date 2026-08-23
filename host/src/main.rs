@@ -22,6 +22,7 @@ mod tcp_proxy;
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use log::{error, info};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -50,6 +51,13 @@ struct Cli {
     /// Port for the RA-TLS ingress server
     #[arg(short, long, default_value_t = 443)]
     port: u16,
+
+    /// Public literal IP advertised by a cluster after explicit --init.
+    /// This is a transport assertion only; membership authority remains in
+    /// the enclave. If omitted, local status remains available but cluster
+    /// initialization is rejected.
+    #[arg(long)]
+    peer_advertise_ip: Option<IpAddr>,
 
     /// TCP listen backlog
     #[arg(short, long, default_value_t = 128)]
@@ -358,6 +366,9 @@ fn main() -> Result<()> {
         "port": cli.port,
         "backlog": cli.backlog,
     });
+    if let Some(address) = cli.peer_advertise_ip {
+        config["cluster_control_peer_ip"] = serde_json::Value::String(address.to_string());
+    }
 
     // If an egress CA bundle is provided, read it and hex-encode for the enclave
     if let Some(ref bundle_path) = cli.egress_ca_bundle {
