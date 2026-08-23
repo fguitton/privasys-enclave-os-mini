@@ -28,9 +28,8 @@ unexpected configurations — without trusting the server operator.
 ## Certificate Trust Chain
 
 ```
-Root CA (operator-provisioned)
- └── Intermediary CA (sealed inside the enclave)
-      └── Leaf RA-TLS certificate (generated per-connection)
+Enclave-owned local CA (generated and sealed inside the enclave)
+ └── Leaf RA-TLS certificate (generated per-connection)
                ├── SGX Quote           (OID 1.2.840.113741.1.13.1.0)
                ├── Config Merkle Root  (OID 1.3.6.1.4.1.65230.1.1)
                ├── Module OIDs         (OID 1.3.6.1.4.1.65230.2.*)
@@ -39,16 +38,16 @@ Root CA (operator-provisioned)
 
 ### Intermediary CA
 
-The CA certificate and private key (ECDSA P-256) are provisioned by the
-operator at first run via `--ca-cert` and `--ca-key`.  They are:
+The local CA certificate and private key (ECDSA P-256) are generated inside
+the enclave at first run. They are:
 
 - Sealed to disk using `sgx_tseal` with **MRENCLAVE policy** — only the
   exact same enclave binary can unseal them
 - Kept only in encrypted enclave memory at runtime
 - Used to sign every leaf certificate the enclave generates
 
-The operator never needs to provide them again — the enclave unseals them
-automatically on restart.
+No CA private-key path crosses the host boundary. The enclave unseals the same
+identity automatically on restart.
 
 ### Leaf Certificate
 
@@ -373,9 +372,8 @@ Enclave OS achieves this with a **two-tier certificate hierarchy** where each
 WASM app gets its own leaf certificate, signed by the enclave's attested CA:
 
 ```
-Root CA (operator-provisioned)
- └── Intermediary CA (sealed inside enclave)
-      └── Enclave CA Cert (attested — SGX quote lives here)
+Enclave-owned local CA (generated and sealed inside enclave)
+ └── Enclave CA Cert (attested — SGX quote lives here)
             ├── OID: MRENCLAVE / MRSIGNER
             ├── OID: Enclave Config Merkle Root (core config only)
             │

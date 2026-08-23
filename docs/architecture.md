@@ -261,10 +261,9 @@ untrusted {
 
 ## Sealed Configuration
 
-On first run, the operator provides:
-
-- **Intermediary CA** certificate + private key (ECDSA P-256)
-- **Egress CA bundle** (optional — Mozilla root CAs for HTTPS egress)
+On first run, the enclave generates its local intermediary CA and master key.
+The operator may provide an **egress CA bundle** for outbound HTTPS; that public
+trust input is distinct from the enclave-owned ingress CA private key.
 
 The enclave:
 
@@ -281,8 +280,8 @@ The sealed config contains:
 | Field | Description |
 |-------|-------------|
 | `master_key` | AES-256 key (32 bytes) for KV store encryption |
-| `ca_cert_der` | DER-encoded intermediary CA certificate |
-| `ca_key_pkcs8` | PKCS#8-encoded CA private key (ECDSA P-256) |
+| `ca_cert_der` | DER-encoded enclave-generated local CA certificate |
+| `ca_key_pkcs8` | Enclave-generated PKCS#8 local CA private key (ECDSA P-256) |
 | `module_data` | Per-module opaque blobs (BTreeMap) |
 
 ---

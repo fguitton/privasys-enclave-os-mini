@@ -77,13 +77,11 @@ See [Architecture](docs/architecture.md) for the full module interface, composit
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 
-# First run — provision CA material
+# First run — the enclave generates and seals its CA material
 cd build/bin
 ./enclave-os-host \
     --port 8443 \
-    --kv-path ./kvdata \
-    --ca-cert /path/to/intermediary-ca.crt \
-    --ca-key  /path/to/intermediary-ca.key
+    --kv-path ./kvdata
 
 # Subsequent restarts — sealed config auto-loaded
 ./enclave-os-host --port 8443 --kv-path ./kvdata
@@ -94,9 +92,8 @@ See [Building and Usage](docs/building.md) for prerequisites, build options, WAS
 ## Certificate Trust Chain
 
 ```
-Root CA (your organization's root)
- └── Intermediary CA (sealed inside enclave)
-      └── Leaf RA-TLS cert (per-connection, with SGX quote + config OIDs)
+Enclave-owned local CA (generated and sealed inside enclave)
+ └── Leaf RA-TLS cert (per-connection, with SGX quote + config OIDs)
 ```
 
 Every leaf certificate embeds:
@@ -111,13 +108,28 @@ See [RA-TLS and Attestation](docs/ra-tls.md) for the full OID hierarchy, Merkle 
 | What | Where | How |
 |------|-------|-----|
 | TLS keys & plaintext | Enclave only | Generated per-connection, never leave enclave |
-| CA material | Enclave only | Sealed to MRENCLAVE on first run |
+| Local CA material | Enclave only | Generated and sealed to MRENCLAVE on first run |
 | KV master key | Enclave only | RDRAND-generated, sealed in config |
 | KV data at rest | Host (opaque) | Keys: HMAC-SHA256, Values: AES-256-GCM |
 | Config attestation | X.509 cert | Merkle root + per-module OIDs in every RA-TLS cert |
 | Network I/O | Host | Sees only ciphertext |
 
 Clients verify: **MRENCLAVE** (code identity) + **Config Merkle Root** (config identity) + **Module OIDs** (individual property checks). The enclave is an honest reporter — no owner key or authorization gate.
+
+## Honest composition control boundary
+
+Honest uses Mini's optional `--local-control-socket` listener as a Unix-domain
+ciphertext relay into the enclave TLS terminator. The host labels this ingress
+class for routing and applies mode `0600`, but neither fact grants semantic
+authority: Honest verifies bootstrap or governor proof inside the enclave.
+The same host proxy also relays peer TCP ciphertext. `--peer-advertise-ip`
+places a literal listener assertion in measured enclave configuration; it does
+not admit a member or prove address ownership.
+
+These adopter rules do not turn every generic Mini RA-TLS application route
+into Honest cluster control. Generic modules retain their normal attested TLS,
+SNI, and application-dispatch behavior. Honest adds a distinct local-control
+route and ALPN in its composition.
 
 ## Documentation
 

@@ -98,10 +98,10 @@ current GCC toolchain.
 
 ## Running the Enclave
 
-### First run — provision CA material
+### First run — generate enclave-owned CA material
 
-On the first run, provide the intermediary CA certificate and private key
-so the enclave can seal them:
+On the first run, the enclave generates its local CA key and certificate and
+seals them. No CA private-key path crosses the host boundary:
 
 ```bash
 cd build/bin
@@ -109,8 +109,6 @@ cd build/bin
 ./enclave-os-host \
     --port 8443 \
     --kv-path ./kvdata \
-    --ca-cert /path/to/intermediary-ca.crt \
-    --ca-key  /path/to/intermediary-ca.key \
     --egress-ca-bundle /etc/ssl/certs/ca-certificates.crt \
     --debug
 ```
@@ -119,14 +117,14 @@ cd build/bin
 |------|----------|-------------|
 | `--port` | yes | TLS listen port |
 | `--kv-path` | yes | Directory for RocksDB encrypted KV store |
-| `--ca-cert` | first run | PEM or DER intermediary CA certificate |
-| `--ca-key` | first run | PEM or PKCS#8 CA private key (ECDSA P-256) |
 | `--egress-ca-bundle` | optional | Root CA bundle for HTTPS egress |
+| `--local-control-socket` | optional | Absolute Unix path for ciphertext-only adopter control ingress |
+| `--peer-advertise-ip` | optional | Literal peer-listener assertion included in measured configuration |
 | `--debug` | optional | Enable debug logging |
 
 The enclave will:
 
-1. Generate an AES-256 master key via RDRAND
+1. Generate the local CA and an AES-256 master key inside the enclave
 2. Seal everything into a unified `SealedConfig` (MRENCLAVE policy)
 3. Store the sealed blob in the KV store
 4. Start the RA-TLS server
@@ -142,8 +140,8 @@ port and KV path:
     --kv-path ./kvdata
 ```
 
-Providing `--ca-cert` or `--ca-key` on restart **updates** the sealed
-config (e.g. CA rotation).  The master key is preserved.
+The enclave unseals the same local CA and master key on restart. Mini exposes
+no host CA-private-key input on this path.
 
 ### Production deployment
 
@@ -237,12 +235,14 @@ go run . --host enclave.example.com --port 443
 ## Certificate Trust Chain
 
 ```
-Root CA (your organization's root)
- └── Intermediary CA (provisioned at first run, sealed inside enclave)
-      └── Leaf RA-TLS cert (per-connection, with SGX quote + config OIDs)
+Enclave-owned local CA (generated and sealed inside enclave)
+ └── Leaf RA-TLS cert (per-connection, with SGX quote + config OIDs)
 ```
 
-Use the root CA when configuring client libraries:
+Generic clients either appraise and pin the RA-TLS evidence directly or use an
+explicitly exported public trust input appropriate to their composition. The
+Honest local-control client uses measurement-pinned quote appraisal and does
+not receive a host-provisioned CA private key.
 
 ```bash
 # Go client
