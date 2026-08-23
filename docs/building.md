@@ -41,6 +41,20 @@ Outputs in `build/bin/`:
 - `enclave-os-host` — untrusted host binary
 - `enclave.signed.so` — signed SGX enclave
 
+For an adopter-owned composition, point `CUSTOM_ENCLAVE_DIR` at its Rust
+`staticlib` crate and build the explicit signed target. CMake owns that build
+directory's Cargo archive as a declared output, links the archive into the SGX
+image, and makes signing depend on both steps:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+    -DCUSTOM_ENCLAVE_DIR=/absolute/path/to/composition
+cmake --build build --target signed_enclave
+```
+
+This is a compile and measurement input only. Successful signing does not
+establish quote appraisal, physical execution or release qualification.
+
 ### Build with WASM runtime
 
 The WASM runtime requires a **composition crate** that combines the base
@@ -69,6 +83,7 @@ points CMake at the composition crate that registers the WASM module.
 |------------|---------|-------------|
 | `CMAKE_BUILD_TYPE` | `Debug` | `Release` for production (LTO, no debug symbols) |
 | `RUST_ENCLAVE_SOURCE_ROOT` | source checkout | Source prefix remapped to `/workspace` for path-independent enclave measurements |
+| `CUSTOM_ENCLAVE_DIR` | *(none)* | Absolute path to an adopter-owned enclave composition `staticlib` crate |
 | `ENABLE_WASM` | `OFF` | Enable the WASM runtime module |
 | `WASM_ENCLAVE_DIR` | *(none)* | Path to the WASM composition crate (required when `ENABLE_WASM=ON`) |
 
