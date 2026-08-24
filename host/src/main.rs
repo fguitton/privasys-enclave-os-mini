@@ -10,7 +10,7 @@
 //! - Implement the single OCALL: `ocall_notify()`
 //! - Provide the CLI entry point
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(sgx_mode_sim)))]
 mod dcap;
 mod dispatcher;
 mod enclave;

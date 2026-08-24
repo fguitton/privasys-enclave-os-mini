@@ -467,7 +467,7 @@ impl RpcDispatcher {
     //  DCAP attestation handlers
     // ====================================================================
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(sgx_mode_sim)))]
     fn handle_qe_get_target_info(&self) -> (i32, Vec<u8>) {
         debug!("RPC: QeGetTargetInfo");
         match crate::dcap::qe_get_target_info() {
@@ -479,13 +479,13 @@ impl RpcDispatcher {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(not(target_os = "linux"), sgx_mode_sim))]
     fn handle_qe_get_target_info(&self) -> (i32, Vec<u8>) {
         error!("QeGetTargetInfo: not supported on this platform");
         (-1, Vec::new())
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(sgx_mode_sim)))]
     fn handle_qe_get_quote(&self, payload: &[u8]) -> (i32, Vec<u8>) {
         debug!("RPC: QeGetQuote ({} bytes)", payload.len());
         match crate::dcap::qe_get_quote(payload) {
@@ -500,7 +500,7 @@ impl RpcDispatcher {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(not(target_os = "linux"), sgx_mode_sim))]
     fn handle_qe_get_quote(&self, _payload: &[u8]) -> (i32, Vec<u8>) {
         error!("QeGetQuote: not supported on this platform");
         (-1, Vec::new())

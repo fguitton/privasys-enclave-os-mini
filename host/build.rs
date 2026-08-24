@@ -14,6 +14,7 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(sgx_mode_sim)");
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let mock = env::var("CARGO_FEATURE_MOCK").is_ok();
 
@@ -101,7 +102,10 @@ fn main() {
     // -----------------------------------------------------------------------
     println!("cargo:rustc-link-search=native={}/lib64", sgx_sdk);
     match env::var("SGX_MODE").as_deref().unwrap_or("HW") {
-        "SIM" => println!("cargo:rustc-link-lib=sgx_urts_sim"),
+        "SIM" => {
+            println!("cargo:rustc-cfg=sgx_mode_sim");
+            println!("cargo:rustc-link-lib=sgx_urts_sim");
+        }
         "HW" => {
             println!("cargo:rustc-link-lib=sgx_urts");
             // DCAP Quoting Library — provides sgx_qe_get_target_info / sgx_qe_get_quote.
