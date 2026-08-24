@@ -34,6 +34,8 @@ set(CUSTOM_ENCLAVE_DIR "" CACHE PATH
      When set, all ENABLE_* flags are ignored and this crate is built instead.")
 set(CUSTOM_ENCLAVE_FEATURES "" CACHE STRING
     "Comma-separated Cargo features for a custom composition crate")
+set(CUSTOM_ENCLAVE_CONFIG "" CACHE FILEPATH
+    "Optional enclave signing configuration for a custom composition")
 
 # ── Resolve crate directory and feature list ────────────────────────────
 if(NOT CUSTOM_ENCLAVE_DIR STREQUAL "")
@@ -120,8 +122,13 @@ add_custom_target(enclave_so ALL
 add_dependencies(enclave_so ${_ENCLAVE_CRATE_NAME} edl_trusted_obj)
 
 # -- Step 6: Sign enclave --
-# Pick debug vs release enclave config
-if(CMAKE_BUILD_TYPE STREQUAL "Release")
+# Pick a caller-supplied composition profile or the normal Mini profile.
+if(NOT CUSTOM_ENCLAVE_CONFIG STREQUAL "")
+    if(NOT EXISTS "${CUSTOM_ENCLAVE_CONFIG}")
+        message(FATAL_ERROR "CUSTOM_ENCLAVE_CONFIG does not exist: ${CUSTOM_ENCLAVE_CONFIG}")
+    endif()
+    set(ENCLAVE_CONFIG "${CUSTOM_ENCLAVE_CONFIG}")
+elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
     set(ENCLAVE_CONFIG "${CMAKE_SOURCE_DIR}/config/enclave.config.release.xml")
 else()
     set(ENCLAVE_CONFIG "${CMAKE_SOURCE_DIR}/config/enclave.config.xml")
