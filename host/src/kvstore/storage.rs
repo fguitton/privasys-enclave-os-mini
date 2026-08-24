@@ -109,10 +109,12 @@ pub enum RaftReadyPersistenceResult {
     Conflict,
 }
 
-fn raft_ready_prefix(node_id: u64, node_generation: u64) -> Vec<u8> {
+fn raft_ready_prefix(node_id: u64, node_generation: u64, persistence_epoch: u64) -> Vec<u8> {
     let mut key = b"honest-s1/ready/v1/".to_vec();
     key.extend_from_slice(&node_id.to_be_bytes());
     key.extend_from_slice(&node_generation.to_be_bytes());
+    key.push(b'/');
+    key.extend_from_slice(&persistence_epoch.to_be_bytes());
     key.push(b'/');
     key
 }
@@ -162,7 +164,11 @@ pub fn persist_raft_ready_batch_on_db(
 ) -> Result<RaftReadyPersistenceResult> {
     let canonical = encode_persist_raft_ready_batch(request)
         .map_err(|error| anyhow::anyhow!("invalid Ready batch: {error:?}"))?;
-    let prefix = raft_ready_prefix(request.node_id, request.node_generation);
+    let prefix = raft_ready_prefix(
+        request.node_id,
+        request.node_generation,
+        request.persistence_epoch,
+    );
     let meta_key = raft_ready_meta_key(&prefix);
     let batch_key = raft_ready_batch_key(&prefix, request.batch_id);
     let current = read_durable_id(db, &meta_key)?;
@@ -344,6 +350,7 @@ mod tests {
         let first = PersistRaftReadyBatch {
             node_id: 3,
             node_generation: 7,
+            persistence_epoch: 11,
             batch_id: 1,
             expected_previous_durable_id: 0,
             records: vec![
