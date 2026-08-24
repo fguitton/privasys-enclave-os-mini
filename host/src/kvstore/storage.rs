@@ -9,7 +9,8 @@
 
 use anyhow::{Context, Result};
 use enclave_os_common::rpc::{
-    encode_persist_raft_ready_batch, PersistRaftReadyBatch, RaftReadyRecordKind,
+    decode_persist_opaque_stream_batch, encode_persist_opaque_stream_batch, LoadOpaqueStreamTip,
+    OpaqueStreamTip, PersistOpaqueStreamBatch,
 };
 use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, WriteOptions, DB};
 use std::sync::{Mutex, OnceLock};
@@ -102,119 +103,158 @@ pub fn delete(table: &str, enc_key: &[u8]) -> Result<bool> {
     Ok(existed)
 }
 
-/// Outcome of one predecessor-bound synchronous Ready batch.
+/// Outcome of one predecessor-bound synchronous opaque stream batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RaftReadyPersistenceResult {
+pub enum OpaqueStreamPersistenceResult {
     Persisted { batch_id: u64, durable_id: u64 },
     Conflict,
 }
 
-fn raft_ready_prefix(node_id: u64, node_generation: u64, persistence_epoch: u64) -> Vec<u8> {
-    let mut key = b"honest-s1/ready/v1/".to_vec();
+fn opaque_stream_prefix(
+    node_id: u64,
+    node_generation: u64,
+    stream_id: [u8; 32],
+    persistence_epoch: u64,
+) -> Vec<u8> {
+    let mut key = b"honest/opaque-stream/v1/".to_vec();
     key.extend_from_slice(&node_id.to_be_bytes());
     key.extend_from_slice(&node_generation.to_be_bytes());
+    key.push(b'/');
+    key.extend_from_slice(&stream_id);
     key.push(b'/');
     key.extend_from_slice(&persistence_epoch.to_be_bytes());
     key.push(b'/');
     key
 }
 
-fn raft_ready_meta_key(prefix: &[u8]) -> Vec<u8> {
+fn opaque_stream_meta_key(prefix: &[u8]) -> Vec<u8> {
     let mut key = prefix.to_vec();
     key.extend_from_slice(b"current");
     key
 }
 
-fn raft_ready_batch_key(prefix: &[u8], batch_id: u64) -> Vec<u8> {
+fn opaque_stream_batch_key(prefix: &[u8], batch_id: u64) -> Vec<u8> {
     let mut key = prefix.to_vec();
     key.extend_from_slice(b"batch/");
     key.extend_from_slice(&batch_id.to_be_bytes());
     key
 }
 
-fn raft_ready_record_key(prefix: &[u8], kind: RaftReadyRecordKind, record_key: &[u8]) -> Vec<u8> {
-    let mut key = prefix.to_vec();
-    key.extend_from_slice(b"record/");
-    key.push(kind as u8);
-    key.push(b'/');
-    key.extend_from_slice(record_key);
-    key
-}
-
 fn read_durable_id(db: &DB, key: &[u8]) -> Result<u64> {
-    let Some(bytes) = db.get(key).context("RocksDB Ready metadata read failed")? else {
+    let Some(bytes) = db
+        .get(key)
+        .context("RocksDB opaque-stream metadata read failed")?
+    else {
         return Ok(0);
     };
     if bytes.len() != 8 {
-        anyhow::bail!("RocksDB Ready metadata has an invalid durable ID");
+        anyhow::bail!("RocksDB opaque-stream metadata has an invalid durable ID");
     }
     Ok(u64::from_be_bytes(bytes.as_slice().try_into().map_err(
-        |_| anyhow::anyhow!("invalid Ready durable ID"),
+        |_| anyhow::anyhow!("invalid opaque-stream durable ID"),
     )?))
 }
 
-/// Persist one canonical encrypted/authenticated Ready batch with a single
-/// synchronous RocksDB `WriteBatch`.
+/// Persist one canonical opaque batch with a single synchronous RocksDB
+/// `WriteBatch`.
 ///
 /// A matching replay is accepted only while that batch remains the current
 /// durable tip. A changed replay or wrong predecessor writes nothing.
-pub fn persist_raft_ready_batch_on_db(
+pub fn persist_opaque_stream_batch_on_db(
     db: &DB,
-    request: &PersistRaftReadyBatch,
-) -> Result<RaftReadyPersistenceResult> {
-    let canonical = encode_persist_raft_ready_batch(request)
-        .map_err(|error| anyhow::anyhow!("invalid Ready batch: {error:?}"))?;
-    let prefix = raft_ready_prefix(
+    request: &PersistOpaqueStreamBatch,
+) -> Result<OpaqueStreamPersistenceResult> {
+    let canonical = encode_persist_opaque_stream_batch(request)
+        .map_err(|error| anyhow::anyhow!("invalid opaque-stream batch: {error:?}"))?;
+    let prefix = opaque_stream_prefix(
         request.node_id,
         request.node_generation,
+        request.stream_id,
         request.persistence_epoch,
     );
-    let meta_key = raft_ready_meta_key(&prefix);
-    let batch_key = raft_ready_batch_key(&prefix, request.batch_id);
+    let meta_key = opaque_stream_meta_key(&prefix);
+    let batch_key = opaque_stream_batch_key(&prefix, request.batch_id);
     let current = read_durable_id(db, &meta_key)?;
 
     if let Some(previous) = db
         .get(&batch_key)
-        .context("RocksDB Ready replay read failed")?
+        .context("RocksDB opaque-stream replay read failed")?
     {
         if previous == canonical && current == request.batch_id {
-            return Ok(RaftReadyPersistenceResult::Persisted {
+            return Ok(OpaqueStreamPersistenceResult::Persisted {
                 batch_id: request.batch_id,
                 durable_id: request.batch_id,
             });
         }
-        return Ok(RaftReadyPersistenceResult::Conflict);
+        return Ok(OpaqueStreamPersistenceResult::Conflict);
     }
     if current != request.expected_previous_durable_id {
-        return Ok(RaftReadyPersistenceResult::Conflict);
+        return Ok(OpaqueStreamPersistenceResult::Conflict);
     }
 
     let mut batch = WriteBatch::default();
-    for record in &request.records {
-        batch.put(
-            raft_ready_record_key(&prefix, record.kind, &record.key),
-            &record.value,
-        );
-    }
     batch.put(&batch_key, canonical);
     batch.put(&meta_key, request.batch_id.to_be_bytes());
 
     let mut options = WriteOptions::default();
     options.set_sync(true);
     db.write_opt(batch, &options)
-        .context("synchronous RocksDB Ready WriteBatch failed")?;
-    Ok(RaftReadyPersistenceResult::Persisted {
+        .context("synchronous RocksDB opaque-stream WriteBatch failed")?;
+    Ok(OpaqueStreamPersistenceResult::Persisted {
         batch_id: request.batch_id,
         durable_id: request.batch_id,
     })
 }
 
 /// Persist through the process-global host database.
-pub fn persist_raft_ready_batch(
-    request: &PersistRaftReadyBatch,
-) -> Result<RaftReadyPersistenceResult> {
+pub fn persist_opaque_stream_batch(
+    request: &PersistOpaqueStreamBatch,
+) -> Result<OpaqueStreamPersistenceResult> {
     let database = db();
-    persist_raft_ready_batch_on_db(&database, request)
+    persist_opaque_stream_batch_on_db(&database, request)
+}
+
+/// Load the exact current opaque-stream tip from one database.
+pub fn load_opaque_stream_tip_on_db(
+    db: &DB,
+    request: LoadOpaqueStreamTip,
+) -> Result<Option<OpaqueStreamTip>> {
+    let prefix = opaque_stream_prefix(
+        request.node_id,
+        request.node_generation,
+        request.stream_id,
+        request.persistence_epoch,
+    );
+    let current = read_durable_id(db, &opaque_stream_meta_key(&prefix))?;
+    if current == 0 {
+        return Ok(None);
+    }
+    let canonical = db
+        .get(opaque_stream_batch_key(&prefix, current))
+        .context("RocksDB opaque-stream tip read failed")?
+        .ok_or_else(|| anyhow::anyhow!("opaque-stream metadata points to a missing batch"))?;
+    let batch = decode_persist_opaque_stream_batch(&canonical)
+        .map_err(|error| anyhow::anyhow!("stored opaque-stream batch is invalid: {error:?}"))?;
+    if batch.node_id != request.node_id
+        || batch.node_generation != request.node_generation
+        || batch.stream_id != request.stream_id
+        || batch.persistence_epoch != request.persistence_epoch
+        || batch.batch_id != current
+    {
+        anyhow::bail!("stored opaque-stream tip identity differs");
+    }
+    Ok(Some(OpaqueStreamTip {
+        batch_id: batch.batch_id,
+        durable_id: batch.batch_id,
+        payload_digest: batch.payload_digest,
+        payload: batch.payload,
+    }))
+}
+
+/// Load through the process-global host database.
+pub fn load_opaque_stream_tip(request: LoadOpaqueStreamTip) -> Result<Option<OpaqueStreamTip>> {
+    let database = db();
+    load_opaque_stream_tip_on_db(&database, request)
 }
 
 /// List all keys in a table, optionally filtered by a prefix.
@@ -249,6 +289,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
 
     struct TestDbDirectory(PathBuf);
 
@@ -343,77 +384,161 @@ mod tests {
     }
 
     #[test]
-    fn raft_ready_batch_is_atomic_idempotent_and_predecessor_bound() {
-        use enclave_os_common::rpc::{PersistRaftReadyBatch, RaftReadyRecord, RaftReadyRecordKind};
+    fn opaque_stream_is_atomic_idempotent_predecessor_bound_and_loadable() {
+        use enclave_os_common::rpc::{LoadOpaqueStreamTip, PersistOpaqueStreamBatch};
 
         let (_tmp, db) = open_tmp();
-        let first = PersistRaftReadyBatch {
+        let first = PersistOpaqueStreamBatch {
             node_id: 3,
             node_generation: 7,
+            stream_id: [4; 32],
             persistence_epoch: 11,
             batch_id: 1,
             expected_previous_durable_id: 0,
-            records: vec![
-                RaftReadyRecord {
-                    kind: RaftReadyRecordKind::HardState,
-                    key: b"hard-state".to_vec(),
-                    value: b"ciphertext-hs-1".to_vec(),
-                },
-                RaftReadyRecord {
-                    kind: RaftReadyRecordKind::AppliedIndex,
-                    key: b"applied-index".to_vec(),
-                    value: b"ciphertext-index-1".to_vec(),
-                },
-            ],
+            payload_digest: [8; 32],
+            payload: b"opaque-ciphertext-1".to_vec(),
         };
 
         assert_eq!(
-            persist_raft_ready_batch_on_db(&db, &first).unwrap(),
-            RaftReadyPersistenceResult::Persisted {
+            persist_opaque_stream_batch_on_db(&db, &first).unwrap(),
+            OpaqueStreamPersistenceResult::Persisted {
                 batch_id: 1,
                 durable_id: 1
             }
         );
         assert_eq!(
-            persist_raft_ready_batch_on_db(&db, &first).unwrap(),
-            RaftReadyPersistenceResult::Persisted {
+            persist_opaque_stream_batch_on_db(&db, &first).unwrap(),
+            OpaqueStreamPersistenceResult::Persisted {
                 batch_id: 1,
                 durable_id: 1
             }
         );
 
         let mut altered_replay = first.clone();
-        altered_replay.records[0].value = b"different-ciphertext".to_vec();
+        altered_replay.payload = b"different-ciphertext".to_vec();
+        altered_replay.payload_digest = [9; 32];
         assert_eq!(
-            persist_raft_ready_batch_on_db(&db, &altered_replay).unwrap(),
-            RaftReadyPersistenceResult::Conflict
+            persist_opaque_stream_batch_on_db(&db, &altered_replay).unwrap(),
+            OpaqueStreamPersistenceResult::Conflict
         );
 
-        let wrong_predecessor = PersistRaftReadyBatch {
+        let wrong_predecessor = PersistOpaqueStreamBatch {
             batch_id: 2,
             expected_previous_durable_id: 0,
-            records: vec![RaftReadyRecord {
-                kind: RaftReadyRecordKind::AppliedIndex,
-                key: b"applied-index".to_vec(),
-                value: b"must-not-be-written".to_vec(),
-            }],
+            payload_digest: [10; 32],
+            payload: b"must-not-be-written".to_vec(),
             ..first.clone()
         };
         assert_eq!(
-            persist_raft_ready_batch_on_db(&db, &wrong_predecessor).unwrap(),
-            RaftReadyPersistenceResult::Conflict
+            persist_opaque_stream_batch_on_db(&db, &wrong_predecessor)
+                .unwrap_err()
+                .to_string(),
+            "invalid opaque-stream batch: InvalidPredecessor"
         );
 
-        let second = PersistRaftReadyBatch {
+        let second = PersistOpaqueStreamBatch {
             expected_previous_durable_id: 1,
             ..wrong_predecessor
         };
         assert_eq!(
-            persist_raft_ready_batch_on_db(&db, &second).unwrap(),
-            RaftReadyPersistenceResult::Persisted {
+            persist_opaque_stream_batch_on_db(&db, &second).unwrap(),
+            OpaqueStreamPersistenceResult::Persisted {
                 batch_id: 2,
                 durable_id: 2
             }
+        );
+
+        let tip = load_opaque_stream_tip_on_db(
+            &db,
+            LoadOpaqueStreamTip {
+                node_id: first.node_id,
+                node_generation: first.node_generation,
+                stream_id: first.stream_id,
+                persistence_epoch: first.persistence_epoch,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(tip.batch_id, 2);
+        assert_eq!(tip.durable_id, 2);
+        assert_eq!(tip.payload_digest, second.payload_digest);
+        assert_eq!(tip.payload, second.payload);
+
+        assert!(load_opaque_stream_tip_on_db(
+            &db,
+            LoadOpaqueStreamTip {
+                stream_id: [5; 32],
+                ..LoadOpaqueStreamTip {
+                    node_id: first.node_id,
+                    node_generation: first.node_generation,
+                    stream_id: first.stream_id,
+                    persistence_epoch: first.persistence_epoch,
+                }
+            },
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn opaque_stream_concurrent_successors_select_one_exact_tip() {
+        use enclave_os_common::rpc::PersistOpaqueStreamBatch;
+
+        let (_tmp, db) = open_tmp();
+        let db = Arc::new(Mutex::new(db));
+        let first = PersistOpaqueStreamBatch {
+            node_id: 9,
+            node_generation: 2,
+            stream_id: [6; 32],
+            persistence_epoch: 17,
+            batch_id: 1,
+            expected_previous_durable_id: 0,
+            payload_digest: [1; 32],
+            payload: b"first".to_vec(),
+        };
+        assert!(matches!(
+            persist_opaque_stream_batch_on_db(&db.lock().unwrap(), &first).unwrap(),
+            OpaqueStreamPersistenceResult::Persisted { .. }
+        ));
+
+        let barrier = Arc::new(Barrier::new(3));
+        let contenders = [
+            ([2; 32], b"second-a".to_vec()),
+            ([3; 32], b"second-b".to_vec()),
+        ]
+        .into_iter()
+        .map(|(payload_digest, payload)| {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            let mut request = first.clone();
+            request.batch_id = 2;
+            request.expected_previous_durable_id = 1;
+            request.payload_digest = payload_digest;
+            request.payload = payload;
+            std::thread::spawn(move || {
+                barrier.wait();
+                persist_opaque_stream_batch_on_db(&db.lock().unwrap(), &request).unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+        barrier.wait();
+        let results = contenders
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, OpaqueStreamPersistenceResult::Persisted { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, OpaqueStreamPersistenceResult::Conflict))
+                .count(),
+            1
         );
     }
 }

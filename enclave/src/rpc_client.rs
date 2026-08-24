@@ -4,7 +4,7 @@
 //! Enclave-side RPC client.
 //!
 //! Wraps the SPSC queues to provide typed host calls. Legacy Mini services use
-//! the synchronous interface. Honest's control-plane Ready persistence uses a
+//! the synchronous interface. Honest's control-plane opaque persistence uses a
 //! separate polled interface: submission performs one `try_send`, and each
 //! poll performs at most one `try_recv`.
 //!
@@ -17,8 +17,8 @@ use std::vec::Vec;
 
 use enclave_os_common::queue::{SpscConsumer, SpscProducer};
 use enclave_os_common::rpc::{
-    self, HonestRpcFrameError, HonestRpcIdentity, PersistRaftReadyBatch, PersistedRaftReadyBatch,
-    RaftReadyBatchCodecError, RpcMethod, RpcRole,
+    self, HonestRpcFrameError, HonestRpcIdentity, LoadOpaqueStreamTip, OpaqueStreamCodecError,
+    OpaqueStreamTip, PersistOpaqueStreamBatch, PersistedOpaqueStreamBatch, RpcMethod, RpcRole,
 };
 
 // ---------------------------------------------------------------------------
@@ -65,14 +65,15 @@ pub struct RpcClient {
     in_flight_request_id: AtomicU64,
 }
 
-/// Token owned by the control scheduler while one Ready batch is in flight.
+/// Token owned by the control scheduler while one opaque batch is in flight.
 ///
 /// It deliberately exposes no request ID: callers can only return it to the
 /// same [`RpcClient`] for a bounded poll.
 #[derive(Debug)]
-pub struct PendingRaftReadyBatch {
+pub struct PendingOpaqueStreamBatch {
     identity: HonestRpcIdentity,
     batch_id: u64,
+    payload_digest: [u8; 32],
 }
 
 /// Token owned by the execution worker while one host operation is in flight.
@@ -103,10 +104,10 @@ impl ExecutionRpcCompletion {
     }
 }
 
-/// Fail-closed errors from the polled Ready persistence interface.
+/// Fail-closed errors from the opaque-stream persistence interface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PolledRaftReadyError {
-    InvalidRequest(RaftReadyBatchCodecError),
+pub enum PolledOpaqueStreamError {
+    InvalidRequest(OpaqueStreamCodecError),
     Busy,
     OperationIdExhausted,
     QueueFull,
@@ -176,51 +177,54 @@ impl RpcClient {
     //  Polled control-plane persistence
     // ====================================================================
 
-    /// Try to submit one atomic Raft Ready batch without waiting for queue
+    /// Try to submit one atomic opaque stream batch without waiting for queue
     /// capacity or a host response.
-    pub fn try_persist_raft_ready_batch(
+    pub fn try_persist_opaque_stream_batch(
         &self,
-        batch: &PersistRaftReadyBatch,
-    ) -> Result<PendingRaftReadyBatch, PolledRaftReadyError> {
-        let payload = rpc::encode_persist_raft_ready_batch(batch)
-            .map_err(PolledRaftReadyError::InvalidRequest)?;
+        batch: &PersistOpaqueStreamBatch,
+    ) -> Result<PendingOpaqueStreamBatch, PolledOpaqueStreamError> {
+        let payload = rpc::encode_persist_opaque_stream_batch(batch)
+            .map_err(PolledOpaqueStreamError::InvalidRequest)?;
         let request_id = self.try_reserve_request().map_err(|error| match error {
-            RequestReserveError::Busy => PolledRaftReadyError::Busy,
-            RequestReserveError::OperationIdExhausted => PolledRaftReadyError::OperationIdExhausted,
+            RequestReserveError::Busy => PolledOpaqueStreamError::Busy,
+            RequestReserveError::OperationIdExhausted => {
+                PolledOpaqueStreamError::OperationIdExhausted
+            }
         })?;
         let identity = HonestRpcIdentity {
             role: RpcRole::Control,
             node_id: batch.node_id,
             node_generation: batch.node_generation,
             operation_id: request_id,
-            method: RpcMethod::PersistRaftReadyBatch,
+            method: RpcMethod::PersistOpaqueStreamBatch,
         };
         let message = rpc::encode_honest_request(identity, &payload).map_err(|_| {
             self.release_request(request_id);
-            PolledRaftReadyError::InvalidRequest(RaftReadyBatchCodecError::BatchBound)
+            PolledOpaqueStreamError::InvalidRequest(OpaqueStreamCodecError::BatchBound)
         })?;
         if self.request_tx.try_send(&message).is_err() {
             self.release_request(request_id);
-            return Err(PolledRaftReadyError::QueueFull);
+            return Err(PolledOpaqueStreamError::QueueFull);
         }
         notify_host();
-        Ok(PendingRaftReadyBatch {
+        Ok(PendingOpaqueStreamBatch {
             identity,
             batch_id: batch.batch_id,
+            payload_digest: batch.payload_digest,
         })
     }
 
-    /// Poll one submitted Ready batch.
+    /// Poll one submitted opaque stream batch.
     ///
     /// `Ok(None)` means the host has not replied. Every call consumes at most
     /// one response frame and never waits. A malformed, stale, mismatched or
     /// negative response terminates the operation fail-closed.
-    pub fn poll_persist_raft_ready_batch(
+    pub fn poll_persist_opaque_stream_batch(
         &self,
-        pending: &PendingRaftReadyBatch,
-    ) -> Result<Option<PersistedRaftReadyBatch>, PolledRaftReadyError> {
+        pending: &PendingOpaqueStreamBatch,
+    ) -> Result<Option<PersistedOpaqueStreamBatch>, PolledOpaqueStreamError> {
         if self.in_flight_request_id.load(Ordering::Acquire) != pending.identity.operation_id {
-            return Err(PolledRaftReadyError::NotPending);
+            return Err(PolledOpaqueStreamError::NotPending);
         }
         let Some(raw_response) = self.response_rx.try_recv() else {
             return Ok(None);
@@ -231,20 +235,41 @@ impl RpcClient {
             rpc::decode_honest_response_for(&raw_response, pending.identity).map_err(|error| {
                 match error {
                     HonestRpcFrameError::UnexpectedIdentity => {
-                        PolledRaftReadyError::UnexpectedResponse
+                        PolledOpaqueStreamError::UnexpectedResponse
                     }
-                    _ => PolledRaftReadyError::MalformedResponse,
+                    _ => PolledOpaqueStreamError::MalformedResponse,
                 }
             })?;
         if response.status != 0 {
-            return Err(PolledRaftReadyError::HostStatus(response.status));
+            return Err(PolledOpaqueStreamError::HostStatus(response.status));
         }
-        let persisted = rpc::decode_persisted_raft_ready_batch(response.payload)
-            .ok_or(PolledRaftReadyError::MalformedResponse)?;
-        if persisted.batch_id != pending.batch_id || persisted.durable_id != pending.batch_id {
-            return Err(PolledRaftReadyError::UnexpectedResponse);
+        let persisted = rpc::decode_persisted_opaque_stream_batch(response.payload)
+            .ok_or(PolledOpaqueStreamError::MalformedResponse)?;
+        if persisted.batch_id != pending.batch_id
+            || persisted.durable_id != pending.batch_id
+            || persisted.payload_digest != pending.payload_digest
+        {
+            return Err(PolledOpaqueStreamError::UnexpectedResponse);
         }
         Ok(Some(persisted))
+    }
+
+    /// Load the current tip of one opaque stream. The enclave remains
+    /// responsible for authenticating any returned digest and payload.
+    pub fn load_opaque_stream_tip(
+        &self,
+        request: LoadOpaqueStreamTip,
+    ) -> Result<Option<OpaqueStreamTip>, PolledOpaqueStreamError> {
+        let payload = rpc::encode_load_opaque_stream_tip(request)
+            .map_err(PolledOpaqueStreamError::InvalidRequest)?;
+        let (status, response) = self.call(RpcMethod::LoadOpaqueStreamTip, &payload);
+        match status {
+            0 => rpc::decode_opaque_stream_tip(&response)
+                .map(Some)
+                .map_err(PolledOpaqueStreamError::InvalidRequest),
+            1 => Ok(None),
+            status => Err(PolledOpaqueStreamError::HostStatus(status)),
+        }
     }
 
     // ====================================================================
@@ -410,7 +435,7 @@ impl RpcClient {
     fn call(&self, method: RpcMethod, payload: &[u8]) -> (i32, Vec<u8>) {
         let req_id = match self.try_reserve_request() {
             Ok(request_id) => request_id,
-            // Legacy callers cannot safely interleave with a polled Ready
+            // Legacy callers cannot safely interleave with a polled opaque
             // operation. Return EBUSY instead of blocking the control TCS.
             Err(RequestReserveError::Busy) => return (-16, Vec::new()),
             Err(RequestReserveError::OperationIdExhausted) => return (-75, Vec::new()),
