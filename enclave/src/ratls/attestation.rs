@@ -31,11 +31,11 @@ use std::string::String;
 use std::vec::Vec;
 use time::OffsetDateTime;
 
-use enclave_os_common::oids::{APP_CONFIG_MERKLE_ROOT_OID, CONFIG_MERKLE_ROOT_OID};
 #[cfg(not(feature = "sgx-sim-attestation"))]
 use enclave_os_common::oids::SGX_QUOTE_OID;
 #[cfg(feature = "sgx-sim-attestation")]
 use enclave_os_common::oids::SGX_SIM_REPORT_OID;
+use enclave_os_common::oids::{APP_CONFIG_MERKLE_ROOT_OID, CONFIG_MERKLE_ROOT_OID};
 
 use crate::ratls::cert_store::AppCertData;
 
