@@ -144,6 +144,10 @@ impl EgressModule {
                 .map_err(|_| "Egress root store already set".to_string())?;
             count
         } else {
+            #[cfg(feature = "sgx-sim-attestation")]
+            EGRESS_ROOT_STORE
+                .set(RootCertStore::empty())
+                .map_err(|_| "Egress root store already set".to_string())?;
             0
         };
 
