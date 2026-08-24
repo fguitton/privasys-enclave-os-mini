@@ -27,7 +27,10 @@ use crate::kvstore;
 use crate::net;
 
 fn legacy_role_allows_method(role: RpcRole, method: RpcMethod) -> bool {
-    method != RpcMethod::PersistRaftReadyBatch || role == RpcRole::Control
+    !matches!(
+        method,
+        RpcMethod::PersistOpaqueStreamBatch | RpcMethod::LoadOpaqueStreamTip
+    ) || role == RpcRole::Control
 }
 
 const fn role_name(role: RpcRole) -> &'static str {
@@ -231,7 +234,8 @@ impl RpcDispatcher {
             RpcMethod::KvGet => self.handle_kv_get(payload),
             RpcMethod::KvDelete => self.handle_kv_delete(payload),
             RpcMethod::KvListKeys => self.handle_kv_list_keys(payload),
-            RpcMethod::PersistRaftReadyBatch => self.handle_persist_raft_ready_batch(payload),
+            RpcMethod::PersistOpaqueStreamBatch => self.handle_persist_opaque_stream_batch(payload),
+            RpcMethod::LoadOpaqueStreamTip => self.handle_load_opaque_stream_tip(payload),
 
             // ---- Utility ----
             RpcMethod::GetCurrentTime => self.handle_get_current_time(),
@@ -407,31 +411,59 @@ impl RpcDispatcher {
         }
     }
 
-    fn handle_persist_raft_ready_batch(&self, payload: &[u8]) -> (i32, Vec<u8>) {
-        let request = match rpc::decode_persist_raft_ready_batch(payload) {
+    fn handle_persist_opaque_stream_batch(&self, payload: &[u8]) -> (i32, Vec<u8>) {
+        let request = match rpc::decode_persist_opaque_stream_batch(payload) {
             Ok(request) => request,
             Err(error) => {
                 warn!(
-                    "PersistRaftReadyBatch rejected malformed payload: {:?}",
+                    "PersistOpaqueStreamBatch rejected malformed payload: {:?}",
                     error
                 );
                 return (-1, Vec::new());
             }
         };
-        match kvstore::persist_raft_ready_batch(&request) {
-            Ok(kvstore::RaftReadyPersistenceResult::Persisted {
+        match kvstore::persist_opaque_stream_batch(&request) {
+            Ok(kvstore::OpaqueStreamPersistenceResult::Persisted {
                 batch_id,
                 durable_id,
             }) => (
                 0,
-                rpc::encode_persisted_raft_ready_batch(rpc::PersistedRaftReadyBatch {
+                rpc::encode_persisted_opaque_stream_batch(rpc::PersistedOpaqueStreamBatch {
                     batch_id,
                     durable_id,
+                    payload_digest: request.payload_digest,
                 }),
             ),
-            Ok(kvstore::RaftReadyPersistenceResult::Conflict) => (1, Vec::new()),
+            Ok(kvstore::OpaqueStreamPersistenceResult::Conflict) => (1, Vec::new()),
             Err(error) => {
-                error!("PersistRaftReadyBatch failed: {}", error);
+                error!("PersistOpaqueStreamBatch failed: {}", error);
+                (-1, Vec::new())
+            }
+        }
+    }
+
+    fn handle_load_opaque_stream_tip(&self, payload: &[u8]) -> (i32, Vec<u8>) {
+        let request = match rpc::decode_load_opaque_stream_tip(payload) {
+            Ok(request) => request,
+            Err(error) => {
+                warn!(
+                    "LoadOpaqueStreamTip rejected malformed payload: {:?}",
+                    error
+                );
+                return (-1, Vec::new());
+            }
+        };
+        match kvstore::load_opaque_stream_tip(request) {
+            Ok(Some(tip)) => match rpc::encode_opaque_stream_tip(&tip) {
+                Ok(encoded) => (0, encoded),
+                Err(error) => {
+                    error!("LoadOpaqueStreamTip encoded invalid storage: {:?}", error);
+                    (-1, Vec::new())
+                }
+            },
+            Ok(None) => (1, Vec::new()),
+            Err(error) => {
+                error!("LoadOpaqueStreamTip failed: {}", error);
                 (-1, Vec::new())
             }
         }
@@ -570,14 +602,22 @@ mod tests {
     }
 
     #[test]
-    fn ready_persistence_is_control_role_only() {
+    fn opaque_stream_storage_is_control_role_only() {
         assert!(legacy_role_allows_method(
             RpcRole::Control,
-            RpcMethod::PersistRaftReadyBatch
+            RpcMethod::PersistOpaqueStreamBatch
+        ));
+        assert!(legacy_role_allows_method(
+            RpcRole::Control,
+            RpcMethod::LoadOpaqueStreamTip
         ));
         assert!(!legacy_role_allows_method(
             RpcRole::Execution,
-            RpcMethod::PersistRaftReadyBatch
+            RpcMethod::PersistOpaqueStreamBatch
+        ));
+        assert!(!legacy_role_allows_method(
+            RpcRole::Execution,
+            RpcMethod::LoadOpaqueStreamTip
         ));
         assert!(legacy_role_allows_method(
             RpcRole::Execution,
