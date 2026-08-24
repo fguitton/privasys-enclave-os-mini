@@ -603,7 +603,7 @@ pub fn quote_binding_nonce(nonce: &[u8]) -> Result<Vec<u8>, String> {
 /// Report), so we read it from the report bytes rather than depend on the SDK
 /// fork's struct field names — matching how the rest of this module treats
 /// reports and quotes as opaque bytes.
-#[cfg(not(feature = "mock"))]
+#[cfg(all(not(feature = "mock"), not(feature = "sgx-sim-attestation")))]
 pub fn self_mrenclave() -> Result<[u8; 32], String> {
     use sgx_types::types::{ReportData, TargetInfo};
 
@@ -642,7 +642,19 @@ pub fn self_mrenclave() -> Result<[u8; 32], String> {
     Ok(out)
 }
 
-#[cfg(feature = "mock")]
+#[cfg(feature = "sgx-sim-attestation")]
+pub fn self_mrenclave() -> Result<[u8; 32], String> {
+    use sgx_tse::{EnclaveReport, EnclaveTarget};
+    use sgx_types::types::{Report, ReportData, TargetInfo};
+
+    let target = TargetInfo::for_self()
+        .map_err(|error| format!("SGX simulation target failed: {error:?}"))?;
+    let report = Report::for_target(&target, &ReportData::default())
+        .map_err(|error| format!("SGX simulation self report failed: {error:?}"))?;
+    Ok(report.body.mr_enclave.m)
+}
+
+#[cfg(all(feature = "mock", not(feature = "sgx-sim-attestation")))]
 pub fn self_mrenclave() -> Result<[u8; 32], String> {
     // Deterministic dummy for host/mock builds.
     Ok([0x11u8; 32])
