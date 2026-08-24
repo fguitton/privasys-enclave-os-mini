@@ -597,25 +597,32 @@ fn build_client_config(
     let provider = Arc::new(default_provider());
 
     let config = if let Some(policy) = ratls {
-        // Build a WebPkiServerVerifier for standard chain validation,
-        // then wrap it with our RA-TLS verifier.
-        let inner = WebPkiServerVerifier::builder_with_provider(
-            Arc::new(root_store.clone()),
-            provider.clone(),
-        )
-        .build()
-        .map_err(|_| "WebPKI verifier build error")?;
-
-        let verifier = RaTlsVerifier {
-            inner,
-            policy: policy.clone(),
+        #[cfg(not(feature = "sgx-sim-attestation"))]
+        let verifier: Arc<dyn ServerCertVerifier> = {
+            // Production RA-TLS retains standard chain validation in addition
+            // to quote appraisal.
+            let inner = WebPkiServerVerifier::builder_with_provider(
+                Arc::new(root_store.clone()),
+                provider.clone(),
+            )
+            .build()
+            .map_err(|_| "WebPKI verifier build error")?;
+            Arc::new(RaTlsVerifier {
+                inner,
+                policy: policy.clone(),
+            })
         };
+        #[cfg(feature = "sgx-sim-attestation")]
+        let verifier: Arc<dyn ServerCertVerifier> = Arc::new(AttestedRaTlsVerifier {
+            provider: provider.clone(),
+            policy: policy.clone(),
+        });
 
         let wants_client_cert = ClientConfig::builder_with_provider(provider.clone())
             .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
             .map_err(|_| "TLS config error")?
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(verifier));
+            .with_custom_certificate_verifier(verifier);
         let mut cfg = match &policy.client_identity {
             Some(identity) => {
                 wants_client_cert.with_client_cert_resolver(Arc::new(ChallengeBoundClientAuth {
@@ -846,21 +853,25 @@ struct VerifiedRaTlsCertificate {
     quote: Vec<u8>,
 }
 
+fn expected_attestation_oid(tee: TeeType) -> Result<&'static str, String> {
+    #[cfg(feature = "sgx-sim-attestation")]
+    return match tee {
+        TeeType::Sgx => Ok(oids::SGX_SIM_REPORT_OID_STR),
+        TeeType::Tdx => Err("SGX simulation appraisal cannot verify TDX evidence".into()),
+    };
+    #[cfg(not(feature = "sgx-sim-attestation"))]
+    match tee {
+        TeeType::Sgx => Ok(oids::SGX_QUOTE_OID_STR),
+        TeeType::Tdx => Ok(oids::TDX_QUOTE_OID_STR),
+    }
+}
+
 fn verify_ratls_cert(der: &[u8], policy: &RaTlsPolicy) -> Result<VerifiedRaTlsCertificate, String> {
     let (_, cert) = X509Certificate::from_der(der)
         .map_err(|_| "RA-TLS: failed to parse leaf certificate DER".to_string())?;
 
     // --- Find the expected attestation extension ---
-    #[cfg(feature = "sgx-sim-attestation")]
-    let expected_oid = match policy.tee {
-        TeeType::Sgx => oids::SGX_SIM_REPORT_OID_STR,
-        TeeType::Tdx => return Err("SGX simulation appraisal cannot verify TDX evidence".into()),
-    };
-    #[cfg(not(feature = "sgx-sim-attestation"))]
-    let expected_oid = match policy.tee {
-        TeeType::Sgx => oids::SGX_QUOTE_OID_STR,
-        TeeType::Tdx => oids::TDX_QUOTE_OID_STR,
-    };
+    let expected_oid = expected_attestation_oid(policy.tee)?;
 
     let quote_ext = cert
         .extensions()
@@ -1321,10 +1332,7 @@ fn verify_certificate_channel_binding(
     let spki_der = enclave_os_common::quote::build_p256_spki_der(ec_point);
     let expected = compute_report_data_hash(&spki_der, &binding);
 
-    let expected_oid = match policy.tee {
-        TeeType::Sgx => oids::SGX_QUOTE_OID_STR,
-        TeeType::Tdx => oids::TDX_QUOTE_OID_STR,
-    };
+    let expected_oid = expected_attestation_oid(policy.tee)?;
     let quote_ext = cert
         .extensions()
         .iter()
@@ -1376,10 +1384,33 @@ fn sha256_array(bytes: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod peer_appraisal_tests {
     use super::{
-        locally_verify_sgx_peer_certificate, verify_webpki_client_certificate_chain_at,
-        verify_webpki_server_certificate_chain_at, RootCertStore, MAX_TLS_PEER_CERTIFICATES,
-        MAX_TLS_PEER_CERTIFICATE_BYTES,
+        expected_attestation_oid, locally_verify_sgx_peer_certificate,
+        verify_webpki_client_certificate_chain_at, verify_webpki_server_certificate_chain_at,
+        RootCertStore, TeeType, MAX_TLS_PEER_CERTIFICATES, MAX_TLS_PEER_CERTIFICATE_BYTES,
     };
+
+    #[test]
+    fn certificate_and_channel_binding_share_the_mode_specific_evidence_oid() {
+        #[cfg(feature = "sgx-sim-attestation")]
+        {
+            assert_eq!(
+                expected_attestation_oid(TeeType::Sgx).unwrap(),
+                enclave_os_common::oids::SGX_SIM_REPORT_OID_STR
+            );
+            assert!(expected_attestation_oid(TeeType::Tdx).is_err());
+        }
+        #[cfg(not(feature = "sgx-sim-attestation"))]
+        {
+            assert_eq!(
+                expected_attestation_oid(TeeType::Sgx).unwrap(),
+                enclave_os_common::oids::SGX_QUOTE_OID_STR
+            );
+            assert_eq!(
+                expected_attestation_oid(TeeType::Tdx).unwrap(),
+                enclave_os_common::oids::TDX_QUOTE_OID_STR
+            );
+        }
+    }
 
     #[test]
     fn strict_peer_appraisal_rejects_missing_or_malformed_live_bindings_first() {
