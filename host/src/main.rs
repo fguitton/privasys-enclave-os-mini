@@ -468,8 +468,8 @@ fn main() -> Result<()> {
         anyhow::bail!("component supplier configuration requires the complete C3 profile");
     }
     if let Some(node_id) = cli.c3_development_node_id {
-        if !(1..=5).contains(&node_id) {
-            anyhow::bail!("--c3-development-node-id must be in 1..=5");
+        if node_id == 0 {
+            anyhow::bail!("--c3-development-node-id must be nonzero");
         }
         let generation = cli.c3_development_generation.unwrap_or(1);
         if generation == 0 {
@@ -483,8 +483,12 @@ fn main() -> Result<()> {
             .c3_development_peer_endpoints
             .as_ref()
             .expect("all C3 arguments checked");
-        if endpoints.len() != 5 {
-            anyhow::bail!("--c3-development-peer-endpoints requires exactly five entries");
+        if endpoints.is_empty()
+            || usize::try_from(node_id)
+                .ok()
+                .is_none_or(|position| position > endpoints.len())
+        {
+            anyhow::bail!("--c3-development-peer-endpoints must include the configured local node");
         }
         let reviewer_path = cli
             .c3_development_reviewer_keys_file
