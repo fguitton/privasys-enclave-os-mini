@@ -310,6 +310,7 @@ dependencies = [
  "serde_json",
  "webpki-roots 0.26.11",
  "x509-parser",
+ "zeroize",
 ]
 
 [[package]]
