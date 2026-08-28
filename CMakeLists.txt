@@ -45,26 +45,79 @@ include(cmake/RustBuild.cmake)
 # The Cargo.lock in the workspace pins the teaclave-sgx-sdk commit hash.
 # We parse it and find the matching checkout directory under ~/.cargo/git/checkouts.
 
-# Find the teaclave-sgx-sdk base checkout directory (respect CARGO_HOME)
+# Find the sole checkout whose full Git identity matches Cargo.lock (respect
+# CARGO_HOME). A same-prefix directory or a different checkout base must never
+# become the enclave compiler merely because it sorts first.
 if(DEFINED ENV{CARGO_HOME})
     set(_CARGO_DIR "$ENV{CARGO_HOME}")
 else()
     set(_CARGO_DIR "$ENV{HOME}/.cargo")
 endif()
-file(GLOB TEACLAVE_BASE "${_CARGO_DIR}/git/checkouts/teaclave-sgx-sdk-*")
-list(GET TEACLAVE_BASE 0 TEACLAVE_BASE)
 
 # Extract the commit hash from the workspace Cargo.lock
 file(READ "${CMAKE_SOURCE_DIR}/Cargo.lock" _CARGO_LOCK)
 string(REGEX MATCH "teaclave-sgx-sdk[^\n]*#([0-9a-f]+)" _MATCH "${_CARGO_LOCK}")
 set(TEACLAVE_FULL_REV "${CMAKE_MATCH_1}")
+string(LENGTH "${TEACLAVE_FULL_REV}" TEACLAVE_REV_LENGTH)
+if(NOT TEACLAVE_FULL_REV MATCHES "^[0-9a-f]+$" OR NOT TEACLAVE_REV_LENGTH EQUAL 40)
+    message(FATAL_ERROR "Cargo.lock has no exact Teaclave revision")
+endif()
 string(SUBSTRING "${TEACLAVE_FULL_REV}" 0 7 TEACLAVE_SHORT_REV)
 
-set(TEACLAVE_CHECKOUT "${TEACLAVE_BASE}/${TEACLAVE_SHORT_REV}")
-if(NOT EXISTS "${TEACLAVE_CHECKOUT}")
+file(GLOB TEACLAVE_BASES "${_CARGO_DIR}/git/checkouts/teaclave-sgx-sdk-*")
+set(TEACLAVE_CANDIDATES)
+foreach(TEACLAVE_BASE IN LISTS TEACLAVE_BASES)
+    set(TEACLAVE_CANDIDATE "${TEACLAVE_BASE}/${TEACLAVE_SHORT_REV}")
+    if(IS_DIRECTORY "${TEACLAVE_CANDIDATE}" AND NOT IS_SYMLINK "${TEACLAVE_CANDIDATE}")
+        execute_process(
+            COMMAND git -C "${TEACLAVE_CANDIDATE}" rev-parse HEAD
+            RESULT_VARIABLE TEACLAVE_GIT_STATUS
+            OUTPUT_VARIABLE TEACLAVE_GIT_HEAD
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+        if(TEACLAVE_GIT_STATUS EQUAL 0 AND TEACLAVE_GIT_HEAD STREQUAL TEACLAVE_FULL_REV)
+            list(APPEND TEACLAVE_CANDIDATES "${TEACLAVE_CANDIDATE}")
+        endif()
+    endif()
+endforeach()
+list(LENGTH TEACLAVE_CANDIDATES TEACLAVE_CANDIDATE_COUNT)
+if(NOT TEACLAVE_CANDIDATE_COUNT EQUAL 1)
     message(FATAL_ERROR
-        "Teaclave checkout not found at ${TEACLAVE_CHECKOUT}. "
-        "Run 'cargo fetch' in the workspace first.")
+        "Expected exactly one checkout of Teaclave ${TEACLAVE_FULL_REV}; "
+        "found ${TEACLAVE_CANDIDATE_COUNT}")
+endif()
+list(GET TEACLAVE_CANDIDATES 0 TEACLAVE_CHECKOUT)
+
+# The SGX-SIM gate may mirror the already verified revision into its bounded
+# CMake build tree so the pinned SDK's source-relative Cargo target directory
+# cannot consume root disk or retain stale metadata. This is SIM-only, must be
+# inside CMAKE_BINARY_DIR, and retains the exact branch-owned patched source.
+set(HONEST_PINNED_TEACLAVE_SIM_SOURCE "" CACHE PATH
+    "Bounded exact Teaclave source mirror used only by the SGX-SIM gate")
+if(HONEST_PINNED_TEACLAVE_SIM_SOURCE)
+    if(NOT SGX_MODE STREQUAL "SIM")
+        message(FATAL_ERROR "The bounded Teaclave source mirror is SGX-SIM-only")
+    endif()
+    file(REAL_PATH "${HONEST_PINNED_TEACLAVE_SIM_SOURCE}"
+        TEACLAVE_SIM_SOURCE_REAL)
+    file(REAL_PATH "${CMAKE_BINARY_DIR}" CMAKE_BINARY_REAL)
+    string(FIND "${TEACLAVE_SIM_SOURCE_REAL}" "${CMAKE_BINARY_REAL}/"
+        TEACLAVE_SIM_SOURCE_PREFIX)
+    if(NOT TEACLAVE_SIM_SOURCE_PREFIX EQUAL 0)
+        message(FATAL_ERROR "The bounded Teaclave source mirror is outside the build tree")
+    endif()
+    set(TEACLAVE_PATCHED_SOURCE
+        "${TEACLAVE_SIM_SOURCE_REAL}/sgx_unwind/libunwind/src/mi/mempool.c")
+    if(NOT EXISTS "${TEACLAVE_PATCHED_SOURCE}" OR IS_SYMLINK "${TEACLAVE_PATCHED_SOURCE}")
+        message(FATAL_ERROR "The bounded Teaclave patched source is invalid")
+    endif()
+    file(SHA256 "${TEACLAVE_PATCHED_SOURCE}" TEACLAVE_PATCHED_SOURCE_SHA256)
+    if(NOT TEACLAVE_PATCHED_SOURCE_SHA256 STREQUAL
+        "623824d8f94eaa2a1a39de4a352f35f17417c89378891deef586a4be3fdaed70")
+        message(FATAL_ERROR "The bounded Teaclave patched source identity is invalid")
+    endif()
+    set(TEACLAVE_CHECKOUT "${TEACLAVE_SIM_SOURCE_REAL}")
 endif()
 
 message(STATUS "Teaclave SDK: ${TEACLAVE_CHECKOUT}")

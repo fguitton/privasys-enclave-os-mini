@@ -17,6 +17,8 @@ set(RUST_ENCLAVE_TOOLCHAIN "nightly-2026-06-21" CACHE STRING
 
 set(RUST_ENCLAVE_SOURCE_ROOT "${CMAKE_SOURCE_DIR}" CACHE PATH
     "Source root remapped to /workspace in enclave compiler output")
+set(RUST_HOST_TARGET_DIR "${CMAKE_BINARY_DIR}/cargo/host" CACHE PATH
+    "Cargo target directory for the untrusted host build")
 
 # Build type mapping
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
@@ -40,6 +42,7 @@ function(rust_build_host CRATE_DIR OUTPUT_NAME)
             "SGX_MODE=${SGX_MODE}"
             "RUSTUP_TOOLCHAIN=${RUST_ENCLAVE_TOOLCHAIN}"
             "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}"
+            "CARGO_TARGET_DIR=${RUST_HOST_TARGET_DIR}"
             "CC=${CMAKE_C_COMPILER}"
             "CXX=${CMAKE_CXX_COMPILER}"
             ${CARGO_EXECUTABLE} build
@@ -50,9 +53,9 @@ function(rust_build_host CRATE_DIR OUTPUT_NAME)
         COMMENT "Building host Rust crate: ${OUTPUT_NAME}"
     )
 
-    # Workspace member: binary lands in workspace root target/
+    # Keep host artifacts inside the caller-selected CMake build tree.
     set(${OUTPUT_NAME}_BINARY
-        "${CMAKE_SOURCE_DIR}/target/${CARGO_OUT_DIR}/${OUTPUT_NAME}"
+        "${RUST_HOST_TARGET_DIR}/${CARGO_OUT_DIR}/${OUTPUT_NAME}"
         PARENT_SCOPE)
 endfunction()
 

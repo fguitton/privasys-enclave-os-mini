@@ -99,6 +99,11 @@ enclave {
             uint64_t config_len
         );
 
+        /* Release-disabled signed-enclave test registry. The uint32 result
+         * packs code/collected/executed/failed into one byte each. Intel SGX
+         * transport status remains the separate generated EDL return value. */
+        public uint32_t ecall_enclave_tests(uint32_t selection);
+
         /* The only supported worker is zero. It occupies the second TCS. */
         public int ecall_execution_worker(uint32_t worker_id);
 

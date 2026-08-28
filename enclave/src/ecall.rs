@@ -642,6 +642,14 @@ pub extern "C" fn ecall_execution_worker(worker_id: u32) -> i32 {
     crate::run_execution_worker(worker_id)
 }
 
+/// Fail-closed implementation for ordinary Mini compositions. A custom
+/// composition must explicitly provide its own fixed signed-enclave registry.
+#[cfg(feature = "default-ecall")]
+#[no_mangle]
+pub extern "C" fn ecall_enclave_tests(_selection: u32) -> u32 {
+    0xff00_0000
+}
+
 // ==========================================================================
 //  ecall_run – default implementation (feature-gated)
 // ==========================================================================

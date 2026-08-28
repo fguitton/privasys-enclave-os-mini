@@ -142,6 +142,8 @@ mod sgx {
             config_len: u64,
         ) -> SgxStatus;
 
+        fn ecall_enclave_tests(eid: EnclaveId, retval: *mut u32, selection: u32) -> SgxStatus;
+
         fn ecall_execution_worker(eid: EnclaveId, retval: *mut i32, worker_id: u32) -> SgxStatus;
     }
 
@@ -256,6 +258,15 @@ mod sgx {
         retval
     }
 
+    pub fn call_ecall_enclave_tests(eid: u64, selection: u32) -> anyhow::Result<u32> {
+        let mut retval = 0xff00_0000_u32;
+        let status = unsafe { ecall_enclave_tests(eid, &mut retval, selection) };
+        if status != SgxStatus::Success {
+            anyhow::bail!("ecall_enclave_tests SGX status: {status:?}");
+        }
+        Ok(retval)
+    }
+
     pub fn call_ecall_execution_worker(eid: u64, worker_id: u32) -> i32 {
         let mut retval: i32 = -1;
         let status = unsafe { ecall_execution_worker(eid, &mut retval, worker_id) };
@@ -328,6 +339,10 @@ mod sgx {
         info!("[MOCK] ecall_run (config {} bytes)", config_json.len());
         // In mock mode, just return immediately
         0
+    }
+
+    pub fn call_ecall_enclave_tests(_eid: u64, _selection: u32) -> anyhow::Result<u32> {
+        anyhow::bail!("signed-enclave tests are unavailable in mock mode")
     }
 
     pub fn call_ecall_execution_worker(_eid: u64, worker_id: u32) -> i32 {

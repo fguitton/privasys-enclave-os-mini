@@ -40,6 +40,37 @@ enum EcallStartOrder {
     ControlFirst,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum EnclaveTestSelection {
+    All,
+    Empty,
+    Failure,
+    Panic,
+    Invalid,
+}
+
+impl EnclaveTestSelection {
+    const fn code(self) -> u32 {
+        match self {
+            Self::All => 0,
+            Self::Empty => 1,
+            Self::Failure => 2,
+            Self::Panic => 3,
+            Self::Invalid => u32::MAX,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Empty => "empty",
+            Self::Failure => "failure",
+            Self::Panic => "panic",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "enclave-os-host",
@@ -114,6 +145,11 @@ struct Cli {
     /// CorePhase barrier.
     #[arg(long, value_enum, default_value_t = EcallStartOrder::WorkerFirst)]
     ecall_start_order: EcallStartOrder,
+
+    /// Run the release-disabled signed-enclave regression registry and exit.
+    /// Negative selections exist only to prove fail-closed gate propagation.
+    #[arg(long, value_enum)]
+    enclave_test_selection: Option<EnclaveTestSelection>,
 
     /// S1.2 test-only synthetic worker budget. Ignored by legacy compositions.
     #[arg(long)]
@@ -207,6 +243,54 @@ fn spawn_execution_ecall(enclave_id: u64) -> Result<thread::JoinHandle<i32>> {
     Ok(handle)
 }
 
+fn run_enclave_tests(enclave_path: &str, selection: EnclaveTestSelection) -> Result<()> {
+    let enclave_id = enclave::create_enclave(enclave_path)?;
+    let packed = enclave::call_ecall_enclave_tests(enclave_id, selection.code())?;
+    enclave::destroy_enclave(enclave_id);
+
+    let code = u8::try_from(packed >> 24).expect("packed result code is one byte");
+    let collected = u8::try_from((packed >> 16) & 0xff).expect("packed collection is one byte");
+    let executed = u8::try_from((packed >> 8) & 0xff).expect("packed execution is one byte");
+    let failed = u8::try_from(packed & 0xff).expect("packed failure count is one byte");
+    println!(
+        "TEACLAVE-SIM-HOST: selection={} collected={} executed={} failed={} code={}",
+        selection.label(),
+        collected,
+        executed,
+        failed,
+        code
+    );
+
+    if code != 0 {
+        anyhow::bail!(
+            "signed-enclave registry rejected selection {} with code {}",
+            selection.label(),
+            code
+        );
+    }
+    if selection != EnclaveTestSelection::All || collected != 5 || executed != 5 || failed != 0 {
+        anyhow::bail!(
+            "signed-enclave registry returned an invalid successful result: selection={} collected={} executed={} failed={}",
+            selection.label(),
+            collected,
+            executed,
+            failed
+        );
+    }
+    Ok(())
+}
+
+fn validate_long_lived_ecall_results(control: i32, execution: i32) -> Result<()> {
+    if control != 0 || execution != 0 {
+        anyhow::bail!(
+            "enclave ECALL failure: control={} execution={}",
+            control,
+            execution
+        );
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -218,6 +302,10 @@ fn main() -> Result<()> {
     info!("Enclave path : {}", cli.enclave_path);
     info!("RA-TLS port  : {}", cli.port);
     info!("KV store path: {}", cli.kv_path);
+
+    if let Some(selection) = cli.enclave_test_selection {
+        return run_enclave_tests(&cli.enclave_path, selection);
+    }
 
     // Initialise the KV store backend
     kvstore::init(&cli.kv_path)?;
@@ -579,6 +667,7 @@ fn main() -> Result<()> {
     if execution_ret != 0 {
         error!("ecall_execution_worker returned: {}", execution_ret);
     }
+    let ecall_result = validate_long_lived_ecall_results(control_ret, execution_ret);
 
     // Signal dispatcher and proxy to stop
     shutdown.store(true, Ordering::Relaxed);
@@ -598,5 +687,18 @@ fn main() -> Result<()> {
     drop(execution_channel);
     drop(data_channel);
 
-    Ok(())
+    ecall_result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_long_lived_ecall_results;
+
+    #[test]
+    fn long_lived_ecall_success_requires_both_zero_results() {
+        assert!(validate_long_lived_ecall_results(0, 0).is_ok());
+        assert!(validate_long_lived_ecall_results(-83, 0).is_err());
+        assert!(validate_long_lived_ecall_results(0, -79).is_err());
+        assert!(validate_long_lived_ecall_results(-83, -79).is_err());
+    }
 }
