@@ -92,9 +92,9 @@ endif()
 list(GET TEACLAVE_CANDIDATES 0 TEACLAVE_CHECKOUT)
 
 # The SGX-SIM gate may mirror the already verified revision into its bounded
-# CMake build tree so the pinned SDK's source-relative Cargo target directory
-# cannot consume root disk or retain stale metadata. This is SIM-only, must be
-# inside CMAKE_BINARY_DIR, and retains the exact branch-owned patched source.
+# CMake build tree so compiler inputs can be mounted read-only while generated
+# Cargo output stays disposable. This is SIM-only, must be inside
+# CMAKE_BINARY_DIR, and retains the exact branch-owned patched source.
 set(HONEST_PINNED_TEACLAVE_SIM_SOURCE "" CACHE PATH
     "Bounded exact Teaclave source mirror used only by the SGX-SIM gate")
 if(HONEST_PINNED_TEACLAVE_SIM_SOURCE)
@@ -130,28 +130,27 @@ set(TEACLAVE_INC_DIR  "${TEACLAVE_CHECKOUT}/common/inc")
 set(TEACLAVE_TLIBC    "${TEACLAVE_CHECKOUT}/common/inc/tlibc")
 if(SGX_MODE STREQUAL "SIM")
     set(SGX_SYSROOT_DIR "${CMAKE_BINARY_DIR}/sgx-sysroot")
+    set(SYSROOT_BUILD_DIR "${CMAKE_BINARY_DIR}/teaclave-sysroot-build")
 else()
     set(SGX_SYSROOT_DIR "${CMAKE_SOURCE_DIR}/sysroot")
+    set(SYSROOT_BUILD_DIR "${TEACLAVE_CHECKOUT}/build_sysroot")
 endif()
 get_filename_component(TEACLAVE_REMAP_SOURCE_ROOT
     "${TEACLAVE_CHECKOUT}" ABSOLUTE)
 get_filename_component(SGX_SYSROOT_REMAP_OUTPUT_ROOT
     "${SGX_SYSROOT_DIR}" ABSOLUTE)
+get_filename_component(SGX_SYSROOT_REMAP_BUILD_ROOT
+    "${SYSROOT_BUILD_DIR}" ABSOLUTE)
 string(CONCAT SGX_SYSROOT_REPRODUCIBLE_RUSTFLAGS
     "--remap-path-prefix ${TEACLAVE_REMAP_SOURCE_ROOT}=/teaclave-sdk"
     " --remap-path-prefix ${SGX_SYSROOT_REMAP_OUTPUT_ROOT}=/sgx-sysroot"
+    " --remap-path-prefix ${SGX_SYSROOT_REMAP_BUILD_ROOT}=/sgx-sysroot-build"
     " --check-cfg=cfg(target_vendor,values(\"teaclave\"))")
 
 # =============================================================================
 # Step 1: Build SGX sysroot (via the fork's CMake sgx_sysroot target)
 # =============================================================================
 if(BUILD_ENCLAVE)
-    if(SGX_MODE STREQUAL "SIM")
-        set(SYSROOT_BUILD_DIR "${CMAKE_BINARY_DIR}/teaclave-sysroot-build")
-    else()
-        set(SYSROOT_BUILD_DIR "${TEACLAVE_CHECKOUT}/build_sysroot")
-    endif()
-
     # ExternalProject-like: configure + build the fork's sysroot target
     set(SYSROOT_STAMP "${CMAKE_BINARY_DIR}/sysroot.stamp")
     add_custom_command(
