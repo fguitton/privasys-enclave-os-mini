@@ -19,7 +19,7 @@ aot = ["wasmtime/cranelift", "wasmtime/parallel-compilation"]
 
 [dependencies]
 sha2 = { version = "=0.10.9", default-features = false }
-wasmtime = { git = "https://github.com/Privasys/wasmtime", tag = "privasys-v0.2.0", default-features = false, features = [
+wasmtime = { git = "https://github.com/Privasys/wasmtime", rev = "6d01615eaf52d4e70010290f8444a8ec285d01ae", default-features = false, features = [
     "component-model",
     "runtime",
     "std",

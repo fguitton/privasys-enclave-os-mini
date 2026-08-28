@@ -28,7 +28,7 @@ native-sgx-types = ["dep:sgx_types", "enclave-os-common/jwt"]
 enclave-os-common = { path = "../../common", features = ["crypto", "jwt"] }
 
 # TLS (Privasys fork with RA-TLS 0xFFBB challenge extension)
-rustls = { git = "https://github.com/Privasys/rustls", tag = "privasys-v0.8.1", default-features = false, features = ["ring", "tls12", "std"] }
+rustls = { git = "https://github.com/Privasys/rustls", rev = "ab630583b58fee84260cbbfe2f4a8b45d8bde200", default-features = false, features = ["ring", "tls12", "std"] }
 
 # Mozilla root CAs for general-purpose HTTPS egress (WASM SDK, etc.)
 webpki-roots = "0.26"
@@ -47,4 +47,4 @@ base64 = "0.21"
 
 # Native-only source for the quote layout types. This is the same pinned SDK
 # revision used by the enclave; it must not be enabled in Teaclave builds.
-sgx_types = { git = "https://github.com/Privasys/teaclave-sgx-sdk", tag = "privasys-v0.4.0", optional = true }
+sgx_types = { git = "https://github.com/Privasys/teaclave-sgx-sdk", rev = "2330b2a5aa8404d3c0a38e9d3a760144549f4943", optional = true }
