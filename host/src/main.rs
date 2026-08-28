@@ -10,6 +10,7 @@
 //! - Implement the single OCALL: `ocall_notify()`
 //! - Provide the CLI entry point
 
+mod c3_endpoints;
 #[cfg(all(target_os = "linux", not(sgx_mode_sim)))]
 mod dcap;
 mod dispatcher;
@@ -20,6 +21,7 @@ mod ocall_impl;
 mod tcp_proxy;
 
 use anyhow::Result;
+use c3_endpoints::validate_c3_development_endpoints;
 use clap::{Parser, ValueEnum};
 use log::{error, info};
 use std::net::IpAddr;
@@ -126,7 +128,7 @@ struct Cli {
     #[arg(long)]
     s1_peer_probe_endpoint: Option<String>,
 
-    /// Development-only physical-cluster node ID (1..=5).
+    /// Development-only physical-cluster node ID (1..=cluster cardinality).
     #[arg(long)]
     c3_development_node_id: Option<u64>,
 
@@ -139,7 +141,7 @@ struct Cli {
     #[arg(long)]
     c3_development_network_id: Option<String>,
 
-    /// Five `node-id=IP:port` entries for the physical cluster.
+    /// Three to sixteen ordered `node-id=IPv4:port` cluster entries.
     #[arg(long, value_delimiter = ',')]
     c3_development_peer_endpoints: Option<Vec<String>>,
 
@@ -468,9 +470,6 @@ fn main() -> Result<()> {
         anyhow::bail!("component supplier configuration requires the complete C3 profile");
     }
     if let Some(node_id) = cli.c3_development_node_id {
-        if !(1..=5).contains(&node_id) {
-            anyhow::bail!("--c3-development-node-id must be in 1..=5");
-        }
         let generation = cli.c3_development_generation.unwrap_or(1);
         if generation == 0 {
             anyhow::bail!("--c3-development-generation must be nonzero");
@@ -483,9 +482,7 @@ fn main() -> Result<()> {
             .c3_development_peer_endpoints
             .as_ref()
             .expect("all C3 arguments checked");
-        if endpoints.len() != 5 {
-            anyhow::bail!("--c3-development-peer-endpoints requires exactly five entries");
-        }
+        validate_c3_development_endpoints(node_id, endpoints).map_err(anyhow::Error::msg)?;
         let reviewer_path = cli
             .c3_development_reviewer_keys_file
             .as_deref()
