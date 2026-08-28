@@ -51,6 +51,7 @@ function(rust_build_host CRATE_DIR OUTPUT_NAME)
                 --manifest-path "${CRATE_DIR}/Cargo.toml"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
         COMMENT "Building host Rust crate: ${OUTPUT_NAME}"
+        VERBATIM
     )
 
     # Keep host artifacts inside the caller-selected CMake build tree.
@@ -97,10 +98,17 @@ function(rust_build_enclave CRATE_DIR OUTPUT_NAME FEATURES)
     endif()
     get_filename_component(_ENCLAVE_SOURCE_ROOT
         "${RUST_ENCLAVE_SOURCE_ROOT}" ABSOLUTE)
+    get_filename_component(_TEACLAVE_SOURCE_ROOT
+        "${TEACLAVE_CHECKOUT}" ABSOLUTE)
+    get_filename_component(_SGX_SYSROOT_ROOT
+        "${SGX_SYSROOT_DIR}" ABSOLUTE)
     string(CONCAT _ENCLAVE_RUSTFLAGS
         "--sysroot ${SGX_SYSROOT_DIR} -C target-feature=+rdrand"
         " --remap-path-prefix ${_ENCLAVE_SOURCE_ROOT}=/workspace"
-        " --remap-path-prefix ${_ENCLAVE_TARGET_DIR}=/cargo-target")
+        " --remap-path-prefix ${_ENCLAVE_TARGET_DIR}=/cargo-target"
+        " --remap-path-prefix ${_TEACLAVE_SOURCE_ROOT}=/teaclave-sdk"
+        " --remap-path-prefix ${_SGX_SYSROOT_ROOT}=/sgx-sysroot"
+        " --check-cfg=cfg(target_vendor,values(\"teaclave\"))")
 
     set(_BUILD_COMMENT "Building enclave Rust crate: ${OUTPUT_NAME}")
     if(_FEATURES)
@@ -130,6 +138,7 @@ function(rust_build_enclave CRATE_DIR OUTPUT_NAME FEATURES)
         BYPRODUCTS "${_ENCLAVE_STATIC_LIB}"
         WORKING_DIRECTORY "${CRATE_DIR}"
         COMMENT "${_BUILD_COMMENT}"
+        VERBATIM
     )
 
     set(${OUTPUT_NAME}_STATIC_LIB
@@ -157,6 +166,7 @@ function(sgx_link_enclave STATIC_LIB EDL_OBJ VERSION_SCRIPT ENCLAVE_SO)
             -Wl,--gc-sections
         DEPENDS "${STATIC_LIB}" "${EDL_OBJ}" "${VERSION_SCRIPT}"
         COMMENT "Linking enclave: ${ENCLAVE_SO}"
+        VERBATIM
     )
 endfunction()
 
@@ -174,5 +184,6 @@ function(sgx_sign_enclave ENCLAVE_SO CONFIG_XML KEY_PEM SIGNED_OUTPUT)
             -config "${CONFIG_XML}"
         DEPENDS "${ENCLAVE_SO}" "${CONFIG_XML}" "${KEY_PEM}"
         COMMENT "Signing enclave: ${SIGNED_OUTPUT}"
+        VERBATIM
     )
 endfunction()

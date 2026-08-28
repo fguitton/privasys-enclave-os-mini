@@ -36,6 +36,8 @@ set(CUSTOM_ENCLAVE_FEATURES "" CACHE STRING
     "Comma-separated Cargo features for a custom composition crate")
 set(CUSTOM_ENCLAVE_CONFIG "" CACHE FILEPATH
     "Optional enclave signing configuration for a custom composition")
+set(CUSTOM_ENCLAVE_KEY "" CACHE FILEPATH
+    "Optional caller-custodied enclave signing key")
 
 # ── Resolve crate directory and feature list ────────────────────────────
 if(NOT CUSTOM_ENCLAVE_DIR STREQUAL "")
@@ -134,14 +136,28 @@ else()
     set(ENCLAVE_CONFIG "${CMAKE_SOURCE_DIR}/config/enclave.config.xml")
 endif()
 
-set(ENCLAVE_KEY     "${CMAKE_SOURCE_DIR}/config/enclave_private.pem")
 set(ENCLAVE_SIGNED  "${CMAKE_BINARY_DIR}/bin/enclave.signed.so")
 
-# Generate a development signing key if it doesn't exist
-if(NOT EXISTS "${ENCLAVE_KEY}")
-    execute_process(
-        COMMAND openssl genrsa -out "${ENCLAVE_KEY}" -3 3072
-    )
+# Use caller custody when requested; otherwise retain Mini's development-key
+# behavior for interactive builds.
+if(NOT CUSTOM_ENCLAVE_KEY STREQUAL "")
+    if(NOT EXISTS "${CUSTOM_ENCLAVE_KEY}"
+       OR IS_DIRECTORY "${CUSTOM_ENCLAVE_KEY}"
+       OR IS_SYMLINK "${CUSTOM_ENCLAVE_KEY}")
+        message(FATAL_ERROR "CUSTOM_ENCLAVE_KEY does not exist: ${CUSTOM_ENCLAVE_KEY}")
+    endif()
+    set(ENCLAVE_KEY "${CUSTOM_ENCLAVE_KEY}")
+else()
+    set(ENCLAVE_KEY "${CMAKE_SOURCE_DIR}/config/enclave_private.pem")
+    if(NOT EXISTS "${ENCLAVE_KEY}")
+        execute_process(
+            COMMAND openssl genrsa -out "${ENCLAVE_KEY}" -3 3072
+            RESULT_VARIABLE ENCLAVE_KEY_GENERATION_STATUS
+        )
+        if(NOT ENCLAVE_KEY_GENERATION_STATUS EQUAL 0 OR NOT EXISTS "${ENCLAVE_KEY}")
+            message(FATAL_ERROR "Failed to generate the development enclave key")
+        endif()
+    endif()
 endif()
 
 sgx_sign_enclave(

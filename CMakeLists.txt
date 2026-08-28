@@ -45,9 +45,11 @@ include(cmake/RustBuild.cmake)
 # The Cargo.lock in the workspace pins the teaclave-sgx-sdk commit hash.
 # We parse it and find the matching checkout directory under ~/.cargo/git/checkouts.
 
-# Find the sole checkout whose full Git identity matches Cargo.lock (respect
+# Find the sole checkout whose HEAD identity matches Cargo.lock (respect
 # CARGO_HOME). A same-prefix directory or a different checkout base must never
-# become the enclave compiler merely because it sorts first.
+# become the enclave compiler merely because it sorts first. Callers that need
+# clean compiler bytes, including the SGX-SIM gate, validate the checkout and
+# its tree separately before configuration and after each build.
 if(DEFINED ENV{CARGO_HOME})
     set(_CARGO_DIR "$ENV{CARGO_HOME}")
 else()
@@ -131,6 +133,14 @@ if(SGX_MODE STREQUAL "SIM")
 else()
     set(SGX_SYSROOT_DIR "${CMAKE_SOURCE_DIR}/sysroot")
 endif()
+get_filename_component(TEACLAVE_REMAP_SOURCE_ROOT
+    "${TEACLAVE_CHECKOUT}" ABSOLUTE)
+get_filename_component(SGX_SYSROOT_REMAP_OUTPUT_ROOT
+    "${SGX_SYSROOT_DIR}" ABSOLUTE)
+string(CONCAT SGX_SYSROOT_REPRODUCIBLE_RUSTFLAGS
+    "--remap-path-prefix ${TEACLAVE_REMAP_SOURCE_ROOT}=/teaclave-sdk"
+    " --remap-path-prefix ${SGX_SYSROOT_REMAP_OUTPUT_ROOT}=/sgx-sysroot"
+    " --check-cfg=cfg(target_vendor,values(\"teaclave\"))")
 
 # =============================================================================
 # Step 1: Build SGX sysroot (via the fork's CMake sgx_sysroot target)
@@ -147,14 +157,32 @@ if(BUILD_ENCLAVE)
     add_custom_command(
         OUTPUT "${SYSROOT_STAMP}"
         COMMENT "Building SGX sysroot via Teaclave fork CMake..."
-        COMMAND ${CMAKE_COMMAND} -E env "SGX_MODE=${SGX_MODE}" ${CMAKE_COMMAND}
+        COMMAND ${CMAKE_COMMAND} -E env
+            "SGX_MODE=${SGX_MODE}"
+            "RUSTUP_TOOLCHAIN=${RUST_ENCLAVE_TOOLCHAIN}"
+            "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}"
+            "CARGO_INCREMENTAL=0"
+            "RUSTFLAGS=${SGX_SYSROOT_REPRODUCIBLE_RUSTFLAGS}"
+            "CC=${CMAKE_C_COMPILER}"
+            "CXX=${CMAKE_CXX_COMPILER}"
+            ${CMAKE_COMMAND}
             -S "${TEACLAVE_CHECKOUT}"
             -B "${SYSROOT_BUILD_DIR}"
             -DBUILD_SYSROOT=ON
             -DBUILD_URTS=OFF
             -DSGX_SYSROOT_OUTPUT=${SGX_SYSROOT_DIR}
             -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
-        COMMAND ${CMAKE_COMMAND} -E env "SGX_MODE=${SGX_MODE}" ${CMAKE_COMMAND}
+            -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+            -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+        COMMAND ${CMAKE_COMMAND} -E env
+            "SGX_MODE=${SGX_MODE}"
+            "RUSTUP_TOOLCHAIN=${RUST_ENCLAVE_TOOLCHAIN}"
+            "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}"
+            "CARGO_INCREMENTAL=0"
+            "RUSTFLAGS=${SGX_SYSROOT_REPRODUCIBLE_RUSTFLAGS}"
+            "CC=${CMAKE_C_COMPILER}"
+            "CXX=${CMAKE_CXX_COMPILER}"
+            ${CMAKE_COMMAND}
             --build "${SYSROOT_BUILD_DIR}"
             --target sgx_sysroot
         COMMAND ${CMAKE_COMMAND} -E touch "${SYSROOT_STAMP}"
