@@ -21,6 +21,8 @@ set(RUST_ENCLAVE_TOOLCHAIN_ROOT "" CACHE PATH
     "Optional toolchain root remapped to /rust-toolchain in compiler output")
 set(RUST_ENCLAVE_VENDOR_ROOT "" CACHE PATH
     "Optional Cargo vendor root remapped to /cargo-vendor in compiler output")
+set(RUST_ENCLAVE_CARGO_HOME_ROOT "" CACHE PATH
+    "Optional Cargo home root remapped to /cargo-home in compiler output")
 set(RUST_HOST_TARGET_DIR "${CMAKE_BINARY_DIR}/cargo/host" CACHE PATH
     "Cargo target directory for the untrusted host build")
 
@@ -39,6 +41,12 @@ if(RUST_ENCLAVE_VENDOR_ROOT)
         "${RUST_ENCLAVE_VENDOR_ROOT}" ABSOLUTE)
     string(APPEND RUST_REPRODUCIBLE_INPUT_REMAP_FLAGS
         " --remap-path-prefix ${RUST_ENCLAVE_VENDOR_REMAP_ROOT}=/cargo-vendor")
+endif()
+if(RUST_ENCLAVE_CARGO_HOME_ROOT)
+    get_filename_component(RUST_ENCLAVE_CARGO_HOME_REMAP_ROOT
+        "${RUST_ENCLAVE_CARGO_HOME_ROOT}" ABSOLUTE)
+    string(APPEND RUST_REPRODUCIBLE_INPUT_REMAP_FLAGS
+        " --remap-path-prefix ${RUST_ENCLAVE_CARGO_HOME_REMAP_ROOT}=/cargo-home")
 endif()
 
 # Build type mapping
