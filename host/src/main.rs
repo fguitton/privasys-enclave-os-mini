@@ -49,6 +49,8 @@ enum EnclaveTestSelection {
     Invalid,
 }
 
+const EXPECTED_SIGNED_ENCLAVE_TESTS: u8 = 6;
+
 impl EnclaveTestSelection {
     const fn code(self) -> u32 {
         match self {
@@ -268,7 +270,11 @@ fn run_enclave_tests(enclave_path: &str, selection: EnclaveTestSelection) -> Res
             code
         );
     }
-    if selection != EnclaveTestSelection::All || collected != 5 || executed != 5 || failed != 0 {
+    if selection != EnclaveTestSelection::All
+        || collected != EXPECTED_SIGNED_ENCLAVE_TESTS
+        || executed != EXPECTED_SIGNED_ENCLAVE_TESTS
+        || failed != 0
+    {
         anyhow::bail!(
             "signed-enclave registry returned an invalid successful result: selection={} collected={} executed={} failed={}",
             selection.label(),
