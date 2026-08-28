@@ -145,6 +145,7 @@ string(CONCAT SGX_SYSROOT_REPRODUCIBLE_RUSTFLAGS
     "--remap-path-prefix ${TEACLAVE_REMAP_SOURCE_ROOT}=/teaclave-sdk"
     " --remap-path-prefix ${SGX_SYSROOT_REMAP_OUTPUT_ROOT}=/sgx-sysroot"
     " --remap-path-prefix ${SGX_SYSROOT_REMAP_BUILD_ROOT}=/sgx-sysroot-build"
+    "${RUST_REPRODUCIBLE_INPUT_REMAP_FLAGS}"
     " --check-cfg=cfg(target_vendor,values(\"teaclave\"))")
 
 # =============================================================================
