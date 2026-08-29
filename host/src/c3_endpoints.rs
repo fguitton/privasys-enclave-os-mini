@@ -4,14 +4,20 @@
 use std::collections::BTreeSet;
 use std::net::SocketAddrV4;
 
+/// Smallest voter population admitting a Byzantine-fault-tolerant quorum
+/// (`n >= 3f + 1` at `f = 1`).
+const MIN_C3_DEVELOPMENT_ENDPOINTS: usize = 4;
+/// Largest roster the replicated execution set carries.
+const MAX_C3_DEVELOPMENT_ENDPOINTS: usize = 16;
+
 pub(crate) fn validate_c3_development_endpoints(
     node_id: u64,
     endpoints: &[String],
 ) -> Result<(), String> {
     let cardinality = endpoints.len();
-    if !(3..=16).contains(&cardinality) {
+    if !(MIN_C3_DEVELOPMENT_ENDPOINTS..=MAX_C3_DEVELOPMENT_ENDPOINTS).contains(&cardinality) {
         return Err(format!(
-            "--c3-development-peer-endpoints requires 3..=16 entries, observed {cardinality}"
+            "--c3-development-peer-endpoints requires {MIN_C3_DEVELOPMENT_ENDPOINTS}..={MAX_C3_DEVELOPMENT_ENDPOINTS} entries, observed {cardinality}"
         ));
     }
     if node_id == 0 || node_id > cardinality as u64 {
@@ -57,8 +63,8 @@ mod tests {
     }
 
     #[test]
-    fn accepts_canonical_k3_k5_and_k16() {
-        assert!(validate_c3_development_endpoints(1, &endpoints(3)).is_ok());
+    fn accepts_canonical_minimum_mid_and_maximum_rosters() {
+        assert!(validate_c3_development_endpoints(1, &endpoints(4)).is_ok());
         assert!(validate_c3_development_endpoints(5, &endpoints(5)).is_ok());
         assert!(validate_c3_development_endpoints(16, &endpoints(16)).is_ok());
     }
@@ -71,8 +77,8 @@ mod tests {
 
     #[test]
     fn rejects_node_id_cardinality_mismatch() {
-        assert!(validate_c3_development_endpoints(0, &endpoints(3)).is_err());
-        assert!(validate_c3_development_endpoints(4, &endpoints(3)).is_err());
+        assert!(validate_c3_development_endpoints(0, &endpoints(4)).is_err());
+        assert!(validate_c3_development_endpoints(5, &endpoints(4)).is_err());
     }
 
     #[test]
