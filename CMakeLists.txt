@@ -157,6 +157,14 @@ if(BUILD_ENCLAVE)
     add_custom_command(
         OUTPUT "${SYSROOT_STAMP}"
         COMMENT "Building SGX sysroot via Teaclave fork CMake..."
+        # The fork builds std inside its own checkout using the default target
+        # directory, then copies that whole deps/ tree into the sysroot. The
+        # checkout is shared by every build tree, and each tree's remap flags
+        # give std a different metadata hash, so a second tree would leave two
+        # candidates behind and every enclave crate would then fail to resolve
+        # std. Start from a clean target directory so exactly one set is copied.
+        COMMAND ${CMAKE_COMMAND} -E rm -rf
+            "${TEACLAVE_CHECKOUT}/rustlib/std/target/${RUST_ENCLAVE_TARGET}"
         COMMAND ${CMAKE_COMMAND} -E env
             "SGX_MODE=${SGX_MODE}"
             "RUSTUP_TOOLCHAIN=${RUST_ENCLAVE_TOOLCHAIN}"
