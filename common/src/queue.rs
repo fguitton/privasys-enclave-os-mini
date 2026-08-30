@@ -50,8 +50,13 @@ use alloc::vec;
 #[cfg(feature = "sgx")]
 use alloc::vec::Vec;
 
-/// Default ring buffer capacity: 2 MiB. Must be a power of 2.
-pub const DEFAULT_QUEUE_CAPACITY: u64 = 2 * 1024 * 1024;
+/// Default ring buffer capacity: 8 MiB. Must be a power of 2, and must exceed
+/// the largest frame the control protocol can carry
+/// (`rpc::MAX_OPAQUE_STREAM_BATCH_BYTES`) or that frame can never be enqueued.
+///
+/// The ring is host-allocated shared memory, so this costs untrusted RAM rather
+/// than EPC.
+pub const DEFAULT_QUEUE_CAPACITY: u64 = 8 * 1024 * 1024;
 
 /// Cache line size for padding (avoid false sharing).
 const CACHE_LINE: usize = 64;

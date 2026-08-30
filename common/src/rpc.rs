@@ -166,9 +166,16 @@ pub use honest::*;
 /// Version of the protocol-neutral opaque-stream wire contract.
 pub const OPAQUE_STREAM_PROFILE_VERSION: u16 = 1;
 /// The control queue and enclave parser both reject larger persistence frames.
-pub const MAX_OPAQUE_STREAM_BATCH_BYTES: usize = 1024 * 1024;
+///
+/// A persistence frame is sent whole, without chunking, so this has to admit the
+/// widest protected value a client can produce plus its envelope.
+pub const MAX_OPAQUE_STREAM_BATCH_BYTES: usize = 5 * 1024 * 1024;
 /// One protected opaque value must fit within the control frame.
-pub const MAX_OPAQUE_STREAM_PAYLOAD_BYTES: usize = 768 * 1024;
+///
+/// The widest value this carries is a consensus Ready image: two application
+/// state projections, the bounded components and one widest agreement message.
+/// Sizing below that would make a legal Ready impossible to persist.
+pub const MAX_OPAQUE_STREAM_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 
 const PERSIST_OPAQUE_STREAM_HEADER_SIZE: usize = 110;
 const LOAD_OPAQUE_STREAM_HEADER_SIZE: usize = 58;
