@@ -23,7 +23,9 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-/// Domain separator for the identity fold; must match the SDKs.
+/// Domain separator for the identity fold; must match the SDKs. Scoped to the
+/// same feature as `fold_identity`, its only consumer.
+#[cfg(feature = "crypto")]
 const DOMAIN_FOLD_IDENTITY: &str = "privasys-app-identity-v1";
 
 /// One allowed measurement for a dependency, mirroring the vault `Measurement`.
