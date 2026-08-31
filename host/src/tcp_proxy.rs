@@ -133,31 +133,23 @@ pub struct TcpProxy {
 }
 
 impl TcpProxy {
-    /// Create a new TCP proxy bound to the given port.
-    pub fn new(
-        port: u16,
-        _backlog: i32,
-        data_tx: SpscProducer,
-        data_rx: SpscConsumer,
-        shutdown: Arc<AtomicBool>,
-    ) -> io::Result<Self> {
-        Self::new_with_local_control(port, _backlog, None, data_tx, data_rx, shutdown)
-    }
-
     /// Create the shared ciphertext multiplexer with an optional Unix local
     /// control listener. Both listener classes terminate TLS in the enclave.
     pub fn new_with_local_control(
         port: u16,
-        _backlog: i32,
+        backlog: i32,
         local_control_path: Option<PathBuf>,
         data_tx: SpscProducer,
         data_rx: SpscConsumer,
         shutdown: Arc<AtomicBool>,
     ) -> io::Result<Self> {
-        let addr = format!("0.0.0.0:{}", port);
-        let listener = TcpListener::bind(&addr)?;
+        let addr: SocketAddr = format!("0.0.0.0:{}", port)
+            .parse()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let listener = crate::net::listener::bind_tcp_listener(addr, backlog)
+            .map_err(|error| io::Error::other(error.to_string()))?;
         listener.set_nonblocking(true)?;
-        info!("TCP proxy listening on {}", addr);
+        info!("TCP proxy listening on {} (backlog {})", addr, backlog);
 
         let local_control_listener = local_control_path
             .as_deref()

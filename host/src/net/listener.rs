@@ -46,11 +46,28 @@ impl SocketTable {
 //  Public API (called from OCall implementations)
 // ---------------------------------------------------------------------------
 
-/// Create a TCP listener socket, bind to `0.0.0.0:port`, and listen.
-pub fn tcp_listen(port: u16, _backlog: i32) -> Result<i32> {
+/// Bind one reusable TCP listener with an explicit accept backlog.
+///
+/// `TcpListener::bind` fixes the backlog at a std-chosen default, so the
+/// listener is built through `socket2` to honour the operator's value.
+pub(crate) fn bind_tcp_listener(addr: SocketAddr, backlog: i32) -> Result<TcpListener> {
+    let socket = Socket::new(
+        Domain::for_address(addr),
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(backlog)?;
+    Ok(socket.into())
+}
+
+/// Create a TCP listener socket, bind to `0.0.0.0:port`, and listen with the
+/// requested accept backlog.
+pub fn tcp_listen(port: u16, backlog: i32) -> Result<i32> {
     let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
-    let listener =
-        TcpListener::bind(addr).with_context(|| format!("Failed to bind to {}", addr))?;
+    let listener = bind_tcp_listener(addr, backlog)
+        .with_context(|| format!("Failed to bind to {}", addr))?;
 
     // Set non-blocking so the enclave poll loop doesn't block forever
     listener.set_nonblocking(true)?;
