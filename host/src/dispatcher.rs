@@ -214,6 +214,13 @@ impl RpcDispatcher {
 
         let (status, response_payload) = self.dispatch_method(method, payload);
 
+        // Log is one-way. A reply would land in the shared response queue and
+        // be mis-consumed by whichever polled operation reads next, so the
+        // enclave never waits for one.
+        if method == RpcMethod::Log {
+            return;
+        }
+
         // Send response back to legacy Mini callers.
         let resp = rpc::encode_response(req_id, status, &response_payload);
         self.response_tx.send(&resp);
