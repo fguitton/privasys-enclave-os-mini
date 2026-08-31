@@ -594,11 +594,21 @@ impl RpcClient {
     }
 
     /// Log a message via the host.
+    /// Emit one host log line.
+    ///
+    /// This is genuinely one-way: reserving an in-flight request would return
+    /// EBUSY whenever a polled opaque operation is outstanding, which silences
+    /// the enclave exactly while persistence is in flight — when its
+    /// diagnostics matter most. The host does not reply to `Log`, so nothing
+    /// enters the shared response queue for a polled operation to mis-consume.
     pub fn log(&self, level: u8, message: &str) {
+        let Some(request_id) = next_req_id() else {
+            return;
+        };
         let payload = rpc::encode_log_req(level as i32, message);
-        // Fire-and-forget: we still wait for the response to maintain ordering,
-        // but we discard the result.
-        let _ = self.call(RpcMethod::Log, &payload);
+        let msg = rpc::encode_request(request_id, RpcMethod::Log, &payload);
+        self.request_tx.send(&msg);
+        notify_host();
     }
 
     /// Signal shutdown to the host.
