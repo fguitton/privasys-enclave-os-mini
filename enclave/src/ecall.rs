@@ -47,7 +47,7 @@ use crate::rpc_client::RpcClient;
 use crate::sealed_config::SealedConfig;
 use crate::{enclave_log_error, enclave_log_info, ShutdownOriginV1};
 use enclave_os_common::channel;
-use enclave_os_common::hex::{hex_decode, hex_encode};
+use enclave_os_common::hex::hex_encode;
 use enclave_os_common::queue::{SpscConsumer, SpscProducer, SpscQueueHeader};
 use enclave_os_common::types::AEAD_KEY_SIZE;
 
