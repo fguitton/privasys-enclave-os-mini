@@ -24,10 +24,7 @@ use ring::digest;
 use x509_parser::prelude::*;
 
 // OIDs imported from common — single source of truth.
-use enclave_os_common::oids::{
-    ATTESTATION_SERVERS_HASH_OID, ATTESTATION_SERVERS_HASH_OID_STR, CONFIG_MERKLE_ROOT_OID,
-    CONFIG_MERKLE_ROOT_OID_STR,
-};
+use enclave_os_common::oids::{CONFIG_MERKLE_ROOT_OID, CONFIG_MERKLE_ROOT_OID_STR};
 
 // ---------------------------------------------------------------------------
 //  Helpers — mirror the enclave ConfigMerkleTree logic
