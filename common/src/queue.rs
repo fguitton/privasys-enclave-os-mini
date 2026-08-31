@@ -201,6 +201,17 @@ impl SpscProducer {
     }
 
     /// Blocking send: spins until space is available, then writes.
+    /// Bytes this producer has written that the consumer has not yet read.
+    ///
+    /// A one-way sender (the log lane) has no response to wait on, so this is
+    /// the only way to know a message actually reached the host before the
+    /// enclave stops.
+    #[inline]
+    pub fn pending_bytes(&self) -> u64 {
+        // SAFETY: `header` was validated at construction and outlives self.
+        unsafe { (*self.header).available_read() }
+    }
+
     pub fn send(&self, msg: &[u8]) {
         loop {
             match self.try_send(msg) {
