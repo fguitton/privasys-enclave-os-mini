@@ -711,6 +711,10 @@ fn build_attested_client_config(
 
 /// Wraps a standard [`WebPkiServerVerifier`] with additional RA-TLS
 /// attestation checks. The TLS handshake is rejected if any check fails.
+///
+/// This is the production verifier. Simulation builds select
+/// `AttestedRaTlsVerifier` instead, so it is deliberately unused there.
+#[cfg_attr(feature = "sgx-sim-attestation", allow(dead_code))]
 #[derive(Debug)]
 struct RaTlsVerifier {
     /// Standard WebPKI chain verifier (root CA validation).
