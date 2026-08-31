@@ -268,6 +268,10 @@ impl RpcClient {
                 .map(Some)
                 .map_err(PolledOpaqueStreamError::InvalidRequest),
             1 => Ok(None),
+            // `call` reports a local reservation conflict as EBUSY. That is not
+            // a host verdict: the polled operation holding the slot will finish
+            // and the caller may retry, so name it as the transient it is.
+            -16 => Err(PolledOpaqueStreamError::Busy),
             status => Err(PolledOpaqueStreamError::HostStatus(status)),
         }
     }
