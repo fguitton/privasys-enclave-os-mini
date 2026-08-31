@@ -143,6 +143,8 @@ enum RequestReserveError {
 unsafe impl Send for RpcClient {}
 unsafe impl Sync for RpcClient {}
 
+const DRAIN_SPINS: u32 = 100_000;
+
 impl RpcClient {
     /// Create a client from the queue endpoints.
     ///
@@ -613,6 +615,22 @@ impl RpcClient {
         let msg = rpc::encode_request(request_id, RpcMethod::Log, &payload);
         self.request_tx.send(&msg);
         notify_host();
+    }
+
+    /// Wait, bounded, until the host has consumed everything this enclave has
+    /// queued.
+    ///
+    /// The log lane is one-way, so a line emitted immediately before shutdown
+    /// would otherwise be discarded with the ring. Call this before ending a
+    /// long-lived ECALL so the enclave's last words survive.
+    pub fn drain_requests(&self) {
+        for _ in 0..DRAIN_SPINS {
+            if self.request_tx.pending_bytes() == 0 {
+                return;
+            }
+            notify_host();
+            core::hint::spin_loop();
+        }
     }
 
     /// Signal shutdown to the host.

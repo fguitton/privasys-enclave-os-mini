@@ -111,6 +111,11 @@ pub fn log(level: enclave_os_common::types::LogLevel, message: &str) {
     rpc().log(level_u8, message);
 }
 
+/// Let the host consume everything queued before the enclave stops.
+pub fn drain_host_requests() {
+    rpc().drain_requests();
+}
+
 /// Convenience macros for logging (enclave-side).
 #[macro_export]
 macro_rules! enclave_log_info {

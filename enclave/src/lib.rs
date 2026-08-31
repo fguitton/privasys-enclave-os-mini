@@ -261,6 +261,10 @@ pub fn signal_shutdown_with_adopter_code(code: u8) {
         ADOPTER_SHUTDOWN_ORIGIN_BASE + u16::from(code)
     };
     record_shutdown_origin(origin);
+    // The log lane is one-way, so anything the adopter logged on its way here is
+    // still sitting in the request ring. Let the host drain it before the ECALL
+    // returns, or the shutdown reason is lost with the queue.
+    crate::ocall::drain_host_requests();
     SHUTDOWN.store(true, Ordering::Release);
     CORE_PHASE.request_shutdown();
 }
