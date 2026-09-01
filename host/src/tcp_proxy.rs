@@ -903,8 +903,15 @@ mod tests {
         let mut enclave_to_host = QueueMemory::new();
         let data_tx = host_to_enclave.producer();
         let data_rx = enclave_to_host.consumer();
-        let mut proxy =
-            TcpProxy::new(0, 1, data_tx, data_rx, Arc::new(AtomicBool::new(false))).unwrap();
+        let mut proxy = TcpProxy::new_with_local_control(
+            0,
+            1,
+            None,
+            data_tx,
+            data_rx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
