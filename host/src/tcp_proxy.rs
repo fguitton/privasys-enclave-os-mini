@@ -409,11 +409,17 @@ impl TcpProxy {
     /// is freed too.
     fn reap_idle_connections(&mut self) {
         let now = Instant::now();
-        let stale: Vec<u32> = self
+        let stale: Vec<(u32, Option<u64>)> = self
             .connections
             .iter()
             .filter(|(_, c)| now.duration_since(c.last_activity) >= IDLE_TIMEOUT)
-            .map(|(&id, _)| id)
+            .map(|(&id, connection)| {
+                let request_id = match &connection.origin {
+                    ConnectionOrigin::OutboundConnecting { request_id, .. } => Some(*request_id),
+                    _ => None,
+                };
+                (id, request_id)
+            })
             .collect();
         if stale.is_empty() {
             return;
@@ -424,9 +430,19 @@ impl TcpProxy {
             IDLE_TIMEOUT.as_secs(),
             self.connections.len()
         );
-        for conn_id in stale {
+        for (conn_id, request_id) in stale {
             self.connections.remove(&conn_id);
-            let msg = channel::encode_tcp_close(conn_id);
+            // An in-progress outbound socket has not published its host-owned
+            // connection ID to the enclave yet. Complete that attempt through
+            // its enclave-owned request ID; a TcpClose(conn_id) would be
+            // uncorrelatable and leave the enclave's connect_pending fence set
+            // forever.
+            let msg = request_id.map_or_else(
+                || channel::encode_tcp_close(conn_id),
+                |request_id| {
+                    channel::encode_tcp_connect_failed(request_id, TcpConnectFailure::Timeout)
+                },
+            );
             self.send_to_enclave(msg);
         }
     }
@@ -902,6 +918,7 @@ mod tests {
         let mut host_to_enclave = QueueMemory::new();
         let mut enclave_to_host = QueueMemory::new();
         let data_tx = host_to_enclave.producer();
+        let host_output = host_to_enclave.consumer();
         let data_rx = enclave_to_host.consumer();
         let mut proxy = TcpProxy::new_with_local_control(
             0,
@@ -940,5 +957,37 @@ mod tests {
         assert_eq!(&received, b"encrypted response");
         let mut eof = [0_u8; 1];
         assert_eq!(client.read(&mut eof).unwrap(), 0);
+
+        // A connecting socket times out before its conn_id is disclosed to
+        // the enclave. Its timeout must therefore retain the request_id
+        // correlation used by pending_connects, rather than emit an unknown
+        // TcpClose(conn_id) that can never clear connect_pending.
+        let connecting_client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (connecting, _) = listener.accept().unwrap();
+        proxy.connections.insert(
+            8,
+            ConnState {
+                stream: ProxyStream::Tcp(connecting),
+                last_activity: Instant::now() - IDLE_TIMEOUT,
+                origin: ConnectionOrigin::OutboundConnecting {
+                    request_id: 91,
+                    endpoint: "192.0.2.1:443".to_string(),
+                },
+                write_buffer: Vec::new(),
+                write_offset: 0,
+                close_after_write: false,
+            },
+        );
+        proxy.reap_idle_connections();
+        assert!(!proxy.connections.contains_key(&8));
+        let timeout = host_output.try_recv().expect("timeout completion");
+        let (msg_type, conn_id, payload) = channel::decode_channel_msg(&timeout).unwrap();
+        assert_eq!(msg_type, ChannelMsgType::TcpConnectFailed);
+        assert_eq!(conn_id, 0);
+        assert_eq!(
+            channel::decode_tcp_connect_failed(payload),
+            Some((91, TcpConnectFailure::Timeout)),
+        );
+        drop(connecting_client);
     }
 }
