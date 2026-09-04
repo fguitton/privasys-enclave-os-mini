@@ -11,20 +11,34 @@
 //!
 //! # Threading model
 //!
-//! The dispatcher runs on a dedicated host thread (or the main thread).
-//! It spin-polls the `enc_to_host` queue with exponential backoff.
-//! When the enclave calls `ocall_notify()`, the host can optionally
-//! wake immediately, but spinning is fine for high-throughput workloads.
+//! Each dispatcher runs on its own host thread and polls the `enc_to_host`
+//! queue with exponential backoff. The current `ocall_notify()` implementation
+//! is an ABI-compatibility boundary, not a wake primitive, so bounded polling
+//! is also responsible for request pickup while the dispatcher is idle.
 
 use log::{debug, error, info, trace, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use enclave_os_common::queue::{SpscConsumer, SpscProducer};
 use enclave_os_common::rpc::{self, HonestRpcIdentity, RpcMethod, RpcRole};
 
 use crate::kvstore;
 use crate::net;
+
+const fn dispatcher_idle_sleep(sgx_sim: bool) -> Duration {
+    if sgx_sim {
+        // Explicit SGX-SIM tuning retained for the L3 A/B measurement. It
+        // trades more timed wakeups for shorter idle request pickup without
+        // changing the hardware host's conservative policy.
+        Duration::from_micros(50)
+    } else {
+        Duration::from_millis(1)
+    }
+}
+
+const DISPATCHER_IDLE_SLEEP: Duration = dispatcher_idle_sleep(cfg!(sgx_mode_sim));
 
 fn legacy_role_allows_method(role: RpcRole, method: RpcMethod) -> bool {
     !matches!(
@@ -91,18 +105,21 @@ impl RpcDispatcher {
         let mut backoff = Backoff::new();
 
         loop {
-            if self.shutdown.load(Ordering::Relaxed) {
-                info!(
-                    "{} RPC dispatcher: shutdown requested",
-                    role_name(self.role)
-                );
-                break;
-            }
-
             match self.request_rx.try_recv() {
                 Some(msg) => {
                     backoff.reset();
                     self.dispatch(&msg);
+                }
+                None if self.shutdown.load(Ordering::Relaxed) => {
+                    // Producers have stopped before the ordinary host
+                    // shutdown path sets this flag. Observe an empty queue
+                    // before exiting so requests published before shutdown,
+                    // especially one-way terminal logs, are not discarded.
+                    info!(
+                        "{} RPC dispatcher: shutdown requested after queue drain",
+                        role_name(self.role)
+                    );
+                    break;
                 }
                 None => {
                     backoff.spin();
@@ -576,22 +593,37 @@ impl Backoff {
             std::thread::yield_now();
             self.spin_count += 1;
         } else {
-            // Sleep briefly (1ms) — the enclave will call ocall_notify to wake us
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            // The OCall is only a compatibility boundary. This requested
+            // sleep interval bounds polling frequency; scheduler delay may
+            // make actual request-pickup latency longer.
+            std::thread::sleep(DISPATCHER_IDLE_SLEEP);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
-    use super::{legacy_role_allows_method, RpcDispatcher};
+    use super::{dispatcher_idle_sleep, legacy_role_allows_method, RpcDispatcher};
     use enclave_os_common::queue::{SpscConsumer, SpscProducer, SpscQueueHeader};
     use enclave_os_common::rpc::{
         self, honest_role_allows_method, HonestRpcIdentity, RpcMethod, RpcRole,
     };
+
+    #[test]
+    fn simulation_dispatcher_polling_tuning_does_not_change_hardware_policy() {
+        assert_eq!(
+            dispatcher_idle_sleep(true),
+            std::time::Duration::from_micros(50)
+        );
+        assert_eq!(
+            dispatcher_idle_sleep(false),
+            std::time::Duration::from_millis(1)
+        );
+    }
 
     fn queue() -> (SpscProducer, SpscConsumer) {
         let capacity = 8_192_u64;
@@ -606,6 +638,86 @@ mod tests {
                 SpscConsumer::from_raw(header, buffer),
             )
         }
+    }
+
+    fn log_request(request_id: u64, message: &str) -> Vec<u8> {
+        rpc::encode_request(request_id, RpcMethod::Log, &rpc::encode_log_req(2, message))
+    }
+
+    fn wait_until_drained(producer: &SpscProducer) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while producer.pending_bytes() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "dispatcher did not consume its request queue"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn notification_free_log_is_polled_without_a_response() {
+        let (request_tx, request_rx) = queue();
+        let (response_tx, response_rx) = queue();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let dispatcher_shutdown = shutdown.clone();
+        let dispatcher = std::thread::spawn(move || {
+            RpcDispatcher::new(
+                RpcRole::Control,
+                request_rx,
+                response_tx,
+                dispatcher_shutdown,
+            )
+            .run();
+        });
+
+        // Deliberately enqueue directly: no OCALL or other wake signal is
+        // involved, so consumption proves the bounded polling contract.
+        request_tx.send(&log_request(1, "notification-free"));
+        wait_until_drained(&request_tx);
+        shutdown.store(true, Ordering::Relaxed);
+        dispatcher.join().expect("dispatcher exits");
+
+        assert!(response_rx.try_recv().is_none(), "Log must remain one-way");
+    }
+
+    #[test]
+    fn shutdown_observes_an_empty_queue_before_dispatcher_exit() {
+        let (request_tx, request_rx) = queue();
+        let (response_tx, response_rx) = queue();
+        let shutdown = Arc::new(AtomicBool::new(true));
+
+        request_tx.send(&log_request(1, "terminal-log"));
+        RpcDispatcher::new(RpcRole::Control, request_rx, response_tx, shutdown).run();
+
+        assert_eq!(request_tx.pending_bytes(), 0);
+        assert!(response_rx.try_recv().is_none(), "Log must remain one-way");
+    }
+
+    #[test]
+    fn notification_free_log_burst_wraps_and_drains_before_shutdown() {
+        let (request_tx, request_rx) = queue();
+        let (response_tx, response_rx) = queue();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let dispatcher_shutdown = shutdown.clone();
+        let dispatcher = std::thread::spawn(move || {
+            RpcDispatcher::new(
+                RpcRole::Control,
+                request_rx,
+                response_tx,
+                dispatcher_shutdown,
+            )
+            .run();
+        });
+
+        for request_id in 1..=256 {
+            request_tx.send(&log_request(request_id, "log-burst-wrap-padding"));
+        }
+        shutdown.store(true, Ordering::Relaxed);
+        dispatcher.join().expect("dispatcher exits after draining");
+
+        assert_eq!(request_tx.pending_bytes(), 0);
+        assert!(response_rx.try_recv().is_none(), "Log must remain one-way");
     }
 
     #[test]

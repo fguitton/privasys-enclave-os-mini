@@ -607,6 +607,13 @@ impl RpcClient {
     /// the enclave exactly while persistence is in flight — when its
     /// diagnostics matter most. The host does not reply to `Log`, so nothing
     /// enters the shared response queue for a polled operation to mis-consume.
+    ///
+    /// The dispatcher continuously polls this ring with a bounded timed
+    /// backoff. `ocall_notify` is currently an ABI-compatibility call and does
+    /// not wake that separate thread, so invoking it once per line only adds
+    /// an enclave exit. Let ordinary log bursts be consumed by the live poller
+    /// without one transition per message; [`Self::drain_requests`] provides
+    /// the explicit shutdown boundary.
     pub fn log(&self, level: u8, message: &str) {
         let Some(request_id) = next_req_id() else {
             return;
@@ -614,7 +621,6 @@ impl RpcClient {
         let payload = rpc::encode_log_req(level as i32, message);
         let msg = rpc::encode_request(request_id, RpcMethod::Log, &payload);
         self.request_tx.send(&msg);
-        notify_host();
     }
 
     /// Wait, bounded, until the host has consumed everything this enclave has

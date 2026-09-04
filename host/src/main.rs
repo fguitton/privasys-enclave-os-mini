@@ -401,9 +401,6 @@ fn main() -> Result<()> {
     // Set up shared shutdown flag
     let shutdown = Arc::new(AtomicBool::new(false));
 
-    // Store notify flag for the OCALL handler
-    ocall_impl::set_notify_flag(shutdown.clone());
-
     // Spawn one named dispatcher per RPC pair.
     let shutdown_clone = shutdown.clone();
     let control_dispatcher_handle = thread::Builder::new()
