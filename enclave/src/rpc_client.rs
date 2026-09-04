@@ -12,8 +12,8 @@
 //! message-passing channel.
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 use std::string::String;
+use std::sync::Mutex;
 use std::vec::Vec;
 
 use enclave_os_common::queue::{SpscConsumer, SpscProducer};
@@ -255,10 +255,7 @@ impl RpcClient {
         Self::take_from_stash(&self.stashed_responses, request_id)
     }
 
-    fn take_from_stash(
-        stash: &Mutex<Vec<(u64, Vec<u8>)>>,
-        request_id: u64,
-    ) -> Option<Vec<u8>> {
+    fn take_from_stash(stash: &Mutex<Vec<(u64, Vec<u8>)>>, request_id: u64) -> Option<Vec<u8>> {
         let mut stash = stash.lock().ok()?;
         let position = stash.iter().position(|(id, _)| *id == request_id)?;
         Some(stash.remove(position).1)
@@ -572,13 +569,10 @@ impl RpcClient {
         pending: PendingExecutionRpc,
     ) -> Result<(), PolledExecutionRpcError> {
         let operation_id = pending.identity.operation_id;
-        let released = self
-            .in_flight_polled_request_ids
-            .iter()
-            .any(|slot| {
-                slot.compare_exchange(operation_id, 0, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-            });
+        let released = self.in_flight_polled_request_ids.iter().any(|slot| {
+            slot.compare_exchange(operation_id, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        });
         if !released {
             return Err(PolledExecutionRpcError::NotPending);
         }
@@ -894,7 +888,10 @@ mod tests {
         // The other waiter must not be able to collect it.
         assert_eq!(RpcClient::take_from_stash(&stash, 42), None);
         // And it must still be there afterwards.
-        assert_eq!(RpcClient::take_from_stash(&stash, 41), Some(alloc_frame(0xa1)));
+        assert_eq!(
+            RpcClient::take_from_stash(&stash, 41),
+            Some(alloc_frame(0xa1))
+        );
         // Taken exactly once.
         assert_eq!(RpcClient::take_from_stash(&stash, 41), None);
     }
