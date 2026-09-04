@@ -185,13 +185,19 @@ impl RpcClient {
         &self,
         batch: &PersistOpaqueStreamBatch,
     ) -> Result<PendingOpaqueStreamBatch, PolledOpaqueStreamError> {
-        let payload = rpc::encode_persist_opaque_stream_batch(batch)
-            .map_err(PolledOpaqueStreamError::InvalidRequest)?;
         let request_id = self.try_reserve_request().map_err(|error| match error {
             RequestReserveError::Busy => PolledOpaqueStreamError::Busy,
             RequestReserveError::OperationIdExhausted => {
                 PolledOpaqueStreamError::OperationIdExhausted
             }
+        })?;
+        // Reserve before encoding: a competing persistence retry can carry a
+        // multi-megabyte snapshot, and copying it only to discover the single
+        // shared RPC slot is occupied needlessly starves consensus progress.
+        // Every fallible step below must release this exact reservation.
+        let payload = rpc::encode_persist_opaque_stream_batch(batch).map_err(|error| {
+            self.release_request(request_id);
+            PolledOpaqueStreamError::InvalidRequest(error)
         })?;
         let identity = HonestRpcIdentity {
             role: RpcRole::Control,
