@@ -17,6 +17,7 @@ if(NOT DEFINED SGX_MODE)
 endif()
 set(SGX_MODE "${SGX_MODE}" CACHE STRING "Intel SGX execution mode: HW or SIM")
 set_property(CACHE SGX_MODE PROPERTY STRINGS HW SIM)
+include(cmake/HonestSgxSimHostDevProfile.cmake)
 
 # =============================================================================
 # Options
@@ -154,6 +155,14 @@ string(CONCAT SGX_SYSROOT_REPRODUCIBLE_RUSTFLAGS
 if(BUILD_ENCLAVE)
     # ExternalProject-like: configure + build the fork's sysroot target
     set(SYSROOT_STAMP "${CMAKE_BINARY_DIR}/sysroot.stamp")
+    # Make an in-place reconfiguration replace any sysroot previously built
+    # under the retired whole-runtime optimisation. `file(GENERATE)` preserves
+    # the timestamp when content is unchanged, so ordinary configure passes
+    # keep the expensive default-development sysroot hot.
+    set(SYSROOT_PROFILE_INPUT
+        "${CMAKE_BINARY_DIR}/sgx-sysroot-cargo-profile.txt")
+    file(GENERATE OUTPUT "${SYSROOT_PROFILE_INPUT}"
+        CONTENT "cargo-default-dev-v1\n")
     add_custom_command(
         OUTPUT "${SYSROOT_STAMP}"
         COMMENT "Building SGX sysroot via Teaclave fork CMake..."
@@ -166,6 +175,7 @@ if(BUILD_ENCLAVE)
         COMMAND ${CMAKE_COMMAND} -E rm -rf
             "${TEACLAVE_CHECKOUT}/rustlib/std/target/${RUST_ENCLAVE_TARGET}"
         COMMAND ${CMAKE_COMMAND} -E env
+            ${HONEST_CARGO_DEFAULT_DEV_PROFILE_ENV}
             "SGX_MODE=${SGX_MODE}"
             "RUSTUP_TOOLCHAIN=${RUST_ENCLAVE_TOOLCHAIN}"
             "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}"
@@ -182,7 +192,13 @@ if(BUILD_ENCLAVE)
             -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
             -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
             -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+        # The nested project does not know that the outer profile identity
+        # changed. The profile-input dependency runs this recipe exactly when
+        # needed; invalidate the nested stamp before asking it to rebuild.
+        COMMAND ${CMAKE_COMMAND} -E rm -f
+            "${SYSROOT_BUILD_DIR}/sgx_sysroot.stamp"
         COMMAND ${CMAKE_COMMAND} -E env
+            ${HONEST_CARGO_DEFAULT_DEV_PROFILE_ENV}
             "SGX_MODE=${SGX_MODE}"
             "RUSTUP_TOOLCHAIN=${RUST_ENCLAVE_TOOLCHAIN}"
             "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}"
@@ -194,6 +210,7 @@ if(BUILD_ENCLAVE)
             --build "${SYSROOT_BUILD_DIR}"
             --target sgx_sysroot
         COMMAND ${CMAKE_COMMAND} -E touch "${SYSROOT_STAMP}"
+        DEPENDS "${SYSROOT_PROFILE_INPUT}"
         VERBATIM
     )
     add_custom_target(sgx_sysroot DEPENDS "${SYSROOT_STAMP}")

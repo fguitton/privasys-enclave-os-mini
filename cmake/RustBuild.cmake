@@ -67,6 +67,7 @@ endif()
 function(rust_build_host CRATE_DIR OUTPUT_NAME)
     add_custom_target(${OUTPUT_NAME} ALL
         COMMAND ${CMAKE_COMMAND} -E env
+            ${HONEST_SGX_SIM_HOST_DEV_PROFILE_ENV}
             "SGX_SDK_PATH=${SGX_SDK_PATH}"
             "SGX_MODE=${SGX_MODE}"
             "RUSTUP_TOOLCHAIN=${RUST_ENCLAVE_TOOLCHAIN}"
@@ -145,8 +146,45 @@ function(rust_build_enclave CRATE_DIR OUTPUT_NAME FEATURES)
     set(_ENCLAVE_STATIC_LIB
         "${_ENCLAVE_TARGET_DIR}/${RUST_ENCLAVE_TARGET}/${CARGO_OUT_DIR}/lib${OUTPUT_NAME}.a")
 
+    # Cargo records the compiler/sysroot identity in every crate artifact, but
+    # it does not know that our externally built SGX sysroot changed. Reusing a
+    # target directory across that boundary can therefore surface stale rmeta
+    # as E0463 ("can't find crate for std"). Bind each unique Cargo target
+    # directory to SYSROOT_STAMP outside the directory being invalidated. The
+    # boundary recipe runs once after each stamped sysroot generation and then
+    # remains up to date for ordinary warm builds.
+    string(SHA256 _ENCLAVE_TARGET_DIR_ID "${_ENCLAVE_TARGET_DIR}")
+    string(SUBSTRING "${_ENCLAVE_TARGET_DIR_ID}" 0 16
+        _ENCLAVE_TARGET_DIR_ID)
+    set(_ENCLAVE_SYSROOT_BOUNDARY_DIR
+        "${CMAKE_BINARY_DIR}/enclave-sysroot-cache-boundaries")
+    set(_ENCLAVE_SYSROOT_BOUNDARY_STAMP
+        "${_ENCLAVE_SYSROOT_BOUNDARY_DIR}/${_ENCLAVE_TARGET_DIR_ID}.stamp")
+    set(_ENCLAVE_SYSROOT_BOUNDARY_TARGET
+        "enclave_sysroot_cache_boundary_${_ENCLAVE_TARGET_DIR_ID}")
+    if(NOT TARGET ${_ENCLAVE_SYSROOT_BOUNDARY_TARGET})
+        add_custom_command(
+            OUTPUT "${_ENCLAVE_SYSROOT_BOUNDARY_STAMP}"
+            COMMAND ${CMAKE_COMMAND} -E rm -rf "${_ENCLAVE_TARGET_DIR}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                "${_ENCLAVE_SYSROOT_BOUNDARY_DIR}"
+            COMMAND ${CMAKE_COMMAND} -E touch
+                "${_ENCLAVE_SYSROOT_BOUNDARY_STAMP}"
+            DEPENDS "${SYSROOT_STAMP}"
+            COMMENT "Invalidating enclave Cargo cache after SGX sysroot change"
+            VERBATIM
+        )
+        add_custom_target(${_ENCLAVE_SYSROOT_BOUNDARY_TARGET}
+            DEPENDS "${_ENCLAVE_SYSROOT_BOUNDARY_STAMP}")
+        # The file dependency above determines when this recipe must rerun;
+        # explicit target ordering also ensures a clean parallel build creates
+        # SYSROOT_STAMP before the boundary target's recursive Make invocation.
+        add_dependencies(${_ENCLAVE_SYSROOT_BOUNDARY_TARGET} sgx_sysroot)
+    endif()
+
     add_custom_target(${OUTPUT_NAME} ALL
         COMMAND ${CMAKE_COMMAND} -E env
+            ${HONEST_CARGO_DEFAULT_DEV_PROFILE_ENV}
             "SGX_SDK_PATH=${SGX_SDK_PATH}"
             "SGX_MODE=${SGX_MODE}"
             "RUSTUP_TOOLCHAIN=${RUST_ENCLAVE_TOOLCHAIN}"
@@ -167,6 +205,7 @@ function(rust_build_enclave CRATE_DIR OUTPUT_NAME FEATURES)
         COMMENT "${_BUILD_COMMENT}"
         VERBATIM
     )
+    add_dependencies(${OUTPUT_NAME} ${_ENCLAVE_SYSROOT_BOUNDARY_TARGET})
 
     set(${OUTPUT_NAME}_STATIC_LIB
         "${_ENCLAVE_STATIC_LIB}"
