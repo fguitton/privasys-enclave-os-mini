@@ -8,12 +8,19 @@
 //! separate polled interface: submission performs one `try_send`, and each
 //! poll performs at most one `try_recv`.
 //!
+//! A client is installed over a fresh request/response ring pair. Operation
+//! IDs are globally monotonic and never reused for that enclave-process
+//! lifetime; a process restart installs fresh rings before the counter begins
+//! again. Thus an old response cannot collide with a new lifetime. Within one
+//! lifetime, only an ID in the active reservation table is eligible: late or
+//! host-forged future IDs are both discarded before any semantic validation.
+//!
 //! This replaces all the individual OCALL wrappers with a single
 //! message-passing channel.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::string::String;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::vec::Vec;
 
 use enclave_os_common::queue::{SpscConsumer, SpscProducer};
@@ -60,58 +67,183 @@ pub struct RpcClient {
     request_tx: SpscProducer,
     /// Receives responses from the host.
     response_rx: SpscConsumer,
-    /// Outstanding polled operations; a zero entry is free.
+    /// Serializes every enclave writer to the request ring.
     ///
-    /// This was one slot, which made the two consensus lanes mutually
-    /// exclusive: both persist through the polled opaque-stream interface, so
-    /// whichever submitted first refused the other for its whole lifetime.
-    /// Measured at 208 deferrals in a 29 s campaign, split 106 application and
-    /// 102 control, every one of them `PolledOpaqueStreamError::Busy` with
-    /// `control_rpc=true` naming the holder.
+    /// Polled APIs use `try_lock` and report `Busy`; blocking legacy/log paths
+    /// acquire this only for one bounded `try_send` attempt and release it
+    /// before waiting or retrying.
+    request_tx_lock: Mutex<()>,
+    /// Bounded reservation and response-routing state for this queue pair.
     ///
-    /// Widening this is only sound because [`Self::stashed_responses`] makes a
-    /// frame attributable before it is consumed; without that, concurrent
-    /// pollers would take each other's replies and fail closed on them.
-    in_flight_polled_request_ids: [AtomicU64; MAX_IN_FLIGHT_POLLED],
-    /// Zero when idle, otherwise the outstanding synchronous `call`.
-    ///
-    /// Held separately from the polled reservation. Sharing one slot made a
-    /// polled persistence batch exclude every synchronous sealed write for its
-    /// whole lifetime, which serialised the two consensus lanes onto one host
-    /// slot: measured at 208 persistence deferrals in a 29 s campaign, split
-    /// 106 application and 102 control. Interleaving is only safe because
-    /// [`Self::stashed_responses`] makes responses attributable.
-    in_flight_sync_request_id: AtomicU64,
-    /// Response frames belonging to another outstanding operation, held until
-    /// that operation collects them.
-    ///
-    /// Every waiter reads one queue, so any of them can dequeue another's
-    /// reply. Previously that could not happen because only one operation was
-    /// ever outstanding; the synchronous path therefore discarded unmatched
-    /// frames and the polled paths fail-closed on them. Once several
-    /// operations are in flight, discarding would lose a persistence response,
-    /// so a frame that is not ours is parked here instead of dropped.
-    stashed_responses: Mutex<Vec<(u64, Vec<u8>)>>,
+    /// The control scheduler may pipeline one control and one application
+    /// persistence request. Synchronous calls and execution requests retain
+    /// their historical single-flight behavior. The mutex serializes the one
+    /// response consumer while keeping the underlying queue SPSC.
+    request_state: Mutex<RpcRequestState>,
+    /// Allocation identity binds consuming APIs to the client whose fresh
+    /// ring pair owns the reservation, without requiring a shared-state lock.
+    client_identity: Arc<()>,
+}
+
+/// Exactly two outstanding persistence operations: one per independent
+/// control/application stream. Distinctness is the complete durable stream
+/// identity below, not merely the current batch or operation ID. Execution
+/// keeps exclusive use of this table and therefore still remains single-flight.
+const MAX_IN_FLIGHT_PERSISTENCE_REQUESTS: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OpaqueStreamReservationKey {
+    node_id: u64,
+    node_generation: u64,
+    stream_id: [u8; 32],
+    persistence_epoch: u64,
+}
+
+impl From<&PersistOpaqueStreamBatch> for OpaqueStreamReservationKey {
+    fn from(batch: &PersistOpaqueStreamBatch) -> Self {
+        Self {
+            node_id: batch.node_id,
+            node_generation: batch.node_generation,
+            stream_id: batch.stream_id,
+            persistence_epoch: batch.persistence_epoch,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PolledRequestKind {
+    OpaqueStream(OpaqueStreamReservationKey),
+    Execution,
+}
+
+#[derive(Debug)]
+struct ActivePolledRequest {
+    request_id: u64,
+    kind: PolledRequestKind,
+    /// Shared only with the unique custody token for this request. Token Drop
+    /// publishes retirement without waiting for the response-routing mutex.
+    retired: Arc<AtomicBool>,
+}
+
+#[derive(Debug)]
+struct RpcRequestState {
+    synchronous_request_id: u64,
+    polled_requests: [Option<ActivePolledRequest>; MAX_IN_FLIGHT_PERSISTENCE_REQUESTS],
+    /// At most one response per active operation ID. Inactive and duplicate
+    /// frames are dropped, and a live entry is never evicted to make room.
+    stashed_responses: Vec<(u64, Vec<u8>)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestStateAccessError {
+    Contended,
+    NotPending,
+}
+
+#[derive(Debug)]
+struct PendingPolledReservation {
+    retired: Arc<AtomicBool>,
+    client_identity: Arc<()>,
+}
+
+impl PendingPolledReservation {
+    /// Retire this token exactly once without acquiring the routing mutex.
+    fn retire(&self) -> bool {
+        !self.retired.swap(true, Ordering::AcqRel)
+    }
+}
+
+impl Drop for PendingPolledReservation {
+    fn drop(&mut self) {
+        // Token destruction can run on either enclave TCS and must never wait
+        // behind the response-routing mutex. The next state owner observes
+        // this Release store with Acquire and prunes the exact slot and stash.
+        self.retired.store(true, Ordering::Release);
+    }
+}
+
+impl RpcRequestState {
+    fn new() -> Self {
+        Self {
+            synchronous_request_id: 0,
+            polled_requests: [const { None }; MAX_IN_FLIGHT_PERSISTENCE_REQUESTS],
+            stashed_responses: Vec::new(),
+        }
+    }
+
+    fn polled_request_is_active(&self, request_id: u64) -> bool {
+        self.polled_requests
+            .iter()
+            .flatten()
+            .any(|active| active.request_id == request_id)
+    }
+
+    /// Apply token retirement before making any admission or routing
+    /// decision. Work is bounded by the two-slot table. Removing the exact
+    /// stash entry prevents an abandoned reply from occupying live capacity.
+    fn prune_retired(&mut self) {
+        let mut retired_ids = [0_u64; MAX_IN_FLIGHT_PERSISTENCE_REQUESTS];
+        let mut retired_count = 0;
+        for slot in &mut self.polled_requests {
+            let Some(active) = slot.as_ref() else {
+                continue;
+            };
+            if active.retired.load(Ordering::Acquire) {
+                retired_ids[retired_count] = active.request_id;
+                retired_count += 1;
+                *slot = None;
+            }
+        }
+        if retired_count != 0 {
+            self.stashed_responses
+                .retain(|(stashed_id, _)| !retired_ids[..retired_count].contains(stashed_id));
+        }
+    }
+
+    fn release_polled_request(&mut self, request_id: u64) -> bool {
+        let Some(slot) = self.polled_requests.iter_mut().find(|slot| {
+            slot.as_ref()
+                .is_some_and(|active| active.request_id == request_id)
+        }) else {
+            return false;
+        };
+        let active = slot.take().expect("matching polled request disappeared");
+        // Exact completion and explicit retirement share the same marker, so
+        // later token destruction is idempotent and `abandon` can preserve
+        // NotPending without reacquiring this mutex.
+        active.retired.store(true, Ordering::Release);
+        self.stashed_responses
+            .retain(|(stashed_id, _)| *stashed_id != request_id);
+        true
+    }
 }
 
 /// Token owned by the control scheduler while one opaque batch is in flight.
 ///
 /// It deliberately exposes no request ID: callers can only return it to the
-/// same [`RpcClient`] for a bounded poll.
+/// same [`RpcClient`] for a bounded poll. Dropping it abandons and retires its
+/// exact reservation without blocking; the next routing turn reclaims its
+/// slot, and a later response is discarded under its inactive ID.
 #[derive(Debug)]
+#[must_use = "a submitted persistence operation must be polled or deliberately abandoned"]
 pub struct PendingOpaqueStreamBatch {
     identity: HonestRpcIdentity,
     batch_id: u64,
     payload_digest: [u8; 32],
+    _reservation: PendingPolledReservation,
 }
 
 /// Token owned by the execution worker while one host operation is in flight.
 ///
 /// Its complete framed identity is private; only the submitting client may
-/// poll it.
+/// poll it. Dropping it abandons and retires its exact reservation; a later
+/// routing turn reclaims the slot, and a later response is discarded under
+/// its inactive ID.
 #[derive(Debug)]
+#[must_use = "a submitted execution operation must be completed or deliberately abandoned"]
 pub struct PendingExecutionRpc {
     identity: HonestRpcIdentity,
+    _reservation: PendingPolledReservation,
 }
 
 /// One bounded execution response returned by a single non-blocking poll.
@@ -165,17 +297,21 @@ enum RequestReserveError {
     OperationIdExhausted,
 }
 
-// SAFETY: RpcClient uses SPSC queues backed by shared memory pointers.
-// In the SGX enclave, it is accessed from a single thread only.
-// The raw pointers inside SpscProducer/SpscConsumer point to host memory
-// that remains valid for the enclave's lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestSendError {
+    Contended,
+    QueueFull,
+}
+
+// SAFETY: RpcClient uses SPSC queues backed by shared-memory pointers that
+// remain valid for the enclave's lifetime. All logical producers serialize
+// each bounded write with `request_tx_lock`. All polled consumers serialize
+// each bounded read with `request_state`; synchronous consumption
+// is admitted only while no polled operation is active. The host remains the
+// single consumer of the request ring and single producer of the response
+// ring, so the physical queues retain their SPSC contract.
 unsafe impl Send for RpcClient {}
 unsafe impl Sync for RpcClient {}
-
-/// Polled operations that may be outstanding at once. Two consensus lanes
-/// persist concurrently; the spare capacity covers the execution interface
-/// without letting unbounded work accumulate.
-const MAX_IN_FLIGHT_POLLED: usize = 4;
 
 const DRAIN_SPINS: u32 = 100_000;
 
@@ -184,125 +320,257 @@ impl RpcClient {
     ///
     /// - `request_tx`: producer for `enc_to_host` (enclave writes, host reads)
     /// - `response_rx`: consumer for `host_to_enc` (host writes, enclave reads)
+    ///
+    /// Both endpoints must belong to one freshly initialized, empty ring pair.
+    /// In particular, a process restart must not reuse a response ring holding
+    /// frames from the previous operation-ID lifetime.
     pub fn new(request_tx: SpscProducer, response_rx: SpscConsumer) -> Self {
         Self {
             request_tx,
             response_rx,
-            in_flight_polled_request_ids: [const { AtomicU64::new(0) }; MAX_IN_FLIGHT_POLLED],
-            in_flight_sync_request_id: AtomicU64::new(0),
-            stashed_responses: Mutex::new(Vec::new()),
+            request_tx_lock: Mutex::new(()),
+            request_state: Mutex::new(RpcRequestState::new()),
+            client_identity: Arc::new(()),
         }
     }
 
-    /// Reserve one polled operation. `Busy` once every slot is taken, which
-    /// bounds outstanding work exactly as the single slot did — just at more
-    /// than one.
-    fn try_reserve_request(&self) -> Result<u64, RequestReserveError> {
-        let request_id = next_req_id().ok_or(RequestReserveError::OperationIdExhausted)?;
-        for slot in &self.in_flight_polled_request_ids {
-            if slot
-                .compare_exchange(0, request_id, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return Ok(request_id);
+    fn request_state(&self) -> MutexGuard<'_, RpcRequestState> {
+        let mut state = self
+            .request_state
+            .lock()
+            .expect("RPC request state mutex poisoned");
+        state.prune_retired();
+        state
+    }
+
+    fn try_request_state(
+        &self,
+    ) -> Result<MutexGuard<'_, RpcRequestState>, RequestStateAccessError> {
+        let mut state = match self.request_state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return Err(RequestStateAccessError::Contended),
+            Err(TryLockError::Poisoned(_)) => std::panic!("RPC request state mutex poisoned"),
+        };
+        state.prune_retired();
+        Ok(state)
+    }
+
+    fn try_reserve_polled_request(
+        &self,
+        kind: PolledRequestKind,
+    ) -> Result<(u64, PendingPolledReservation), RequestReserveError> {
+        let mut state = self
+            .try_request_state()
+            .map_err(|_| RequestReserveError::Busy)?;
+        if state.synchronous_request_id != 0 {
+            return Err(RequestReserveError::Busy);
+        }
+        match kind {
+            PolledRequestKind::OpaqueStream(key) => {
+                if state.polled_requests.iter().flatten().any(|active| {
+                    matches!(active.kind, PolledRequestKind::Execution)
+                        || active.kind == PolledRequestKind::OpaqueStream(key)
+                }) {
+                    return Err(RequestReserveError::Busy);
+                }
+            }
+            PolledRequestKind::Execution => {
+                if state.polled_requests.iter().any(Option::is_some) {
+                    return Err(RequestReserveError::Busy);
+                }
             }
         }
-        Err(RequestReserveError::Busy)
-    }
-
-    fn release_request(&self, request_id: u64) {
-        for slot in &self.in_flight_polled_request_ids {
-            Self::release_slot(slot, request_id);
-        }
-    }
-
-    /// Whether `request_id` is still an outstanding polled operation.
-    fn polled_request_is_in_flight(&self, request_id: u64) -> bool {
-        self.in_flight_polled_request_ids
-            .iter()
-            .any(|slot| slot.load(Ordering::Acquire) == request_id)
-    }
-
-    fn try_reserve_slot(slot: &AtomicU64) -> Result<u64, RequestReserveError> {
-        let request_id = next_req_id().ok_or(RequestReserveError::OperationIdExhausted)?;
-        slot.compare_exchange(0, request_id, Ordering::AcqRel, Ordering::Acquire)
-            .map(|_| request_id)
-            .map_err(|_| RequestReserveError::Busy)
-    }
-
-    /// Whether the single synchronous request slot is currently free.
-    ///
-    /// Observation only, and deliberately racy: a caller may still lose the
-    /// slot between this read and its reservation, and the ordinary `EBUSY`
-    /// path remains the authority. Its purpose is to let a caller skip
-    /// expensive request preparation — whole-state encoding and sealing — when
-    /// the slot is already known to be held, instead of preparing a payload it
-    /// will immediately discard and rebuild on the next pass.
-    pub fn synchronous_slot_is_available(&self) -> bool {
-        self.in_flight_sync_request_id.load(Ordering::Acquire) == 0
-    }
-
-    fn release_slot(slot: &AtomicU64, request_id: u64) {
-        let _ = slot.compare_exchange(request_id, 0, Ordering::AcqRel, Ordering::Acquire);
-    }
-
-    /// The request id a response frame answers, whichever framing it uses.
-    ///
-    /// Two waiters now read one queue, so a frame must be attributable before
-    /// it is consumed. `has_honest_rpc_magic` is the discriminator; a frame
-    /// that decodes as neither framing is unattributable and is dropped by the
-    /// caller exactly as before.
-    fn frame_request_id(raw: &[u8]) -> Option<u64> {
-        if rpc::has_honest_rpc_magic(raw) {
-            rpc::decode_honest_response(raw)
-                .ok()
-                .map(|response| response.identity.operation_id)
-        } else {
-            rpc::decode_response(raw).map(|(request_id, _, _)| request_id)
-        }
-    }
-
-    /// Take the stashed frame that answers `request_id`, if one is parked.
-    fn take_stashed_response(&self, request_id: u64) -> Option<Vec<u8>> {
-        Self::take_from_stash(&self.stashed_responses, request_id)
-    }
-
-    fn take_from_stash(stash: &Mutex<Vec<(u64, Vec<u8>)>>, request_id: u64) -> Option<Vec<u8>> {
-        let mut stash = stash.lock().ok()?;
-        let position = stash.iter().position(|(id, _)| *id == request_id)?;
-        Some(stash.remove(position).1)
-    }
-
-    /// Hold a frame that belongs to the other waiter.
-    ///
-    /// At most two operations are outstanding — one polled, one synchronous —
-    /// so one slot is sufficient. An occupied stash means a frame arrived for
-    /// an operation that never collected it; dropping the older one keeps this
-    /// bounded, and the abandoned operation fails closed on its own identity
-    /// check rather than consuming someone else's reply.
-    fn stash_response(&self, request_id: u64, frame: Vec<u8>) {
-        Self::put_in_stash(&self.stashed_responses, request_id, frame);
-    }
-
-    fn put_in_stash(stash: &Mutex<Vec<(u64, Vec<u8>)>>, request_id: u64, frame: Vec<u8>) {
-        let Ok(mut stash) = stash.lock() else {
-            return;
+        let Some(slot) = state.polled_requests.iter_mut().find(|slot| slot.is_none()) else {
+            return Err(RequestReserveError::Busy);
         };
-        // One entry per operation: a second frame for an id already parked
-        // means the host answered twice, and the newer answer is the one the
-        // identity check should judge.
-        if let Some(existing) = stash.iter_mut().find(|(id, _)| *id == request_id) {
-            existing.1 = frame;
-            return;
+        let request_id = next_req_id().ok_or(RequestReserveError::OperationIdExhausted)?;
+        let retired = Arc::new(AtomicBool::new(false));
+        let reservation = PendingPolledReservation {
+            retired: Arc::clone(&retired),
+            client_identity: Arc::clone(&self.client_identity),
+        };
+        *slot = Some(ActivePolledRequest {
+            request_id,
+            kind,
+            retired,
+        });
+        Ok((request_id, reservation))
+    }
+
+    fn try_reserve_synchronous_request(&self) -> Result<u64, RequestReserveError> {
+        let mut state = self.request_state();
+        if state.synchronous_request_id != 0 || state.polled_requests.iter().any(Option::is_some) {
+            return Err(RequestReserveError::Busy);
         }
-        // Bounded by the number of operations that can be outstanding. If a
-        // frame arrives for an operation that has already gone away, drop the
-        // oldest rather than growing without limit; that operation fails
-        // closed on its own identity check instead of consuming another's.
-        if stash.len() >= MAX_IN_FLIGHT_POLLED + 1 {
-            stash.remove(0);
+        let request_id = next_req_id().ok_or(RequestReserveError::OperationIdExhausted)?;
+        state.synchronous_request_id = request_id;
+        Ok(request_id)
+    }
+
+    /// Conservatively report whether a synchronous request could be admitted
+    /// at this instant.
+    ///
+    /// This is only a preparation hint for callers whose request payload is
+    /// expensive to construct. It neither reserves a request ID nor touches
+    /// either queue, and the later synchronous reservation remains the
+    /// authoritative admission decision. Published token retirement may be
+    /// observed without pruning its slot; the real reservation turn performs
+    /// that bounded mutation before it can admit a synchronous operation.
+    #[must_use]
+    pub fn synchronous_request_may_be_available(&self) -> bool {
+        let state = match self.request_state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return false,
+            Err(TryLockError::Poisoned(_)) => std::panic!("RPC request state mutex poisoned"),
+        };
+        if state.synchronous_request_id != 0
+            || state
+                .polled_requests
+                .iter()
+                .flatten()
+                .any(|active| !active.retired.load(Ordering::Acquire))
+        {
+            return false;
         }
-        stash.push((request_id, frame));
+        drop(state);
+
+        // The producer can become occupied after this guard is released. The
+        // actual request reservation and send handle that race; this check
+        // merely avoids expensive preparation when contention is already
+        // visible.
+        match self.request_tx_lock.try_lock() {
+            Ok(producer) => {
+                drop(producer);
+                true
+            }
+            Err(TryLockError::WouldBlock) => false,
+            Err(TryLockError::Poisoned(_)) => std::panic!("RPC request producer mutex poisoned"),
+        }
+    }
+
+    fn release_synchronous_request(&self, request_id: u64) {
+        let mut state = self.request_state();
+        if state.synchronous_request_id == request_id {
+            state.synchronous_request_id = 0;
+        }
+    }
+
+    fn honest_response_request_id(raw: &[u8]) -> Option<u64> {
+        rpc::decode_honest_response(raw)
+            .ok()
+            .map(|response| response.identity.operation_id)
+    }
+
+    /// Return at most one response for this operation.
+    ///
+    /// A response for another active operation is parked without evicting an
+    /// earlier live response. A late response for an operation already
+    /// completed or abandoned is discarded. The complete response identity
+    /// and persistence acknowledgement remain validated by the caller.
+    fn poll_polled_response(
+        &self,
+        request_id: u64,
+    ) -> Result<Option<Vec<u8>>, RequestStateAccessError> {
+        let mut state = self.try_request_state()?;
+        if !state.polled_request_is_active(request_id) {
+            return Err(RequestStateAccessError::NotPending);
+        }
+        if let Some(position) = state
+            .stashed_responses
+            .iter()
+            .position(|(stashed_id, _)| *stashed_id == request_id)
+        {
+            let response = state.stashed_responses.remove(position).1;
+            let released = state.release_polled_request(request_id);
+            debug_assert!(released);
+            return Ok(Some(response));
+        }
+        let Some(response) = self.response_rx.try_recv() else {
+            return Ok(None);
+        };
+        match Self::honest_response_request_id(&response) {
+            Some(response_id) if response_id == request_id => {
+                let released = state.release_polled_request(request_id);
+                debug_assert!(released);
+                Ok(Some(response))
+            }
+            Some(response_id) if state.polled_request_is_active(response_id) => {
+                // Keep the first response for an active operation. A duplicate
+                // cannot acknowledge twice and must not displace another live
+                // operation's response.
+                if !state
+                    .stashed_responses
+                    .iter()
+                    .any(|(stashed_id, _)| *stashed_id == response_id)
+                {
+                    assert!(
+                        state.stashed_responses.len() < MAX_IN_FLIGHT_PERSISTENCE_REQUESTS,
+                        "active RPC response stash exceeded its reservation bound"
+                    );
+                    state.stashed_responses.push((response_id, response));
+                }
+                Ok(None)
+            }
+            Some(_) => {
+                // Globally monotonic operation IDs are never reused. A reply
+                // for an inactive ID is either late or forged for a future
+                // ID; either way it carries no authority for current work and
+                // is discarded before any future reservation can exist.
+                Ok(None)
+            }
+            None => {
+                // Preserve the historical fail-closed rule for an
+                // unattributable frame: terminate the operation whose poll
+                // consumed it and let its exact decoder report the error.
+                let released = state.release_polled_request(request_id);
+                debug_assert!(released);
+                Ok(Some(response))
+            }
+        }
+    }
+
+    /// Attempt one atomic request-ring write without waiting for either the
+    /// logical producer or ring capacity.
+    fn try_send_request(&self, message: &[u8]) -> Result<(), RequestSendError> {
+        let _producer = match self.request_tx_lock.try_lock() {
+            Ok(producer) => producer,
+            Err(TryLockError::WouldBlock) => return Err(RequestSendError::Contended),
+            Err(TryLockError::Poisoned(_)) => std::panic!("RPC request producer mutex poisoned"),
+        };
+        self.request_tx
+            .try_send(message)
+            .map_err(|()| RequestSendError::QueueFull)
+    }
+
+    /// Send one legacy or one-way request while releasing the producer mutex
+    /// between bounded attempts. Encoding and response waiting happen outside
+    /// this critical section.
+    fn send_request(&self, message: &[u8]) {
+        loop {
+            match self.try_send_request(message) {
+                Ok(()) => return,
+                Err(RequestSendError::Contended | RequestSendError::QueueFull) => {
+                    core::hint::spin_loop();
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_request_producer_for_test(&self) -> impl Drop + '_ {
+        self.request_tx_lock
+            .lock()
+            .expect("RPC request producer mutex poisoned")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_request_state_for_test(&self) -> impl Drop + '_ {
+        self.request_state()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stashed_response_count_for_test(&self) -> usize {
+        self.request_state().stashed_responses.len()
     }
 
     // ====================================================================
@@ -315,20 +583,23 @@ impl RpcClient {
         &self,
         batch: &PersistOpaqueStreamBatch,
     ) -> Result<PendingOpaqueStreamBatch, PolledOpaqueStreamError> {
-        let request_id = self.try_reserve_request().map_err(|error| match error {
-            RequestReserveError::Busy => PolledOpaqueStreamError::Busy,
-            RequestReserveError::OperationIdExhausted => {
-                PolledOpaqueStreamError::OperationIdExhausted
-            }
-        })?;
+        let (request_id, reservation) = self
+            .try_reserve_polled_request(PolledRequestKind::OpaqueStream(
+                OpaqueStreamReservationKey::from(batch),
+            ))
+            .map_err(|error| match error {
+                RequestReserveError::Busy => PolledOpaqueStreamError::Busy,
+                RequestReserveError::OperationIdExhausted => {
+                    PolledOpaqueStreamError::OperationIdExhausted
+                }
+            })?;
         // Reserve before encoding: a competing persistence retry can carry a
-        // multi-megabyte snapshot, and copying it only to discover the single
-        // shared RPC slot is occupied needlessly starves consensus progress.
-        // Every fallible step below must release this exact reservation.
-        let payload = rpc::encode_persist_opaque_stream_batch(batch).map_err(|error| {
-            self.release_request(request_id);
-            PolledOpaqueStreamError::InvalidRequest(error)
-        })?;
+        // multi-megabyte snapshot, and copying it only to discover that both
+        // bounded slots are occupied needlessly starves consensus progress.
+        // The local guard releases this exact reservation on every failure or
+        // unwind before custody transfers into the returned token.
+        let payload = rpc::encode_persist_opaque_stream_batch(batch)
+            .map_err(PolledOpaqueStreamError::InvalidRequest)?;
         let identity = HonestRpcIdentity {
             role: RpcRole::Control,
             node_id: batch.node_id,
@@ -337,54 +608,43 @@ impl RpcClient {
             method: RpcMethod::PersistOpaqueStreamBatch,
         };
         let message = rpc::encode_honest_request(identity, &payload).map_err(|_| {
-            self.release_request(request_id);
             PolledOpaqueStreamError::InvalidRequest(OpaqueStreamCodecError::BatchBound)
         })?;
-        if self.request_tx.try_send(&message).is_err() {
-            self.release_request(request_id);
-            return Err(PolledOpaqueStreamError::QueueFull);
-        }
+        self.try_send_request(&message)
+            .map_err(|error| match error {
+                RequestSendError::Contended => PolledOpaqueStreamError::Busy,
+                RequestSendError::QueueFull => PolledOpaqueStreamError::QueueFull,
+            })?;
         notify_host();
         Ok(PendingOpaqueStreamBatch {
             identity,
             batch_id: batch.batch_id,
             payload_digest: batch.payload_digest,
+            _reservation: reservation,
         })
     }
 
     /// Poll one submitted opaque stream batch.
     ///
-    /// `Ok(None)` means the host has not replied. Every call consumes at most
-    /// one response frame and never waits. A malformed, stale, mismatched or
-    /// negative response terminates the operation fail-closed.
+    /// `Ok(None)` means no exact reply was available. Every call consumes at
+    /// most one response frame and never waits. A reply for another live
+    /// operation is parked, and an inactive late reply is discarded. An
+    /// unattributable malformed frame is charged only to this polling
+    /// operation; an attributable exact mismatch or negative response also
+    /// terminates this operation fail-closed.
     pub fn poll_persist_opaque_stream_batch(
         &self,
         pending: &PendingOpaqueStreamBatch,
     ) -> Result<Option<PersistedOpaqueStreamBatch>, PolledOpaqueStreamError> {
-        if !self.polled_request_is_in_flight(pending.identity.operation_id) {
-            return Err(PolledOpaqueStreamError::NotPending);
-        }
-        // A synchronous call sharing this queue may have parked our reply.
-        let raw_response = match self.take_stashed_response(pending.identity.operation_id) {
-            Some(stashed) => stashed,
-            None => {
-                let Some(raw_response) = self.response_rx.try_recv() else {
-                    return Ok(None);
-                };
-                // Not ours: park it for the synchronous caller and report no
-                // progress. Consuming it here would both lose that reply and
-                // fail this operation closed on an identity that was never
-                // meant for it.
-                match Self::frame_request_id(&raw_response) {
-                    Some(other_id) if other_id != pending.identity.operation_id => {
-                        self.stash_response(other_id, raw_response);
-                        return Ok(None);
-                    }
-                    _ => raw_response,
-                }
-            }
+        let Some(raw_response) = self
+            .poll_polled_response(pending.identity.operation_id)
+            .map_err(|error| match error {
+                RequestStateAccessError::Contended => PolledOpaqueStreamError::Busy,
+                RequestStateAccessError::NotPending => PolledOpaqueStreamError::NotPending,
+            })?
+        else {
+            return Ok(None);
         };
-        self.release_request(pending.identity.operation_id);
 
         let response =
             rpc::decode_honest_response_for(&raw_response, pending.identity).map_err(|error| {
@@ -445,12 +705,14 @@ impl RpcClient {
         if !rpc::honest_role_allows_method(RpcRole::Execution, method) {
             return Err(PolledExecutionRpcError::MethodDenied);
         }
-        let operation_id = self.try_reserve_request().map_err(|error| match error {
-            RequestReserveError::Busy => PolledExecutionRpcError::Busy,
-            RequestReserveError::OperationIdExhausted => {
-                PolledExecutionRpcError::OperationIdExhausted
-            }
-        })?;
+        let (operation_id, reservation) = self
+            .try_reserve_polled_request(PolledRequestKind::Execution)
+            .map_err(|error| match error {
+                RequestReserveError::Busy => PolledExecutionRpcError::Busy,
+                RequestReserveError::OperationIdExhausted => {
+                    PolledExecutionRpcError::OperationIdExhausted
+                }
+            })?;
         let identity = HonestRpcIdentity {
             role: RpcRole::Execution,
             node_id,
@@ -458,16 +720,18 @@ impl RpcClient {
             operation_id,
             method,
         };
-        let message = rpc::encode_honest_request(identity, payload).map_err(|_| {
-            self.release_request(operation_id);
-            PolledExecutionRpcError::InvalidRequest
-        })?;
-        if self.request_tx.try_send(&message).is_err() {
-            self.release_request(operation_id);
-            return Err(PolledExecutionRpcError::QueueFull);
-        }
+        let message = rpc::encode_honest_request(identity, payload)
+            .map_err(|_| PolledExecutionRpcError::InvalidRequest)?;
+        self.try_send_request(&message)
+            .map_err(|error| match error {
+                RequestSendError::Contended => PolledExecutionRpcError::Busy,
+                RequestSendError::QueueFull => PolledExecutionRpcError::QueueFull,
+            })?;
         notify_host();
-        Ok(PendingExecutionRpc { identity })
+        Ok(PendingExecutionRpc {
+            identity,
+            _reservation: reservation,
+        })
     }
 
     /// Try to submit one execution-owned non-blocking connect.
@@ -541,26 +805,15 @@ impl RpcClient {
         &self,
         pending: &PendingExecutionRpc,
     ) -> Result<Option<ExecutionRpcCompletion>, PolledExecutionRpcError> {
-        if !self.polled_request_is_in_flight(pending.identity.operation_id) {
-            return Err(PolledExecutionRpcError::NotPending);
-        }
-        // Same attribution rule as the opaque-stream poll above.
-        let raw_response = match self.take_stashed_response(pending.identity.operation_id) {
-            Some(stashed) => stashed,
-            None => {
-                let Some(raw_response) = self.response_rx.try_recv() else {
-                    return Ok(None);
-                };
-                match Self::frame_request_id(&raw_response) {
-                    Some(other_id) if other_id != pending.identity.operation_id => {
-                        self.stash_response(other_id, raw_response);
-                        return Ok(None);
-                    }
-                    _ => raw_response,
-                }
-            }
+        let Some(raw_response) = self
+            .poll_polled_response(pending.identity.operation_id)
+            .map_err(|error| match error {
+                RequestStateAccessError::Contended => PolledExecutionRpcError::Busy,
+                RequestStateAccessError::NotPending => PolledExecutionRpcError::NotPending,
+            })?
+        else {
+            return Ok(None);
         };
-        self.release_request(pending.identity.operation_id);
         let response =
             rpc::decode_honest_response_for(&raw_response, pending.identity).map_err(|error| {
                 match error {
@@ -579,25 +832,26 @@ impl RpcClient {
     /// Abandon one exact execution operation after its committed fence or
     /// local budget expires.
     ///
-    /// A late response remains framed with the abandoned identity. A future
-    /// operation can consume it only as an explicit `UnexpectedResponse`;
-    /// it can never be accepted for the new operation.
+    /// A late response remains framed with the abandoned identity and is
+    /// discarded as inactive; it can never be accepted for a new operation.
+    /// Returns `NotPending` after exact completion or when invoked through a
+    /// different client/ring pair. Consuming the token still retires its
+    /// origin reservation in the latter case.
     pub fn abandon_execution_rpc(
         &self,
         pending: PendingExecutionRpc,
     ) -> Result<(), PolledExecutionRpcError> {
-        let operation_id = pending.identity.operation_id;
-        let released = self.in_flight_polled_request_ids.iter().any(|slot| {
-            slot.compare_exchange(operation_id, 0, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        });
-        if !released {
+        if !Arc::ptr_eq(&self.client_identity, &pending._reservation.client_identity) {
+            // Consuming the token still retires its origin reservation via
+            // Drop, but a different queue pair cannot report that operation
+            // as one of its own active requests.
             return Err(PolledExecutionRpcError::NotPending);
         }
-        // Drop any reply already parked for the abandoned operation, so it
-        // cannot be handed to a later operation that reuses this slot.
-        let _ = self.take_stashed_response(operation_id);
-        Ok(())
+        pending
+            ._reservation
+            .retire()
+            .then_some(())
+            .ok_or(PolledExecutionRpcError::NotPending)
     }
 
     // ====================================================================
@@ -608,50 +862,34 @@ impl RpcClient {
     ///
     /// Returns `(status, payload)` from the host's response.
     fn call(&self, method: RpcMethod, payload: &[u8]) -> (i32, Vec<u8>) {
-        // Reserves the synchronous slot only. A polled operation no longer
-        // excludes this path; see `in_flight_sync_request_id`.
-        let req_id = match Self::try_reserve_slot(&self.in_flight_sync_request_id) {
+        let req_id = match self.try_reserve_synchronous_request() {
             Ok(request_id) => request_id,
-            // Another synchronous call is already outstanding. Return EBUSY
-            // instead of blocking the control TCS.
+            // Legacy callers cannot safely interleave with a polled opaque
+            // operation. Return EBUSY instead of blocking the control TCS.
             Err(RequestReserveError::Busy) => return (-16, Vec::new()),
             Err(RequestReserveError::OperationIdExhausted) => return (-75, Vec::new()),
         };
         let msg = rpc::encode_request(req_id, method, payload);
 
         // Send
-        self.request_tx.send(&msg);
+        self.send_request(&msg);
 
         // Wake the host dispatcher
         notify_host();
-
-        // A polled operation may have already parked this reply.
-        if let Some(stashed) = self.take_stashed_response(req_id) {
-            Self::release_slot(&self.in_flight_sync_request_id, req_id);
-            if let Some((_, status, resp_payload)) = rpc::decode_response(&stashed) {
-                return (status, resp_payload.to_vec());
-            }
-            return (-71, Vec::new());
-        }
 
         // Wait for response
         loop {
             let resp_raw = self.response_rx.recv();
             if let Some((resp_id, status, resp_payload)) = rpc::decode_response(&resp_raw) {
                 if resp_id == req_id {
-                    Self::release_slot(&self.in_flight_sync_request_id, req_id);
+                    self.release_synchronous_request(req_id);
                     return (status, resp_payload.to_vec());
                 }
+                // Mismatched ID cannot belong to another response-producing
+                // request: synchronous admission is exclusive. Ignore it as
+                // malformed or late legacy traffic and continue fail-closed.
             }
-            // Not ours. It belongs to the polled operation now running
-            // alongside this call, so park it rather than dropping it — the
-            // poll would otherwise wait forever for a reply already consumed.
-            // A frame that decodes as neither framing is unattributable and is
-            // discarded, exactly as before.
-            match Self::frame_request_id(&resp_raw) {
-                Some(other_id) => self.stash_response(other_id, resp_raw),
-                None => continue,
-            }
+            // Malformed response – try again
         }
     }
 
@@ -806,7 +1044,7 @@ impl RpcClient {
         };
         let payload = rpc::encode_log_req(level as i32, message);
         let msg = rpc::encode_request(request_id, RpcMethod::Log, &payload);
-        self.request_tx.send(&msg);
+        self.send_request(&msg);
     }
 
     /// Wait, bounded, until the host has consumed everything this enclave has
@@ -858,88 +1096,5 @@ impl RpcClient {
         } else {
             Err(status)
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use enclave_os_common::rpc::encode_honest_response;
-
-    fn identity(operation_id: u64) -> HonestRpcIdentity {
-        HonestRpcIdentity {
-            role: RpcRole::Control,
-            node_id: 7,
-            node_generation: 1,
-            operation_id,
-            method: RpcMethod::PersistOpaqueStreamBatch,
-        }
-    }
-
-    #[test]
-    fn a_frame_is_attributed_to_its_operation_in_either_framing() {
-        // Attribution is what makes two outstanding operations safe: a frame
-        // must be assignable to one of them before it is consumed.
-        let polled = encode_honest_response(identity(41), 0, &[]).expect("honest response");
-        assert_eq!(RpcClient::frame_request_id(&polled), Some(41));
-
-        let synchronous = rpc::encode_response(42, 0, &[]);
-        assert_eq!(RpcClient::frame_request_id(&synchronous), Some(42));
-
-        // The two framings must not be confused for one another.
-        assert!(rpc::has_honest_rpc_magic(&polled));
-        assert!(!rpc::has_honest_rpc_magic(&synchronous));
-
-        // An unattributable frame stays unattributable rather than being
-        // charged to whichever waiter happens to look at it.
-        assert_eq!(RpcClient::frame_request_id(&[]), None);
-        assert_eq!(RpcClient::frame_request_id(&[0xff; 3]), None);
-    }
-
-    #[test]
-    fn a_stashed_frame_is_returned_only_to_the_operation_it_answers() {
-        let stash: Mutex<Vec<(u64, Vec<u8>)>> = Mutex::new(Vec::new());
-
-        assert_eq!(RpcClient::take_from_stash(&stash, 41), None);
-
-        RpcClient::put_in_stash(&stash, 41, alloc_frame(0xa1));
-        // The other waiter must not be able to collect it.
-        assert_eq!(RpcClient::take_from_stash(&stash, 42), None);
-        // And it must still be there afterwards.
-        assert_eq!(
-            RpcClient::take_from_stash(&stash, 41),
-            Some(alloc_frame(0xa1))
-        );
-        // Taken exactly once.
-        assert_eq!(RpcClient::take_from_stash(&stash, 41), None);
-    }
-
-    #[test]
-    fn either_completion_order_delivers_both_replies() {
-        // The regression this guards: with one slot the synchronous path
-        // discarded frames that were not its own, so a persistence reply
-        // dequeued by a synchronous caller was lost and its poll waited
-        // forever. Both interleavings must now deliver both replies.
-        for (first, second) in [(41_u64, 42_u64), (42, 41)] {
-            let stash: Mutex<Vec<(u64, Vec<u8>)>> = Mutex::new(Vec::new());
-
-            // The waiter for `second` dequeues `first`'s reply and parks it.
-            RpcClient::put_in_stash(&stash, first, alloc_frame(0xb2));
-            // `second`'s own reply is still on the queue, so it makes no
-            // progress from the stash.
-            assert_eq!(RpcClient::take_from_stash(&stash, second), None);
-            // `first` collects what was parked for it.
-            assert_eq!(
-                RpcClient::take_from_stash(&stash, first),
-                Some(alloc_frame(0xb2)),
-                "the parked reply must reach the operation it answers",
-            );
-        }
-    }
-
-    fn alloc_frame(marker: u8) -> Vec<u8> {
-        let mut frame = Vec::new();
-        frame.push(marker);
-        frame
     }
 }
