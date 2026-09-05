@@ -197,6 +197,35 @@ pub struct PersistOpaqueStreamBatch {
     pub payload: Vec<u8>,
 }
 
+/// A decoded opaque persistence request bound to its exact canonical wire
+/// bytes.
+///
+/// The fields are private so callers cannot pair a validated request with
+/// unrelated bytes. Instances are produced only by
+/// [`decode_persist_opaque_stream_batch`].
+#[derive(Debug)]
+pub struct ValidatedPersistOpaqueStreamBatch<'a> {
+    request: PersistOpaqueStreamBatch,
+    canonical: &'a [u8],
+}
+
+impl<'a> ValidatedPersistOpaqueStreamBatch<'a> {
+    /// Return the fully decoded and validated request.
+    pub fn request(&self) -> &PersistOpaqueStreamBatch {
+        &self.request
+    }
+
+    /// Return the exact canonical bytes from which the request was decoded.
+    pub fn canonical_bytes(&self) -> &'a [u8] {
+        self.canonical
+    }
+
+    /// Consume the provenance wrapper and return the validated request.
+    pub fn into_request(self) -> PersistOpaqueStreamBatch {
+        self.request
+    }
+}
+
 /// Successful opaque persistence response. The durable ID equals the accepted
 /// batch ID, forming an explicit predecessor chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,7 +323,7 @@ pub fn encode_persist_opaque_stream_batch(
 /// Decode and validate one exact bounded opaque persistence request.
 pub fn decode_persist_opaque_stream_batch(
     encoded: &[u8],
-) -> Result<PersistOpaqueStreamBatch, OpaqueStreamCodecError> {
+) -> Result<ValidatedPersistOpaqueStreamBatch<'_>, OpaqueStreamCodecError> {
     if encoded.len() < PERSIST_OPAQUE_STREAM_HEADER_SIZE
         || encoded.len() > MAX_OPAQUE_STREAM_BATCH_BYTES
     {
@@ -354,7 +383,10 @@ pub fn decode_persist_opaque_stream_batch(
         payload: encoded[PERSIST_OPAQUE_STREAM_HEADER_SIZE..end].to_vec(),
     };
     validate_persist_opaque_stream_batch(&batch)?;
-    Ok(batch)
+    Ok(ValidatedPersistOpaqueStreamBatch {
+        request: batch,
+        canonical: encoded,
+    })
 }
 
 /// Encode the fixed-size successful response.
@@ -1337,17 +1369,20 @@ mod tests {
         };
 
         let encoded = encode_persist_opaque_stream_batch(&batch).expect("bounded batch");
-        assert_eq!(
-            decode_persist_opaque_stream_batch(&encoded).expect("canonical batch"),
-            batch
-        );
+        let decoded = decode_persist_opaque_stream_batch(&encoded).expect("canonical batch");
+        assert_eq!(decoded.request(), &batch);
+        assert_eq!(decoded.canonical_bytes(), encoded.as_slice());
+        assert!(core::ptr::eq(
+            decoded.canonical_bytes().as_ptr(),
+            encoded.as_ptr()
+        ));
 
         let mut trailing = encoded.clone();
         trailing.push(0);
-        assert_eq!(
+        assert!(matches!(
             decode_persist_opaque_stream_batch(&trailing),
             Err(OpaqueStreamCodecError::TrailingBytes)
-        );
+        ));
 
         let wrong_predecessor = PersistOpaqueStreamBatch {
             expected_previous_durable_id: 17,

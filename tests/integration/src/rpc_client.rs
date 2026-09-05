@@ -139,10 +139,9 @@ fn successful_acknowledgement_releases_only_the_matching_slot() {
     let pending = client.try_persist_opaque_stream_batch(&submitted).unwrap();
     let request = request_rx.try_recv().unwrap();
     let framed = rpc::decode_honest_request(&request).unwrap();
-    assert_eq!(
-        rpc::decode_persist_opaque_stream_batch(framed.payload).unwrap(),
-        submitted
-    );
+    let decoded = rpc::decode_persist_opaque_stream_batch(framed.payload).unwrap();
+    assert_eq!(decoded.request(), &submitted);
+    assert_eq!(decoded.canonical_bytes(), framed.payload);
 
     let acknowledgement =
         rpc::encode_persisted_opaque_stream_batch(rpc::PersistedOpaqueStreamBatch {
