@@ -230,6 +230,18 @@ impl RpcClient {
             .map_err(|_| RequestReserveError::Busy)
     }
 
+    /// Whether the single synchronous request slot is currently free.
+    ///
+    /// Observation only, and deliberately racy: a caller may still lose the
+    /// slot between this read and its reservation, and the ordinary `EBUSY`
+    /// path remains the authority. Its purpose is to let a caller skip
+    /// expensive request preparation — whole-state encoding and sealing — when
+    /// the slot is already known to be held, instead of preparing a payload it
+    /// will immediately discard and rebuild on the next pass.
+    pub fn synchronous_slot_is_available(&self) -> bool {
+        self.in_flight_sync_request_id.load(Ordering::Acquire) == 0
+    }
+
     fn release_slot(slot: &AtomicU64, request_id: u64) {
         let _ = slot.compare_exchange(request_id, 0, Ordering::AcqRel, Ordering::Acquire);
     }
