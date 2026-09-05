@@ -407,6 +407,47 @@ impl RpcClient {
         Ok(request_id)
     }
 
+    /// Conservatively report whether a synchronous request could be admitted
+    /// at this instant.
+    ///
+    /// This is only a preparation hint for callers whose request payload is
+    /// expensive to construct. It neither reserves a request ID nor touches
+    /// either queue, and the later synchronous reservation remains the
+    /// authoritative admission decision. Published token retirement may be
+    /// observed without pruning its slot; the real reservation turn performs
+    /// that bounded mutation before it can admit a synchronous operation.
+    #[must_use]
+    pub fn synchronous_request_may_be_available(&self) -> bool {
+        let state = match self.request_state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return false,
+            Err(TryLockError::Poisoned(_)) => std::panic!("RPC request state mutex poisoned"),
+        };
+        if state.synchronous_request_id != 0
+            || state
+                .polled_requests
+                .iter()
+                .flatten()
+                .any(|active| !active.retired.load(Ordering::Acquire))
+        {
+            return false;
+        }
+        drop(state);
+
+        // The producer can become occupied after this guard is released. The
+        // actual request reservation and send handle that race; this check
+        // merely avoids expensive preparation when contention is already
+        // visible.
+        match self.request_tx_lock.try_lock() {
+            Ok(producer) => {
+                drop(producer);
+                true
+            }
+            Err(TryLockError::WouldBlock) => false,
+            Err(TryLockError::Poisoned(_)) => std::panic!("RPC request producer mutex poisoned"),
+        }
+    }
+
     fn release_synchronous_request(&self, request_id: u64) {
         let mut state = self.request_state();
         if state.synchronous_request_id == request_id {

@@ -9,6 +9,7 @@ use enclave_os_common::rpc::{
     PersistedOpaqueStreamBatch, RpcMethod,
 };
 use std::collections::BTreeSet;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{mpsc, Arc, Barrier};
 use std::thread;
 use std::time::Duration;
@@ -135,6 +136,117 @@ fn occupied_stream_and_synchronous_call_remain_exclusive() {
     assert!(
         request_rx.try_recv().is_none(),
         "Busy retry must not enqueue a frame"
+    );
+}
+
+#[test]
+fn synchronous_availability_preflight_is_non_reserving_and_conservative() {
+    let (client, request_rx, response_tx) = client(16 * 1024);
+    let client = Arc::new(client);
+
+    assert!(client.synchronous_request_may_be_available());
+    assert!(
+        request_rx.try_recv().is_none(),
+        "availability observation must not enqueue a request",
+    );
+
+    let state_guard = client.hold_request_state_for_test();
+    assert!(
+        !client.synchronous_request_may_be_available(),
+        "routing-state contention is conservatively unavailable",
+    );
+    drop(state_guard);
+
+    let producer_guard = client.hold_request_producer_for_test();
+    assert!(
+        !client.synchronous_request_may_be_available(),
+        "request-producer contention is conservatively unavailable",
+    );
+    drop(producer_guard);
+
+    let persistence = batch_for(0x18, 16);
+    let pending_persistence = client
+        .try_persist_opaque_stream_batch(&persistence)
+        .expect("persistence reservation");
+    assert!(!client.synchronous_request_may_be_available());
+    let (persistence_identity, _) = decode_request(&request_rx);
+    response_tx
+        .try_send(&acknowledgement(persistence_identity, &persistence))
+        .unwrap();
+    assert!(!client.synchronous_request_may_be_available());
+    assert!(
+        client
+            .poll_persist_opaque_stream_batch(&pending_persistence)
+            .unwrap()
+            .is_some(),
+        "preflight must not consume a queued response",
+    );
+    assert!(client.synchronous_request_may_be_available());
+
+    let execution = client
+        .try_execution_net_close(4, 7, 51)
+        .expect("execution reservation");
+    assert!(!client.synchronous_request_may_be_available());
+    assert!(request_rx.try_recv().is_some(), "execution request");
+    client
+        .abandon_execution_rpc(execution)
+        .expect("execution retirement");
+
+    // Abandonment publishes retirement. The non-mutating preflight may
+    // observe that release, while the next real reservation remains
+    // responsible for pruning the slot.
+    assert!(client.synchronous_request_may_be_available());
+
+    let synchronous_client = Arc::clone(&client);
+    let synchronous = thread::spawn(move || synchronous_client.kv_put(b"table", b"key", b"value"));
+    let request = loop {
+        if let Some(request) = request_rx.try_recv() {
+            break request;
+        }
+        thread::yield_now();
+    };
+    let (request_id, method, _) = rpc::decode_request(&request).expect("synchronous request");
+    assert_eq!(method, RpcMethod::KvPut);
+    assert!(
+        !client.synchronous_request_may_be_available(),
+        "an active synchronous operation is unavailable",
+    );
+    assert!(request_rx.try_recv().is_none());
+    response_tx
+        .try_send(&rpc::encode_response(request_id, 0, &[]))
+        .unwrap();
+    assert_eq!(synchronous.join().unwrap(), Ok(()));
+    assert!(client.synchronous_request_may_be_available());
+}
+
+#[test]
+fn synchronous_availability_preflight_never_downgrades_poison_to_busy() {
+    let (state_client, _request_rx, _response_tx) = client(4096);
+    assert!(catch_unwind(AssertUnwindSafe(|| {
+        let _state_guard = state_client.hold_request_state_for_test();
+        panic!("poison request state fixture");
+    }))
+    .is_err());
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            state_client.synchronous_request_may_be_available()
+        }))
+        .is_err(),
+        "request-state poison must retain the authoritative fatal behavior",
+    );
+
+    let (producer_client, _request_rx, _response_tx) = client(4096);
+    assert!(catch_unwind(AssertUnwindSafe(|| {
+        let _producer_guard = producer_client.hold_request_producer_for_test();
+        panic!("poison request producer fixture");
+    }))
+    .is_err());
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            producer_client.synchronous_request_may_be_available()
+        }))
+        .is_err(),
+        "request-producer poison must retain the authoritative fatal behavior",
     );
 }
 

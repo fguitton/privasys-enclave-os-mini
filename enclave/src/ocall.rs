@@ -137,6 +137,16 @@ pub fn kv_store_put(table: &[u8], enc_key: &[u8], enc_val: &[u8]) -> Result<(), 
     rpc().kv_put(table, enc_key, enc_val)
 }
 
+/// Conservatively report whether a synchronous host request could currently
+/// be admitted without competing with polled persistence or execution work.
+///
+/// This is a non-reserving preparation hint. Callers must still treat the
+/// result of the subsequent request as authoritative.
+#[must_use]
+pub fn synchronous_request_may_be_available() -> bool {
+    rpc().synchronous_request_may_be_available()
+}
+
 /// Get an encrypted value from the host. Returns None if not found.
 pub fn kv_store_get(
     table: &[u8],
