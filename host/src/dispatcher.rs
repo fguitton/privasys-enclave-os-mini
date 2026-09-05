@@ -455,7 +455,7 @@ impl RpcDispatcher {
                 rpc::encode_persisted_opaque_stream_batch(rpc::PersistedOpaqueStreamBatch {
                     batch_id,
                     durable_id,
-                    payload_digest: request.payload_digest,
+                    payload_digest: request.request().payload_digest,
                 }),
             ),
             Ok(kvstore::OpaqueStreamPersistenceResult::Conflict) => (1, Vec::new()),

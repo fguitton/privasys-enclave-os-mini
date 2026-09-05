@@ -9,8 +9,8 @@
 
 use anyhow::{Context, Result};
 use enclave_os_common::rpc::{
-    decode_persist_opaque_stream_batch, encode_persist_opaque_stream_batch, LoadOpaqueStreamTip,
-    OpaqueStreamTip, PersistOpaqueStreamBatch,
+    decode_persist_opaque_stream_batch, LoadOpaqueStreamTip, OpaqueStreamTip,
+    ValidatedPersistOpaqueStreamBatch,
 };
 use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, WriteOptions, DB};
 use std::sync::{Mutex, OnceLock};
@@ -162,10 +162,10 @@ fn read_durable_id(db: &DB, key: &[u8]) -> Result<u64> {
 /// durable tip. A changed replay or wrong predecessor writes nothing.
 pub fn persist_opaque_stream_batch_on_db(
     db: &DB,
-    request: &PersistOpaqueStreamBatch,
+    validated: &ValidatedPersistOpaqueStreamBatch<'_>,
 ) -> Result<OpaqueStreamPersistenceResult> {
-    let canonical = encode_persist_opaque_stream_batch(request)
-        .map_err(|error| anyhow::anyhow!("invalid opaque-stream batch: {error:?}"))?;
+    let request = validated.request();
+    let canonical = validated.canonical_bytes();
     let prefix = opaque_stream_prefix(
         request.node_id,
         request.node_generation,
@@ -180,7 +180,7 @@ pub fn persist_opaque_stream_batch_on_db(
         .get(&batch_key)
         .context("RocksDB opaque-stream replay read failed")?
     {
-        if previous == canonical && current == request.batch_id {
+        if previous.as_slice() == canonical && current == request.batch_id {
             return Ok(OpaqueStreamPersistenceResult::Persisted {
                 batch_id: request.batch_id,
                 durable_id: request.batch_id,
@@ -208,7 +208,7 @@ pub fn persist_opaque_stream_batch_on_db(
 
 /// Persist through the process-global host database.
 pub fn persist_opaque_stream_batch(
-    request: &PersistOpaqueStreamBatch,
+    request: &ValidatedPersistOpaqueStreamBatch<'_>,
 ) -> Result<OpaqueStreamPersistenceResult> {
     let database = db();
     persist_opaque_stream_batch_on_db(&database, request)
@@ -234,7 +234,8 @@ pub fn load_opaque_stream_tip_on_db(
         .context("RocksDB opaque-stream tip read failed")?
         .ok_or_else(|| anyhow::anyhow!("opaque-stream metadata points to a missing batch"))?;
     let batch = decode_persist_opaque_stream_batch(&canonical)
-        .map_err(|error| anyhow::anyhow!("stored opaque-stream batch is invalid: {error:?}"))?;
+        .map_err(|error| anyhow::anyhow!("stored opaque-stream batch is invalid: {error:?}"))?
+        .into_request();
     if batch.node_id != request.node_id
         || batch.node_generation != request.node_generation
         || batch.stream_id != request.stream_id
@@ -287,6 +288,10 @@ pub fn list_keys(table: &str, prefix: &[u8], limit: usize) -> Result<Vec<Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use enclave_os_common::rpc::{
+        decode_persist_opaque_stream_batch, encode_persist_opaque_stream_batch,
+        PersistOpaqueStreamBatch,
+    };
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Barrier};
@@ -313,6 +318,17 @@ mod tests {
         opts.create_missing_column_families(true);
         let db = DB::open(&opts, &path).unwrap();
         (TestDbDirectory(path), db)
+    }
+
+    fn persist_request_on_db(
+        db: &DB,
+        request: &PersistOpaqueStreamBatch,
+    ) -> Result<OpaqueStreamPersistenceResult> {
+        let canonical = encode_persist_opaque_stream_batch(request)
+            .map_err(|error| anyhow::anyhow!("invalid opaque-stream batch: {error:?}"))?;
+        let validated = decode_persist_opaque_stream_batch(&canonical)
+            .map_err(|error| anyhow::anyhow!("invalid opaque-stream batch: {error:?}"))?;
+        persist_opaque_stream_batch_on_db(db, &validated)
     }
 
     #[test]
@@ -385,7 +401,7 @@ mod tests {
 
     #[test]
     fn opaque_stream_is_atomic_idempotent_predecessor_bound_and_loadable() {
-        use enclave_os_common::rpc::{LoadOpaqueStreamTip, PersistOpaqueStreamBatch};
+        use enclave_os_common::rpc::LoadOpaqueStreamTip;
 
         let (_tmp, db) = open_tmp();
         let first = PersistOpaqueStreamBatch {
@@ -399,15 +415,27 @@ mod tests {
             payload: b"opaque-ciphertext-1".to_vec(),
         };
 
+        let first_canonical = encode_persist_opaque_stream_batch(&first).unwrap();
+        let first_validated = decode_persist_opaque_stream_batch(&first_canonical).unwrap();
         assert_eq!(
-            persist_opaque_stream_batch_on_db(&db, &first).unwrap(),
+            persist_opaque_stream_batch_on_db(&db, &first_validated).unwrap(),
             OpaqueStreamPersistenceResult::Persisted {
                 batch_id: 1,
                 durable_id: 1
             }
         );
+        let first_key = opaque_stream_batch_key(
+            &opaque_stream_prefix(
+                first.node_id,
+                first.node_generation,
+                first.stream_id,
+                first.persistence_epoch,
+            ),
+            first.batch_id,
+        );
+        assert_eq!(db.get(first_key).unwrap(), Some(first_canonical.clone()));
         assert_eq!(
-            persist_opaque_stream_batch_on_db(&db, &first).unwrap(),
+            persist_opaque_stream_batch_on_db(&db, &first_validated).unwrap(),
             OpaqueStreamPersistenceResult::Persisted {
                 batch_id: 1,
                 durable_id: 1
@@ -418,7 +446,7 @@ mod tests {
         altered_replay.payload = b"different-ciphertext".to_vec();
         altered_replay.payload_digest = [9; 32];
         assert_eq!(
-            persist_opaque_stream_batch_on_db(&db, &altered_replay).unwrap(),
+            persist_request_on_db(&db, &altered_replay).unwrap(),
             OpaqueStreamPersistenceResult::Conflict
         );
 
@@ -430,7 +458,7 @@ mod tests {
             ..first.clone()
         };
         assert_eq!(
-            persist_opaque_stream_batch_on_db(&db, &wrong_predecessor)
+            persist_request_on_db(&db, &wrong_predecessor)
                 .unwrap_err()
                 .to_string(),
             "invalid opaque-stream batch: InvalidPredecessor"
@@ -441,7 +469,7 @@ mod tests {
             ..wrong_predecessor
         };
         assert_eq!(
-            persist_opaque_stream_batch_on_db(&db, &second).unwrap(),
+            persist_request_on_db(&db, &second).unwrap(),
             OpaqueStreamPersistenceResult::Persisted {
                 batch_id: 2,
                 durable_id: 2
@@ -482,8 +510,6 @@ mod tests {
 
     #[test]
     fn opaque_stream_concurrent_successors_select_one_exact_tip() {
-        use enclave_os_common::rpc::PersistOpaqueStreamBatch;
-
         let (_tmp, db) = open_tmp();
         let db = Arc::new(Mutex::new(db));
         let first = PersistOpaqueStreamBatch {
@@ -497,7 +523,7 @@ mod tests {
             payload: b"first".to_vec(),
         };
         assert!(matches!(
-            persist_opaque_stream_batch_on_db(&db.lock().unwrap(), &first).unwrap(),
+            persist_request_on_db(&db.lock().unwrap(), &first).unwrap(),
             OpaqueStreamPersistenceResult::Persisted { .. }
         ));
 
@@ -517,7 +543,7 @@ mod tests {
             request.payload = payload;
             std::thread::spawn(move || {
                 barrier.wait();
-                persist_opaque_stream_batch_on_db(&db.lock().unwrap(), &request).unwrap()
+                persist_request_on_db(&db.lock().unwrap(), &request).unwrap()
             })
         })
         .collect::<Vec<_>>();
