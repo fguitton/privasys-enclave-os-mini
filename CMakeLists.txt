@@ -162,7 +162,7 @@ if(BUILD_ENCLAVE)
     set(SYSROOT_PROFILE_INPUT
         "${CMAKE_BINARY_DIR}/sgx-sysroot-cargo-profile.txt")
     file(GENERATE OUTPUT "${SYSROOT_PROFILE_INPUT}"
-        CONTENT "${HONEST_SGX_SIM_SYSROOT_DEV_PROFILE_ID}\n")
+        CONTENT "cargo-default-dev-v1\n")
     add_custom_command(
         OUTPUT "${SYSROOT_STAMP}"
         COMMENT "Building SGX sysroot via Teaclave fork CMake..."
@@ -175,7 +175,7 @@ if(BUILD_ENCLAVE)
         COMMAND ${CMAKE_COMMAND} -E rm -rf
             "${TEACLAVE_CHECKOUT}/rustlib/std/target/${RUST_ENCLAVE_TARGET}"
         COMMAND ${CMAKE_COMMAND} -E env
-            ${HONEST_SGX_SIM_SYSROOT_DEV_PROFILE_ENV}
+            ${HONEST_CARGO_DEFAULT_DEV_PROFILE_ENV}
             "SGX_MODE=${SGX_MODE}"
             "RUSTUP_TOOLCHAIN=${RUST_ENCLAVE_TOOLCHAIN}"
             "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}"
@@ -198,7 +198,7 @@ if(BUILD_ENCLAVE)
         COMMAND ${CMAKE_COMMAND} -E rm -f
             "${SYSROOT_BUILD_DIR}/sgx_sysroot.stamp"
         COMMAND ${CMAKE_COMMAND} -E env
-            ${HONEST_SGX_SIM_SYSROOT_DEV_PROFILE_ENV}
+            ${HONEST_CARGO_DEFAULT_DEV_PROFILE_ENV}
             "SGX_MODE=${SGX_MODE}"
             "RUSTUP_TOOLCHAIN=${RUST_ENCLAVE_TOOLCHAIN}"
             "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}"
