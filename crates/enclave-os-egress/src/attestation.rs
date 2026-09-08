@@ -100,6 +100,13 @@ pub struct VerifyResponse {
     #[serde(default)]
     pub mrsigner: String,
 
+    /// Intel platform TCB status derived by the server from PCS collateral
+    /// (e.g. `"UpToDate"`, `"SWHardeningNeeded"`,
+    /// `"ConfigurationAndSWHardeningNeeded"`, `"Revoked"`). Empty when the
+    /// server did not run the TCB check (older server, or TCB reporting off).
+    #[serde(default, rename = "tcbStatus")]
+    pub tcb_status: String,
+
     /// Error description when `success` is `false`.
     #[serde(default)]
     pub error: String,
@@ -108,6 +115,35 @@ pub struct VerifyResponse {
 // ---------------------------------------------------------------------------
 //  Public API
 // ---------------------------------------------------------------------------
+
+/// Decide whether a reported Intel platform TCB status is acceptable under an
+/// optional acceptable-status policy.
+///
+///   - empty status (the server did not derive one — older server, or TCB
+///     reporting off) → accepted, for compatibility;
+///   - `"Revoked"` → NEVER accepted, policy or not (a revoked TCB is
+///     known-broken, not merely behind — nothing legitimate runs on it);
+///   - `acceptable` is `None` (policy predates TCB enforcement / opted out)
+///     → accepted: enforcement is opt-in so that rolling this build out does
+///     not reject fleets whose policies have not yet been updated;
+///   - `acceptable` is `Some`: the secure floor (`"UpToDate"`,
+///     `"SWHardeningNeeded"`) always passes, anything else must be listed
+///     (`Some(&[])` = strict floor-only).
+pub fn tcb_status_acceptable(status: &str, acceptable: Option<&[String]>) -> bool {
+    if status.is_empty() {
+        return true;
+    }
+    if status == "Revoked" {
+        return false;
+    }
+    let Some(set) = acceptable else {
+        return true;
+    };
+    if status == "UpToDate" || status == "SWHardeningNeeded" {
+        return true;
+    }
+    set.iter().any(|s| s == status)
+}
 
 /// Verify a raw attestation quote against one or more attestation servers.
 ///
@@ -141,25 +177,36 @@ pub struct VerifyResponse {
 /// attestation::verify_quote(&raw_quote_bytes, &servers)?;
 /// ```
 pub fn verify_quote(evidence: &[u8], attestation_servers: &[String]) -> Result<(), String> {
+    verify_quote_statuses(evidence, attestation_servers).map(|_| ())
+}
+
+/// Like [`verify_quote`], but returns each server's full [`VerifyResponse`]
+/// so the caller can apply policy to reported fields beyond pass/fail — in
+/// particular the Intel `tcbStatus` (the vault enforces an acceptable-TCB
+/// set per attestation profile). Returns an empty vec when verification was
+/// skipped (no servers configured, or a mock quote in dev/test builds).
+pub fn verify_quote_statuses(
+    evidence: &[u8],
+    attestation_servers: &[String],
+) -> Result<Vec<VerifyResponse>, String> {
     #[cfg(feature = "sgx-sim-attestation")]
     if evidence.starts_with(enclave_os_common::quote::SGX_SIM_REPORT_PREFIX) {
         enclave_os_common::quote::parse_sgx_sim_report(evidence)?;
         return if attestation_servers.is_empty() {
-            Ok(())
+            Ok(Vec::new())
         } else {
             Err("SGX simulation evidence cannot be sent to a hardware appraisal service".into())
         };
     }
-
     // Nothing to verify when no servers are configured.
     if attestation_servers.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     // Mock quotes are used in dev/test — skip verification.
     #[cfg(feature = "mock")]
     if evidence.starts_with(MOCK_PREFIX) {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let store = root_store().ok_or_else(|| {
@@ -172,6 +219,7 @@ pub fn verify_quote(evidence: &[u8], attestation_servers: &[String]) -> Result<(
     let quote_b64 = STANDARD.encode(evidence);
     let body = format!(r#"{{"quote":"{}"}}"#, quote_b64);
 
+    let mut responses = Vec::with_capacity(attestation_servers.len());
     for server_url in attestation_servers {
         // Look up an optional bearer token from core attestation server config.
         let token = enclave_os_common::attestation_servers::token_for(server_url);
@@ -208,9 +256,10 @@ pub fn verify_quote(evidence: &[u8], attestation_servers: &[String]) -> Result<(
                 server_url, result.status, result.error
             ));
         }
+        responses.push(result);
     }
 
-    Ok(())
+    Ok(responses)
 }
 
 #[cfg(all(test, feature = "sgx-sim-attestation"))]

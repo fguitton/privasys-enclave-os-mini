@@ -173,6 +173,9 @@ fn register_native_ocalls() {
         kv_store_get: unavailable_get,
         kv_store_delete: unavailable_delete,
         kv_store_list_keys: unavailable_list,
+        kv_store_write_batch: |_, _| Err(-1),
+        kv_store_multi_get: |_, _| Err(-1),
+        kv_store_scan: |_, _, _, _| Err(-1),
         get_current_time: current_time,
         log: discard_log,
         cert_store_register: discard_identity,
@@ -514,6 +517,7 @@ fn request_with_status(
             Vec::new()
         },
         attestation_servers: vec![args.appraiser_url.clone()],
+        acceptable_tcb_statuses: None,
         client_identity: None,
         dependencies: None,
     };

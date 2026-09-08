@@ -12,10 +12,14 @@
 //! - Decouples TLS logic from transport (testable, composable)
 //! - Supports future multi-threading (sessions are `Send`)
 
+use super::cert_store::ConfigurationLease;
 use crate::enclave_log_error;
 use enclave_os_common::protocol;
-use std::sync::{Arc, Mutex};
 use std::vec::Vec;
+
+#[cfg(test)]
+#[path = "session_tests.rs"]
+mod tests;
 
 /// A TLS session backed by a rustls `ServerConnection`.
 ///
@@ -32,18 +36,22 @@ pub struct RaTlsSession {
     tls_conn: rustls::ServerConnection,
     /// Accumulation buffer for incomplete application-level frames.
     read_buf: Vec<u8>,
-    /// Random nonce sent to the client via the TLS CertificateRequest
-    /// extension `0xFFBB` (challenge mode only).  The client binds it
-    /// into its own attestation report_data.
-    client_challenge_nonce: Option<Vec<u8>>,
-    /// ClientHello challenge committed by this session's served leaf.
-    local_challenge_nonce: Option<Vec<u8>>,
-    /// Exact leaf emitted after the TLS 1.3 channel binder became available.
-    local_cert_der: Arc<Mutex<Option<Vec<u8>>>>,
-    /// Exact SNI selected before the TLS connection was constructed.
+    /// Exact v2 leaf served on this connection (evidence is exchanged separately).
+    local_cert_der: Vec<u8>,
+    /// SNI and endpoint identity selected with the served leaf.
     server_name: Option<String>,
-    /// Endpoint identity selected with the SNI leaf for this session.
     attested_endpoint: Option<enclave_os_common::modules::AttestedEndpointIdentity>,
+    /// Attestation tag of this connection: "none" until the client asks for
+    /// evidence after the handshake, then "deterministic" or "challenge".
+    attestation: &'static str,
+    /// Client context issued in the last attest response that required
+    /// client evidence (mutual leg), consumed by the present message.
+    client_context: Option<[u8; 32]>,
+    /// The peer's evidence accepted at present time (binding verified).
+    peer_evidence: Option<enclave_os_common::modules::PeerEvidence>,
+    local_evidence: Option<enclave_os_common::modules::PeerEvidence>,
+    attestation_failed: bool,
+    configuration: ConfigurationLease,
     /// FIDO2 identity, set after a successful FIDO2 ceremony on this
     /// session.  When present, subsequent requests on this TLS session
     /// are authenticated without tokens.
@@ -72,26 +80,25 @@ impl RaTlsSession {
     /// The caller (IngressServer) is responsible for creating the
     /// ServerConnection from the Acceptor flow.
     ///
-    /// `client_challenge_nonce` is the random nonce sent to the client
-    /// via the TLS CertificateRequest extension `0xFFBB` (challenge mode
-    /// only).  It will be used later to verify the client's RA-TLS cert
-    /// report_data.
     pub fn new(
         tls_conn: rustls::ServerConnection,
-        client_challenge_nonce: Option<Vec<u8>>,
-        local_challenge_nonce: Option<Vec<u8>>,
-        local_cert_der: Arc<Mutex<Option<Vec<u8>>>>,
+        local_cert_der: Vec<u8>,
         server_name: Option<String>,
         attested_endpoint: Option<enclave_os_common::modules::AttestedEndpointIdentity>,
+        configuration: ConfigurationLease,
     ) -> Self {
         Self {
             tls_conn,
             read_buf: Vec::new(),
-            client_challenge_nonce,
-            local_challenge_nonce,
             local_cert_der,
             server_name,
             attested_endpoint,
+            attestation: "none",
+            client_context: None,
+            peer_evidence: None,
+            local_evidence: None,
+            attestation_failed: false,
+            configuration,
             fido2_identity: None,
         }
     }
@@ -109,11 +116,12 @@ impl RaTlsSession {
     ///
     /// After calling this, check:
     /// - `collect_tls_output()` for bytes to send back (handshake msgs,
-    ///    encrypted app data, NewSessionTicket, etc.)
+    ///   encrypted app data, NewSessionTicket, etc.)
     /// - `recv_http_request()` for decoded HTTP/1.1 requests
     ///
     /// Returns an error on fatal TLS protocol errors.
     pub fn feed_tls_bytes(&mut self, data: &[u8]) -> Result<(), &'static str> {
+        self.require_current_configuration()?;
         if data.is_empty() {
             return Ok(());
         }
@@ -186,6 +194,7 @@ impl RaTlsSession {
     /// - `Ok(None)` — more data needed (partial request)
     /// - `Err` — fatal TLS or parse error
     pub fn recv_http_request(&mut self) -> Result<Option<protocol::HttpRequest>, &'static str> {
+        self.require_current_configuration()?;
         // Drain any available decrypted plaintext into read_buf
         self.drain_plaintext()?;
 
@@ -291,6 +300,7 @@ impl RaTlsSession {
         data: &[u8],
         output: &mut Vec<u8>,
     ) -> Result<(), &'static str> {
+        self.require_current_configuration()?;
         use std::io::Write;
         let mut offset = 0;
         while offset < data.len() {
@@ -344,45 +354,95 @@ impl RaTlsSession {
             .map(|cert| cert.as_ref().to_vec())
     }
 
-    /// Return the client challenge nonce stored for this connection.
-    ///
-    /// Present only when the server generated a challenge-mode certificate.
-    /// The nonce is sent to the client via the TLS CertificateRequest
-    /// extension `0xFFBB`.
-    pub fn client_challenge_nonce(&self) -> Option<&Vec<u8>> {
-        self.client_challenge_nonce.as_ref()
+    /// Attestation tag of this connection ("none", "deterministic", "challenge").
+    pub fn attestation(&self) -> &'static str {
+        self.attestation
     }
 
-    /// Return the ClientHello challenge committed by the served certificate.
-    pub fn local_challenge_nonce(&self) -> Option<&Vec<u8>> {
-        self.local_challenge_nonce.as_ref()
-    }
-
-    /// Return the exact channel-bound leaf served on this TLS session.
+    /// Exact DER leaf served by this session.
     pub fn local_cert_der(&self) -> Option<Vec<u8>> {
-        self.local_cert_der
-            .lock()
-            .ok()
-            .and_then(|certificate| certificate.clone())
+        Some(self.local_cert_der.clone())
     }
 
-    /// Return the exact SNI selected by the ClientHello.
     pub fn server_name(&self) -> Option<&str> {
         self.server_name.as_deref()
     }
 
-    /// Return the endpoint identity selected with this session's SNI leaf.
     pub fn attested_endpoint(
         &self,
     ) -> Option<enclave_os_common::modules::AttestedEndpointIdentity> {
         self.attested_endpoint
     }
 
-    /// Return this session's 32-byte RA-TLS channel binder (TLS 1.3), derived
-    /// from the handshake key schedule. Used to verify a mutual-auth client
-    /// cert's channel binding post-handshake.
-    pub fn ratls_channel_binder(&self) -> Option<Vec<u8>> {
-        self.tls_conn.ratls_channel_binder().map(|b| b.to_vec())
+    /// Record what the client asked for after the handshake.
+    pub fn set_attestation(&mut self, tag: &'static str) {
+        self.attestation = tag;
+    }
+
+    /// Start a new proof exchange without retaining a previous client's admission.
+    pub fn begin_attestation(&mut self) {
+        self.attestation = "none";
+        self.client_context = None;
+        self.peer_evidence = None;
+        self.local_evidence = None;
+    }
+
+    pub fn fail_attestation(&mut self) {
+        self.begin_attestation();
+        self.attestation_failed = true;
+    }
+
+    pub fn attestation_failed(&self) -> bool {
+        self.attestation_failed
+    }
+
+    pub fn local_evidence(&self) -> Option<&enclave_os_common::modules::PeerEvidence> {
+        self.configuration.is_current().then_some(())?;
+        self.local_evidence.as_ref()
+    }
+
+    pub fn set_local_evidence(&mut self, evidence: enclave_os_common::modules::PeerEvidence) {
+        self.local_evidence = Some(evidence);
+    }
+
+    pub fn channel_binder(&self) -> Option<Vec<u8>> {
+        self.export_hctx(b"EXPORTER-honest-peer-channel-v2", &[])
+            .ok()
+            .map(|value| value.to_vec())
+    }
+
+    /// Remember the client context issued with an attest response that
+    /// requires client evidence.
+    pub fn set_client_context(&mut self, ctx: [u8; 32]) {
+        self.client_context = Some(ctx);
+    }
+
+    /// Take the pending client context (one present per response).
+    pub fn take_client_context(&mut self) -> Option<[u8; 32]> {
+        self.client_context.take()
+    }
+
+    /// The peer's evidence accepted at present time, if any.
+    pub fn peer_evidence(&self) -> Option<&enclave_os_common::modules::PeerEvidence> {
+        self.configuration.is_current().then_some(())?;
+        self.peer_evidence.as_ref()
+    }
+
+    /// Retain evidence whose key/exporter binding was checked. Its quote
+    /// signature and admission policy still require application appraisal.
+    pub fn set_peer_evidence(&mut self, ev: enclave_os_common::modules::PeerEvidence) {
+        self.peer_evidence = Some(ev);
+    }
+
+    /// The 32-byte RFC 8446 exporter value of this connection for `label` and
+    /// `context`, keyed by exporter_master_secret (RA-TLS v2 binding).
+    pub fn export_hctx(&self, label: &[u8], context: &[u8]) -> Result<[u8; 32], String> {
+        if !self.configuration.is_current() {
+            return Err("certificate configuration changed; reconnect required".into());
+        }
+        self.tls_conn
+            .export_keying_material([0u8; 32], label, Some(context))
+            .map_err(|e| format!("exporter: {e}"))
     }
 
     /// Return the FIDO2 identity for this session, if authenticated.
@@ -406,5 +466,16 @@ impl RaTlsSession {
     pub fn close_notify(&mut self) -> Vec<u8> {
         self.tls_conn.send_close_notify();
         self.collect_tls_output().unwrap_or_default()
+    }
+    /// Check at ingress and before each decoded request/response. Buffered
+    /// requests must not cross a workload replacement within one TLS flight.
+    fn require_current_configuration(&mut self) -> Result<(), &'static str> {
+        if !self.configuration.is_current() {
+            self.fail_attestation();
+            self.fido2_identity = None;
+            self.read_buf.clear();
+            return Err("certificate configuration changed; reconnect required");
+        }
+        Ok(())
     }
 }

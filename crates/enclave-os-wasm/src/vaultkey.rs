@@ -77,6 +77,14 @@ pub struct VaultConfig {
     /// e.g. `https://privasys.id`). Only needed to re-author on migration.
     #[serde(default)]
     pub oidc_issuer: String,
+    /// Intel TCB statuses accepted (beyond the secure floor) when verifying the
+    /// VAULTS' quotes on this leg — from the constellation's
+    /// `acceptable_tcb_statuses`. Empty (incl. every pre-existing sealed
+    /// selection) = no TCB acceptance check on the dial, matching the
+    /// constellation-unset case; `Revoked` is rejected by the egress gate
+    /// whenever enforcement is on.
+    #[serde(default)]
+    pub acceptable_tcb_statuses: Vec<String>,
 }
 
 impl VaultConfig {
@@ -86,6 +94,46 @@ impl VaultConfig {
         } else {
             self.threshold
         }
+    }
+
+    /// Build a config from caller-supplied constellation addressing (the
+    /// cross-constellation migration path: management-service passes the
+    /// TARGET constellation's coordinates inline, exactly like the container
+    /// rotate request). Addressing is not trust: the vaults still have to
+    /// pass RA-TLS against `mrenclave_hex` + the attestation server, and the
+    /// key policy inside them stays the authorisation boundary.
+    pub fn from_parts(
+        endpoints: Vec<String>,
+        mrenclave_hex: &str,
+        attestation_server: &str,
+        ca_roots_hex: &[String],
+        threshold: usize,
+        oidc_issuer: &str,
+        acceptable_tcb_statuses: Vec<String>,
+    ) -> Result<VaultConfig, String> {
+        if endpoints.is_empty() {
+            return Err("vaultkey: target constellation has no endpoints".into());
+        }
+        let mrenclave = parse_mrenclave(mrenclave_hex)?;
+        if attestation_server.is_empty() {
+            return Err("vaultkey: target constellation has no attestation server".into());
+        }
+        let ca_roots_der: Vec<Vec<u8>> =
+            ca_roots_hex.iter().filter_map(|h| hex_decode(h)).collect();
+        if ca_roots_der.is_empty() {
+            return Err(
+                "vaultkey: target constellation has no CA roots (cannot trust vault leaves)".into(),
+            );
+        }
+        Ok(VaultConfig {
+            endpoints,
+            threshold: threshold.max(2),
+            mrenclave,
+            attestation_servers: std::vec![attestation_server.to_string()],
+            ca_roots_der,
+            oidc_issuer: oidc_issuer.to_string(),
+            acceptable_tcb_statuses,
+        })
     }
 }
 
@@ -114,6 +162,10 @@ struct DirConstellation {
     /// for the enclave-driven path (inc.4); empty on an older directory.
     #[serde(default)]
     ca_roots: Vec<String>,
+    /// Constellation's acceptable Intel TCB statuses (empty on an older
+    /// directory = no enforcement on the dial).
+    #[serde(default)]
+    acceptable_tcb_statuses: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -183,6 +235,9 @@ enum VaultRequest {
         material_b64: String,
         grant: String,
     },
+    GetPolicy {
+        handle: String,
+    },
 }
 
 /// Subset of the server's `VaultResponse` we care about.
@@ -192,8 +247,17 @@ struct VaultResponse {
     key_material: Option<KeyMaterialResp>,
     #[serde(rename = "KeyCreated")]
     key_created: Option<KeyCreatedResp>,
+    #[serde(rename = "Policy")]
+    policy: Option<PolicyResp>,
     #[serde(rename = "Error")]
     error: Option<String>,
+}
+
+/// `GetPolicy` response: the policy is walked generically (we only
+/// need the Tees measurement set), so it stays a raw value.
+#[derive(Deserialize)]
+struct PolicyResp {
+    policy: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -246,6 +310,7 @@ pub fn discover(mgmt_url: &str, environment: &str) -> Result<VaultConfig, String
         attestation_servers: std::vec![con.attestation_server.clone()],
         ca_roots_der,
         oidc_issuer: con.oidc_issuer.clone(),
+        acceptable_tcb_statuses: con.acceptable_tcb_statuses.clone(),
     })
 }
 
@@ -387,6 +452,129 @@ pub fn resolve_or_provision(
     Ok(kek)
 }
 
+/// Read the Tees measurement set of a key's policy from the
+/// constellation. The vault authorises `GetPolicy` by principal
+/// resolution, so the running TEE can read its OWN credential's
+/// policy — this is how a cluster node learns the admissible peer
+/// measurement set from the policy instead of from configuration.
+/// Returns the UNION over reachable vaults (mid-update the vaults may
+/// briefly differ; the union opens an upgrade window as soon as any
+/// vault carries the new measurement) and requires at least one vault
+/// to answer.
+pub fn read_policy_measurements(
+    cfg: &VaultConfig,
+    handle: &str,
+    code_hash: &[u8],
+    app_id: Option<&[u8]>,
+) -> Result<Vec<enclave_os_common::quote::TeeMeasurement>, String> {
+    let root_store = root_store_from_der(cfg.ca_roots_der.iter().cloned())
+        .map_err(|e| format!("vaultkey: bad CA roots: {e}"))?;
+    let policy = build_ratls_policy(cfg, code_hash, app_id)?;
+    let mut set: Vec<enclave_os_common::quote::TeeMeasurement> = Vec::new();
+    let mut answered = 0usize;
+    let mut last_err: Option<String> = None;
+    for ep in &cfg.endpoints {
+        let body = match serde_json::to_vec(&VaultRequest::GetPolicy {
+            handle: handle.into(),
+        }) {
+            Ok(b) => b,
+            Err(e) => return Err(format!("marshal GetPolicy: {e}")),
+        };
+        let url = format!("https://{ep}/data");
+        let resp = match https_fetch("POST", &url, &[], Some(&body), &root_store, Some(&policy)) {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
+        let vr: VaultResponse = match serde_json::from_slice(&resp.body) {
+            Ok(v) => v,
+            Err(e) => {
+                last_err = Some(format!("decode GetPolicy response: {e}"));
+                continue;
+            }
+        };
+        if let Some(msg) = vr.error {
+            last_err = Some(msg);
+            continue;
+        }
+        let Some(p) = vr.policy else {
+            last_err = Some("vault: GetPolicy returned no policy".into());
+            continue;
+        };
+        answered += 1;
+        collect_measurements(&p.policy, &mut set);
+    }
+    if answered == 0 {
+        return Err(format!(
+            "vaultkey: no vault answered GetPolicy for {handle:?}: {last_err:?}"
+        ));
+    }
+    Ok(set)
+}
+
+/// Collect `principals.tees[].Tee.measurements[]` into `set`, TEE-typed
+/// and deduplicated: `{"Mrenclave": <hex32>}` (SGX) and
+/// `{"Tdx": {"mrtd", "rtmr1", "rtmr2"}}` (48-byte hex each) are both
+/// recognised. Unknown shapes are skipped — the pin set only ever
+/// narrows admission on top of the vault's own enforcement.
+fn collect_measurements(
+    policy: &serde_json::Value,
+    set: &mut Vec<enclave_os_common::quote::TeeMeasurement>,
+) {
+    use enclave_os_common::quote::TeeMeasurement;
+    let Some(tees) = policy
+        .get("principals")
+        .and_then(|p| p.get("tees"))
+        .and_then(|t| t.as_array())
+    else {
+        return;
+    };
+    let hex48 = |v: Option<&serde_json::Value>| -> Option<[u8; 48]> {
+        v.and_then(|v| v.as_str())
+            .and_then(hex_decode)
+            .and_then(|b| <[u8; 48]>::try_from(b).ok())
+    };
+    for tee in tees {
+        let Some(measurements) = tee
+            .get("Tee")
+            .and_then(|t| t.get("measurements"))
+            .and_then(|m| m.as_array())
+        else {
+            continue;
+        };
+        for m in measurements {
+            let parsed = if let Some(mr) = m
+                .get("Mrenclave")
+                .and_then(|v| v.as_str())
+                .and_then(hex_decode)
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+            {
+                Some(TeeMeasurement::Sgx(mr))
+            } else if let Some(tdx) = m.get("Tdx") {
+                match (
+                    hex48(tdx.get("mrtd")),
+                    hex48(tdx.get("rtmr1")),
+                    hex48(tdx.get("rtmr2")),
+                ) {
+                    (Some(mrtd), Some(rtmr1), Some(rtmr2)) => {
+                        Some(TeeMeasurement::Tdx { mrtd, rtmr1, rtmr2 })
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(p) = parsed {
+                if !set.contains(&p) {
+                    set.push(p);
+                }
+            }
+        }
+    }
+}
+
 fn to_kek(v: Vec<u8>) -> Result<[u8; KEK_SIZE], String> {
     if v.len() != KEK_SIZE {
         return Err(format!(
@@ -420,20 +608,28 @@ fn build_ratls_policy(
     code_hash: &[u8],
     app_id: Option<&[u8]>,
 ) -> Result<RaTlsPolicy, String> {
-    let mut nonce = [0u8; 32];
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut nonce = vec![0u8; 32];
     SystemRandom::new()
         .fill(&mut nonce)
-        .map_err(|_| "vaultkey: rng (nonce)")?;
+        .map_err(|_| "vault challenge entropy unavailable")?;
     Ok(RaTlsPolicy {
         tee: TeeType::Sgx,
         mr_enclave: Some(cfg.mrenclave),
         mr_signer: None,
         mr_td: None,
-        report_data: ReportDataBinding::ChallengeResponse {
-            nonce: nonce.to_vec(),
-        },
+        // Challenge mode: the vault's evidence is bound to this connection's
+        // exporter value and a fresh context (RA-TLS v2).
+        report_data: ReportDataBinding::ChallengeResponse { nonce },
         expected_oids: Vec::new(),
         attestation_servers: cfg.attestation_servers.clone(),
+        // Enforce the constellation's acceptable-TCB set on the vault's quote
+        // (empty set = legacy no-check, matching an unset constellation).
+        acceptable_tcb_statuses: if cfg.acceptable_tcb_statuses.is_empty() {
+            None
+        } else {
+            Some(cfg.acceptable_tcb_statuses.clone())
+        },
         // Mutual RA-TLS: present this app's identity (OS signer mints the cert).
         client_identity: Some(ClientCertIdentity {
             code_hash: code_hash.to_vec(),

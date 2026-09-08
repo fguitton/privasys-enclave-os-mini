@@ -3,10 +3,11 @@
 
 //! RA-TLS (Remote Attestation - Transport Layer Security) module.
 //!
-//! Provides mutual attestation over TLS 1.3 using SGX quotes embedded
-//! in X.509 certificates.
+//! Provides mutual attestation after the standard TLS 1.3 handshake using
+//! connection-bound evidence and reusable identity certificates.
 
 pub mod attestation;
 pub mod cert_store;
+mod client_auth;
 pub mod server;
 pub mod session;

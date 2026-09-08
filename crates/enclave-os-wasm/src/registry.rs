@@ -64,6 +64,62 @@ use enclave_os_common::types::AEAD_KEY_SIZE;
 /// untrusted host; only an enclave that can reconstruct the KEK can unwrap it.
 const VAULTWRAP_TABLE: &[u8] = b"vaultwrap";
 
+/// Reserved key inside an app's own `app:<name>` DEK-encrypted KV table that
+/// mirrors the configure-then-freeze marker. The sealed `AppMeta` copy of
+/// `config_complete` is MRENCLAVE-bound and dies with the old runtime on an
+/// enclave upgrade, while a vault-backed app's KV (and everything the owner
+/// configured into it) survives — this mirror lets `load_app` restore the
+/// configured state alongside the data. The value is the configuration hash
+/// in force when the owner configured (empty when the app declares none), so
+/// a changed policy still re-freezes. Reads are self-guarding: only the
+/// surviving DEK decrypts the marker; a fresh generated key finds nothing.
+/// Apps address their KV with arbitrary keys, so the name is namespaced to
+/// make a collision practically impossible.
+const CONFIGURED_MARKER_KEY: &[u8] = b"__privasys.config_complete.v1";
+
+/// Write the configured marker into the app's DEK-encrypted KV (best-effort:
+/// the sealed AppMeta remains the primary record for same-MRENCLAVE restarts).
+fn write_configured_marker(
+    dek: [u8; AEAD_KEY_SIZE],
+    app_name: &str,
+    configuration_hash: Option<[u8; 32]>,
+) {
+    let table = format!("app:{}", app_name);
+    let store =
+        enclave_os_kvstore::SealedKvStore::from_master_key_with_table(dek, table.as_bytes());
+    let value: &[u8] = match configuration_hash.as_ref() {
+        Some(h) => h.as_slice(),
+        None => &[],
+    };
+    // Best-effort by design (and this crate has no logging channel): a failed
+    // mirror write only degrades upgrade survival — same-MRENCLAVE restarts
+    // still restore from the sealed AppMeta, and the owner can re-configure.
+    let _ = store.put(CONFIGURED_MARKER_KEY, value);
+}
+
+/// True when the app's DEK-encrypted KV carries a configured marker matching
+/// the current configuration hash — i.e. the data this app was configured
+/// with is present and readable under `dek`, and the policy is unchanged.
+fn read_configured_marker(
+    dek: [u8; AEAD_KEY_SIZE],
+    app_name: &str,
+    configuration_hash: Option<[u8; 32]>,
+) -> bool {
+    let table = format!("app:{}", app_name);
+    let store =
+        enclave_os_kvstore::SealedKvStore::from_master_key_with_table(dek, table.as_bytes());
+    match store.get(CONFIGURED_MARKER_KEY) {
+        Ok(Some(recorded)) => {
+            let expected: &[u8] = match configuration_hash.as_ref() {
+                Some(h) => h.as_slice(),
+                None => &[],
+            };
+            recorded == expected
+        }
+        _ => false,
+    }
+}
+
 /// Instructs `load_app` to vault-back an app's `encryption_key`. The platform
 /// authors the owner-bound policy and delivers it as a key-creation grant; the
 /// enclave discovers the constellation from the directory (`mgmt_url`), then on
@@ -161,18 +217,22 @@ fn resolve_vault_backed_key(
 }
 
 /// Rotate a vault-backed app's storage KEK: re-wrap the `encryption_key` (the KV
-/// DEK) from the OLD key generation to a NEW one on the same constellation.
+/// DEK) from the OLD key generation to a NEW one.
 ///
 /// This is the WASM analog of the container's LUKS keyslot re-key: the DEK never
 /// changes, so the sealed KV (encrypted under the DEK) is untouched — only the
 /// KEK that protects the host-side wrapped DEK blob advances. The old KEK is
-/// reconstructed by EXPORT (it exists, so no grant is needed); the new KEK is
-/// reconstructed by CREATE with the owner-minted `new_grant`. The freshly wrapped
-/// blob is stored under the new handle (AAD-bound to it) and the old blob is
-/// retired. The vault retires the old KEK generation separately (owner-proxied),
-/// after which the old blob is permanently un-unwrappable.
+/// reconstructed by EXPORT from `old_cfg` (it exists, so no grant is needed);
+/// the new KEK is reconstructed by CREATE on `new_cfg` with the owner-minted
+/// `new_grant`. Same-constellation generation rotation passes the same config
+/// twice; the graceful cross-constellation migration passes the TARGET
+/// constellation as `new_cfg`. The freshly wrapped blob is stored under the new
+/// handle (AAD-bound to it) and the old blob is retired. The vault retires the
+/// old KEK generation separately (owner-proxied), after which the old blob is
+/// permanently un-unwrappable.
 fn rotate_vault_backed_key(
-    cfg: &crate::vaultkey::VaultConfig,
+    old_cfg: &crate::vaultkey::VaultConfig,
+    new_cfg: &crate::vaultkey::VaultConfig,
     old_handle: &str,
     new_handle: &str,
     new_grant: &str,
@@ -187,10 +247,10 @@ fn rotate_vault_backed_key(
 
     // Old KEK: the key already exists, so export it (a grant is only needed to
     // CREATE). A policy denial here is the upgrade gate, not a first boot.
-    let old_kek = vaultkey::resolve_or_provision(cfg, old_handle, "", code_hash, app_id_slice)?;
+    let old_kek = vaultkey::resolve_or_provision(old_cfg, old_handle, "", code_hash, app_id_slice)?;
     // New KEK: create the new generation with the owner-minted grant.
     let new_kek =
-        vaultkey::resolve_or_provision(cfg, new_handle, new_grant, code_hash, app_id_slice)?;
+        vaultkey::resolve_or_provision(new_cfg, new_handle, new_grant, code_hash, app_id_slice)?;
 
     let old_cipher = AeadCipher::from_key(old_kek);
     let new_cipher = AeadCipher::from_key(new_kek);
@@ -458,6 +518,10 @@ pub struct AppMeta {
     /// no declared dependencies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dependencies: Option<Vec<u8>>,
+    /// Replay-mode cluster transactions (see `WasmLoad::txn_replay`):
+    /// imports verified deterministic at load; replicas re-execute.
+    #[serde(default)]
+    pub txn_replay: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -608,6 +672,7 @@ impl AppRegistry {
         app_id: Option<[u8; 16]>,
         vault: Option<VaultBacking>,
         dependencies: Option<Vec<u8>>,
+        txn_replay: bool,
     ) -> Result<AppMeta, String> {
         if self.known.contains_key(name) {
             return Err(format!("app '{}' is already loaded", name));
@@ -620,6 +685,29 @@ impl AppRegistry {
 
         // ── Deserialize (AOT) ──────────────────────────────────────
         let component = self.engine.deserialize(wasm_bytes)?;
+
+        // ── Transaction world (replay mode): load-time import
+        //    verification ────────────────────────────────────────────
+        // A replay-mode app must be deterministic: HTTPS egress and
+        // raw sockets are non-deterministic inputs and are rejected AT
+        // LOAD, not at call time — the operator learns immediately,
+        // and the measured runtime provably cannot run a replay app
+        // that could observe the network. wasi:random and the clocks
+        // STAY importable: inside a transaction they serve the shared
+        // per-transaction DRBG and the frozen timestamp.
+        if txn_replay {
+            for (import_name, _) in component.component_type().imports(self.engine.engine()) {
+                if import_name.starts_with("privasys:enclave-os/https")
+                    || import_name.starts_with("wasi:sockets/")
+                {
+                    return Err(format!(
+                        "replay-mode app imports non-deterministic interface \
+                         '{import_name}' — https and sockets are unavailable in \
+                         replay transactions"
+                    ));
+                }
+            }
+        }
 
         // ── Trial instantiation ────────────────────────────────────
         // Eagerly verify that the component can be linked against the
@@ -752,6 +840,38 @@ impl AppRegistry {
             }
         }
 
+        // ── Configured-state carry-over ─────────────────────────────
+        // A redeploy of an already-known app goes through THIS path (wasm_load
+        // → load_app), not register_known — so the literal `false` here used to
+        // discard the persisted config_complete on every redeploy/reconciler
+        // reload, re-freezing an app around secrets it still holds (prod
+        // web-search-brave, repeatedly). Carry the flag over, but only when the
+        // KV really is the same one the app configured:
+        //   - the DEK bytes match (a vault-backed reload reconstructs the SAME
+        //     key; a non-vault reload gets a fresh key, so its old data is
+        //     unreadable and the freeze is correct), belt-and-braced by
+        //     key_source/vault_handle equality;
+        //   - the configuration hash is unchanged (a new permissions policy
+        //     re-freezes: the owner must confirm configuration under the new
+        //     contract).
+        let carried_config_complete = self.known.get(name).is_some_and(|prev| {
+            prev.config_complete
+                && prev.encryption_key == app_key
+                && prev.key_source == key_source
+                && prev.vault_handle == vault.as_ref().map(|vb| vb.handle.clone())
+                && prev.configuration_hash == configuration_hash
+        });
+        // Enclave-UPGRADE survival: after an MRENCLAVE roll the sealed AppMeta
+        // (and with it the flag above) is gone, but a vault-backed app's KV
+        // survives — the reconstructed DEK opens the same data. mark_configured
+        // mirrors a marker into that per-app encrypted KV; reading it back is
+        // self-guarding, since only the surviving DEK can decrypt it (a fresh
+        // generated key simply finds nothing). The marker records the
+        // configuration hash so a changed policy still re-freezes.
+        let config_complete = carried_config_complete
+            || (config_api_function.is_some()
+                && read_configured_marker(app_key, name, configuration_hash));
+
         let meta = AppMeta {
             name: name.to_string(),
             hostname: hostname.to_string(),
@@ -768,12 +888,9 @@ impl AppRegistry {
             app_id,
             vault_config,
             vault_handle: vault.as_ref().map(|vb| vb.handle.clone()),
-            // A brand-new load starts unconfigured; the marker is set + persisted
-            // by mark_configured on a successful configure. A same-MRENCLAVE
-            // replay restores the persisted value via register_known instead of
-            // reaching this literal.
-            config_complete: false,
+            config_complete,
             dependencies,
+            txn_replay,
         };
         self.known.insert(name.to_string(), meta.clone());
         // Wire the freeze gate: when a config_api function is declared, the app
@@ -813,6 +930,11 @@ impl AppRegistry {
     /// Used during startup to restore app identities from the sealed
     /// KV store.  The component stays uncompiled until the first
     /// `wasm_call` triggers [`ensure_loaded()`](Self::ensure_loaded).
+    /// Metadata of a known (registered) app.
+    pub fn app_meta(&self, name: &str) -> Option<&AppMeta> {
+        self.known.get(name)
+    }
+
     pub fn register_known(&mut self, meta: AppMeta) {
         // Restore the freeze gate from the sealed KV. An app that persisted a
         // config_complete marker keeps its configured state across the restart
@@ -836,6 +958,12 @@ impl AppRegistry {
     /// host-side wrapped DEK advances (a cheap re-wrap, like the container's LUKS
     /// keyslot re-key). `mgmt_url`/`environment` are only consulted if the app has
     /// no sealed selection to reuse.
+    ///
+    /// `new_cfg` = None rotates generations on the SAME constellation (today's
+    /// KEK rotation). Some(target) is the graceful cross-constellation
+    /// migration: the old KEK exports from the sealed selection, the new one
+    /// is created on `target`, and the sealed selection advances to `target`
+    /// so every later reconstruct goes there.
     pub fn rotate_vault_key(
         &mut self,
         name: &str,
@@ -843,6 +971,7 @@ impl AppRegistry {
         new_grant: &str,
         mgmt_url: &str,
         environment: &str,
+        new_cfg: Option<crate::vaultkey::VaultConfig>,
     ) -> Result<AppMeta, String> {
         let meta = self
             .known
@@ -857,21 +986,34 @@ impl AppRegistry {
                 "rotate: new handle equals the current handle {new_handle}"
             ));
         }
-        let cfg = match &meta.vault_config {
+        let old_cfg = match &meta.vault_config {
             Some(c) => c.clone(),
             None => crate::vaultkey::discover(mgmt_url, environment)?,
         };
+        let target_cfg = new_cfg.clone().unwrap_or_else(|| old_cfg.clone());
         let code_hash = meta.code_hash;
         let app_id = meta.app_id;
 
-        rotate_vault_backed_key(&cfg, &old_handle, new_handle, new_grant, &code_hash, app_id)?;
+        rotate_vault_backed_key(
+            &old_cfg,
+            &target_cfg,
+            &old_handle,
+            new_handle,
+            new_grant,
+            &code_hash,
+            app_id,
+        )?;
 
-        // Advance the sealed handle (the DEK and vault_config are unchanged).
+        // Advance the sealed handle (the DEK is unchanged); on a migration the
+        // sealed constellation selection advances with it.
         let source = format!("vault:{new_handle}");
         let updated = {
             let m = self.known.get_mut(name).expect("known checked above");
             m.vault_handle = Some(new_handle.to_string());
             m.key_source = source.clone();
+            if new_cfg.is_some() {
+                m.vault_config = Some(target_cfg);
+            }
             m.clone()
         };
         if let Some(la) = self.loaded.get_mut(name) {
@@ -956,6 +1098,29 @@ impl AppRegistry {
         self.known.remove(name).map(|m| m.hostname)
     }
 
+    /// Whether the app has completed configure-then-freeze, as the runtime sees
+    /// it. An app that declared no config function is never frozen, so it
+    /// reports true. Exported in the metrics so the control plane can PULL this
+    /// state instead of depending on having witnessed the configure call — the
+    /// same shape as polling a container's manager.
+    pub fn is_configured(&self, name: &str) -> bool {
+        if !self.config_api.contains_key(name) {
+            return true;
+        }
+        self.configured.get(name).copied().unwrap_or(false)
+    }
+
+    /// Configure-then-freeze state for every known app.
+    ///
+    /// Snapshotted in one call so a reporter never has to hold this lock and
+    /// the metrics lock at the same time.
+    pub fn configured_snapshot(&self) -> Vec<(String, bool)> {
+        self.known
+            .keys()
+            .map(|name| (name.clone(), self.is_configured(name)))
+            .collect()
+    }
+
     /// Returns `true` when the app is frozen (declared a `config_api`
     /// at load time and has not yet called `set-config-complete`) and
     /// the requested function is NOT the configure function.
@@ -972,8 +1137,11 @@ impl AppRegistry {
 
     /// Flip the freeze flag for `name` to configured. Also persists the marker
     /// on the app's sealed `AppMeta` (returned so the caller writes it to KV) so
-    /// a restart whose KV survives does not re-freeze the app. No-op / returns
-    /// None when the app has no declared `config_api`.
+    /// a restart whose KV survives does not re-freeze the app, and mirrors it
+    /// into the app's own DEK-encrypted KV so a vault-backed app stays
+    /// configured across an ENCLAVE UPGRADE too (the sealed AppMeta is
+    /// MRENCLAVE-bound and dies with the old runtime; the app's KV does not).
+    /// No-op / returns None when the app has no declared `config_api`.
     pub fn mark_configured(&mut self, name: &str) -> Option<AppMeta> {
         if !self.config_api.contains_key(name) {
             return None;
@@ -984,6 +1152,7 @@ impl AppRegistry {
             return None; // already persisted; nothing to write
         }
         meta.config_complete = true;
+        write_configured_marker(meta.encryption_key, name, meta.configuration_hash);
         Some(meta.clone())
     }
 

@@ -425,7 +425,7 @@ pub fn initialise_runtime_and_ingress(
     // dynamically (e.g. WASM) will call cert_store().register()
     // at runtime.
     {
-        let store = crate::ratls::cert_store::CertStore::new(ca.clone());
+        let store = crate::ratls::cert_store::CertStore::new();
         let identities = crate::modules::collect_app_identities();
         let count = identities.len();
         for identity in identities {
@@ -558,6 +558,39 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
                 // Decode the channel message
                 match channel::decode_channel_msg(&msg) {
                     Some((msg_type, conn_id, payload)) => {
+                        // The optional upstream peer transport has a separate
+                        // ID range and wire protocol. Honest's host-assigned
+                        // connections remain in the ingress range and reach
+                        // the adopter hook below.
+                        if !channel::conn_id_is_ingress(conn_id)
+                            || msg_type == channel::ChannelMsgType::Tick
+                        {
+                            if msg_type == channel::ChannelMsgType::Tick {
+                                // Scheduling hints also belong to the adopter;
+                                // they must not disappear when upstream Raft is off.
+                                hook.on_data_channel_message(msg_type, conn_id, payload);
+                            }
+                            #[cfg(feature = "raft")]
+                            let consumed =
+                                crate::raftglue::handle_channel_msg(msg_type, conn_id, payload);
+                            #[cfg(not(feature = "raft"))]
+                            let consumed = false;
+                            if !consumed && msg_type == channel::ChannelMsgType::TcpNew {
+                                if crate::data_tx()
+                                    .try_send(&channel::encode_tcp_close(conn_id))
+                                    .is_err()
+                                {
+                                    crate::signal_shutdown_with_origin(
+                                        ShutdownOriginV1::IngressOutputCreditBacklog,
+                                    );
+                                    break;
+                                }
+                            }
+                            apply_control_action(
+                                hook.on_opportunity(ControlLoopOpportunity::DataChannelProgress),
+                            );
+                            continue;
+                        }
                         if !hook.on_data_channel_message(msg_type, conn_id, payload) {
                             let mut st = match crate::state().lock() {
                                 Ok(st) => st,
@@ -671,6 +704,9 @@ pub fn register_ocall_vtable() {
         kv_store_get: |table, key| crate::ocall::kv_store_get(table, key, 0),
         kv_store_delete: crate::ocall::kv_store_delete,
         kv_store_list_keys: crate::ocall::kv_store_list_keys,
+        kv_store_write_batch: crate::ocall::kv_store_write_batch,
+        kv_store_multi_get: crate::ocall::kv_store_multi_get,
+        kv_store_scan: crate::ocall::kv_store_scan,
         get_current_time: crate::ocall::get_current_time,
         log: |level, msg| {
             let ll = match level {
@@ -783,6 +819,228 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
         _module_count += 1;
     }
 
+    // ── Merkle module (authenticated KV store, versioned sparse tree) ─
+    #[cfg(feature = "merkle")]
+    {
+        let store_name = config
+            .extra
+            .get("merkle_store_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("default");
+        let merkle = match enclave_os_merkle::MerkleModule::new(sealed_cfg.master_key(), store_name)
+        {
+            Ok(m) => m,
+            Err(e) => {
+                enclave_log_error!("MerkleModule init failed: {}", e);
+                return -35;
+            }
+        };
+        crate::modules::register_module(Box::new(merkle));
+        _module_count += 1;
+    }
+
+    // ── Raft module (attested consensus + clustered ledger) ──────────
+    #[cfg(feature = "raft")]
+    {
+        // Config: raft_node_id (u64, required to activate),
+        // raft_peers ({"<id>": "host:port"}), and raft_vault — the
+        // cluster key lives in the vault constellation under a grant
+        // policy and is released by attestation alone: fetching the
+        // credential IS admission. There is no config-supplied key
+        // path — a shared secret in host configuration would hand the
+        // commitment key to the adversary the design defends against.
+        if let Some(node_id) = config.extra.get("raft_node_id").and_then(|v| v.as_u64()) {
+            let peers: std::collections::BTreeMap<u64, String> = config
+                .extra
+                .get("raft_peers")
+                .and_then(|v| v.as_object())
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, v)| Some((k.parse().ok()?, v.as_str()?.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let Some(vault) = config.extra.get("raft_vault").and_then(|v| v.as_object()) else {
+                enclave_log_error!(
+                    "raft: raft_vault is required (the cluster key is vault-anchored; \
+                     there is no config-supplied key)"
+                );
+                return -36;
+            };
+            let get = |k: &str| {
+                vault
+                    .get(k)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let str_list = |v: Option<&serde_json::Value>| -> Vec<String> {
+                v.and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|s| s.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            // Addressing: the platform directory (mgmt_url) or an
+            // inline constellation (BYOK — customer-owned vaults, no
+            // platform involvement). Exactly one of the two.
+            let addressing = if let Some(c) = vault.get("constellation").and_then(|v| v.as_object())
+            {
+                if vault.contains_key("mgmt_url") {
+                    enclave_log_error!(
+                        "raft: raft_vault takes either mgmt_url (directory) or \
+                         constellation (direct), not both"
+                    );
+                    return -36;
+                }
+                let cget = |k: &str| c.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                crate::raftglue::VaultAddressing::Direct {
+                    endpoints: str_list(c.get("endpoints")),
+                    mrenclave_hex: cget("mrenclave"),
+                    attestation_server: cget("attestation_server"),
+                    ca_roots_hex: str_list(c.get("ca_roots")),
+                    threshold: c.get("threshold").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                    oidc_issuer: cget("oidc_issuer"),
+                    acceptable_tcb_statuses: str_list(c.get("acceptable_tcb_statuses")),
+                }
+            } else {
+                let mgmt_url = get("mgmt_url");
+                if mgmt_url.is_empty() {
+                    enclave_log_error!(
+                        "raft: raft_vault needs mgmt_url (directory) or \
+                         constellation (direct)"
+                    );
+                    return -36;
+                }
+                crate::raftglue::VaultAddressing::Directory {
+                    mgmt_url,
+                    environment: {
+                        let e = get("environment");
+                        if e.is_empty() {
+                            "production".to_string()
+                        } else {
+                            e
+                        }
+                    },
+                }
+            };
+            let vcfg = crate::raftglue::RaftVaultConfig {
+                addressing,
+                handle: get("handle"),
+                grant: get("grant"),
+                app_id: vault
+                    .get("app_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(enclave_os_common::hex::hex_decode),
+            };
+            if vcfg.handle.is_empty() {
+                enclave_log_error!("raft: raft_vault needs a handle");
+                return -36;
+            }
+            let cluster_key: [u8; 32] = match crate::raftglue::resolve_cluster_key(&vcfg) {
+                Ok(k) => k,
+                Err(e) => {
+                    enclave_log_error!("raft: cluster credential: {}", e);
+                    return -36;
+                }
+            };
+            let ca = match crate::ratls::attestation::CaContext::from_parts(
+                sealed_cfg.ca_cert_der.clone(),
+                sealed_cfg.ca_key_pkcs8.clone(),
+            ) {
+                Ok(ca) => ca,
+                Err(e) => {
+                    enclave_log_error!("raft: CA context: {}", e);
+                    return -36;
+                }
+            };
+            // Joining nodes supply the CLUSTER's original genesis
+            // voter list (not including themselves).
+            let genesis_voters: Option<Vec<u64>> = config
+                .extra
+                .get("raft_genesis_voters")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_u64()).collect());
+            // Peer measurement pinning is policy-sourced, always: the
+            // credential policy's Tees (owner-approved, refreshed
+            // periodically) are the SOLE source of the admissible set.
+            // The former config overrides are gone — refuse them
+            // loudly rather than silently changing admission
+            // semantics (same precedent as raft_cluster_key).
+            if config.extra.contains_key("raft_pin_measurements")
+                || config.extra.contains_key("raft_pin_measurement")
+            {
+                enclave_log_error!(
+                    "raft: raft_pin_measurements / raft_pin_measurement were removed — \
+                     the credential policy is the sole source of the admissible \
+                     measurement set (stage + promote a Tee profile for upgrades)"
+                );
+                return -36;
+            }
+            // Acceptable Intel TCB statuses on peer quotes: tri-state
+            // with vault semantics (absent = no check, [] = strict
+            // floor-only, list = floor + list; Revoked never).
+            let acceptable_tcb_statuses: Option<Vec<String>> = config
+                .extra
+                .get("raft_acceptable_tcb_statuses")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                });
+            if let Some(set) = &acceptable_tcb_statuses {
+                if set.iter().any(|s| s == "Revoked") {
+                    enclave_log_error!("raft: Revoked can never be an acceptable TCB status");
+                    return -36;
+                }
+            }
+            // Link re-attestation window (fresh quotes): seconds,
+            // default 24 h, 0 disables.
+            let reattest_ticks = config
+                .extra
+                .get("raft_reattest_secs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(86_400)
+                .saturating_mul(10);
+            // Keep roughly this many applied entries in the log;
+            // followers further behind catch up via snapshot transfer.
+            let log_retain = config
+                .extra
+                .get("raft_log_retain")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1024);
+            match crate::raftglue::RaftGlue::new(
+                sealed_cfg.master_key(),
+                cluster_key,
+                node_id,
+                peers,
+                genesis_voters,
+                ca,
+                crate::raftglue::RaftNetConfig {
+                    acceptable_tcb_statuses,
+                    reattest_ticks,
+                },
+                vcfg,
+                log_retain,
+            ) {
+                Ok(glue) => {
+                    crate::raftglue::install(glue);
+                    crate::modules::register_module(Box::new(crate::raftglue::RaftModule));
+                    _module_count += 1;
+                }
+                Err(e) => {
+                    enclave_log_error!("raft init failed: {}", e);
+                    return -36;
+                }
+            }
+        } else {
+            enclave_log_info!("raft feature built but raft_node_id not configured — inactive");
+        }
+    }
+
     // ── Vault module (policy-gated secrets, JWT + mRA-TLS) ───────────
     #[cfg(feature = "vault")]
     {
@@ -808,6 +1066,14 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
         // lifetime, which matches the module's intended scope.
         let wasm_static: &'static enclave_os_wasm::WasmModule = Box::leak(Box::new(wasm));
         enclave_os_wasm::install_global(wasm_static);
+        // Sovereign sealing root (sovereign-data framework, Phase 1): a
+        // domain-separated derivative of the MRENCLAVE-sealed master key.
+        // The wasm crate receives only the derivative, never the master
+        // key; the `sealing.get-seal-key` host function binds it further
+        // to each calling app's own code hash.
+        enclave_os_wasm::install_sovereign_root(
+            enclave_os_wasm::sovereign_seal::derive_sovereign_root(&sealed_cfg.master_key()),
+        );
         crate::modules::register_module(Box::new(enclave_os_wasm::WasmModuleHandle(wasm_static)));
         _module_count += 1;
     }
@@ -843,6 +1109,8 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
     #[cfg(not(any(
         feature = "egress",
         feature = "kvstore",
+        feature = "merkle",
+        feature = "raft",
         feature = "vault",
         feature = "wasm",
         feature = "fido2"

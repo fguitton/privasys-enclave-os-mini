@@ -162,8 +162,12 @@ pub struct WasmSetDependencies {
 /// ```
 ///
 /// The old handle is the app's currently sealed generation; only the new handle
-/// and its owner-minted grant come in here. Both KEKs are reconstructed from the
-/// same constellation the app is already sealed to.
+/// and its owner-minted grant come in here. Without the `new_vault_*` fields
+/// both KEKs are reconstructed from the same constellation the app is already
+/// sealed to (a generation rotation). With them, the new KEK is created on the
+/// TARGET constellation instead — the graceful cross-constellation migration,
+/// mirroring the container rotate request — and the app's sealed constellation
+/// selection advances to it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WasmRotateKey {
     /// App identifier to rotate.
@@ -180,6 +184,32 @@ pub struct WasmRotateKey {
     /// Platform environment for the directory query (`dev` / `prod`).
     #[serde(default)]
     pub environment: Option<String>,
+    /// TARGET constellation endpoints (`"host:port"` each) for a
+    /// cross-constellation migration. Addressing, not trust: the vaults must
+    /// still pass RA-TLS against `new_vault_mrenclave` and the key policy
+    /// remains the boundary.
+    #[serde(default)]
+    pub new_vault_endpoints: Option<Vec<String>>,
+    /// TARGET constellation vault MRENCLAVE (64 hex chars).
+    #[serde(default)]
+    pub new_vault_mrenclave: Option<String>,
+    /// TARGET constellation attestation server (verify endpoint URL).
+    #[serde(default)]
+    pub new_vault_attestation_server: Option<String>,
+    /// TARGET constellation CA trust anchors, hex-encoded DER each.
+    #[serde(default)]
+    pub new_vault_ca_roots: Option<Vec<String>>,
+    /// TARGET constellation Shamir threshold (defaults to 2).
+    #[serde(default)]
+    pub new_vault_threshold: Option<usize>,
+    /// TARGET constellation OIDC issuer (informational, carried in the sealed
+    /// selection for a later re-author).
+    #[serde(default)]
+    pub new_vault_oidc_issuer: Option<String>,
+    /// TARGET constellation acceptable Intel TCB statuses (empty/absent =
+    /// no TCB acceptance check on the dial).
+    #[serde(default)]
+    pub new_vault_acceptable_tcb_statuses: Option<Vec<String>>,
 }
 
 /// Host-driven billing freeze command.
@@ -261,6 +291,15 @@ pub struct WasmLoad {
     /// read across app reloads.
     #[serde(default)]
     pub encryption_key: Option<String>,
+    /// Replay-mode cluster transactions: replicas RE-EXECUTE this
+    /// app's transactions deterministically and verify the write-set
+    /// instead of trusting it. Loading enforces the transaction
+    /// world: imports of https egress or raw sockets are rejected
+    /// (wasi:random stays available, backed by the per-transaction
+    /// DRBG; clocks are frozen to the committed timestamp). The app
+    /// must be loaded IDENTICALLY on every cluster node.
+    #[serde(default)]
+    pub txn_replay: bool,
     /// Optional per-app permission policy.
     ///
     /// When present, the enclave enforces per-function access control on

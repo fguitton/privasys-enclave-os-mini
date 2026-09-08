@@ -28,6 +28,8 @@ option(ENABLE_KVSTORE "Include the sealed KV store module"                    OF
 option(ENABLE_VAULT   "Include the vault module (implies egress + kvstore)"   OFF)
 option(ENABLE_WASM    "Include the WASM runtime module (implies egress + kvstore)" OFF)
 option(ENABLE_FIDO2   "Include the FIDO2/WebAuthn authentication module (implies kvstore)" OFF)
+option(ENABLE_MERKLE  "Include the authenticated Merkle KV store module"      OFF)
+option(ENABLE_RAFT    "Include the raft consensus module (clustered ledger)"  OFF)
 
 set(CUSTOM_ENCLAVE_DIR "" CACHE PATH
     "Path to an external composition crate with a custom ecall_run. \
@@ -69,6 +71,12 @@ else()
     endif()
     if(ENABLE_FIDO2)
         list(APPEND _features "fido2")
+    endif()
+    if(ENABLE_MERKLE)
+        list(APPEND _features "merkle")
+    endif()
+    if(ENABLE_RAFT)
+        list(APPEND _features "raft")
     endif()
 
     # Join into comma-separated string for Cargo

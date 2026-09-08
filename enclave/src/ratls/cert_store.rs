@@ -7,7 +7,8 @@
 //! the Enclave CA) containing:
 //! - A per-app config Merkle root OID
 //! - Any OID-flagged config entries as direct extensions
-//! - An SGX quote (proving the enclave is genuine)
+//!
+//! Evidence is exchanged separately on the TLS connection (RA-TLS v2).
 //!
 //! Incoming TLS connections are routed to the correct certificate via
 //! the SNI hostname in the ClientHello.
@@ -26,14 +27,34 @@
 
 use std::collections::BTreeMap;
 use std::string::String;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::vec::Vec;
 
 use ring::digest;
 
-use crate::ratls::attestation::CaContext;
 use enclave_os_common::modules::{AppIdentity, AttestedEndpointIdentity, ConfigEntry};
+
+/// Validity of one certificate configuration, shared by its cache and sessions.
+/// Replacement revokes the old allocation permanently, including across an
+/// unload/reload with identical configuration. It never depends on host time.
+#[derive(Clone)]
+pub struct ConfigurationLease(Arc<AtomicBool>);
+
+impl ConfigurationLease {
+    fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(true)))
+    }
+
+    pub fn is_current(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn replace(&mut self) {
+        self.0.store(false, Ordering::Release);
+        *self = Self::new();
+    }
+}
 
 // ---------------------------------------------------------------------------
 //  Global accessor
@@ -83,6 +104,7 @@ pub struct AppCertData {
 
 /// A registered app with pre-computed Merkle tree data.
 struct RegisteredApp {
+    configuration: ConfigurationLease,
     /// Per-app Merkle root.
     merkle_root: [u8; 32],
     /// Direct OID extensions from config entries.
@@ -103,35 +125,25 @@ struct RegisteredApp {
 /// Thread-safe: uses an `RwLock` internally so that the RA-TLS server
 /// can read while modules concurrently register/unregister apps.
 pub struct CertStore {
-    /// CA context for signing app leaf certificates.
-    ca: Arc<CaContext>,
-    /// Hostname → registered app data.
-    inner: RwLock<BTreeMap<String, RegisteredApp>>,
-    /// Monotonically increasing generation counter.  Bumped on every
-    /// `register()` / `unregister()` so that consumers (IngressServer
-    /// cert cache) can detect stale entries.
-    generation: AtomicU64,
+    inner: RwLock<StoreState>,
+}
+
+struct StoreState {
+    apps: BTreeMap<String, RegisteredApp>,
+    /// Platform leaves describe the combined workload set. Unknown SNI also
+    /// uses this lease, so later registration cannot silently change routing.
+    platform: ConfigurationLease,
 }
 
 impl CertStore {
-    /// Create a new cert store with the given CA context.
-    pub fn new(ca: Arc<CaContext>) -> Self {
+    /// Create a metadata store. The ingress server owns the certificate signer.
+    pub fn new() -> Self {
         Self {
-            ca,
-            inner: RwLock::new(BTreeMap::new()),
-            generation: AtomicU64::new(0),
+            inner: RwLock::new(StoreState {
+                apps: BTreeMap::new(),
+                platform: ConfigurationLease::new(),
+            }),
         }
-    }
-
-    /// Current generation counter.  Changes whenever an app is
-    /// registered or unregistered.
-    pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
-    }
-
-    /// Get the CA context (for cert generation).
-    pub fn ca(&self) -> &Arc<CaContext> {
-        &self.ca
     }
 
     /// Register an app identity.
@@ -141,25 +153,49 @@ impl CertStore {
     /// is already registered, it is replaced.
     pub fn register(&self, identity: AppIdentity) {
         let registered = Self::compute_app(&identity.config, identity.attested_endpoint);
-        if let Ok(mut inner) = self.inner.write() {
-            inner.insert(identity.hostname, registered);
+        let mut inner = self.inner.write().expect("CertStore poisoned");
+        if let Some(previous) = inner.apps.get_mut(&identity.hostname) {
+            previous.configuration.replace();
         }
-        self.generation.fetch_add(1, Ordering::Release);
+        inner.platform.replace();
+        inner.apps.insert(identity.hostname, registered);
     }
 
     /// Unregister an app by SNI hostname.
     ///
     /// Returns `true` if the app was found and removed.
     pub fn unregister(&self, hostname: &str) -> bool {
-        let removed = if let Ok(mut inner) = self.inner.write() {
-            inner.remove(hostname).is_some()
+        let mut inner = self.inner.write().expect("CertStore poisoned");
+        if let Some(mut previous) = inner.apps.remove(hostname) {
+            previous.configuration.replace();
+            inner.platform.replace();
+            true
         } else {
             false
-        };
-        if removed {
-            self.generation.fetch_add(1, Ordering::Release);
         }
-        removed
+    }
+
+    /// Revoke cached configurations and existing sessions for this name.
+    pub fn invalidate(&self, hostname: &str) {
+        let mut inner = self.inner.write().expect("CertStore poisoned");
+        if let Some(app) = inner.apps.get_mut(hostname) {
+            app.configuration.replace();
+        }
+        inner.platform.replace();
+    }
+
+    /// Capture certificate data and its validity under the same lock. A
+    /// concurrent replacement revokes this snapshot, never associates old
+    /// certificate contents with a new configuration's validity.
+    pub fn snapshot(
+        &self,
+        hostname: Option<&str>,
+    ) -> Result<(Option<AppCertData>, ConfigurationLease), &'static str> {
+        let inner = self.inner.read().map_err(|_| "CertStore poisoned")?;
+        match hostname.and_then(|name| inner.apps.get(name).map(|app| (name, app))) {
+            Some((name, app)) => Ok((Some(Self::app_data(name, app)), app.configuration.clone())),
+            None => Ok((None, inner.platform.clone())),
+        }
     }
 
     /// Resolve an app by SNI hostname.
@@ -168,20 +204,24 @@ impl CertStore {
     /// `None` if no app is registered for this hostname.
     pub fn resolve(&self, hostname: &str) -> Option<AppCertData> {
         let inner = self.inner.read().ok()?;
-        let app = inner.get(hostname)?;
-        Some(AppCertData {
+        let app = inner.apps.get(hostname)?;
+        Some(Self::app_data(hostname, app))
+    }
+
+    fn app_data(hostname: &str, app: &RegisteredApp) -> AppCertData {
+        AppCertData {
             hostname: hostname.to_string(),
             merkle_root: app.merkle_root,
             oid_extensions: app.oid_extensions.clone(),
             attested_endpoint: app.attested_endpoint,
-        })
+        }
     }
 
     /// List all registered hostnames.
     pub fn hostnames(&self) -> Vec<String> {
         self.inner
             .read()
-            .map(|inner| inner.keys().cloned().collect())
+            .map(|inner| inner.apps.keys().cloned().collect())
             .unwrap_or_default()
     }
 
@@ -246,6 +286,7 @@ impl CertStore {
         };
 
         RegisteredApp {
+            configuration: ConfigurationLease::new(),
             merkle_root,
             oid_extensions,
             attested_endpoint,
@@ -254,11 +295,57 @@ impl CertStore {
     }
 }
 
+impl Default for CertStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use enclave_os_common::modules::AttestedEndpointIdentity;
+    use enclave_os_common::modules::{AppIdentity, AttestedEndpointIdentity};
 
     use super::CertStore;
+
+    #[test]
+    fn configuration_replacement_revokes_only_dependent_snapshots_without_aba() {
+        let store = CertStore::new();
+        let identity = |name: &str| AppIdentity {
+            hostname: name.into(),
+            config: vec![],
+            attested_endpoint: None,
+        };
+        let (_, unknown) = store.snapshot(Some("a.test")).unwrap();
+        store.register(identity("a.test"));
+        assert!(!unknown.is_current());
+        store.register(identity("b.test"));
+        let (a_data, a) = store.snapshot(Some("a.test")).unwrap();
+        let (_, b) = store.snapshot(Some("b.test")).unwrap();
+        let (_, platform) = store.snapshot(None).unwrap();
+        store.register(identity("a.test"));
+        let (replacement_data, replacement) = store.snapshot(Some("a.test")).unwrap();
+        assert_eq!(
+            a_data.unwrap().merkle_root,
+            replacement_data.unwrap().merkle_root
+        );
+        assert!(!a.is_current());
+        assert!(!platform.is_current());
+        assert!(b.is_current());
+        assert!(replacement.is_current());
+        assert!(store.unregister("a.test"));
+        assert!(!replacement.is_current());
+        store.register(identity("a.test"));
+        assert!(!a.is_current());
+        assert!(!replacement.is_current());
+        let (_, reloaded) = store.snapshot(Some("a.test")).unwrap();
+        store.invalidate("a.test");
+        assert!(!reloaded.is_current());
+        assert!(store.snapshot(Some("a.test")).unwrap().1.is_current());
+        assert!(b.is_current());
+        let (_, platform) = store.snapshot(None).unwrap();
+        assert!(!store.unregister("missing.test"));
+        assert!(platform.is_current());
+    }
 
     #[test]
     fn endpoint_identity_is_retained_and_changes_the_app_root() {

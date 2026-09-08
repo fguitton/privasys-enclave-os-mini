@@ -45,13 +45,21 @@
 //! | `TcpConnected`     | 0x06 | u64 request ID | Outbound socket connected |
 //! | `TcpConnectFailed` | 0x07 | u64 request ID + u8 reason | Outbound socket failed |
 //!
+//! The optional upstream peer-link transport uses separate message types:
+//! `PeerTcpConnect` (0x09, enclave-assigned outbound conn_id, UTF-8 endpoint),
+//! `PeerTcpConnected` (0x0A, that conn_id, empty payload).
+//! Peer connect failure is `TcpClose`. These
+//! must never be interpreted as Honest's request-correlated connect messages.
+//! `Tick` (0x0B, conn_id zero, empty payload) is a generic scheduling hint,
+//! delivered even when the optional peer listener is disabled.
+//!
 //! # Queue layout
 //!
 //! Two SPSC queue pairs are used:
 //! - **RPC channel** (existing): enclave ↔ host RPC for KV, time, log,
 //!   shutdown, and egress socket calls.
-//! - **Data channel** (new): host TCP proxy ↔ enclave TLS engine for
-//!   inbound connections only.
+//! - **Data channel**: host TCP proxy ↔ enclave TLS engine, inbound and
+//!   proxy-owned outbound connections.
 
 #[cfg(feature = "sgx")]
 use alloc::string::String;
@@ -67,6 +75,9 @@ pub const CHANNEL_MSG_HEADER: usize = 5;
 /// The 1 MiB limit is a safety cap — large WASM uploads arrive as
 /// multiple TCP segments anyway.
 pub const MAX_CHANNEL_PAYLOAD: usize = 1024 * 1024;
+/// Nominal host scheduling cadence. Ticks are untrusted hints, never time
+/// evidence or consensus authority, and may be delayed by queue backpressure.
+pub const SCHEDULING_TICK_INTERVAL_MILLIS: u64 = 100;
 const CONNECT_REQUEST_ID_BYTES: usize = 8;
 
 // ========================================================================
@@ -108,6 +119,12 @@ pub enum ChannelMsgType {
     /// New Unix-domain local-control connection (host → enclave).
     /// The host-provided class is routing metadata only, never authority.
     LocalControlNew = 0x08,
+    /// Optional upstream peer link: enclave-assigned conn_id, UTF-8 endpoint.
+    PeerTcpConnect = 0x09,
+    /// Peer connect success, with an empty payload; failure is TcpClose.
+    PeerTcpConnected = 0x0A,
+    /// Untrusted scheduling tick, conn_id zero and empty payload.
+    Tick = 0x0B,
 }
 
 /// Bounded, non-sensitive reason for an asynchronous connect failure.
@@ -144,9 +161,40 @@ impl ChannelMsgType {
             0x06 => Some(Self::TcpConnected),
             0x07 => Some(Self::TcpConnectFailed),
             0x08 => Some(Self::LocalControlNew),
+            0x09 => Some(Self::PeerTcpConnect),
+            0x0A => Some(Self::PeerTcpConnected),
+            0x0B => Some(Self::Tick),
             _ => None,
         }
     }
+}
+
+// ========================================================================
+//  Connection-id ranges
+// ========================================================================
+
+/// First conn_id of the proxy-assigned inbound *peer-port* range.
+pub const CONN_ID_PEER_IN_BASE: u32 = 0x4000_0000;
+
+/// First conn_id of the enclave-assigned *outbound* range.
+pub const CONN_ID_OUTBOUND_BASE: u32 = 0x8000_0000;
+
+/// Is this conn_id an inbound connection on the ingress port?
+#[inline]
+pub fn conn_id_is_ingress(conn_id: u32) -> bool {
+    conn_id < CONN_ID_PEER_IN_BASE
+}
+
+/// Is this conn_id an inbound connection on the peer port?
+#[inline]
+pub fn conn_id_is_peer_inbound(conn_id: u32) -> bool {
+    (CONN_ID_PEER_IN_BASE..CONN_ID_OUTBOUND_BASE).contains(&conn_id)
+}
+
+/// Is this conn_id an enclave-initiated outbound connection?
+#[inline]
+pub fn conn_id_is_outbound(conn_id: u32) -> bool {
+    conn_id >= CONN_ID_OUTBOUND_BASE
 }
 
 // ========================================================================
@@ -232,6 +280,16 @@ pub fn encode_tcp_connected(request_id: u64, conn_id: u32) -> Vec<u8> {
     )
 }
 
+/// Request an optional upstream peer connection using its enclave-owned ID.
+pub fn encode_peer_tcp_connect(conn_id: u32, endpoint: &str) -> Vec<u8> {
+    encode_channel_msg(ChannelMsgType::PeerTcpConnect, conn_id, endpoint.as_bytes())
+}
+
+/// Report the successful completion of an enclave-ID peer connection.
+pub fn encode_peer_tcp_connected(conn_id: u32) -> Vec<u8> {
+    encode_channel_msg(ChannelMsgType::PeerTcpConnected, conn_id, &[])
+}
+
 /// Report failure of a host-owned outbound connection.
 #[inline]
 pub fn encode_tcp_connect_failed(request_id: u64, reason: TcpConnectFailure) -> Vec<u8> {
@@ -310,6 +368,37 @@ mod tests {
         assert_eq!(typ, ChannelMsgType::TcpClose);
         assert_eq!(id, 7);
         assert!(payload.is_empty());
+    }
+
+    #[test]
+    fn test_roundtrip_tcp_connect() {
+        let msg = encode_peer_tcp_connect(0x8000_0001, "10.0.0.7:7400");
+        let (typ, id, payload) = decode_channel_msg(&msg).unwrap();
+        assert_eq!(typ, ChannelMsgType::PeerTcpConnect);
+        assert_eq!(id, 0x8000_0001);
+        assert_eq!(core::str::from_utf8(payload).unwrap(), "10.0.0.7:7400");
+    }
+
+    #[test]
+    fn test_roundtrip_tcp_connected() {
+        let msg = encode_peer_tcp_connected(0x8000_0001);
+        let (typ, id, payload) = decode_channel_msg(&msg).unwrap();
+        assert_eq!(typ, ChannelMsgType::PeerTcpConnected);
+        assert_eq!(id, 0x8000_0001);
+        assert!(payload.is_empty());
+    }
+
+    #[test]
+    fn test_conn_id_ranges() {
+        assert!(conn_id_is_ingress(1));
+        assert!(conn_id_is_ingress(CONN_ID_PEER_IN_BASE - 1));
+        assert!(!conn_id_is_ingress(CONN_ID_PEER_IN_BASE));
+        assert!(conn_id_is_peer_inbound(CONN_ID_PEER_IN_BASE));
+        assert!(conn_id_is_peer_inbound(CONN_ID_OUTBOUND_BASE - 1));
+        assert!(!conn_id_is_peer_inbound(CONN_ID_OUTBOUND_BASE));
+        assert!(conn_id_is_outbound(CONN_ID_OUTBOUND_BASE));
+        assert!(conn_id_is_outbound(u32::MAX));
+        assert!(!conn_id_is_outbound(CONN_ID_OUTBOUND_BASE - 1));
     }
 
     #[test]

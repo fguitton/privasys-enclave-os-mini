@@ -11,7 +11,7 @@
 //! - Provide the CLI entry point
 
 mod c3_endpoints;
-#[cfg(all(target_os = "linux", not(sgx_mode_sim)))]
+#[cfg(all(target_os = "linux", not(sgx_mode_sim), not(feature = "mock")))]
 mod dcap;
 mod dispatcher;
 mod enclave;
@@ -49,7 +49,7 @@ enum EnclaveTestSelection {
     Invalid,
 }
 
-const EXPECTED_SIGNED_ENCLAVE_TESTS: u8 = 6;
+const EXPECTED_SIGNED_ENCLAVE_TESTS: u8 = 7;
 
 impl EnclaveTestSelection {
     const fn code(self) -> u32 {
@@ -102,6 +102,11 @@ struct Cli {
     /// The enclave, not this host process, terminates the TLS session.
     #[arg(long)]
     local_control_socket: Option<PathBuf>,
+    /// Optional second listen port for cluster peer links (raft).
+    /// Inbound connections on this port are routed to the enclave's
+    /// peer-link layer instead of the HTTPS ingress.
+    #[arg(long)]
+    peer_port: Option<u16>,
 
     /// Path for the KV store data directory
     #[arg(short, long, default_value = "./kvdata")]
@@ -116,7 +121,7 @@ struct Cli {
     /// Comma-separated list of attestation server URLs for remote quote
     /// verification.  e.g. "https://as.privasys.org/verify,https://as.customer.com/verify"
     /// The list is hashed into the config Merkle tree (leaf: egress.attestation_servers)
-    /// and embedded as X.509 OID 1.3.6.1.4.1.65230.2.7.
+    /// and embedded as X.509 OID 1.3.6.1.4.1.65230.2.3.
     #[arg(long, value_delimiter = ',')]
     attestation_servers: Option<Vec<String>>,
 
@@ -138,6 +143,12 @@ struct Cli {
     /// Required when --oidc-issuer is set.
     #[arg(long)]
     oidc_audience: Option<String>,
+
+    /// Extra enclave config as a JSON object, merged into the config
+    /// passed to ecall_run (e.g. '{"raft_node_id":1,"raft_peers":
+    /// {"2":"10.0.0.2:7400"},"raft_cluster_key":"<hex64>"}').
+    #[arg(long)]
+    extra: Option<String>,
 
     /// Enable debug logging
     #[arg(short, long)]
@@ -437,14 +448,16 @@ fn main() -> Result<()> {
     let proxy_port = cli.port;
     let proxy_backlog = cli.backlog;
     let local_control_socket = cli.local_control_socket.clone();
+    let proxy_peer_port = cli.peer_port;
     let shutdown_clone = shutdown.clone();
     let proxy_handle = thread::Builder::new()
         .name("tcp-proxy".into())
         .spawn(move || {
-            match tcp_proxy::TcpProxy::new_with_local_control(
+            match tcp_proxy::TcpProxy::new_with_listeners(
                 proxy_port,
                 proxy_backlog,
                 local_control_socket,
+                proxy_peer_port,
                 data_to_enc_tx,
                 data_from_enc_rx,
                 shutdown_clone,
@@ -640,6 +653,26 @@ fn main() -> Result<()> {
                 serde_json::Value::String(supplier_public_key.to_string());
         }
         config["c3_development"] = development;
+    }
+
+    // Merge --extra JSON object into the enclave config (raft_*, ...).
+    if let Some(ref extra) = cli.extra {
+        match serde_json::from_str::<serde_json::Value>(extra) {
+            Ok(serde_json::Value::Object(map)) => {
+                for (k, v) in map {
+                    if config.get(&k).is_some()
+                        || k.starts_with("c3_")
+                        || k.starts_with("s1_")
+                        || k.starts_with("s1_2_")
+                        || k.starts_with("s2_")
+                    {
+                        anyhow::bail!("--extra cannot override reserved configuration key: {}", k);
+                    }
+                    config[k] = v;
+                }
+            }
+            _ => anyhow::bail!("--extra must be a JSON object"),
+        }
     }
 
     let config_bytes = serde_json::to_vec(&config)?;

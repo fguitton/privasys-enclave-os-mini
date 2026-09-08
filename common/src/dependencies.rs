@@ -24,6 +24,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 /// Domain separator for the identity fold; must match the SDKs.
+#[cfg(feature = "crypto")]
 const DOMAIN_FOLD_IDENTITY: &str = "privasys-app-identity-v1";
 
 /// One allowed measurement for a dependency, mirroring the vault `Measurement`.
@@ -190,7 +191,7 @@ fn measurement_from_canonical(s: &str) -> DepMeasurement {
 
 /// Decode the canonical encoding. Rejects truncated or trailing-byte input. Used
 /// to validate a dependency set the platform supplies before the runtime seals it
-/// into OID 65230.6.1.
+/// into OID 65230.7.1.
 pub fn decode_dependency_set(bytes: &[u8]) -> Result<DependencySet, &'static str> {
     let mut r = CanonicalReader { buf: bytes, off: 0 };
     let count = r.u32()?;

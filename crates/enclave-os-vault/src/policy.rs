@@ -29,7 +29,7 @@ use enclave_os_common::hex::hex_encode;
 use enclave_os_common::modules::RequestContext;
 use enclave_os_common::oidc::OidcClaims;
 
-use crate::quote::{dissect_peer_cert, parse_quote, verify_challenge_binding, TeeType};
+use crate::quote::{dissect_peer_cert, parse_quote, TeeType};
 use crate::signing::verify_approval_token;
 use crate::types::{
     ApprovalToken, AttestationProfile, Condition, KeyPolicy, Measurement, Mutability, Operation,
@@ -137,12 +137,7 @@ pub fn resolve_caller(
     if let Some(peer_der) = ctx.peer_cert_der.as_deref() {
         for (i, p) in policy.principals.tees.iter().enumerate() {
             if let Principal::Tee(profile) = p {
-                if tee_matches(
-                    profile,
-                    peer_der,
-                    ctx.client_challenge_nonce.as_deref(),
-                    ctx.channel_binder.as_deref(),
-                ) {
+                if tee_matches(profile, peer_der, ctx.peer_evidence.as_ref()) {
                     return Some((PrincipalRef::Tee(i as u32), CallerRole::Tee));
                 }
             }
@@ -195,17 +190,23 @@ pub fn has_required_roles(claims: &OidcClaims, required_roles: &[String]) -> boo
 ///
 /// Performs (in order):
 ///   1. cert dissection (quote + OID claims + pubkey),
-///   2. attestation server verification of the quote,
+///   2. attestation server verification of the quote (incl. the Intel TCB
+///      status gate against `profile.acceptable_tcb_statuses`),
 ///   3. parse + measurement match against `profile.measurements`,
-///   4. bidirectional challenge-response binding,
+///   4. the peer's evidence, presented after the handshake and bound by the
+///      ingress server to the peer's leaf key and this connection (RA-TLS v2),
 ///   5. required OID extension match.
 pub(crate) fn tee_matches(
     profile: &AttestationProfile,
     peer_der: &[u8],
-    challenge_nonce: Option<&[u8]>,
-    channel_binder: Option<&[u8]>,
+    peer_evidence: Option<&enclave_os_common::modules::PeerEvidence>,
 ) -> bool {
-    let evidence = match dissect_peer_cert(peer_der) {
+    // A TEE principal must have presented evidence for its leaf on this
+    // connection; a v2 leaf carries none itself.
+    let Some(pe) = peer_evidence else {
+        return false;
+    };
+    let evidence = match dissect_peer_cert(peer_der, &pe.quote) {
         Ok(e) => e,
         Err(_) => return false,
     };
@@ -220,8 +221,24 @@ pub(crate) fn tee_matches(
         // Refuse: a TEE principal must list at least one attestation server.
         return false;
     }
-    if enclave_os_egress::attestation::verify_quote(&evidence.evidence, &urls).is_err() {
-        return false;
+    let verdicts =
+        match enclave_os_egress::attestation::verify_quote_statuses(&evidence.evidence, &urls) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+    // Enforce the Intel platform TCB status reported by each server against
+    // the profile's acceptable set (opt-in: `None` = legacy policy, no check;
+    // `Some` = secure floor + explicit relaxations; `Revoked` always fails,
+    // opt-in or not). A server that reports no status is accepted for
+    // compatibility — the sgx.fail downgrade gate only tightens when the
+    // hardened attestation server actually derives a status.
+    for v in &verdicts {
+        if !enclave_os_egress::attestation::tcb_status_acceptable(
+            &v.tcb_status,
+            profile.acceptable_tcb_statuses.as_deref(),
+        ) {
+            return false;
+        }
     }
 
     // 3. Parse + measurement match.
@@ -233,17 +250,10 @@ pub(crate) fn tee_matches(
         return false;
     }
 
-    // 4. Challenge binding.
-    if verify_challenge_binding(
-        &evidence.evidence,
-        &evidence.pubkey_raw,
-        challenge_nonce,
-        channel_binder,
-    )
-    .is_err()
-    {
-        return false;
-    }
+    // 4. Binding: verified by the ingress server when the peer presented its
+    // evidence (report_data over the leaf key, the client context and the
+    // connection's exporter value); the evidence reaches this policy only
+    // after that check.
 
     // 5. Required OIDs.
     for req in &profile.required_oids {
@@ -382,12 +392,7 @@ fn evaluate_conditions(
                 let peer = ctx.peer_cert_der.as_deref().ok_or_else(|| {
                     "AttestationMatches: no peer RA-TLS cert in request".to_string()
                 })?;
-                if !tee_matches(
-                    profile,
-                    peer,
-                    ctx.client_challenge_nonce.as_deref(),
-                    ctx.channel_binder.as_deref(),
-                ) {
+                if !tee_matches(profile, peer, ctx.peer_evidence.as_ref()) {
                     return Err(format!(
                         "AttestationMatches: peer does not match profile '{}'",
                         profile.name
@@ -582,7 +587,75 @@ pub fn evaluate_policy_update(
             ));
         }
     }
+    // The auto-migrate opt-in is a standing trust grant to the platform's own
+    // enclave-upgrade approval; only the key OWNER may flip it, in either
+    // direction. Unconditional like the OID rule above — the flag rides inside
+    // `Lifecycle`, whose Mutability entry a policy may hand to managers for
+    // TTL tuning, and that delegation must never extend to this grant.
+    if old.lifecycle.auto_migrate_to_next_attestation_profile
+        != new.lifecycle.auto_migrate_to_next_attestation_profile
+        && role != CallerRole::Owner
+    {
+        return Err(
+            "lifecycle.auto_migrate_to_next_attestation_profile may only be changed by the key owner"
+                .into(),
+        );
+    }
     Ok(())
+}
+
+/// True iff `staged` differs from the accepted profile `active` ONLY in the
+/// platform-runtime measurement — the acceptance test for the auto-migrate
+/// opt-in ([`crate::types::Lifecycle`]). Requires:
+///   - identical `required_oids` (as an unordered set; both sides are
+///     normalised, so the app-code digest at …65230.3.2 and the app id at
+///     …3.6 must be byte-identical),
+///   - identical `attestation_servers` (URL + pinned SPKI, unordered),
+///   - identical `acceptable_tcb_statuses` (unordered — a migration must not
+///     change the TCB acceptance policy),
+///   - non-empty measurement lists of the SAME TEE family on both sides
+///     (all-SGX or all-TDX — a runtime roll never changes the TEE type),
+///   - actually different measurements (an identical profile is a re-stage,
+///     not a migration — the caller dedupes that separately).
+/// `name` is advisory display text and deliberately ignored.
+pub(crate) fn runtime_only_delta(staged: &AttestationProfile, active: &AttestationProfile) -> bool {
+    if !same_elements(&staged.required_oids, &active.required_oids) {
+        return false;
+    }
+    if !same_elements(&staged.attestation_servers, &active.attestation_servers) {
+        return false;
+    }
+    // A migration must not smuggle a TCB-policy change past the owner: the
+    // acceptable-TCB set has to be the same policy on both sides (None==None,
+    // or Some sets equal as unordered element sets).
+    match (
+        &staged.acceptable_tcb_statuses,
+        &active.acceptable_tcb_statuses,
+    ) {
+        (None, None) => {}
+        (Some(a), Some(b)) if same_elements(a, b) => {}
+        _ => return false,
+    }
+    let family = |ms: &[Measurement]| -> Option<bool> {
+        // Some(true) = all SGX, Some(false) = all TDX, None = empty or mixed.
+        let mut it = ms.iter().map(|m| matches!(m, Measurement::Mrenclave(_)));
+        let first = it.next()?;
+        if it.all(|f| f == first) {
+            Some(first)
+        } else {
+            None
+        }
+    };
+    match (family(&staged.measurements), family(&active.measurements)) {
+        (Some(a), Some(b)) if a == b => {}
+        _ => return false,
+    }
+    staged.measurements != active.measurements
+}
+
+/// Unordered, duplicate-insensitive equality for small profile field vecs.
+fn same_elements<T: PartialEq>(a: &[T], b: &[T]) -> bool {
+    a.iter().all(|x| b.contains(x)) && b.iter().all(|x| a.contains(x))
 }
 
 /// The OIDs that EVERY accepted Tee profile already requires (the intersection of
@@ -799,5 +872,218 @@ mod measurement_match_tests {
             },
             &pol
         ));
+    }
+}
+
+#[cfg(test)]
+mod auto_migrate_tests {
+    use super::*;
+    use crate::types::{
+        AttestationProfile, AttestationServer, KeyPolicy, Lifecycle, Measurement, Mutability,
+        OidRequirement, Principal, PrincipalSet,
+    };
+
+    fn profile(mrenclave: &str, code: &str, app_id: &str) -> AttestationProfile {
+        AttestationProfile {
+            name: format!("app:x / SGX ({})", mrenclave),
+            measurements: vec![Measurement::Mrenclave(mrenclave.into())],
+            attestation_servers: vec![AttestationServer {
+                url: "https://as.privasys.org/verify".into(),
+                pinned_spki_sha256_hex: None,
+            }],
+            required_oids: vec![
+                OidRequirement {
+                    oid: "1.3.6.1.4.1.65230.3.2".into(),
+                    value: code.into(),
+                },
+                OidRequirement {
+                    oid: "1.3.6.1.4.1.65230.3.6".into(),
+                    value: app_id.into(),
+                },
+            ],
+            acceptable_tcb_statuses: None,
+        }
+    }
+
+    fn tdx_profile(mrtd: &str, r1: &str, r2: &str, code: &str) -> AttestationProfile {
+        let mut p = profile("unused", code, "aid");
+        p.measurements = vec![Measurement::Tdx {
+            mrtd: mrtd.into(),
+            rtmr1: r1.into(),
+            rtmr2: r2.into(),
+        }];
+        p
+    }
+
+    #[test]
+    fn accepts_runtime_only_change() {
+        let active = profile("aaaa", "code1", "aid1");
+        let staged = profile("bbbb", "code1", "aid1");
+        assert!(runtime_only_delta(&staged, &active));
+        // Name is advisory and ignored — already differs in the fixtures.
+    }
+
+    #[test]
+    fn rejects_tcb_set_change_as_runtime_only() {
+        let active = profile("aaaa", "code1", "aid1");
+        // Opting a profile into TCB enforcement (or relaxing/tightening the
+        // set) is a policy change, never an auto-acceptable runtime roll.
+        let mut opted = profile("bbbb", "code1", "aid1");
+        opted.acceptable_tcb_statuses = Some(vec!["ConfigurationAndSWHardeningNeeded".into()]);
+        assert!(!runtime_only_delta(&opted, &active));
+        // Same set (order-insensitive) still qualifies.
+        let mut active2 = profile("aaaa", "code1", "aid1");
+        active2.acceptable_tcb_statuses =
+            Some(vec!["OutOfDate".into(), "ConfigurationNeeded".into()]);
+        let mut staged2 = profile("bbbb", "code1", "aid1");
+        staged2.acceptable_tcb_statuses =
+            Some(vec!["ConfigurationNeeded".into(), "OutOfDate".into()]);
+        assert!(runtime_only_delta(&staged2, &active2));
+    }
+
+    #[test]
+    fn tcb_status_gate() {
+        use enclave_os_egress::attestation::tcb_status_acceptable;
+        let strict: Vec<String> = vec![];
+        let relax = vec!["ConfigurationAndSWHardeningNeeded".to_string()];
+        // Legacy policy (None): no enforcement — anything but Revoked passes.
+        assert!(tcb_status_acceptable(
+            "ConfigurationAndSWHardeningNeeded",
+            None
+        ));
+        assert!(tcb_status_acceptable("OutOfDate", None));
+        // …but Revoked always fails, opt-in or not.
+        assert!(!tcb_status_acceptable("Revoked", None));
+        // Empty status (server did not derive one) is accepted for compat.
+        assert!(tcb_status_acceptable("", Some(&strict)));
+        // Secure floor always passes under enforcement.
+        assert!(tcb_status_acceptable("UpToDate", Some(&strict)));
+        assert!(tcb_status_acceptable("SWHardeningNeeded", Some(&strict)));
+        // Outside the floor: rejected under strict floor-only…
+        assert!(!tcb_status_acceptable(
+            "ConfigurationAndSWHardeningNeeded",
+            Some(&strict)
+        ));
+        assert!(!tcb_status_acceptable("OutOfDate", Some(&strict)));
+        // …accepted only when explicitly listed…
+        assert!(tcb_status_acceptable(
+            "ConfigurationAndSWHardeningNeeded",
+            Some(&relax)
+        ));
+        // …and one relaxation never implies another.
+        assert!(!tcb_status_acceptable("OutOfDate", Some(&relax)));
+        // Revoked is non-overridable, even if a policy lists it.
+        let evil = vec!["Revoked".to_string()];
+        assert!(!tcb_status_acceptable("Revoked", Some(&evil)));
+    }
+
+    #[test]
+    fn rejects_code_or_app_id_change() {
+        let active = profile("aaaa", "code1", "aid1");
+        assert!(!runtime_only_delta(
+            &profile("bbbb", "code2", "aid1"),
+            &active
+        ));
+        assert!(!runtime_only_delta(
+            &profile("bbbb", "code1", "aid2"),
+            &active
+        ));
+        // Dropping an OID entirely is also not a runtime-only delta.
+        let mut dropped = profile("bbbb", "code1", "aid1");
+        dropped.required_oids.pop();
+        assert!(!runtime_only_delta(&dropped, &active));
+        // Adding an extra OID is a strengthening — still not auto-acceptable
+        // (the platform must not author policy semantics on its own).
+        let mut added = profile("bbbb", "code1", "aid1");
+        added.required_oids.push(OidRequirement {
+            oid: "1.3.6.1.4.1.65230.3.1".into(),
+            value: "cfg".into(),
+        });
+        assert!(!runtime_only_delta(&added, &active));
+    }
+
+    #[test]
+    fn rejects_identical_and_cross_family_and_server_changes() {
+        let active = profile("aaaa", "code1", "aid1");
+        // Identical profile is a re-stage, not a migration.
+        assert!(!runtime_only_delta(
+            &profile("aaaa", "code1", "aid1"),
+            &active
+        ));
+        // SGX -> TDX is never a runtime roll.
+        assert!(!runtime_only_delta(
+            &tdx_profile("m", "r1", "r2", "code1"),
+            &active
+        ));
+        // Changing the attestation server is a trust change, not a runtime roll.
+        let mut moved = profile("bbbb", "code1", "aid1");
+        moved.attestation_servers[0].url = "https://evil.example/verify".into();
+        assert!(!runtime_only_delta(&moved, &active));
+        // Empty measurement lists never qualify.
+        let mut empty = profile("bbbb", "code1", "aid1");
+        empty.measurements.clear();
+        assert!(!runtime_only_delta(&empty, &active));
+    }
+
+    #[test]
+    fn accepts_tdx_runtime_roll() {
+        let active = tdx_profile("m1", "r1", "r2", "img1");
+        assert!(runtime_only_delta(
+            &tdx_profile("m2", "x1", "x2", "img1"),
+            &active
+        ));
+        assert!(!runtime_only_delta(
+            &tdx_profile("m2", "x1", "x2", "img2"),
+            &active
+        ));
+    }
+
+    fn policy_with_auto(auto: bool) -> KeyPolicy {
+        KeyPolicy {
+            version: 1,
+            principals: PrincipalSet {
+                owner: Principal::Oidc {
+                    issuer: "https://privasys.id".into(),
+                    sub: "owner".into(),
+                    required_roles: vec![],
+                },
+                managers: vec![],
+                auditors: vec![],
+                tees: vec![],
+            },
+            operations: vec![],
+            mutability: Mutability::default(),
+            lifecycle: Lifecycle {
+                ttl_seconds: 0,
+                auto_migrate_to_next_attestation_profile: auto,
+            },
+        }
+    }
+
+    #[test]
+    fn auto_migrate_flag_is_owner_only_to_change() {
+        let off = policy_with_auto(false);
+        let on = policy_with_auto(true);
+        // Owner may flip it either way (Lifecycle is in owner_can by default).
+        assert!(evaluate_policy_update(&off, &on, CallerRole::Owner).is_ok());
+        assert!(evaluate_policy_update(&on, &off, CallerRole::Owner).is_ok());
+        // A manager may not, even when Mutability delegates Lifecycle.
+        let mut off_delegated = policy_with_auto(false);
+        off_delegated
+            .mutability
+            .manager_can
+            .push(crate::types::PolicyField::Lifecycle);
+        let mut on_delegated = policy_with_auto(true);
+        on_delegated
+            .mutability
+            .manager_can
+            .push(crate::types::PolicyField::Lifecycle);
+        let err =
+            evaluate_policy_update(&off_delegated, &on_delegated, CallerRole::Manager).unwrap_err();
+        assert!(err.contains("only be changed by the key owner"), "{err}");
+        // The same delegated manager may still change the TTL.
+        let mut ttl_changed = off_delegated.clone();
+        ttl_changed.lifecycle.ttl_seconds = 1234;
+        assert!(evaluate_policy_update(&off_delegated, &ttl_changed, CallerRole::Manager).is_ok());
     }
 }

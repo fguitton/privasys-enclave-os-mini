@@ -1,4 +1,5 @@
-# Copyright (c) Florian Guitton. All rights reserved.
+# Copyright (c) Privasys. All rights reserved.
+# Portions copyright (c) 2026 Florian Guitton.
 # Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
 [package]
@@ -27,8 +28,8 @@ native-sgx-types = ["dep:sgx_types", "enclave-os-common/jwt"]
 # Shared types, module trait, and OCall vtable
 enclave-os-common = { path = "../../common", features = ["crypto", "jwt"] }
 
-# TLS (Privasys fork with RA-TLS 0xFFBB challenge extension)
-rustls = { git = "https://github.com/Privasys/rustls", rev = "ab630583b58fee84260cbbfe2f4a8b45d8bde200", default-features = false, features = ["ring", "tls12", "std"] }
+# Standard TLS 1.3; RA-TLS v2 uses the RFC 8446 exporter after the handshake.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 # Mozilla root CAs for general-purpose HTTPS egress (WASM SDK, etc.)
 webpki-roots = "0.26"
@@ -48,3 +49,6 @@ base64 = "0.21"
 # Native-only source for the quote layout types. This is the same pinned SDK
 # revision used by the enclave; it must not be enabled in Teaclave builds.
 sgx_types = { git = "https://github.com/Privasys/teaclave-sgx-sdk", rev = "2330b2a5aa8404d3c0a38e9d3a760144549f4943", optional = true }
+
+[dev-dependencies]
+rcgen = { version = "0.13.2", default-features = false, features = ["ring"] }

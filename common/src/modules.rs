@@ -104,6 +104,44 @@ pub struct AppIdentity {
 //  Request context
 // ---------------------------------------------------------------------------
 
+/// A peer's attestation evidence, accepted on the server side of a mutual leg
+/// (RA-TLS v2).
+#[derive(Debug, Clone)]
+pub struct PeerEvidence {
+    /// Evidence family: "sgx", "tdx", "tdx-gpu".
+    pub tee: String,
+    /// Raw DCAP quote.
+    pub quote: Vec<u8>,
+    /// NVIDIA CC evidence, when present.
+    pub gpu_evidence: Option<Vec<u8>>,
+    /// Minute the quote was minted (`YYYY-MM-DDTHH:MMZ`).
+    pub quote_time: String,
+    /// Context chosen by this connection's verifier, never read from the quote.
+    pub context: Option<[u8; 32]>,
+    /// Role-specific exporter computed by the enclave TLS terminator.
+    pub hctx: Option<[u8; 32]>,
+}
+
+#[cfg(feature = "crypto")]
+impl PeerEvidence {
+    /// Reconstruct the proof inputs retained by the trusted TLS terminator.
+    pub fn as_evidence(&self) -> crate::attest::Evidence {
+        crate::attest::Evidence {
+            mode: if self.context.is_some() || self.hctx.is_some() {
+                crate::attest::AttestationMode::Challenge
+            } else {
+                crate::attest::AttestationMode::Deterministic
+            },
+            tee: self.tee.clone(),
+            quote: self.quote.clone(),
+            gpu_evidence: self.gpu_evidence.clone(),
+            quote_time: self.quote_time.clone(),
+            context: self.context,
+            hctx: self.hctx,
+        }
+    }
+}
+
 /// Per-request context passed to [`EnclaveModule::handle()`].
 ///
 /// Carries optional metadata extracted from the TLS session and OIDC auth.
@@ -141,26 +179,26 @@ pub struct RequestContext {
     /// handshake (mutual RA-TLS). `None` for regular browser clients.
     pub peer_cert_der: Option<Vec<u8>>,
 
-    /// DER-encoded leaf certificate actually served by this TLS session.
-    ///
-    /// This is captured at the channel-binding certificate-emission seam, so
-    /// it is the rebound leaf seen by the peer rather than the pre-handshake
-    /// placeholder certificate.
+    /// Exact DER leaf served on this TLS connection.
     pub local_cert_der: Option<Vec<u8>>,
-
-    /// Random nonce sent to the client via the TLS CertificateRequest
-    /// extension `0xFFBB` for bidirectional challenge-response attestation.
-    pub client_challenge_nonce: Option<Vec<u8>>,
-
-    /// Random nonce received in the client's ClientHello and committed by the
-    /// locally served challenge-mode certificate.
-    pub local_challenge_nonce: Option<Vec<u8>>,
-
-    /// 32-byte RA-TLS channel binder for this TLS session (TLS 1.3), derived
-    /// from the handshake key schedule. A mutual-auth verifier folds it into the
-    /// expected client-cert `report_data` so a relayed client cert from another
-    /// session fails closed. `None` on non-TLS-1.3 handshakes.
+    /// Exact local quote and its verifier context/exporter for this connection.
+    pub local_evidence: Option<PeerEvidence>,
+    /// Separate shared exporter used to bind Honest's application session.
     pub channel_binder: Option<Vec<u8>>,
+
+    /// The peer's attestation evidence for this connection (RA-TLS v2 mutual
+    /// leg): the quote the client presented after the handshake, whose
+    /// `report_data` the ingress server verified against the peer's leaf key,
+    /// the client context it issued and this connection's exporter value.
+    /// `None` when the client presented no evidence. A verifier that
+    /// authorises a TEE principal takes the quote from here, never from the
+    /// certificate (a v2 leaf carries none), and skips the binding check
+    /// (done at present time).
+    pub peer_evidence: Option<PeerEvidence>,
+
+    /// Attestation tag of the connection: "none", "deterministic" or
+    /// "challenge" (what the client asked for after the handshake).
+    pub attestation: String,
 
     /// Verified OIDC claims extracted from the `"auth"` field in the
     /// JSON envelope.  `None` when no bearer token was provided (e.g.
@@ -221,8 +259,8 @@ pub fn classify_honest_ingress(
             return HonestIngressRoute::Denied;
         }
         if context.peer_cert_der.is_none()
-            || context.client_challenge_nonce.is_none()
-            || context.channel_binder.is_none()
+            || context.peer_evidence.is_none()
+            || context.attestation != "challenge"
         {
             return HonestIngressRoute::PeerAuthenticationRequired;
         }
@@ -302,9 +340,17 @@ mod tests {
             attested_endpoint: None,
             peer_cert_der: mutual.then(|| vec![1]),
             local_cert_der: mutual.then(|| vec![4]),
-            client_challenge_nonce: mutual.then(|| vec![2]),
-            local_challenge_nonce: mutual.then(|| vec![5]),
-            channel_binder: mutual.then(|| vec![3]),
+            local_evidence: None,
+            channel_binder: None,
+            peer_evidence: mutual.then(|| super::PeerEvidence {
+                tee: "sgx".into(),
+                quote: vec![2],
+                gpu_evidence: None,
+                quote_time: "2026-09-07T12:00Z".into(),
+                context: Some([1; 32]),
+                hctx: Some([2; 32]),
+            }),
+            attestation: if mutual { "challenge" } else { "none" }.into(),
             oidc_claims: None,
         }
     }

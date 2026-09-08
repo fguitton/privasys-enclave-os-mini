@@ -1,5 +1,14 @@
 # Remote Attestation TLS (RA-TLS)
 
+> **Historical v1 reference.** The runtime on this branch has migrated to
+> RA-TLS v2: an ordinary TLS 1.3 handshake followed by a connection-bound
+> evidence exchange. Quotes no longer live in the certificate, and the v1
+> challenge extension and OID assignments below are obsolete. Use the
+> [v2 protocol](https://github.com/Privasys/ra-tls-clients/blob/main/docs/ratls-v2.md),
+> [current OID reference](https://github.com/Privasys/ra-tls-clients/blob/main/docs/oids.md),
+> and the implementation in `common/src/attest.rs`. The text below describes
+> the earlier design and must not be used to implement a v2 verifier.
+
 ## Why RA-TLS?
 
 Standard TLS proves that a client is talking to the holder of a private key.

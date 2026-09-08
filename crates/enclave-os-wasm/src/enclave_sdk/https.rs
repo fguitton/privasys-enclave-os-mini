@@ -130,8 +130,11 @@ fn build_ratls_policy(p: wit::RatlsPolicy) -> Result<RaTlsPolicy, String> {
         a
     });
 
+    // Retain the caller's exact challenge as the v2 context; the TLS exporter
+    // also binds the quote to this connection.
     let report_data = match p.challenge_nonce {
-        Some(nonce) => ReportDataBinding::ChallengeResponse { nonce },
+        Some(nonce) if nonce.len() == 32 => ReportDataBinding::ChallengeResponse { nonce },
+        Some(_) => return Err("challenge nonce must be exactly 32 bytes".into()),
         None => ReportDataBinding::Deterministic,
     };
 
@@ -150,6 +153,9 @@ fn build_ratls_policy(p: wit::RatlsPolicy) -> Result<RaTlsPolicy, String> {
             })
             .collect(),
         attestation_servers: p.attestation_servers,
+        // TCB acceptance stays legacy (Revoked-only) until apps can carry an
+        // acceptable-TCB set in their sealed metadata.
+        acceptable_tcb_statuses: None,
         // App egress presents no client certificate (server attestation only).
         client_identity: None,
         // Set by the caller from the app's sealed metadata, not the app request.

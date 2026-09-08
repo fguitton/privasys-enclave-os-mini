@@ -48,4 +48,4 @@ ring = "0.17"
 # Pure-Rust P-256 for PRE-HASH ECDSA signing (CKM_ECDSA / TLS): ring's ECDSA
 # only signs messages (hashes internally), so raw digest signing needs this.
 # Deterministic (RFC 6979), so no entropy is drawn in-enclave.
-p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8"] }
+p256 = { version = "=0.14.0", default-features = false, features = ["ecdsa", "pkcs8"] }

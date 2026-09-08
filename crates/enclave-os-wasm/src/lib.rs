@@ -74,6 +74,7 @@ pub mod jwks_fetcher;
 pub mod metrics;
 pub mod protocol;
 pub mod registry;
+pub mod sovereign_seal;
 pub mod vaultkey;
 pub mod wasi;
 pub mod wasm_docs;
@@ -103,7 +104,7 @@ use crate::registry::AppRegistry;
 //  OID for WASM apps combined code hash — imported from common
 // ---------------------------------------------------------------------------
 
-pub use enclave_os_common::oids::WASM_APPS_HASH_OID;
+pub use enclave_os_common::oids::COMBINED_WORKLOADS_HASH_OID;
 
 use crate::registry::AppMeta;
 
@@ -243,6 +244,7 @@ impl WasmModule {
         app_id: Option<[u8; 16]>,
         vault: Option<crate::registry::VaultBacking>,
         dependencies: Option<Vec<u8>>,
+        txn_replay: bool,
     ) -> Result<(), String> {
         // Load into the registry (compile + introspect + per-app key)
         let meta = {
@@ -264,6 +266,7 @@ impl WasmModule {
                 app_id,
                 vault,
                 dependencies,
+                txn_replay,
             )?
         };
 
@@ -382,6 +385,20 @@ impl WasmModule {
         Ok(())
     }
 
+    /// The code hash (SHA-256 of the module, attested at OID 3.2) of a
+    /// known app. Used by the `sealing.get-seal-key` host function to
+    /// bind the sovereign sealing key S_N to the calling app's current
+    /// code — see [`crate::sovereign_seal`].
+    pub fn app_code_hash(&self, name: &str) -> Result<[u8; 32], String> {
+        let reg = self
+            .registry
+            .lock()
+            .map_err(|_| String::from("registry lock poisoned"))?;
+        reg.app_code_hash(name)
+            .copied()
+            .ok_or_else(|| format!("unknown app: '{}'", name))
+    }
+
     /// Apply or lift the host-driven billing freeze for `name`.
     /// `Some(reason)` freezes; `None` unfreezes. Returns `true` when
     /// the app is known. Called from the `wasm_freeze` control command.
@@ -398,6 +415,40 @@ impl WasmModule {
     /// If the app is known but not currently compiled in memory, its
     /// WASM bytes are loaded from the sealed KV store and compiled
     /// on the fly (AOT deserialization — very fast).
+    /// Whether an app was loaded in replay mode (replicas re-execute
+    /// its transactions deterministically). Unknown apps are `false`.
+    pub fn txn_replay(&self, app: &str) -> bool {
+        self.registry
+            .lock()
+            .ok()
+            .and_then(|r| r.app_meta(app).map(|m| m.txn_replay))
+            .unwrap_or(false)
+    }
+
+    /// The app's per-call fuel budget (recorded in replay envelopes).
+    pub fn app_max_fuel(&self, app: &str) -> Option<u64> {
+        self.registry
+            .lock()
+            .ok()
+            .and_then(|r| r.app_meta(app).map(|m| m.max_fuel))
+    }
+
+    /// Execute one exported function for a CLUSTER TRANSACTION. The
+    /// raft layer authorises the caller (its own envelope gate) and
+    /// installs the transaction-ledger scope around this call; here it
+    /// is a plain dispatch with no platform auth context (an app-level
+    /// `permissions` policy still applies via `call.app_auth`). The
+    /// serialized return values are handed back to the raft layer,
+    /// which commits them alongside the write-set proposal.
+    pub fn call_for_transaction(&self, call: &WasmCall) -> Result<serde_json::Value, String> {
+        match self.dispatch_call(call, None) {
+            WasmResult::Ok { returns, .. } => {
+                serde_json::to_value(&returns).map_err(|e| format!("serialize returns: {e}"))
+            }
+            WasmResult::Error { message, .. } => Err(message),
+        }
+    }
+
     fn dispatch_call(&self, call: &WasmCall, auth: Option<AuthResult>) -> WasmResult {
         // Ensure the app is compiled.  This is a no-op when the app
         // is already in the `loaded` map.
@@ -439,7 +490,6 @@ impl WasmModule {
         // `auth` is consumed by prepare_call below. Used only in the
         // on-success fee recording at the bottom of this function.
         let fee_caller = auth.as_ref().and_then(|a| a.user_id.clone());
-        let fee_wallet = auth.as_ref().map(|a| a.wallet_class).unwrap_or(false);
 
         // Prepare under lock, but release the lock before invoking
         // the wasm function. Wasm host bindings (e.g.
@@ -543,17 +593,22 @@ impl WasmModule {
                     let (rule, sponsor_idx) = reg.price_context(&call.app, &call.function)?;
                     match rule.payer {
                         Payer::Caller => {
-                            if fee_wallet && rule.free_for.iter().any(|c| c == "wallet") {
-                                None // wallet-class exemption: caller pays 0
-                            } else {
-                                // check_app_permissions enforced an
-                                // authenticated caller for priced functions;
-                                // a missing sub here means an unbillable
-                                // legacy path — skip, never mischarge.
-                                fee_caller
-                                    .clone()
-                                    .map(|sub| (rule.credits, Some(sub), None))
-                            }
+                            // No `free_for` class is reachable here. The
+                            // exemption means "the WALLET APP made this call",
+                            // which only a per-request proof can establish
+                            // (device attestation + a holder-key signature
+                            // bound to the call). This runtime has no channel
+                            // to carry one yet, so the class is unreachable by
+                            // construction and a priced call is charged. See
+                            // wallet_class_unavailable below.
+                            //
+                            // check_app_permissions enforced an authenticated
+                            // caller for priced functions; a missing sub here
+                            // means an unbillable legacy path — skip, never
+                            // mischarge.
+                            fee_caller
+                                .clone()
+                                .map(|sub| (rule.credits, Some(sub), None))
                         }
                         Payer::Sponsor => sponsor_idx
                             .and_then(|i| match call.params.get(i) {
@@ -833,7 +888,7 @@ impl WasmModule {
         // proof the caller knew the price they were charged.
         if let Some((rule, _)) = &price_ctx {
             if rule.payer == Payer::Caller {
-                let exempt = auth.wallet_class && rule.free_for.iter().any(|c| c == "wallet");
+                let exempt = wallet_class_unavailable(&rule.free_for);
                 if !exempt {
                     let expected = format!("{} credits", rule.credits);
                     match call.billing_approved.as_deref().map(str::trim) {
@@ -915,7 +970,6 @@ impl WasmModule {
             return Ok(AuthResult {
                 roles: Vec::new(),
                 user_id: None,
-                wallet_class: false,
             });
         }
 
@@ -937,7 +991,7 @@ impl WasmModule {
                 audience: cfg.audience.clone(),
                 roles_claim: cfg.role_claim.clone(),
             };
-            if let Ok((roles, sub, wallet)) = verify_app_token(token, &platform) {
+            if let Ok((roles, sub)) = verify_app_token(token, &platform) {
                 if let Some(id) = app_id {
                     let hexid = enclave_os_common::hex::hex_encode(&id);
                     let owner_role = format!("{}:app:{}:owner", cfg.audience, hexid);
@@ -951,7 +1005,6 @@ impl WasmModule {
                         return Ok(AuthResult {
                             roles,
                             user_id: sub,
-                            wallet_class: wallet,
                         });
                     }
                 }
@@ -967,7 +1020,6 @@ impl WasmModule {
                         return Ok(AuthResult {
                             roles,
                             user_id: sub,
-                            wallet_class: wallet,
                         });
                     }
                 }
@@ -1492,6 +1544,24 @@ pub fn global() -> Option<&'static WasmModule> {
     WASM_MODULE_GLOBAL.get().copied()
 }
 
+// The sovereign sealing root (the sovereign-data framework, Phase 1):
+// a domain-separated derivative of the MRENCLAVE-sealed runtime master
+// key, installed once by the enclave init code. The raw master key
+// never enters this crate. See [`sovereign_seal`].
+static SOVEREIGN_ROOT: OnceLock<[u8; 32]> = OnceLock::new();
+
+/// Install the sovereign sealing root. Call exactly once during enclave
+/// initialisation, with `sovereign_seal::derive_sovereign_root(master)`.
+/// Subsequent calls are silently ignored.
+pub fn install_sovereign_root(root: [u8; 32]) {
+    let _ = SOVEREIGN_ROOT.set(root);
+}
+
+/// Borrow the sovereign sealing root, or `None` before installation.
+pub(crate) fn sovereign_root() -> Option<&'static [u8; 32]> {
+    SOVEREIGN_ROOT.get()
+}
+
 /// Boxable adapter so the `'static` reference can be re-registered
 /// with [`crate::modules::register_module`] (which expects
 /// `Box<dyn EnclaveModule>`). Forwards every trait method to the
@@ -1762,6 +1832,7 @@ impl EnclaveModule for WasmModule {
                 app_id,
                 vault,
                 dependencies,
+                load.txn_replay,
             ) {
                 Ok(()) => {
                     // Return the loaded app's info
@@ -1838,6 +1909,31 @@ impl EnclaveModule for WasmModule {
                 .environment
                 .clone()
                 .unwrap_or_else(|| String::from("prod"));
+            // TARGET constellation addressing = a cross-constellation migration:
+            // the new KEK is created there instead of the sealed selection.
+            let new_cfg = match rot.new_vault_endpoints.as_ref() {
+                Some(eps) => {
+                    match crate::vaultkey::VaultConfig::from_parts(
+                        eps.clone(),
+                        rot.new_vault_mrenclave.as_deref().unwrap_or(""),
+                        rot.new_vault_attestation_server.as_deref().unwrap_or(""),
+                        rot.new_vault_ca_roots.as_deref().unwrap_or(&[]),
+                        rot.new_vault_threshold.unwrap_or(0),
+                        rot.new_vault_oidc_issuer.as_deref().unwrap_or(""),
+                        rot.new_vault_acceptable_tcb_statuses
+                            .clone()
+                            .unwrap_or_default(),
+                    ) {
+                        Ok(c) => Some(c),
+                        Err(e) => {
+                            return Some(Response::Data(serialize_or_error(
+                                &WasmManagementResult::Error { message: e },
+                            )));
+                        }
+                    }
+                }
+                None => None,
+            };
             // Re-wrap under the registry lock, then re-seal the advanced metadata
             // with the lock released (persist_meta_to_kv re-enters `self`).
             let result = {
@@ -1857,6 +1953,7 @@ impl EnclaveModule for WasmModule {
                     &rot.new_key_creation_grant,
                     &mgmt_url,
                     &environment,
+                    new_cfg,
                 )
             };
             let mgmt_result = match result {
@@ -2037,8 +2134,24 @@ impl EnclaveModule for WasmModule {
     /// Enrich the core `Metrics` response with per-app fuel-metering data
     /// and persist a snapshot to the sealed KV store.
     fn enrich_metrics(&self, metrics: &mut enclave_os_common::protocol::EnclaveMetrics) {
+        // Configure-then-freeze state comes from the registry, which is the
+        // authority — it is what refuses every other export until the declared
+        // config function has run. Reporting it lets the control plane poll for
+        // it, the way it polls a container's manager, instead of relying on
+        // having seen the configure call go by (which coupled a portal badge to
+        // the data path). Snapshotted BEFORE the metrics lock so the two are
+        // never held together and no lock order has to be remembered.
+        let configured = match self.registry.lock() {
+            Ok(reg) => reg.configured_snapshot(),
+            Err(_) => Vec::new(),
+        };
         if let Ok(m) = self.metrics.lock() {
             metrics.wasm_app_metrics = m.to_app_metrics();
+            for app in metrics.wasm_app_metrics.iter_mut() {
+                if let Some((_, state)) = configured.iter().find(|(n, _)| n == &app.name) {
+                    app.configured = *state;
+                }
+            }
             // Developer API-fee events (x-privasys.price): at-least-once
             // pull — the ledger dedupes on call_id.
             metrics.api_fees = m.api_fee_events();
@@ -2083,7 +2196,7 @@ impl EnclaveModule for WasmModule {
         }
 
         vec![ModuleOid {
-            oid: WASM_APPS_HASH_OID,
+            oid: COMBINED_WORKLOADS_HASH_OID,
             value: combined.to_vec(),
         }]
     }
@@ -2469,11 +2582,33 @@ struct AuthResult {
     roles: Vec<String>,
     /// Caller's identity (FIDO2 user_handle or OIDC `sub` claim).
     user_id: Option<String>,
-    /// Caller holds a wallet-class token (the IdP's constant,
-    /// non-identifying `wallet` claim on tokens minted from a genuine
-    /// wallet WebAuthn ceremony). Drives the `free_for:["wallet"]`
-    /// API-fee exemption (`x-privasys.price`); never identifies anyone.
-    wallet_class: bool,
+}
+
+/// Whether a `free_for` class exempts this caller. Always `false`, and named
+/// for the reason rather than the answer.
+///
+/// `free_for:["wallet"]` means "the WALLET APP made this call" — not "a wallet
+/// authenticated this user". The two differ exactly where it matters: a browser
+/// session that signed in with the wallet must still pay. Establishing the
+/// former needs a per-request proof (a wallet-instance attestation plus a
+/// holder-key signature bound to the call itself), which the container runtime
+/// verifies from two request headers before the app is reached.
+///
+/// This runtime has no such channel: a wasm call is a typed RPC with no header
+/// surface, so there is nothing for a wallet to present and nothing to verify.
+/// It previously read a `wallet` claim off the caller's OIDC token, which is
+/// precisely the session-level signal that gets the rule wrong — and that path
+/// is deleted rather than left dormant, because a claim the IdP could resume
+/// minting would silently start giving browsers free calls.
+///
+/// So the class is unreachable here by construction and every priced call is
+/// charged. That is the safe direction: over-charging is visible and
+/// refundable, under-charging is neither. Reaching real parity means extending
+/// the call protocol to carry the attestation and proof (as `billing_approved`
+/// already carries the consent header) and verifying them in-enclave with the
+/// existing JWKS and raw-ES256 primitives.
+fn wallet_class_unavailable(_free_for: &[String]) -> bool {
+    false
 }
 
 /// Random 128-bit hex call id for an API-fee event — the ledger's
@@ -2551,7 +2686,6 @@ fn verify_auth_token(
                     roles,
                     user_id: Some(user_id),
                     // FIDO2 sessions carry no claims — no wallet class.
-                    wallet_class: false,
                 });
             }
             Err(e) => {
@@ -2583,11 +2717,10 @@ fn verify_auth_token(
 
     // Try OIDC JWT verification.
     if let Some(oidc) = &permissions.oidc {
-        let (roles, sub, wallet) = verify_app_token(token, oidc)?;
+        let (roles, sub) = verify_app_token(token, oidc)?;
         return Ok(AuthResult {
             roles,
             user_id: sub,
-            wallet_class: wallet,
         });
     }
 
@@ -2605,7 +2738,7 @@ fn verify_auth_token(
 fn verify_app_token(
     token: &str,
     oidc: &crate::protocol::AppOidcConfig,
-) -> Result<(Vec<String>, Option<String>, bool), String> {
+) -> Result<(Vec<String>, Option<String>), String> {
     // Verify ES256 signature via JWKS (rejects alg:none, fetches/caches keys)
     let claims: serde_json::Value =
         crate::jwks_fetcher::verify_jwt_signature(token, &oidc.issuer, &oidc.jwks_uri)?;
@@ -2666,18 +2799,10 @@ fn verify_app_token(
     roles.sort();
     roles.dedup();
 
-    // Wallet-class marker (`x-privasys.price` free_for:["wallet"]): the IdP
-    // stamps a constant `wallet` claim (string "true" or boolean) on tokens
-    // minted from a genuine wallet WebAuthn ceremony. Only meaningful when
-    // the app's OIDC issuer IS the platform IdP (the deploy default); any
-    // other issuer simply never yields the class.
-    let wallet = match claims.get("wallet") {
-        Some(serde_json::Value::Bool(b)) => *b,
-        Some(serde_json::Value::String(s)) => s == "true",
-        _ => false,
-    };
-
-    Ok((roles, sub, wallet))
+    // A `wallet` claim on this token is deliberately NOT read. It asserts that
+    // a wallet authenticated the SESSION, which is not what
+    // `free_for:["wallet"]` means — see wallet_class_unavailable.
+    Ok((roles, sub))
 }
 
 /// Collect role strings from a JSON value (array of strings or map

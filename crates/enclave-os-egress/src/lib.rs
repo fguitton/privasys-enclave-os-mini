@@ -12,15 +12,17 @@
 //! enclave-os instance or a Caddy RA-TLS reverse proxy), callers can pass an
 //! [`RaTlsPolicy`] to [`client::https_fetch`]. The policy specifies the expected TEE type and
 //! measurement registers; the egress client will verify the attestation
-//! quote during the TLS handshake and reject the connection if any check fails.
+//! quote in the RA-TLS v2 exchange after TLS completes. Application traffic
+//! remains blocked until the evidence and required appraisal checks succeed.
 //!
 //! ## Responsibilities
 //!
 //! - Owns the egress root CA store (loaded from operator-provided PEM bundle)
 //! - Registers a config Merkle leaf: `egress.ca_bundle`
 //! - Registers a custom X.509 OID:
-//!   - `1.3.6.1.4.1.65230.2.1` — CA bundle SHA-256 hash
-//!   so clients can verify the egress trust anchors without a full Merkle audit.
+//!   - `1.3.6.1.4.1.65230.2.2` — CA bundle SHA-256 hash
+//!
+//! Clients can verify the egress trust anchors without a full Merkle audit.
 //!
 //! Attestation servers and their bearer tokens are managed centrally by
 //! the enclave core (see [`enclave_os_common::attestation_servers`]). The
@@ -51,6 +53,23 @@
 
 pub mod attestation;
 pub mod client;
+
+// Exercise the enclave verifier itself in this lightweight TLS test lane.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../../enclave/src/ratls/cert_store.rs"]
+mod cert_store;
+#[cfg(test)]
+#[path = "../../../enclave/src/ratls/client_auth.rs"]
+mod enclave_client_auth;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../../enclave/src/ratls/session.rs"]
+mod session;
+pub use enclave_os_common::attest;
+#[cfg(test)]
+pub use enclave_os_common::enclave_log_error;
+
 pub mod jwks;
 
 // Re-export RA-TLS verification types for convenience.

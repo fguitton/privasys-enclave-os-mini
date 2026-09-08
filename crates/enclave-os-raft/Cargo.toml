@@ -1,0 +1,26 @@
+[package]
+name = "enclave-os-raft"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+description = "Attested Raft consensus core for Enclave OS (Mini) clusters"
+
+# The consensus core (core/message/types) is deliberately
+# dependency-free: a sans-I/O state machine with a hand-rolled wire
+# codec. The merkle dependency serves only the ledger adapter
+# (ledger.rs): sealing forks into transactions and applying committed
+# transactions with root-transition verification. Networking and log
+# persistence are wired in by the enclave runtime (WS4).
+[dependencies]
+enclave-os-merkle = { path = "../enclave-os-merkle" }
+# AEAD cipher for the encrypted log store
+enclave-os-common = { path = "../../common", features = ["crypto"] }
+# Commit-certificate signing key derivation (HMAC)
+ring = "0.17"
+# Commit-certificate signatures (deterministic ECDSA per RFC 6979)
+p256 = { version = "=0.14.0", default-features = false, features = ["ecdsa", "alloc"] }
+
+# Standalone workspace so `cargo test` runs here without the repo root
+# workspace (which excludes module crates; same pattern as
+# enclave-os-merkle).
+[workspace]

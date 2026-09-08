@@ -91,6 +91,33 @@ if(NOT TEACLAVE_CANDIDATE_COUNT EQUAL 1)
 endif()
 list(GET TEACLAVE_CANDIDATES 0 TEACLAVE_CHECKOUT)
 
+function(require_sdk230_teaclave SOURCE_ROOT)
+    set(_FILES
+        "sgx_build_helper/download_prebuilt/build.rs"
+        "sgx_crypto/sgx_crypto_sys/build.rs"
+        "sgx_trts/src/version.rs")
+    set(_HASHES
+        "fe79813e38a2bb27c7bd2452667e6023db62873f7136674236385d2b357c608b"
+        "c4c6eadaecffdd93d5ee94c8b2455c3aa99cb69f0f165caad8ebdb224462d130"
+        "90a1992e8836591dc2a01ccaa5d21009dc64c747b364882c3c8e4ea1ed6304af")
+    foreach(_INDEX RANGE 0 2)
+        list(GET _FILES ${_INDEX} _FILE)
+        list(GET _HASHES ${_INDEX} _EXPECTED)
+        if(NOT EXISTS "${SOURCE_ROOT}/${_FILE}" OR IS_SYMLINK "${SOURCE_ROOT}/${_FILE}")
+            message(FATAL_ERROR "Teaclave SDK 2.30 compatibility source is unavailable: ${_FILE}")
+        endif()
+        file(SHA256 "${SOURCE_ROOT}/${_FILE}" _ACTUAL)
+        if(NOT _ACTUAL STREQUAL _EXPECTED)
+            message(FATAL_ERROR "Prepare the reviewed Teaclave SDK 2.30 patch in the build-owned Cargo source: ${_FILE}")
+        endif()
+    endforeach()
+endfunction()
+
+# Cargo and the separately built sysroot must consume the same reviewed port.
+if(BUILD_ENCLAVE)
+    require_sdk230_teaclave("${TEACLAVE_CHECKOUT}")
+endif()
+
 # The SGX-SIM gate may mirror the already verified revision into its bounded
 # CMake build tree so compiler inputs can be mounted read-only while generated
 # Cargo output stays disposable. This is SIM-only, must be inside
@@ -120,6 +147,7 @@ if(HONEST_PINNED_TEACLAVE_SIM_SOURCE)
         message(FATAL_ERROR "The bounded Teaclave patched source identity is invalid")
     endif()
     set(TEACLAVE_CHECKOUT "${TEACLAVE_SIM_SOURCE_REAL}")
+    require_sdk230_teaclave("${TEACLAVE_CHECKOUT}")
 endif()
 
 message(STATUS "Teaclave SDK: ${TEACLAVE_CHECKOUT}")
@@ -159,6 +187,9 @@ if(BUILD_ENCLAVE)
         COMMENT "Building SGX sysroot via Teaclave fork CMake..."
         COMMAND ${CMAKE_COMMAND} -E env
             "SGX_MODE=${SGX_MODE}"
+            "SGX_SDK_PATH=${SGX_SDK_PATH}"
+            "SGX_CRYPTO_BACKEND=${SGX_CRYPTO_BACKEND}"
+            "USE_OPT_LIBS=0"
             "RUSTUP_TOOLCHAIN=${RUST_ENCLAVE_TOOLCHAIN}"
             "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}"
             "CARGO_INCREMENTAL=0"
@@ -176,6 +207,9 @@ if(BUILD_ENCLAVE)
             -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
         COMMAND ${CMAKE_COMMAND} -E env
             "SGX_MODE=${SGX_MODE}"
+            "SGX_SDK_PATH=${SGX_SDK_PATH}"
+            "SGX_CRYPTO_BACKEND=${SGX_CRYPTO_BACKEND}"
+            "USE_OPT_LIBS=0"
             "RUSTUP_TOOLCHAIN=${RUST_ENCLAVE_TOOLCHAIN}"
             "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}"
             "CARGO_INCREMENTAL=0"

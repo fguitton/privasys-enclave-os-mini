@@ -128,6 +128,49 @@ pub struct QuoteIdentity {
     pub rtmr2: Option<String>,
 }
 
+/// A TEE-typed measurement identity, as pinned by a key policy's Tee
+/// profiles. This is the shared admission currency: policy readers
+/// produce it, peer verifiers compare a parsed [`QuoteIdentity`]
+/// against it — SGX and TDX alike.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TeeMeasurement {
+    /// SGX: the 32-byte MRENCLAVE.
+    Sgx([u8; 32]),
+    /// TDX: the platform-build identity — MRTD plus the image-derived
+    /// RTMR1/RTMR2 (48 bytes each), exactly what a key policy pins.
+    Tdx {
+        mrtd: [u8; 48],
+        rtmr1: [u8; 48],
+        rtmr2: [u8; 48],
+    },
+}
+
+impl TeeMeasurement {
+    /// Short human-readable label for logs (TEE type + measurement prefix).
+    pub fn describe(&self) -> String {
+        match self {
+            TeeMeasurement::Sgx(m) => format!("sgx:{}", &hex_encode(m)[..16]),
+            TeeMeasurement::Tdx { mrtd, .. } => format!("tdx:{}", &hex_encode(mrtd)[..16]),
+        }
+    }
+}
+
+impl QuoteIdentity {
+    /// Does this parsed quote identity match a pinned TEE measurement?
+    /// TEE types must agree; for TDX every pinned register must match.
+    pub fn matches(&self, m: &TeeMeasurement) -> bool {
+        match (self.tee, m) {
+            (TeeType::Sgx, TeeMeasurement::Sgx(mr)) => self.measurement == hex_encode(mr),
+            (TeeType::Tdx, TeeMeasurement::Tdx { mrtd, rtmr1, rtmr2 }) => {
+                self.measurement == hex_encode(mrtd)
+                    && self.rtmr1.as_deref() == Some(hex_encode(rtmr1).as_str())
+                    && self.rtmr2.as_deref() == Some(hex_encode(rtmr2).as_str())
+            }
+            _ => false,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 //  Parsing
 // ---------------------------------------------------------------------------
@@ -368,4 +411,52 @@ mod simulation_tests {
         zero.extend_from_slice(&[9; 64]);
         assert!(parse_sgx_sim_report(&zero).is_err());
     }
+}
+
+// ---------------------------------------------------------------------------
+//  Bidirectional challenge-response verification (requires `ring`)
+// ---------------------------------------------------------------------------
+
+/// Verify that a peer certificate's quote `report_data` commits to the
+/// challenge nonce we sent during the TLS handshake, and to the session
+/// channel binder.
+///
+/// This is the shared TEE check for challenge-mode RA-TLS, used by every
+/// component that authenticates a TEE peer (vault key policies, cluster peer
+/// links, …). It covers SGX and TDX evidence alike ([`extract_report_data`]
+/// handles both quote formats).
+///
+/// Bidirectional challenge-response is **mandatory** for any TEE
+/// authentication. If `nonce` is `None` we refuse: the TLS layer must have
+/// sent a challenge. `channel_binder` is the 32-byte binder derived from this
+/// session's handshake key schedule (read post-handshake from the
+/// connection's `ratls_channel_binder()`); when present the peer's quote must
+/// commit to `nonce || binder`, so a relayed cert from another session fails
+/// closed. It is `None` only on a non-TLS-1.3 handshake.
+#[cfg(feature = "crypto")]
+pub fn verify_challenge_binding(
+    evidence: &[u8],
+    pubkey_raw: &[u8],
+    nonce: Option<&[u8]>,
+    channel_binder: Option<&[u8]>,
+) -> Result<(), String> {
+    let nonce = nonce.ok_or_else(|| {
+        "TLS challenge nonce missing; bidirectional challenge-response is required".to_string()
+    })?;
+    let actual =
+        extract_report_data(evidence).map_err(|e| format!("report_data extraction: {e}"))?;
+    let spki = build_p256_spki_der(pubkey_raw);
+    let mut binding = nonce.to_vec();
+    if let Some(binder) = channel_binder {
+        binding.extend_from_slice(binder);
+    }
+    let expected = compute_report_data_hash(&spki, &binding);
+    if actual[..] != expected.as_ref()[..] {
+        return Err(
+            "bidirectional challenge-response failed: peer cert report_data \
+             does not commit to the challenge nonce and session binder"
+                .into(),
+        );
+    }
+    Ok(())
 }

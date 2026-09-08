@@ -9,8 +9,8 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConnection, RootCertStore};
 
 use super::{
-    build_attested_client_config, build_client_config, verify_channel_binding, RaTlsPolicy,
-    SharedClientAuthCapture,
+    build_attested_client_config, build_client_config, exchange::AttestationExchange,
+    IdentityClientAuth, RaTlsPolicy,
 };
 
 /// Incrementally advanced TLS client for the control-TCS raw multiplexer.
@@ -24,7 +24,10 @@ pub struct IncrementalTlsClient {
     ratls: Option<RaTlsPolicy>,
     channel_verified: bool,
     plaintext: Vec<u8>,
-    client_auth_capture: Option<SharedClientAuthCapture>,
+    identity: Option<std::sync::Arc<IdentityClientAuth>>,
+    exchange: Option<AttestationExchange>,
+    appraisal_pending: bool,
+    failed: bool,
 }
 
 impl IncrementalTlsClient {
@@ -45,12 +48,8 @@ impl IncrementalTlsClient {
         {
             return Err("incremental TLS requires separately pumped quote appraisal".to_string());
         }
-        let client_auth_capture = ratls
-            .as_ref()
-            .and_then(|policy| policy.client_identity.as_ref())
-            .map(|_| SharedClientAuthCapture::default());
-        let config = build_client_config(root_store, ratls.as_ref(), client_auth_capture.clone())
-            .map_err(str::to_string)?;
+        let (config, identity) =
+            build_client_config(root_store, ratls.as_ref()).map_err(str::to_string)?;
         let server_name = ServerName::try_from(server_name.to_string())
             .map_err(|_| "invalid incremental TLS server name".to_string())?;
         let mut tls_conn = ClientConnection::new(config, server_name)
@@ -64,19 +63,18 @@ impl IncrementalTlsClient {
             ratls,
             channel_verified: false,
             plaintext: Vec::new(),
-            client_auth_capture,
+            identity,
+            exchange: None,
+            failed: false,
+            appraisal_pending: false,
         })
     }
 
     /// Construct a TLS 1.3 client for an enclave-owned CA, authenticating the
     /// leaf through appraised, measurement-pinned, channel-bound RA-TLS.
     pub fn new_attested(server_name: &str, policy: RaTlsPolicy) -> Result<Self, String> {
-        let client_auth_capture = policy
-            .client_identity
-            .as_ref()
-            .map(|_| SharedClientAuthCapture::default());
-        let config = build_attested_client_config(&policy, client_auth_capture.clone())
-            .map_err(str::to_string)?;
+        let (config, identity) = build_attested_client_config(&policy).map_err(str::to_string)?;
+        let appraisal_pending = !policy.attestation_servers.is_empty();
         let server_name = ServerName::try_from(server_name.to_string())
             .map_err(|_| "invalid incremental TLS server name".to_string())?;
         let mut tls_conn = ClientConnection::new(config, server_name)
@@ -87,12 +85,27 @@ impl IncrementalTlsClient {
             ratls: Some(policy),
             channel_verified: false,
             plaintext: Vec::new(),
-            client_auth_capture,
+            identity,
+            exchange: None,
+            failed: false,
+            appraisal_pending,
         })
     }
 
     /// Feed one bounded ciphertext fragment and drain newly decrypted bytes.
     pub fn feed_tls_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
+        if self.failed {
+            return Err("incremental TLS previously failed".into());
+        }
+        let result = self.feed_tls_bytes_inner(bytes);
+        if result.is_err() {
+            self.failed = true;
+            self.tls_conn.send_close_notify();
+        }
+        result
+    }
+
+    fn feed_tls_bytes_inner(&mut self, bytes: &[u8]) -> Result<(), String> {
         if bytes.len() > MAX_INCREMENTAL_TLS_FRAGMENT {
             return Err("incremental TLS fragment exceeds profile bound".to_string());
         }
@@ -108,14 +121,9 @@ impl IncrementalTlsClient {
             self.tls_conn
                 .process_new_packets()
                 .map_err(|error| format!("incremental TLS packet rejected: {error}"))?;
-            self.drain_plaintext()?;
+            self.advance_attestation()?;
         }
-        if !self.tls_conn.is_handshaking() && !self.channel_verified {
-            if let Some(policy) = self.ratls.as_ref() {
-                verify_channel_binding(&self.tls_conn, policy)?;
-            }
-            self.channel_verified = true;
-        }
+        self.advance_attestation()?;
         Ok(())
     }
 
@@ -153,7 +161,10 @@ impl IncrementalTlsClient {
 
     #[must_use]
     pub fn is_ready(&self) -> bool {
-        !self.tls_conn.is_handshaking() && self.channel_verified
+        !self.failed
+            && !self.appraisal_pending
+            && !self.tls_conn.is_handshaking()
+            && self.channel_verified
     }
 
     #[must_use]
@@ -168,26 +179,129 @@ impl IncrementalTlsClient {
     /// requested and the peer asked for a certificate.
     #[must_use]
     pub fn local_cert_der(&self) -> Option<Vec<u8>> {
-        self.client_auth_capture
+        self.identity
             .as_ref()
-            .and_then(|capture| capture.lock().ok())
-            .and_then(|capture| capture.certificate_der())
+            .and_then(|identity| identity.presented_leaf())
     }
 
-    /// Server challenge committed by this session's client certificate.
-    #[must_use]
+    /// Server-issued context bound into the client's v2 quote.
     pub fn peer_challenge_nonce(&self) -> Option<Vec<u8>> {
-        self.client_auth_capture
-            .as_ref()
-            .and_then(|capture| capture.lock().ok())
-            .and_then(|capture| capture.challenge_nonce())
+        self.local_evidence()
+            .and_then(|evidence| evidence.context.map(|value| value.to_vec()))
     }
 
-    #[must_use]
+    /// Shared application channel binding. Quote proofs use their separate
+    /// role-specific exporters retained in `peer_evidence` and `local_evidence`.
     pub fn channel_binder(&self) -> Option<Vec<u8>> {
         self.tls_conn
-            .ratls_channel_binder()
-            .map(|binder| binder.to_vec())
+            .export_keying_material([0u8; 32], b"EXPORTER-honest-peer-channel-v2", Some(&[]))
+            .ok()
+            .map(|value| value.to_vec())
+    }
+
+    pub fn peer_evidence(&self) -> Option<&crate::attest::Evidence> {
+        if self.failed {
+            return None;
+        }
+        self.exchange
+            .as_ref()
+            .and_then(|exchange| exchange.peer_evidence())
+    }
+
+    pub fn local_evidence(&self) -> Option<&crate::attest::Evidence> {
+        if self.failed {
+            return None;
+        }
+        self.exchange
+            .as_ref()
+            .and_then(|exchange| exchange.local_evidence())
+    }
+
+    /// The identity proof is ready for the explicitly configured remote service.
+    pub fn needs_remote_appraisal(&self) -> bool {
+        !self.failed && self.channel_verified && self.appraisal_pending
+    }
+
+    /// Blocking operator-client adapter. Never call from a control TCS: peers
+    /// use `new` with separately pumped quote appraisal instead. Application
+    /// writes remain blocked until every required appraiser accepts.
+    pub fn appraise_pending_evidence(&mut self) -> Result<(), String> {
+        if !self.needs_remote_appraisal() {
+            return Err("no pending remote appraisal".into());
+        }
+        let evidence = self.peer_evidence().ok_or("RA-TLS evidence missing")?;
+        let policy = self.ratls.as_ref().ok_or("RA-TLS policy missing")?;
+        let result = super::appraise_evidence(evidence, policy);
+        if result.is_ok() {
+            self.appraisal_pending = false;
+        } else {
+            self.failed = true;
+            self.tls_conn.send_close_notify();
+        }
+        result
+    }
+
+    /// Begin a fresh challenge exchange on this TLS connection. The HTTP
+    /// owner must first finish its in-flight request/response and pause new
+    /// application traffic; raw protocols must reconnect instead. This method
+    /// performs no socket I/O and does not schedule its own renewal interval.
+    ///
+    /// Both old proofs disappear immediately. Callers doing asynchronous
+    /// appraisal must retire their previous admission and appraise the new
+    /// proof identities before granting application authority again.
+    pub fn re_attest(&mut self) -> Result<[u8; 32], String> {
+        if !self.is_ready() {
+            return Err("RA-TLS renewal requires a ready connection".into());
+        }
+        if self.tls_conn.wants_write() || !self.plaintext.is_empty() {
+            return Err("RA-TLS renewal requires drained application buffers".into());
+        }
+        let policy = self
+            .ratls
+            .as_mut()
+            .ok_or("RA-TLS renewal requires a policy")?;
+        if !matches!(
+            policy.report_data,
+            super::ReportDataBinding::ChallengeResponse { .. }
+        ) {
+            return Err("RA-TLS renewal requires challenge mode".into());
+        }
+        self.channel_verified = false;
+        self.appraisal_pending = !policy.attestation_servers.is_empty();
+        self.exchange = None;
+        let mut nonce = [0u8; 32];
+        if ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut nonce).is_err() {
+            self.close();
+            return Err("RA-TLS renewal entropy unavailable".into());
+        }
+        policy.report_data = super::ReportDataBinding::ChallengeResponse {
+            nonce: nonce.to_vec(),
+        };
+        let result = self.advance_attestation();
+        if result.is_err() {
+            self.close();
+        }
+        result.map(|()| nonce)
+    }
+
+    fn advance_attestation(&mut self) -> Result<(), String> {
+        if self.tls_conn.is_handshaking() {
+            return Ok(());
+        }
+        if let Some(policy) = self.ratls.as_ref() {
+            if self.exchange.is_none() {
+                self.exchange = Some(AttestationExchange::start(&mut self.tls_conn, policy)?);
+            }
+            let exchange = self.exchange.as_mut().ok_or("RA-TLS exchange missing")?;
+            exchange.advance(&mut self.tls_conn, policy, self.identity.as_ref())?;
+            self.channel_verified = exchange.is_complete();
+        } else {
+            self.channel_verified = true;
+        }
+        if self.is_ready() {
+            self.drain_plaintext()?;
+        }
+        Ok(())
     }
 
     /// Take all plaintext accumulated so far.
@@ -196,6 +310,7 @@ impl IncrementalTlsClient {
     }
 
     pub fn close(&mut self) {
+        self.failed = true;
         self.tls_conn.send_close_notify();
     }
 
@@ -256,6 +371,7 @@ mod tests {
             report_data: ReportDataBinding::ChallengeResponse { nonce: vec![9; 32] },
             expected_oids: Vec::new(),
             attestation_servers: Vec::new(),
+            acceptable_tcb_statuses: None,
             client_identity: None,
             dependencies: None,
         };
@@ -278,6 +394,7 @@ mod tests {
             report_data: ReportDataBinding::ChallengeResponse { nonce: vec![9; 32] },
             expected_oids: Vec::new(),
             attestation_servers: Vec::new(),
+            acceptable_tcb_statuses: None,
             client_identity: None,
             dependencies: None,
         };

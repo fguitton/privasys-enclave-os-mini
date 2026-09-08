@@ -123,6 +123,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "enclave-os-common",
+ "rcgen",
  "ring",
  "rustls",
  "serde",
@@ -270,6 +271,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rcgen"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
+dependencies = [
+ "ring",
+ "rustls-pki-types",
+ "time",
+ "yasna",
+]
+
+[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -295,7 +308,8 @@ dependencies = [
 [[package]]
 name = "rustls"
 version = "0.23.41"
-source = "git+https://github.com/Privasys/rustls?rev=ab630583b58fee84260cbbfe2f4a8b45d8bde200#ab630583b58fee84260cbbfe2f4a8b45d8bde200"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b92b125634d9b795e7beca796cc790df15a7fb38323bf3196fda83292d06b1f"
 dependencies = [
  "once_cell",
  "ring",
@@ -591,6 +605,15 @@ dependencies = [
  "oid-registry",
  "rusticata-macros",
  "thiserror",
+ "time",
+]
+
+[[package]]
+name = "yasna"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
+dependencies = [
  "time",
 ]
 

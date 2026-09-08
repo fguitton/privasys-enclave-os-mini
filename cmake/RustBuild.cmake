@@ -149,6 +149,8 @@ function(rust_build_enclave CRATE_DIR OUTPUT_NAME FEATURES)
         COMMAND ${CMAKE_COMMAND} -E env
             "SGX_SDK_PATH=${SGX_SDK_PATH}"
             "SGX_MODE=${SGX_MODE}"
+            "SGX_CRYPTO_BACKEND=${SGX_CRYPTO_BACKEND}"
+            "USE_OPT_LIBS=0"
             "RUSTUP_TOOLCHAIN=${RUST_ENCLAVE_TOOLCHAIN}"
             "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}"
             "CARGO_TARGET_DIR=${_ENCLAVE_TARGET_DIR}"

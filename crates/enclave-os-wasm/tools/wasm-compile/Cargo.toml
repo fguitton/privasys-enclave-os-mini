@@ -8,8 +8,6 @@ edition = "2021"
 license = "AGPL-3.0"
 description = "AOT compiler for WASM components targeting enclave-os."
 
-[workspace]
-
 [[bin]]
 name = "enclave-os-wasm-compile"
 path = "src/main.rs"
@@ -17,3 +15,8 @@ path = "src/main.rs"
 [dependencies]
 honest-wasmtime-profile = { path = "../../../honest-wasmtime-profile", features = ["aot"] }
 clap = { version = "4", features = ["derive"] }
+
+# Standalone: do not join the enclave-os-wasm crate's workspace above
+# (the tool builds on the plain host toolchain, outside the enclave
+# dependency graph).
+[workspace]

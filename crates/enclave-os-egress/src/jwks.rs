@@ -104,10 +104,8 @@ fn get_or_fetch_cache(jwks_uri: &str) -> Result<(), String> {
 
     let needs_fetch = {
         let store = JWKS_STORE.lock().unwrap_or_else(|e| e.into_inner());
-        match store.as_ref().and_then(|s| s.get(jwks_uri)) {
-            Some(entry) if now < entry.fetched_at + JWKS_CACHE_TTL_SECS => false,
-            _ => true,
-        }
+        !matches!(store.as_ref().and_then(|s| s.get(jwks_uri)),
+            Some(entry) if now < entry.fetched_at + JWKS_CACHE_TTL_SECS)
     };
 
     if needs_fetch {

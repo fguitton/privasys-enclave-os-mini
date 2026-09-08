@@ -15,7 +15,7 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 use zeroize::{Zeroize, Zeroizing};
 
-use super::{build_client_config, verify_channel_binding, RaTlsPolicy};
+use super::{build_client_config, exchange, IdentityClientAuth, RaTlsPolicy};
 
 type ParsedHttpResponse = (u16, Vec<(String, String)>, Vec<u8>, Vec<u8>);
 
@@ -63,17 +63,23 @@ pub enum HttpsFetchFailurePhase {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HttpsFetchError {
     pub phase: HttpsFetchFailurePhase,
-    tls_peer: Option<TlsPeerCertificateEvidence>,
-    tls_peer_chain: Option<TlsPeerCertificateChain>,
+    tls_evidence: Option<Box<DispatchedTlsEvidence>>,
     detail: String,
+}
+
+/// Keep the certificate commitment and its exact chain together. Allocating
+/// this only after dispatch keeps the common Result return value small.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DispatchedTlsEvidence {
+    peer: TlsPeerCertificateEvidence,
+    chain: TlsPeerCertificateChain,
 }
 
 impl HttpsFetchError {
     fn new(phase: HttpsFetchFailurePhase, detail: impl Into<String>) -> Self {
         Self {
             phase,
-            tls_peer: None,
-            tls_peer_chain: None,
+            tls_evidence: None,
             detail: detail.into(),
         }
     }
@@ -91,8 +97,10 @@ impl HttpsFetchError {
         ));
         Self {
             phase,
-            tls_peer: Some(tls_peer),
-            tls_peer_chain: Some(tls_peer_chain.clone()),
+            tls_evidence: Some(Box::new(DispatchedTlsEvidence {
+                peer: tls_peer,
+                chain: tls_peer_chain.clone(),
+            })),
             detail: detail.into(),
         }
     }
@@ -108,13 +116,16 @@ impl HttpsFetchError {
 
     #[must_use]
     pub const fn tls_peer(&self) -> Option<TlsPeerCertificateEvidence> {
-        self.tls_peer
+        match &self.tls_evidence {
+            Some(evidence) => Some(evidence.peer),
+            None => None,
+        }
     }
 
     /// Return the exact bounded DER sequence observed after TLS validation.
     #[must_use]
     pub fn tls_peer_chain(&self) -> Option<&TlsPeerCertificateChain> {
-        self.tls_peer_chain.as_ref()
+        self.tls_evidence.as_ref().map(|evidence| &evidence.chain)
     }
 }
 
@@ -127,7 +138,7 @@ impl fmt::Display for HttpsFetchError {
 impl Error for HttpsFetchError {}
 
 /// A parsed HTTP response with status code, headers, and body.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HttpResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
@@ -369,7 +380,7 @@ fn https_request_inner(
     root_store: &RootCertStore,
     ratls: Option<&RaTlsPolicy>,
 ) -> Result<HttpResponse, HttpsFetchError> {
-    let tls_config = build_client_config(root_store, ratls, None).map_err(|error| {
+    let (tls_config, identity) = build_client_config(root_store, ratls).map_err(|error| {
         HttpsFetchError::new(
             HttpsFetchFailurePhase::RequestRejectedBeforeDispatch,
             error.to_string(),
@@ -381,7 +392,8 @@ fn https_request_inner(
             format!("TCP connect failed: {error}"),
         )
     })?;
-    let result = https_request_connected(io, fd, host, request, tls_config, ratls);
+    let result =
+        https_request_connected(io, fd, host, request, tls_config, ratls, identity.as_ref());
     io.close(fd);
     result
 }
@@ -393,6 +405,7 @@ fn https_request_connected(
     request: &[u8],
     tls_config: Arc<ClientConfig>,
     ratls: Option<&RaTlsPolicy>,
+    identity: Option<&Arc<IdentityClientAuth>>,
 ) -> Result<HttpResponse, HttpsFetchError> {
     let server_name = ServerName::try_from(host.to_string()).map_err(|_| {
         HttpsFetchError::new(
@@ -408,6 +421,7 @@ fn https_request_connected(
             )
         })?;
 
+    tls_conn.set_buffer_limit(Some(crate::attest::MAX_MESSAGE + 4096));
     tls_handshake(io, fd, &mut tls_conn).map_err(|error| {
         HttpsFetchError::new(
             HttpsFetchFailurePhase::TlsBeforeDispatch,
@@ -415,7 +429,7 @@ fn https_request_connected(
         )
     })?;
     if let Some(policy) = ratls {
-        verify_channel_binding(&tls_conn, policy).map_err(|error| {
+        exchange::run_blocking(io, fd, &mut tls_conn, policy, identity).map_err(|error| {
             HttpsFetchError::new(
                 HttpsFetchFailurePhase::PeerVerificationBeforeDispatch,
                 error,
@@ -657,7 +671,7 @@ fn tls_handshake(
     }
 }
 
-fn flush_tls(
+pub(super) fn flush_tls(
     io: &mut dyn InterruptibleBlockingNetIo,
     fd: i32,
     tls_conn: &mut ClientConnection,
@@ -937,6 +951,8 @@ mod tests {
         .unwrap_err();
         assert_eq!(detailed.phase, HttpsFetchFailurePhase::TlsBeforeDispatch);
         assert!(!detailed.request_may_have_been_dispatched());
+        assert!(detailed.tls_peer().is_none());
+        assert!(detailed.tls_peer_chain().is_none());
     }
 
     #[test]
@@ -965,5 +981,33 @@ mod tests {
         raw.extend(vec![b'a'; MAX_RESPONSE_HEADER_BYTES]);
         raw.extend_from_slice(b"\r\n\r\n");
         assert!(parse_http_response(&raw).is_err());
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::{HttpResponse, TlsPeerCertificateChain, TlsPeerCertificateEvidence};
+
+    #[test]
+    fn response_debug_never_discloses_protected_material() {
+        let response = HttpResponse {
+            status: 200,
+            headers: vec![("Set-Cookie".into(), "private-session-cookie".into())],
+            body: b"private-body".to_vec(),
+            raw_header_section: b"Set-Cookie: private-session-cookie".to_vec(),
+            tls_peer: TlsPeerCertificateEvidence {
+                leaf_sha256: [0; 32],
+                chain_sha256: [0; 32],
+                certificate_count: 0,
+                chain_bytes: 0,
+            },
+            tls_peer_chain: TlsPeerCertificateChain {
+                certificates_der: vec![],
+            },
+        };
+        let debug = format!("{response:?}");
+        assert!(!debug.contains("private-session-cookie"));
+        assert!(!debug.contains("private-body"));
+        assert!(!debug.contains("Set-Cookie"));
     }
 }

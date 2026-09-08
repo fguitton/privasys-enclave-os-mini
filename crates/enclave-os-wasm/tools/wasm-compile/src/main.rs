@@ -49,6 +49,17 @@ struct Cli {
     output: Option<PathBuf>,
 }
 
+/// Use the same frozen proposal set as the authenticated runtime profile.
+fn verify_frozen_features(engine: &Engine) -> Result<(), String> {
+    let bits = engine.get_wasm_features().bits();
+    let frozen = honest_wasmtime_profile::WASM_FEATURE_BITS;
+    if bits != frozen {
+        return Err(format!(
+            "wasmtime enabled-proposal set drifted: got {bits:#018x}, frozen {frozen:#018x}"
+        ));
+    }
+    Ok(())
+}
 fn main() {
     let cli = Cli::parse();
 
@@ -76,6 +87,10 @@ fn main() {
         eprintln!("error: engine creation failed: {}", e);
         std::process::exit(1);
     });
+    if let Err(e) = verify_frozen_features(&engine) {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+    }
 
     // AOT compile
     eprintln!("Compiling...");
@@ -102,4 +117,22 @@ fn main() {
 
     eprintln!("Output: {} ({} bytes)", output.display(), cwasm.len());
     eprintln!("Done.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::verify_frozen_features;
+
+    #[test]
+    fn enabled_proposal_set_stays_frozen() {
+        let mut config = honest_wasmtime_profile::canonical_config();
+        // Explicit AOT target: the production artefact targets Linux/SGX and
+        // this keeps the test host-independent (Windows hosts reject
+        // `native_unwind_info(false)` for native engines).
+        config.target("x86_64-unknown-linux-gnu").expect("target");
+        let engine = super::Engine::new(&config).expect("engine");
+        if let Err(e) = verify_frozen_features(&engine) {
+            panic!("{e}");
+        }
+    }
 }
