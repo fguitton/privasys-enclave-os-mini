@@ -27,7 +27,10 @@ use crate::kvstore;
 use crate::net;
 
 fn legacy_role_allows_method(role: RpcRole, method: RpcMethod) -> bool {
-    method != RpcMethod::PersistRaftReadyBatch || role == RpcRole::Control
+    !matches!(
+        method,
+        RpcMethod::PersistRaftReadyBatch | RpcMethod::KvPutDurable
+    ) || role == RpcRole::Control
 }
 
 const fn role_name(role: RpcRole) -> &'static str {
@@ -228,6 +231,7 @@ impl RpcDispatcher {
 
             // ---- KV Store ----
             RpcMethod::KvPut => self.handle_kv_put(payload),
+            RpcMethod::KvPutDurable => self.handle_kv_put_durable(payload),
             RpcMethod::KvGet => self.handle_kv_get(payload),
             RpcMethod::KvDelete => self.handle_kv_delete(payload),
             RpcMethod::KvListKeys => self.handle_kv_list_keys(payload),
@@ -440,6 +444,22 @@ impl RpcDispatcher {
         }
     }
 
+    fn handle_kv_put_durable(&self, payload: &[u8]) -> (i32, Vec<u8>) {
+        let Some((table, key, value)) = rpc::decode_durable_kv_put_req(payload) else {
+            return (-22, Vec::new());
+        };
+        let Ok(table) = core::str::from_utf8(table) else {
+            return (-22, Vec::new());
+        };
+        match kvstore::put_durable(table, key, value) {
+            Ok(()) => (0, Vec::new()),
+            Err(error) => {
+                error!("KvPutDurable failed: {}", error);
+                (-1, Vec::new())
+            }
+        }
+    }
+
     fn handle_kv_write_batch(&self, payload: &[u8]) -> (i32, Vec<u8>) {
         let (table, ops) = match rpc::decode_kv_write_batch_req(payload) {
             Some(r) => r,
@@ -626,6 +646,16 @@ mod tests {
 
     #[test]
     fn ready_persistence_is_control_role_only() {
+        for role in [RpcRole::Control, RpcRole::Execution] {
+            assert_eq!(
+                legacy_role_allows_method(role, RpcMethod::KvPutDurable),
+                role == RpcRole::Control
+            );
+            assert_eq!(
+                honest_role_allows_method(role, RpcMethod::KvPutDurable),
+                role == RpcRole::Control
+            );
+        }
         assert!(legacy_role_allows_method(
             RpcRole::Control,
             RpcMethod::PersistRaftReadyBatch
@@ -682,5 +712,23 @@ mod tests {
         let response = rpc::decode_honest_response_for(&encoded_response, wrong_role)
             .expect("denial still echoes submitted identity");
         assert_eq!(response.status, -13);
+        for submitted in [identity, wrong_role] {
+            let submitted = HonestRpcIdentity {
+                method: RpcMethod::KvPutDurable,
+                ..submitted
+            };
+            let payload = rpc::encode_durable_kv_put_req(b"test", b"k", b"v").unwrap();
+            dispatcher.dispatch(&rpc::encode_honest_request(submitted, &payload).unwrap());
+            let response = response_rx.try_recv().expect("durable write denial");
+            assert_eq!(
+                rpc::decode_honest_response_for(&response, submitted)
+                    .unwrap()
+                    .status,
+                -13
+            );
+        }
+        dispatcher.dispatch(&rpc::encode_request(15, RpcMethod::KvPutDurable, &[]));
+        let response = response_rx.try_recv().expect("legacy durable write denial");
+        assert_eq!(rpc::decode_response(&response).unwrap().1, -13);
     }
 }

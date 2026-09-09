@@ -70,6 +70,12 @@ pub fn kv_store_put(table: &[u8], enc_key: &[u8], enc_val: &[u8]) -> Result<(), 
     rpc().kv_put(table, enc_key, enc_val)
 }
 
+/// Control-only synchronous write of ciphertext. The caller must seal before
+/// crossing this boundary; host acknowledgement is not rollback resistance.
+pub fn kv_store_put_durable(table: &[u8], key: &[u8], value: &[u8]) -> Result<(), i32> {
+    rpc().kv_put_durable(table, key, value)
+}
+
 /// Get an encrypted value from the host. Returns None if not found.
 pub fn kv_store_get(
     table: &[u8],

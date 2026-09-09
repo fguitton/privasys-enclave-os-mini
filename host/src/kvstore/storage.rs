@@ -81,6 +81,31 @@ pub fn put(table: &str, enc_key: &[u8], enc_val: &[u8]) -> Result<()> {
         .context("RocksDB put_cf failed")
 }
 
+/// Backend-neutral single-record durability. This operation does not interpret
+/// ciphertext, select consensus populations, or prove host rollback resistance.
+pub fn put_durable_on_db(db: &mut DB, table: &str, key: &[u8], value: &[u8]) -> Result<()> {
+    anyhow::ensure!(
+        enclave_os_common::rpc::durable_kv_put_fields_valid(table.as_bytes(), key, value),
+        "invalid durable KV request"
+    );
+    if db.cf_handle(table).is_none() {
+        db.create_cf(table, &cf_opts())
+            .context("durable KV column family creation failed")?;
+    }
+    let cf = db
+        .cf_handle(table)
+        .context("durable KV column family missing")?;
+    let mut options = WriteOptions::default();
+    options.set_sync(true);
+    options.disable_wal(false);
+    db.put_cf_opt(cf, key, value, &options)
+        .context("synchronous RocksDB KV write failed")
+}
+
+pub fn put_durable(table: &str, key: &[u8], value: &[u8]) -> Result<()> {
+    put_durable_on_db(&mut db(), table, key, value)
+}
+
 /// Retrieve an encrypted value by encrypted key from the given table.
 /// Returns `Ok(None)` if the key is not found.
 pub fn get(table: &str, enc_key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -360,6 +385,7 @@ mod tests {
 
     #[test]
     fn put_get_delete_default_cf() {
+        check_durable_control_write();
         let (_tmp, db) = open_tmp();
 
         let key = b"encrypted_key_123";
@@ -374,6 +400,42 @@ mod tests {
 
         let after_delete = db.get(key).unwrap();
         assert_eq!(after_delete, None);
+    }
+
+    fn check_durable_control_write() {
+        let (tmp, mut database) = open_tmp();
+        let table = "honest.bft-control";
+        let key = b"sealed-initialization-v1";
+        let value = b"opaque-sealed-ciphertext";
+        super::put_durable_on_db(&mut database, table, key, value).unwrap();
+        assert_eq!(
+            database
+                .get_cf(database.cf_handle(table).unwrap(), key)
+                .unwrap(),
+            Some(value.to_vec())
+        );
+        assert!(super::put_durable_on_db(&mut database, "bad/table", key, value).is_err());
+        assert!(super::put_durable_on_db(&mut database, "other", b"", value).is_err());
+        assert!(database.cf_handle("bad/table").is_none());
+        assert!(database.cf_handle("other").is_none());
+        drop(database);
+        let mut reopened =
+            DB::open_cf_for_read_only(&Options::default(), &tmp.0, ["default", table], false)
+                .unwrap();
+        assert_eq!(
+            reopened
+                .get_cf(reopened.cf_handle(table).unwrap(), key)
+                .unwrap(),
+            Some(value.to_vec())
+        );
+        assert!(super::put_durable_on_db(&mut reopened, table, key, b"replacement").is_err());
+        assert!(super::put_durable_on_db(&mut reopened, "new-table", key, value).is_err());
+        assert_eq!(
+            reopened
+                .get_cf(reopened.cf_handle(table).unwrap(), key)
+                .unwrap(),
+            Some(value.to_vec())
+        );
     }
 
     #[test]

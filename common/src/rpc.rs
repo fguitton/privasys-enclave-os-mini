@@ -50,6 +50,8 @@ pub enum RpcMethod {
     KvWriteBatch = 0x0204,
     KvMultiGet = 0x0205,
     KvScan = 0x0206,
+    /// Control-role-only synchronous write of an opaque sealed value.
+    KvPutDurable = 0x0207,
     /// Honest control-role-only synchronous atomic S1 persistence.
     PersistRaftReadyBatch = 0x0240,
 
@@ -81,6 +83,7 @@ impl RpcMethod {
             0x0204 => Some(Self::KvWriteBatch),
             0x0205 => Some(Self::KvMultiGet),
             0x0206 => Some(Self::KvScan),
+            0x0207 => Some(Self::KvPutDurable),
             0x0240 => Some(Self::PersistRaftReadyBatch),
             0x0300 => Some(Self::GetCurrentTime),
             0x0301 => Some(Self::Log),
@@ -161,6 +164,8 @@ pub fn decode_response(data: &[u8]) -> Option<(u64, i32, &[u8])> {
 
 mod honest;
 pub use honest::*;
+mod durable;
+pub use durable::*;
 
 // ========================================================================
 //  Honest S1 control-only Ready persistence
@@ -1114,6 +1119,7 @@ mod tests {
             RpcMethod::KvWriteBatch,
             RpcMethod::KvMultiGet,
             RpcMethod::KvScan,
+            RpcMethod::KvPutDurable,
             RpcMethod::GetCurrentTime,
             RpcMethod::Log,
             RpcMethod::Shutdown,
@@ -1264,6 +1270,7 @@ mod tests {
 
     #[test]
     fn test_kv_put_payload() {
+        durable::check_codec();
         let table = b"my_table";
         let key = b"my_key";
         let value = b"my_value";
@@ -1582,6 +1589,7 @@ mod tests {
         assert_eq!(RpcMethod::from_u16(0x0204), Some(RpcMethod::KvWriteBatch));
         assert_eq!(RpcMethod::from_u16(0x0205), Some(RpcMethod::KvMultiGet));
         assert_eq!(RpcMethod::from_u16(0x0206), Some(RpcMethod::KvScan));
+        assert_eq!(RpcMethod::from_u16(0x0207), Some(RpcMethod::KvPutDurable));
         assert_eq!(
             RpcMethod::from_u16(0x0240),
             Some(RpcMethod::PersistRaftReadyBatch)
@@ -1598,7 +1606,7 @@ mod tests {
         // Invalid IDs
         assert_eq!(RpcMethod::from_u16(0x0000), None);
         assert_eq!(RpcMethod::from_u16(0x0106), None);
-        assert_eq!(RpcMethod::from_u16(0x0207), None);
+        assert_eq!(RpcMethod::from_u16(0x0208), None);
         assert_eq!(RpcMethod::from_u16(0xFFFF), None);
     }
 

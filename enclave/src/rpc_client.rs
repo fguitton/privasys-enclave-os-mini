@@ -521,6 +521,27 @@ impl RpcClient {
         }
     }
 
+    /// Synchronous startup/control persistence, separate from Raft Ready.
+    /// Queue pressure and malformed/stale replies fail closed. The host must
+    /// acknowledge only after the synchronous ciphertext write completes.
+    /// Active consensus scheduling should use a separate polled adapter.
+    pub fn kv_put_durable(&self, table: &[u8], key: &[u8], value: &[u8]) -> Result<(), i32> {
+        let payload = rpc::encode_durable_kv_put_req(table, key, value).ok_or(-22)?;
+        let request_id = self.try_reserve_request().map_err(|error| match error {
+            RequestReserveError::Busy => -16,
+            RequestReserveError::OperationIdExhausted => -75,
+        })?;
+        let message = rpc::encode_request(request_id, RpcMethod::KvPutDurable, &payload);
+        if self.request_tx.try_send(&message).is_err() {
+            self.release_request(request_id);
+            return Err(-11);
+        }
+        notify_host();
+        let response = self.response_rx.recv();
+        self.release_request(request_id);
+        rpc::decode_durable_kv_put_response(&response, request_id)
+    }
+
     /// Get an encrypted value from the given table. Returns `Ok(None)` if not found (status == 1).
     pub fn kv_get(&self, table: &[u8], enc_key: &[u8]) -> Result<Option<Vec<u8>>, i32> {
         let payload = rpc::encode_kv_get_req(table, enc_key);
