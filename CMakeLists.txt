@@ -95,12 +95,16 @@ function(require_sdk230_teaclave SOURCE_ROOT)
     set(_FILES
         "sgx_build_helper/download_prebuilt/build.rs"
         "sgx_crypto/sgx_crypto_sys/build.rs"
-        "sgx_trts/src/version.rs")
+        "sgx_trts/src/version.rs"
+        "sgx_trts/src/inst/sim/inst.rs"
+        "sgx_trts/src/inst/sim/mod.rs")
     set(_HASHES
         "fe79813e38a2bb27c7bd2452667e6023db62873f7136674236385d2b357c608b"
         "c4c6eadaecffdd93d5ee94c8b2455c3aa99cb69f0f165caad8ebdb224462d130"
-        "90a1992e8836591dc2a01ccaa5d21009dc64c747b364882c3c8e4ea1ed6304af")
-    foreach(_INDEX RANGE 0 2)
+        "90a1992e8836591dc2a01ccaa5d21009dc64c747b364882c3c8e4ea1ed6304af"
+        "281acb91eb42a2f22999145d2fd854da8a082fe73abce81a6ab52728b607b4ec"
+        "083bae3dcbef18492cd2cc41fefda91662181b4b319a36c9ed96599b94711fc9")
+    foreach(_INDEX RANGE 0 4)
         list(GET _FILES ${_INDEX} _FILE)
         list(GET _HASHES ${_INDEX} _EXPECTED)
         if(NOT EXISTS "${SOURCE_ROOT}/${_FILE}" OR IS_SYMLINK "${SOURCE_ROOT}/${_FILE}")
