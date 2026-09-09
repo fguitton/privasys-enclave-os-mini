@@ -60,10 +60,6 @@ pub mod ecall;
 pub mod encauth;
 pub mod modules;
 pub mod ocall;
-#[cfg(feature = "raft")]
-pub mod peerlink;
-#[cfg(feature = "raft")]
-pub mod raftglue;
 pub mod ratls;
 pub mod rpc_client;
 pub mod sealed_config;

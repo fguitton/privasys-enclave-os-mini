@@ -434,11 +434,11 @@ impl WasmModule {
     }
 
     /// Execute one exported function for a CLUSTER TRANSACTION. The
-    /// raft layer authorises the caller (its own envelope gate) and
+    /// consensus owner authorises the caller (its own envelope gate) and
     /// installs the transaction-ledger scope around this call; here it
     /// is a plain dispatch with no platform auth context (an app-level
     /// `permissions` policy still applies via `call.app_auth`). The
-    /// serialized return values are handed back to the raft layer,
+    /// serialized return values are handed back to the consensus owner,
     /// which commits them alongside the write-set proposal.
     pub fn call_for_transaction(&self, call: &WasmCall) -> Result<serde_json::Value, String> {
         match self.dispatch_call(call, None) {
