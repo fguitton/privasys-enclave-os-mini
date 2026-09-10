@@ -51,7 +51,7 @@ enum EnclaveTestSelection {
     Invalid,
 }
 
-const EXPECTED_SIGNED_ENCLAVE_TESTS: u8 = 8;
+const EXPECTED_SIGNED_ENCLAVE_TESTS: u8 = 9;
 
 impl EnclaveTestSelection {
     const fn code(self) -> u32 {
