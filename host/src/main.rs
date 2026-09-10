@@ -17,6 +17,8 @@ mod dispatcher;
 mod enclave;
 mod kvstore;
 mod net;
+#[cfg(target_os = "linux")]
+mod ocall_alignment;
 mod ocall_impl;
 mod tcp_proxy;
 

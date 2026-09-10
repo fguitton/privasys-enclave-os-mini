@@ -81,6 +81,21 @@ fn main() {
     let mut build = cc::Build::new();
     build
         .file(&u_c)
+        // edger8r packs the size_t array immediately after an int output.
+        // Route that call through our byte-safe alignment adapter before
+        // Teaclave constructs a Rust slice from the generated pointer.
+        .define(
+            "u_thread_set_multiple_events_ocall",
+            "enclave_os_thread_set_multiple_events_ocall",
+        )
+        .define(
+            "u_thread_wait_event_ocall",
+            "enclave_os_thread_wait_event_ocall",
+        )
+        .define(
+            "u_thread_setwait_events_ocall",
+            "enclave_os_thread_setwait_events_ocall",
+        )
         .include(&out_dir)
         .include(format!("{}/include", sgx_sdk));
 
