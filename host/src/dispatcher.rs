@@ -27,10 +27,7 @@ use crate::kvstore;
 use crate::net;
 
 fn legacy_role_allows_method(role: RpcRole, method: RpcMethod) -> bool {
-    !matches!(
-        method,
-        RpcMethod::PersistRaftReadyBatch | RpcMethod::KvPutDurable
-    ) || role == RpcRole::Control
+    !matches!(method, RpcMethod::KvPutDurable) || role == RpcRole::Control
 }
 
 const fn role_name(role: RpcRole) -> &'static str {
@@ -235,7 +232,6 @@ impl RpcDispatcher {
             RpcMethod::KvGet => self.handle_kv_get(payload),
             RpcMethod::KvDelete => self.handle_kv_delete(payload),
             RpcMethod::KvListKeys => self.handle_kv_list_keys(payload),
-            RpcMethod::PersistRaftReadyBatch => self.handle_persist_raft_ready_batch(payload),
             RpcMethod::KvWriteBatch => self.handle_kv_write_batch(payload),
             RpcMethod::KvMultiGet => self.handle_kv_multi_get(payload),
             RpcMethod::KvScan => self.handle_kv_scan(payload),
@@ -409,36 +405,6 @@ impl RpcDispatcher {
             }
             Err(e) => {
                 error!("KvListKeys failed: {}", e);
-                (-1, Vec::new())
-            }
-        }
-    }
-
-    fn handle_persist_raft_ready_batch(&self, payload: &[u8]) -> (i32, Vec<u8>) {
-        let request = match rpc::decode_persist_raft_ready_batch(payload) {
-            Ok(request) => request,
-            Err(error) => {
-                warn!(
-                    "PersistRaftReadyBatch rejected malformed payload: {:?}",
-                    error
-                );
-                return (-1, Vec::new());
-            }
-        };
-        match kvstore::persist_raft_ready_batch(&request) {
-            Ok(kvstore::RaftReadyPersistenceResult::Persisted {
-                batch_id,
-                durable_id,
-            }) => (
-                0,
-                rpc::encode_persisted_raft_ready_batch(rpc::PersistedRaftReadyBatch {
-                    batch_id,
-                    durable_id,
-                }),
-            ),
-            Ok(kvstore::RaftReadyPersistenceResult::Conflict) => (1, Vec::new()),
-            Err(error) => {
-                error!("PersistRaftReadyBatch failed: {}", error);
                 (-1, Vec::new())
             }
         }
@@ -645,7 +611,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_persistence_is_control_role_only() {
+    fn durable_persistence_is_control_role_only() {
         for role in [RpcRole::Control, RpcRole::Execution] {
             assert_eq!(
                 legacy_role_allows_method(role, RpcMethod::KvPutDurable),
@@ -656,14 +622,6 @@ mod tests {
                 role == RpcRole::Control
             );
         }
-        assert!(legacy_role_allows_method(
-            RpcRole::Control,
-            RpcMethod::PersistRaftReadyBatch
-        ));
-        assert!(!legacy_role_allows_method(
-            RpcRole::Execution,
-            RpcMethod::PersistRaftReadyBatch
-        ));
         assert!(legacy_role_allows_method(
             RpcRole::Execution,
             RpcMethod::NetRecv
