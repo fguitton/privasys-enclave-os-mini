@@ -344,6 +344,25 @@ pub fn https_fetch_interruptible_detailed(
     root_store: &RootCertStore,
     ratls: Option<&RaTlsPolicy>,
 ) -> Result<HttpResponse, HttpsFetchError> {
+    https_fetch_authorized_interruptible_detailed(io, request, root_store, ratls, &mut |_| Ok(()))
+}
+
+/// Perform the normal TLS/optional RA-TLS handshake, then require the caller's
+/// authorization of its exact bounded certificate chain before writing any HTTP
+/// header or body. A rejected authorization closes the connection and reports
+/// `PeerVerificationBeforeDispatch`; it cannot be mistaken for an uncertain send.
+///
+/// The callback may enforce committed certificate time and current private
+/// authority. It runs once per connection, not once per body chunk. Callers must
+/// still inject fence-aware, interruptible I/O to stop an authority retired during
+/// a send, and validate currentness before accepting the returned observation.
+pub fn https_fetch_authorized_interruptible_detailed(
+    io: &mut dyn InterruptibleBlockingNetIo,
+    request: &BoundedHttpsRequest,
+    root_store: &RootCertStore,
+    ratls: Option<&RaTlsPolicy>,
+    authorize_peer: &mut dyn FnMut(&TlsPeerCertificateChain) -> Result<(), String>,
+) -> Result<HttpResponse, HttpsFetchError> {
     let (host, port, path) = parse_url(&request.url).map_err(|error| {
         HttpsFetchError::new(HttpsFetchFailurePhase::RequestRejectedBeforeDispatch, error)
     })?;
@@ -369,7 +388,15 @@ pub fn https_fetch_interruptible_detailed(
     if let Some(body) = &request.body {
         request_bytes.extend_from_slice(body);
     }
-    https_request_inner(io, &host, port, &request_bytes, root_store, ratls)
+    https_request_inner(
+        io,
+        &host,
+        port,
+        &request_bytes,
+        root_store,
+        ratls,
+        authorize_peer,
+    )
 }
 
 fn https_request_inner(
@@ -379,6 +406,7 @@ fn https_request_inner(
     request: &[u8],
     root_store: &RootCertStore,
     ratls: Option<&RaTlsPolicy>,
+    authorize_peer: &mut dyn FnMut(&TlsPeerCertificateChain) -> Result<(), String>,
 ) -> Result<HttpResponse, HttpsFetchError> {
     let (tls_config, identity) = build_client_config(root_store, ratls).map_err(|error| {
         HttpsFetchError::new(
@@ -392,8 +420,16 @@ fn https_request_inner(
             format!("TCP connect failed: {error}"),
         )
     })?;
-    let result =
-        https_request_connected(io, fd, host, request, tls_config, ratls, identity.as_ref());
+    let result = https_request_connected(
+        io,
+        fd,
+        host,
+        request,
+        tls_config,
+        ratls,
+        identity.as_ref(),
+        authorize_peer,
+    );
     io.close(fd);
     result
 }
@@ -406,6 +442,7 @@ fn https_request_connected(
     tls_config: Arc<ClientConfig>,
     ratls: Option<&RaTlsPolicy>,
     identity: Option<&Arc<IdentityClientAuth>>,
+    authorize_peer: &mut dyn FnMut(&TlsPeerCertificateChain) -> Result<(), String>,
 ) -> Result<HttpResponse, HttpsFetchError> {
     let server_name = ServerName::try_from(host.to_string()).map_err(|_| {
         HttpsFetchError::new(
@@ -437,6 +474,12 @@ fn https_request_connected(
         })?;
     }
     let (tls_peer, tls_peer_chain) = tls_peer_certificate_evidence(&tls_conn)?;
+    authorize_peer(&tls_peer_chain).map_err(|error| {
+        HttpsFetchError::new(
+            HttpsFetchFailurePhase::PeerVerificationBeforeDispatch,
+            error,
+        )
+    })?;
 
     for chunk in request.chunks(16 * 1024) {
         tls_conn.writer().write_all(chunk).map_err(|error| {
@@ -847,6 +890,8 @@ fn dechunk(mut data: &[u8]) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[path = "authorized.rs"]
+    mod authorized;
     use super::{
         https_fetch_interruptible, https_fetch_interruptible_detailed, parse_http_response,
         BoundedHttpsRequest, HttpsFetchFailurePhase, InterruptibleBlockingNetIo, RootCertStore,
@@ -953,6 +998,7 @@ mod tests {
         assert!(!detailed.request_may_have_been_dispatched());
         assert!(detailed.tls_peer().is_none());
         assert!(detailed.tls_peer_chain().is_none());
+        authorized::check_authorization_boundary();
     }
 
     #[test]

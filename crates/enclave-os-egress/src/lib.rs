@@ -74,7 +74,8 @@ pub mod jwks;
 
 // Re-export RA-TLS verification types for convenience.
 pub use client::{
-    enclave_attestation_quote, enclave_self_mrenclave, https_fetch, https_fetch_interruptible,
+    enclave_attestation_quote, enclave_self_mrenclave, https_fetch,
+    https_fetch_authorized_interruptible_detailed, https_fetch_interruptible,
     https_fetch_interruptible_detailed, locally_verify_sgx_peer_certificate, mozilla_root_store,
     register_enclave_attestation_provider, register_enclave_client_cert_signer,
     root_store_from_der, verify_webpki_client_certificate_chain_at,
