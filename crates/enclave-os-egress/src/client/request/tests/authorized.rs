@@ -3,9 +3,10 @@
 
 //! Real loopback TLS checks extend the existing injected-transport test identity.
 use crate::{
-    https_fetch_authorized_interruptible_detailed, root_store_from_der,
-    verify_webpki_server_certificate_chain_at, BoundedHttpsRequest, HttpsFetchFailurePhase,
-    InterruptibleBlockingNetIo,
+    https_fetch_authorized_interruptible_detailed,
+    https_fetch_resource_authorized_interruptible_detailed, root_store_from_der,
+    verify_webpki_server_certificate_chain_at, BoundedHttpsRequest, HttpsBodyLimitsV1,
+    HttpsFetchFailurePhase, InterruptibleBlockingNetIo, ResourceBoundHttpsRequest,
 };
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
@@ -77,7 +78,16 @@ pub(super) fn check_authorization_boundary() {
     let config = Arc::new(config);
     // Valid current certificate, explicit authority denial, committed time before
     // the certificate existed, and connection loss after a real request write.
-    for scenario in 0..4 {
+    for selection in 0..8 {
+        let bulk = selection >= 4;
+        let scenario = selection % 4;
+        let mut body = if bulk {
+            vec![55; 3 * 1024 * 1024]
+        } else {
+            Vec::new()
+        };
+        body.extend_from_slice(b"protected output");
+        let server_body = body.clone();
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let server_config = Arc::clone(&config);
@@ -97,9 +107,17 @@ pub(super) fn check_authorization_boundary() {
                 }
                 if request.ends_with(b"protected output") {
                     if scenario == 0 {
+                        let response = if bulk { server_body.as_slice() } else { &[] };
                         stream
-                            .write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n")
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 201 Created\r\nContent-Length: {}\r\n\r\n",
+                                    response.len()
+                                )
+                                .as_bytes(),
+                            )
                             .unwrap();
+                        stream.write_all(response).unwrap();
                         stream.conn.send_close_notify();
                         stream.flush().unwrap();
                     }
@@ -108,45 +126,56 @@ pub(super) fn check_authorization_boundary() {
             }
             request
         });
-        let request = BoundedHttpsRequest::new(
-            "PUT",
-            format!("https://authorized.test:{port}/object"),
-            vec![],
-            Some(b"protected output".to_vec()),
-        )
-        .unwrap();
         let mut wire = Wire {
             port,
             stream: None,
             closed: false,
         };
         let mut calls = 0;
-        let result = https_fetch_authorized_interruptible_detailed(
-            &mut wire,
-            &request,
-            &roots,
-            None,
-            &mut |chain| {
-                calls += 1;
-                assert_eq!(chain.certificates_der(), std::slice::from_ref(&cert));
-                if scenario == 1 {
-                    return Err("private authority retired".into());
-                }
-                verify_webpki_server_certificate_chain_at(
-                    chain.certificates_der(),
-                    "authorized.test",
-                    &roots,
-                    if scenario == 2 { 0 } else { 1_800_000_000 },
-                )
-            },
-        );
+        let mut authorize = |chain: &crate::TlsPeerCertificateChain| {
+            calls += 1;
+            assert_eq!(chain.certificates_der(), std::slice::from_ref(&cert));
+            if scenario == 1 {
+                return Err("private authority retired".into());
+            }
+            verify_webpki_server_certificate_chain_at(
+                chain.certificates_der(),
+                "authorized.test",
+                &roots,
+                if scenario == 2 { 0 } else { 1_800_000_000 },
+            )
+        };
+        let url = format!("https://authorized.test:{port}/object");
+        let result = if bulk {
+            let limits = HttpsBodyLimitsV1::new(body.len() as u64, body.len() as u64).unwrap();
+            let request =
+                ResourceBoundHttpsRequest::new("PUT", url, vec![], Some(&body), limits).unwrap();
+            https_fetch_resource_authorized_interruptible_detailed(
+                &mut wire,
+                &request,
+                &roots,
+                None,
+                &mut authorize,
+            )
+        } else {
+            let request = BoundedHttpsRequest::new("PUT", url, vec![], Some(body.clone())).unwrap();
+            https_fetch_authorized_interruptible_detailed(
+                &mut wire,
+                &request,
+                &roots,
+                None,
+                &mut authorize,
+            )
+        };
         let received = server.join().unwrap();
         assert!(wire.closed);
         assert_eq!(calls, 1);
         match scenario {
             0 => {
-                assert_eq!(result.unwrap().status, 201);
-                assert!(received.ends_with(b"protected output"));
+                let response = result.unwrap();
+                assert_eq!(response.status, 201);
+                assert_eq!(response.body, if bulk { body.clone() } else { vec![] });
+                assert!(received.ends_with(&body));
             }
             1 | 2 => {
                 let error = result.unwrap_err();
@@ -164,7 +193,7 @@ pub(super) fn check_authorization_boundary() {
                     error.tls_peer_chain().unwrap().certificates_der(),
                     std::slice::from_ref(&cert)
                 );
-                assert!(received.ends_with(b"protected output"));
+                assert!(received.ends_with(&body));
             }
             _ => unreachable!(),
         }

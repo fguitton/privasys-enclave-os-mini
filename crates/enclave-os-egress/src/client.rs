@@ -51,8 +51,9 @@ pub use incremental::IncrementalTlsClient;
 pub use renewal::{AttestationRenewalBudget, AttestationRenewalPolicy};
 pub use request::{
     https_fetch, https_fetch_authorized_interruptible_detailed, https_fetch_interruptible,
-    https_fetch_interruptible_detailed, BoundedHttpsRequest, HttpResponse, HttpsFetchError,
-    HttpsFetchFailurePhase, InterruptibleBlockingNetIo, TlsPeerCertificateChain,
+    https_fetch_interruptible_detailed, https_fetch_resource_authorized_interruptible_detailed,
+    BoundedHttpsRequest, HttpResponse, HttpsBodyLimitsV1, HttpsFetchError, HttpsFetchFailurePhase,
+    InterruptibleBlockingNetIo, ResourceBoundHttpsRequest, TlsPeerCertificateChain,
     TlsPeerCertificateEvidence, MAX_REQUEST_BODY, MAX_REQUEST_HEADERS, MAX_REQUEST_HEADER_BYTES,
     MAX_RESPONSE_BODY, MAX_RESPONSE_HEADERS, MAX_RESPONSE_HEADER_BYTES, MAX_TLS_PEER_CERTIFICATES,
     MAX_TLS_PEER_CERTIFICATE_BYTES, MAX_TLS_PEER_CHAIN_BYTES,

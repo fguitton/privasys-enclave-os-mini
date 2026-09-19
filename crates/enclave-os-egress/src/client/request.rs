@@ -17,6 +17,12 @@ use zeroize::{Zeroize, Zeroizing};
 
 use super::{build_client_config, exchange, IdentityClientAuth, RaTlsPolicy};
 
+mod resource;
+pub use resource::{
+    https_fetch_resource_authorized_interruptible_detailed, HttpsBodyLimitsV1,
+    ResourceBoundHttpsRequest,
+};
+
 type ParsedHttpResponse = (u16, Vec<(String, String)>, Vec<u8>, Vec<u8>);
 
 /// Maximum HTTP response body size (2 MiB).
@@ -363,6 +369,37 @@ pub fn https_fetch_authorized_interruptible_detailed(
     ratls: Option<&RaTlsPolicy>,
     authorize_peer: &mut dyn FnMut(&TlsPeerCertificateChain) -> Result<(), String>,
 ) -> Result<HttpResponse, HttpsFetchError> {
+    fetch_authorized(
+        io,
+        RequestInput {
+            metadata: request,
+            body: request.body.as_deref(),
+            response_limit: MAX_RESPONSE_BODY,
+        },
+        root_store,
+        ratls,
+        authorize_peer,
+    )
+}
+
+struct RequestInput<'a> {
+    metadata: &'a BoundedHttpsRequest,
+    body: Option<&'a [u8]>,
+    response_limit: usize,
+}
+struct WireRequest<'a> {
+    head: Zeroizing<Vec<u8>>,
+    body: &'a [u8],
+    response_limit: usize,
+}
+fn fetch_authorized(
+    io: &mut dyn InterruptibleBlockingNetIo,
+    input: RequestInput<'_>,
+    root_store: &RootCertStore,
+    ratls: Option<&RaTlsPolicy>,
+    authorize_peer: &mut dyn FnMut(&TlsPeerCertificateChain) -> Result<(), String>,
+) -> Result<HttpResponse, HttpsFetchError> {
+    let request = input.metadata;
     let (host, port, path) = parse_url(&request.url).map_err(|error| {
         HttpsFetchError::new(HttpsFetchFailurePhase::RequestRejectedBeforeDispatch, error)
     })?;
@@ -373,7 +410,7 @@ pub fn https_fetch_authorized_interruptible_detailed(
     for (key, value) in &request.headers {
         request_head.push_str(&format!("{}: {}\r\n", key, value));
     }
-    if let Some(body) = &request.body {
+    if let Some(body) = input.body {
         if !request
             .headers
             .iter()
@@ -384,10 +421,11 @@ pub fn https_fetch_authorized_interruptible_detailed(
     }
     request_head.push_str("\r\n");
 
-    let mut request_bytes = Zeroizing::new(request_head.into_bytes());
-    if let Some(body) = &request.body {
-        request_bytes.extend_from_slice(body);
-    }
+    let request_bytes = WireRequest {
+        head: Zeroizing::new(request_head.into_bytes()),
+        body: input.body.unwrap_or_default(),
+        response_limit: input.response_limit,
+    };
     https_request_inner(
         io,
         &host,
@@ -403,7 +441,7 @@ fn https_request_inner(
     io: &mut dyn InterruptibleBlockingNetIo,
     host: &str,
     port: u16,
-    request: &[u8],
+    request: &WireRequest<'_>,
     root_store: &RootCertStore,
     ratls: Option<&RaTlsPolicy>,
     authorize_peer: &mut dyn FnMut(&TlsPeerCertificateChain) -> Result<(), String>,
@@ -425,23 +463,28 @@ fn https_request_inner(
         fd,
         host,
         request,
-        tls_config,
-        ratls,
-        identity.as_ref(),
+        TlsSetup {
+            config: tls_config,
+            ratls,
+            identity: identity.as_ref(),
+        },
         authorize_peer,
     );
     io.close(fd);
     result
 }
 
+struct TlsSetup<'a> {
+    config: Arc<ClientConfig>,
+    ratls: Option<&'a RaTlsPolicy>,
+    identity: Option<&'a Arc<IdentityClientAuth>>,
+}
 fn https_request_connected(
     io: &mut dyn InterruptibleBlockingNetIo,
     fd: i32,
     host: &str,
-    request: &[u8],
-    tls_config: Arc<ClientConfig>,
-    ratls: Option<&RaTlsPolicy>,
-    identity: Option<&Arc<IdentityClientAuth>>,
+    request: &WireRequest<'_>,
+    setup: TlsSetup<'_>,
     authorize_peer: &mut dyn FnMut(&TlsPeerCertificateChain) -> Result<(), String>,
 ) -> Result<HttpResponse, HttpsFetchError> {
     let server_name = ServerName::try_from(host.to_string()).map_err(|_| {
@@ -451,7 +494,7 @@ fn https_request_connected(
         )
     })?;
     let mut tls_conn =
-        ClientConnection::new(tls_config, server_name.to_owned()).map_err(|error| {
+        ClientConnection::new(setup.config, server_name.to_owned()).map_err(|error| {
             HttpsFetchError::new(
                 HttpsFetchFailurePhase::TlsBeforeDispatch,
                 format!("TLS init failed: {error}"),
@@ -465,8 +508,8 @@ fn https_request_connected(
             format!("TLS handshake failed: {error}"),
         )
     })?;
-    if let Some(policy) = ratls {
-        exchange::run_blocking(io, fd, &mut tls_conn, policy, identity).map_err(|error| {
+    if let Some(policy) = setup.ratls {
+        exchange::run_blocking(io, fd, &mut tls_conn, policy, setup.identity).map_err(|error| {
             HttpsFetchError::new(
                 HttpsFetchFailurePhase::PeerVerificationBeforeDispatch,
                 error,
@@ -481,7 +524,11 @@ fn https_request_connected(
         )
     })?;
 
-    for chunk in request.chunks(16 * 1024) {
+    for chunk in request
+        .head
+        .chunks(16 * 1024)
+        .chain(request.body.chunks(16 * 1024))
+    {
         tls_conn.writer().write_all(chunk).map_err(|error| {
             HttpsFetchError::after_dispatch(
                 HttpsFetchFailurePhase::AmbiguousAfterDispatch,
@@ -501,6 +548,7 @@ fn https_request_connected(
     }
 
     let mut response_data = Vec::new();
+    let mut header_complete = false;
     let mut net_buf = vec![0u8; 16384];
     let mut app_buf = vec![0u8; 16384];
     tls_conn.set_buffer_limit(None);
@@ -526,16 +574,37 @@ fn https_request_connected(
                                 match tls_conn.reader().read(&mut app_buf) {
                                     Ok(0) => break,
                                     Ok(read) => {
-                                        response_data.extend_from_slice(&app_buf[..read]);
-                                        if response_data.len()
-                                            > MAX_RESPONSE_BODY + MAX_RESPONSE_HEADER_BYTES
-                                        {
+                                        if response_data.len().checked_add(read).is_none_or(
+                                            |length| {
+                                                length
+                                                    > request.response_limit
+                                                        + MAX_RESPONSE_HEADER_BYTES
+                                            },
+                                        ) {
                                             return Err(HttpsFetchError::after_dispatch(
                                                 HttpsFetchFailurePhase::InvalidResponseAfterDispatch,
                                                 tls_peer,
                                                 &tls_peer_chain,
                                                 "HTTP response exceeds header/body bounds",
                                             ));
+                                        }
+                                        response_data.extend_from_slice(&app_buf[..read]);
+                                        if !header_complete {
+                                            let end = response_data
+                                                .windows(4)
+                                                .position(|w| w == b"\r\n\r\n")
+                                                .map(|n| n + 4);
+                                            if end.is_some_and(|n| n > MAX_RESPONSE_HEADER_BYTES)
+                                                || (end.is_none()
+                                                    && response_data.len()
+                                                        > MAX_RESPONSE_HEADER_BYTES)
+                                            {
+                                                return Err(HttpsFetchError::after_dispatch(
+                                                    HttpsFetchFailurePhase::InvalidResponseAfterDispatch,
+                                                    tls_peer, &tls_peer_chain, "HTTP response header exceeds bound",
+                                                ));
+                                            }
+                                            header_complete = end.is_some();
                                         }
                                     }
                                     Err(error)
@@ -579,14 +648,16 @@ fn https_request_connected(
     tls_conn.send_close_notify();
     let _ = flush_tls(io, fd, &mut tls_conn);
     let (status, headers, raw_header_section, body) =
-        parse_http_response(&response_data).map_err(|error| {
-            HttpsFetchError::after_dispatch(
-                HttpsFetchFailurePhase::InvalidResponseAfterDispatch,
-                tls_peer,
-                &tls_peer_chain,
-                error,
-            )
-        })?;
+        parse_http_response_with_limit(&response_data, request.response_limit).map_err(
+            |error| {
+                HttpsFetchError::after_dispatch(
+                    HttpsFetchFailurePhase::InvalidResponseAfterDispatch,
+                    tls_peer,
+                    &tls_peer_chain,
+                    error,
+                )
+            },
+        )?;
     Ok(HttpResponse {
         status,
         headers,
@@ -772,7 +843,14 @@ fn parse_url(url: &str) -> Result<(String, u16, String), String> {
     Ok((host.into(), port, path.into()))
 }
 
+#[cfg(test)]
 fn parse_http_response(data: &[u8]) -> Result<ParsedHttpResponse, String> {
+    parse_http_response_with_limit(data, MAX_RESPONSE_BODY)
+}
+fn parse_http_response_with_limit(
+    data: &[u8],
+    maximum: usize,
+) -> Result<ParsedHttpResponse, String> {
     let separator = data
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -783,7 +861,7 @@ fn parse_http_response(data: &[u8]) -> Result<ParsedHttpResponse, String> {
     let header_bytes = &data[..separator];
     let raw_header_section = data[..separator + 4].to_vec();
     let raw_body = &data[separator + 4..];
-    if raw_body.len() > MAX_RESPONSE_BODY {
+    if raw_body.len() > maximum {
         return Err("invalid HTTP response: body exceeds bound".into());
     }
     let header_text = std::str::from_utf8(header_bytes)
@@ -835,7 +913,7 @@ fn parse_http_response(data: &[u8]) -> Result<ParsedHttpResponse, String> {
         return Err("invalid HTTP response: conflicting body framing".into());
     }
     let body = if chunked {
-        dechunk(raw_body)?
+        dechunk(raw_body, maximum)?
     } else {
         if content_length.is_some_and(|length| length != raw_body.len()) {
             return Err("invalid HTTP response: truncated or excess body".into());
@@ -845,7 +923,7 @@ fn parse_http_response(data: &[u8]) -> Result<ParsedHttpResponse, String> {
     Ok((status, headers, raw_header_section, body))
 }
 
-fn dechunk(mut data: &[u8]) -> Result<Vec<u8>, String> {
+fn dechunk(mut data: &[u8], maximum: usize) -> Result<Vec<u8>, String> {
     let mut output = Vec::new();
     loop {
         let newline = data
@@ -882,7 +960,7 @@ fn dechunk(mut data: &[u8]) -> Result<Vec<u8>, String> {
             return Err("chunked: missing data CRLF".into());
         }
         data = &data[size + 2..];
-        if output.len() > MAX_RESPONSE_BODY {
+        if output.len() > maximum {
             return Err("chunked: body exceeds bound".into());
         }
     }
@@ -900,6 +978,39 @@ mod tests {
 
     #[test]
     fn bounded_request_rejects_method_url_header_and_body_violations() {
+        use super::{HttpsBodyLimitsV1, ResourceBoundHttpsRequest};
+        let limits =
+            HttpsBodyLimitsV1::new(100 * 1024 * 1024 * 1024, 100 * 1024 * 1024 * 1024).unwrap();
+        assert!(HttpsBodyLimitsV1::new(u64::MAX, 0).is_err());
+        assert!(HttpsBodyLimitsV1::new(0, u64::MAX).is_err());
+        let bytes = vec![17; MAX_REQUEST_BODY + 1];
+        let request = ResourceBoundHttpsRequest::new(
+            "PUT",
+            "https://example.test/",
+            vec![],
+            Some(&bytes),
+            limits,
+        )
+        .unwrap();
+        assert!(!format!("{request:?}").contains("example.test"));
+        assert!(ResourceBoundHttpsRequest::new(
+            "PUT",
+            "https://example.test/",
+            vec![],
+            Some(&bytes),
+            HttpsBodyLimitsV1::new(1, 1).unwrap()
+        )
+        .is_err());
+        for name in ["Content-Length", "TRANSFER-encoding", "Host", "Connection"] {
+            assert!(ResourceBoundHttpsRequest::new(
+                "PUT",
+                "https://example.test/",
+                vec![(name.into(), "1".into())],
+                Some(&bytes),
+                limits
+            )
+            .is_err());
+        }
         assert!(BoundedHttpsRequest::new("TRACE", "https://example.test/", vec![], None).is_err());
         assert!(BoundedHttpsRequest::new("GET", "http://example.test/", vec![], None).is_err());
         assert!(BoundedHttpsRequest::new(
@@ -1003,6 +1114,30 @@ mod tests {
 
     #[test]
     fn response_parser_preserves_exact_headers_and_rejects_unsafe_framing() {
+        let payload = vec![12; super::MAX_RESPONSE_BODY + 1];
+        let mut large = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            payload.len()
+        )
+        .into_bytes();
+        large.extend_from_slice(&payload);
+        assert!(parse_http_response(&large).is_err());
+        assert_eq!(
+            super::parse_http_response_with_limit(&large, payload.len())
+                .unwrap()
+                .3,
+            payload
+        );
+        assert!(super::parse_http_response_with_limit(&large, payload.len() - 1).is_err());
+        let chunked =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nbody\r\n0\r\n\r\n";
+        assert_eq!(
+            super::parse_http_response_with_limit(chunked, 32)
+                .unwrap()
+                .3,
+            b"body"
+        );
+        assert!(super::parse_http_response_with_limit(chunked, 3).is_err());
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nX-Node: one\r\n\r\nbody";
         let (status, headers, raw_headers, body) = parse_http_response(raw).unwrap();
         assert_eq!(status, 200);
