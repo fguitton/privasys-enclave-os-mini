@@ -13,10 +13,14 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::string::String;
+use std::sync::Mutex;
 use std::vec::Vec;
 
 use enclave_os_common::queue::{SpscConsumer, SpscProducer};
 use enclave_os_common::rpc::{self, HonestRpcFrameError, HonestRpcIdentity, RpcMethod, RpcRole};
+
+/// Opaque host-stored key/value pairs returned by a bounded scan.
+pub type KvEntries = Vec<(Vec<u8>, Vec<u8>)>;
 
 // ---------------------------------------------------------------------------
 //  External: the single OCALL
@@ -52,6 +56,10 @@ fn next_req_id() -> Option<u64> {
 
 /// Enclave-side RPC client for calling host services.
 pub struct RpcClient {
+    /// Legacy module calls and BFT persistence can originate on different TCSs.
+    /// Serialize complete synchronous exchanges, including response ownership.
+    /// Polled execution operations still use the non-blocking reservation below.
+    synchronous_exchange: Mutex<()>,
     /// Sends requests to the host.
     request_tx: SpscProducer,
     /// Receives responses from the host.
@@ -110,7 +118,8 @@ enum RequestReserveError {
 }
 
 // SAFETY: RpcClient uses SPSC queues backed by shared memory pointers.
-// In the SGX enclave, it is accessed from a single thread only.
+// Complete synchronous exchanges are serialized. Polled operations reserve the
+// endpoints atomically and have a single owning execution thread.
 // The raw pointers inside SpscProducer/SpscConsumer point to host memory
 // that remains valid for the enclave's lifetime.
 unsafe impl Send for RpcClient {}
@@ -123,6 +132,7 @@ impl RpcClient {
     /// - `response_rx`: consumer for `host_to_enc` (host writes, enclave reads)
     pub fn new(request_tx: SpscProducer, response_rx: SpscConsumer) -> Self {
         Self {
+            synchronous_exchange: Mutex::new(()),
             request_tx,
             response_rx,
             in_flight_request_id: AtomicU64::new(0),
@@ -307,10 +317,13 @@ impl RpcClient {
     ///
     /// Returns `(status, payload)` from the host's response.
     fn call(&self, method: RpcMethod, payload: &[u8]) -> (i32, Vec<u8>) {
+        let Ok(_exchange) = self.synchronous_exchange.lock() else {
+            return (-1, Vec::new());
+        };
         let req_id = match self.try_reserve_request() {
             Ok(request_id) => request_id,
-            // Legacy callers cannot safely interleave with a polled Ready
-            // operation. Return EBUSY instead of blocking the control TCS.
+            // A polled execution operation owns its response across calls.
+            // Never wait for or consume that operation's response here.
             Err(RequestReserveError::Busy) => return (-16, Vec::new()),
             Err(RequestReserveError::OperationIdExhausted) => return (-75, Vec::new()),
         };
@@ -420,12 +433,13 @@ impl RpcClient {
         }
     }
 
-    /// Synchronous startup/control persistence, separate from Raft Ready.
+    /// Synchronous control persistence, serialized with other synchronous calls.
     /// Queue pressure and malformed/stale replies fail closed. The host must
     /// acknowledge only after the synchronous ciphertext write completes.
     /// Active consensus scheduling should use a separate polled adapter.
     pub fn kv_put_durable(&self, table: &[u8], key: &[u8], value: &[u8]) -> Result<(), i32> {
         let payload = rpc::encode_durable_kv_put_req(table, key, value).ok_or(-22)?;
+        let _exchange = self.synchronous_exchange.lock().map_err(|_| -1)?;
         let request_id = self.try_reserve_request().map_err(|error| match error {
             RequestReserveError::Busy => -16,
             RequestReserveError::OperationIdExhausted => -75,
@@ -503,7 +517,7 @@ impl RpcClient {
         start: &[u8],
         end: &[u8],
         limit: u32,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, i32> {
+    ) -> Result<KvEntries, i32> {
         let payload = rpc::encode_kv_scan_req(table, start, end, limit);
         let (status, resp) = self.call(RpcMethod::KvScan, &payload);
         if status == 0 {

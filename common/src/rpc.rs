@@ -164,6 +164,8 @@ mod honest;
 pub use honest::*;
 mod durable;
 pub use durable::*;
+#[cfg(test)]
+mod client_tests;
 
 // ========================================================================
 //  Typed request/response payloads (compact binary encoding)
@@ -1217,6 +1219,7 @@ mod tests {
 
     #[test]
     fn test_rpc_over_spsc_roundtrip() {
+        client_tests::check_synchronous_ownership();
         use crate::queue::{SpscConsumer, SpscProducer, SpscQueueHeader};
 
         fn alloc(cap: u64) -> (SpscProducer, SpscConsumer) {

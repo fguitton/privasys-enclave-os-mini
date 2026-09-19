@@ -12,6 +12,9 @@
 // `oidc.rs` uses `alloc::` unconditionally, so the extern crate must not be
 // gated on the sgx feature (gating it broke the host build of this crate).
 extern crate alloc;
+// Compile the actual enclave RPC client in the native queue regression.
+#[cfg(test)]
+extern crate self as enclave_os_common;
 pub mod channel;
 pub mod core_phase;
 pub mod dependencies;
