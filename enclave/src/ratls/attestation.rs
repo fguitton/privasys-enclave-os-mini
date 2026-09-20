@@ -171,13 +171,24 @@ pub fn generate_ratls_certificate(
         extensions.push((oid.oid, oid.value.clone()));
     }
     let (nb, na) = leaf_validity(key, now)?;
+    // These are fixed substrate routes, never host-selected or guest names.
+    // Only the Honest operational profile exposes the peer/control aliases.
+    let names: &[&str] = if crate::honest_ingress_profile_selected() {
+        &[
+            "enclave-os.invalid",
+            enclave_os_common::modules::HONEST_PEER_SNI,
+            "local-control.honest.invalid",
+        ]
+    } else {
+        &["enclave-os.invalid"]
+    };
     let leaf_der = build_leaf_cert(
         &key.pkcs8,
         nb,
         na,
         ca,
         "Enclave OS RA-TLS",
-        Some("enclave-os.invalid"),
+        names,
         &extensions,
     )?;
     Ok(CertGenerationResult {
@@ -255,7 +266,7 @@ pub fn generate_app_certificate(
         na,
         ca,
         &app.hostname,
-        Some(&app.hostname),
+        &[&app.hostname],
         &extensions,
     )?;
     Ok(CertGenerationResult {
@@ -306,7 +317,7 @@ pub fn mint_client_identity(
         na,
         ca,
         "enclave-os client",
-        None,
+        &[],
         &oid_extensions,
     )?;
     Ok((
@@ -508,7 +519,7 @@ fn build_leaf_cert(
     not_after: OffsetDateTime,
     ca: &CaContext,
     common_name: &str,
-    server_name: Option<&str>,
+    server_names: &[&str],
     extensions: &[(&'static [u64], Vec<u8>)],
 ) -> Result<Vec<u8>, String> {
     use rcgen::{
@@ -528,9 +539,7 @@ fn build_leaf_cert(
     // WebPKI does not fall back to Subject CN. Bind the leaf to an admitted DNS
     // identity so a normal verifier can keep hostname checks enabled. The
     // server must never pass through an arbitrary, unregistered SNI here.
-    let subject_alt_names = server_name
-        .map(|name| vec![name.to_string()])
-        .unwrap_or_default();
+    let subject_alt_names: Vec<String> = server_names.iter().map(|name| name.to_string()).collect();
     let mut leaf_params =
         CertificateParams::new(subject_alt_names).map_err(|e| format!("leaf params: {}", e))?;
 
