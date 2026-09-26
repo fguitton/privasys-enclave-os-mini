@@ -1,9 +1,8 @@
 [
   {
     "name": "wasmtime",
-    "url": "https://github.com/Privasys/wasmtime",
-    "revision": "6d01615eaf52d4e70010290f8444a8ec285d01ae",
-    "patch_sha256": "fa8de0b7e719a2ebfa86ca8ace87ef1287930eccd71432f5561f18343dd22496"
+    "url": "https://github.com/fguitton/honest-wasmtime",
+    "revision": "135e3f6cf84770ab1284636c55dfb17533541f4e"
   },
   {
     "name": "wasm-tools",

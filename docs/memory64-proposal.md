@@ -7,9 +7,11 @@ source manifest, movable memory and a 1-TiB per-memory ceiling are authenticated
 The initial reservation remains 4 MiB, with 1 MiB growth headroom. Fuel, epochs,
 explicit bounds checks, no CoW and the conservative native target remain enabled.
 
-Wasmtime's core memory64 support is insufficient for WIT components. The reviewed
-patches in `patches/wasm64` cover Wasmtime's synchronous canonical ABI, component
-encoding/validation, and Rust guest binding generation. They pin exact upstream
+Wasmtime's core memory64 support is insufficient for WIT components. The
+synchronous canonical ABI change is one signed commit on the `memory64` branch of
+`fguitton/honest-wasmtime`, on the pinned Teaclave SGX port; the reviewed
+patches in `patches/wasm64` cover component encoding/validation and Rust guest
+binding generation. `sources.json` pins the fork revision and the exact upstream
 commits and patch digests. `scripts/acquire-wasm64.py` reconstructs the sources;
 `--verify-only` checks them offline and refuses drift, including staged changes.
 Host workspace manifests select these patches. Guest-only manifests deliberately
@@ -37,6 +39,5 @@ and realloc. Existing shared-profile test identities are retained and extended:
 six native AOT tests and five native runtime-role tests. SGX target compilation
 and native tests are distinct from SGX simulation and physical qualification.
 
-Publication of the additional dependency forks requires writable remotes; the
-provided GitHub token currently rejects fork creation. The patches provide a
-reviewable, reproducible proposal without requiring unpinned remote branches.
+wasm-tools and wit-bindgen have no writable fork yet, so they stay reviewed
+patches on immutable upstream revisions.

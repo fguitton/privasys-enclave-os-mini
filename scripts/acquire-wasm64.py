@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Materialize pinned upstream sources plus reviewed memory64 patches.
 
-Acquisition needs network access; subsequent builds can run offline. Existing
-checkouts must match the pin and patch exactly and are never reset or cleaned.
+A source with a patch digest is an upstream revision plus that reviewed patch;
+one without is a fork revision that already carries the change. Acquisition
+needs network access; subsequent builds can run offline. Existing checkouts
+must match the pin and patch exactly and are never reset or cleaned.
 """
 import argparse
 import hashlib
@@ -36,8 +38,15 @@ def main():
     for source in json.loads((PATCHES / 'sources.json').read_text()):
         name = source['name']
         patch = PATCHES / (name + '.patch')
-        if hashlib.sha256(patch.read_bytes()).hexdigest() != source['patch_sha256']:
-            raise ValueError(f'{name}: patch digest mismatch')
+        digest = source.get('patch_sha256')
+        if digest is None:
+            if patch.exists():
+                raise ValueError(f'{name}: a fork revision takes no patch')
+            expected = b''
+        else:
+            expected = patch.read_bytes()
+            if hashlib.sha256(expected).hexdigest() != digest:
+                raise ValueError(f'{name}: patch digest mismatch')
         dest = DESTINATION / name
         if not dest.exists():
             if args.verify_only:
@@ -46,16 +55,16 @@ def main():
             run('git', 'remote', 'add', 'origin', source['url'], cwd=dest)
             run('git', 'fetch', '--depth=1', 'origin', source['revision'], cwd=dest)
             run('git', 'checkout', '--detach', 'FETCH_HEAD', cwd=dest)
-            run('git', 'apply', str(patch), cwd=dest)
+            if digest is not None:
+                run('git', 'apply', str(patch), cwd=dest)
         if run('git', 'rev-parse', 'HEAD', cwd=dest).decode().strip() != source['revision']:
             raise ValueError(f'{name}: source revision mismatch')
-        expected = patch.read_bytes()
         actual = run('git', 'diff', 'HEAD', '--binary', f'--abbrev={abbreviation(expected)}', cwd=dest)
         if actual != expected:
             raise ValueError(f'{name}: source patch differs; refusing to overwrite')
         if run('git', 'ls-files', '--others', '--exclude-standard', cwd=dest).strip():
             raise ValueError(f'{name}: untracked source files')
-        print(f'WASM64-SOURCE PASS {name} {source["revision"]} {source["patch_sha256"]}')
+        print(f'WASM64-SOURCE PASS {name} {source["revision"]} {digest or "fork"}')
 
 
 if __name__ == '__main__':
