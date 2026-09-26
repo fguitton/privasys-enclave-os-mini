@@ -132,7 +132,7 @@ impl WasmEngine {
         fuel: u64,
     ) -> Result<Store<AppContext>, String> {
         let host = AppContext::with_app(app_name, master_key);
-        let mut store = Store::new(&self.engine, host);
+        let mut store = honest_wasmtime_profile::new_store(&self.engine, host);
 
         // ── Fuel / resource limits ─────────────────────────────
         // Fuel limits prevent infinite loops from hanging the enclave.

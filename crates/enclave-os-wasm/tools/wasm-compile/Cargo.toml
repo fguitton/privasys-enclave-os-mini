@@ -20,3 +20,10 @@ clap = { version = "4", features = ["derive"] }
 # (the tool builds on the plain host toolchain, outside the enclave
 # dependency graph).
 [workspace]
+
+# Closed memory64 toolchain reconstructed from Mini patches/wasm64.
+[patch."https://github.com/Privasys/wasmtime"]
+wasmtime = { path = "../../../../third_party/wasm64/wasmtime/crates/wasmtime" }
+
+[patch.crates-io]
+wasmparser = { path = "../../../../third_party/wasm64/wasm-tools/crates/wasmparser" }

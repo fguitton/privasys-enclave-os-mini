@@ -1,0 +1,20 @@
+[
+  {
+    "name": "wasmtime",
+    "url": "https://github.com/Privasys/wasmtime",
+    "revision": "6d01615eaf52d4e70010290f8444a8ec285d01ae",
+    "patch_sha256": "fa8de0b7e719a2ebfa86ca8ace87ef1287930eccd71432f5561f18343dd22496"
+  },
+  {
+    "name": "wasm-tools",
+    "url": "https://github.com/bytecodealliance/wasm-tools",
+    "revision": "d66d4364c441d8b0122628509be52bd53c352a6e",
+    "patch_sha256": "f0228265b629785ffb9276cb8c1f2e40b7b2f6d605e513713daca598c0e80295"
+  },
+  {
+    "name": "wit-bindgen",
+    "url": "https://github.com/bytecodealliance/wit-bindgen",
+    "revision": "32bcc3c00bfe987364d1eccd8c89f7d86ef53389",
+    "patch_sha256": "5e341ea60a47fe67722afe6c6dd97b944bff11b5b2edf6462a84949ca8219ac0"
+  }
+]

@@ -56,3 +56,10 @@ fido2 = ["dep:enclave-os-fido2"]
 # When enabled, FIDO2-authenticated users get roles stored in the app's
 # sealed KV space.  The first user auto-bootstraps as admin.
 app-auth = ["dep:enclave-os-app-auth"]
+
+# Closed memory64 toolchain reconstructed from Mini patches/wasm64.
+[patch."https://github.com/Privasys/wasmtime"]
+wasmtime = { path = "../../third_party/wasm64/wasmtime/crates/wasmtime" }
+
+[patch.crates-io]
+wasmparser = { path = "../../third_party/wasm64/wasm-tools/crates/wasmparser" }

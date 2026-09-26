@@ -10,6 +10,7 @@ members = [
     "tests/wasm-docs-unit",
 ]
 exclude = [
+    "third_party",
     "enclave",
     "crates/enclave-os-app-auth",
     "crates/enclave-os-egress",

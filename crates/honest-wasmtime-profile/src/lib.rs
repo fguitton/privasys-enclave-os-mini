@@ -20,14 +20,31 @@ mod sgx_platform;
 pub use wasmtime;
 pub use wasmtime::*;
 
+/// Core memory64 probes layered on the shared component profile.
+pub mod memory64_proposal;
+
 #[cfg(all(feature = "runtime-sgx", feature = "aot"))]
 compile_error!("select exactly one Wasmtime role: runtime-sgx or aot");
 
 #[cfg(not(any(feature = "runtime-sgx", feature = "aot", feature = "descriptor")))]
 compile_error!("select a Wasmtime role or the descriptor-only profile surface");
 
+/// Explicit profile ceiling; deployments must budget enclave heap and peak relocation.
+pub const MAX_LINEAR_MEMORY: u64 = 1024 * 1024 * 1024 * 1024;
+
+/// Construct a bounded store without coupling limits to the host context type.
+pub fn new_store<T: 'static>(engine: &wasmtime::Engine, data: T) -> wasmtime::Store<T> {
+    let mut store = wasmtime::Store::new(engine, data);
+    store.limiter_owned(
+        wasmtime::StoreLimitsBuilder::new()
+            .memory_size(usize::try_from(MAX_LINEAR_MEMORY).expect("64-bit host required"))
+            .build(),
+    );
+    store
+}
+
 /// Frozen semantic profile identity.
-pub const PROFILE_ID: &str = "honest-s2-x86_64-sgx-v1";
+pub const PROFILE_ID: &str = "honest-s2-x86_64-sgx-memory64-v1";
 /// Pinned Wasmtime source used by both complementary build roles.
 pub const WASMTIME_COMMIT: &str = "6d01615eaf52d4e70010290f8444a8ec285d01ae";
 /// Explicit AOT target. Supplying it disables host-native feature inference.
@@ -44,14 +61,14 @@ pub const FUEL_SCHEDULE_ID: &str = "wasmtime-47-default-fuel-v1";
 /// Closed host ABI/linker family selected by WIT v0.2.
 pub const HOST_LINKER_PROFILE_ID: &str = "honest-stage-host-v0.2.0";
 /// Builder/toolchain identity bound by the S2 source lock.
-pub const BUILDER_PROFILE_ID: &str = "honest-m0-pinned-component-aot-v1";
+pub const BUILDER_PROFILE_ID: &str = "honest-m0-pinned-component-memory64-aot-v1";
 
 /// Exact enabled `wasmparser::WasmFeatures` bits for the pinned Wasmtime.
 ///
 /// This is the pinned default proposal set with SIMD, relaxed SIMD, threads,
 /// shared-everything threads and component-async disabled. Recording the full
 /// bitset catches newly enabled defaults at the compatibility boundary.
-pub const WASM_FEATURE_BITS: u64 = 0x0000_000c_010b_fc3f;
+pub const WASM_FEATURE_BITS: u64 = 0x0000_008c_010b_fc3f;
 
 /// The build role selected by the package consumer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,6 +125,8 @@ pub struct ProfileDescriptor {
     pub relaxed_simd_deterministic: bool,
     pub shared_memory: bool,
     pub host_concurrency: bool,
+    pub guest_address_bits: u8,
+    pub maximum_linear_memory: u64,
     pub memory_reservation: u64,
     pub memory_reservation_for_growth: u64,
     pub memory_guard_size: u64,
@@ -140,7 +159,7 @@ impl ProfileDescriptor {
     #[must_use]
     pub const fn canonical() -> Self {
         Self {
-            schema_version: 2,
+            schema_version: 3,
             profile_id: PROFILE_ID,
             wasmtime_commit: WASMTIME_COMMIT,
             target_triple: TARGET_TRIPLE,
@@ -151,10 +170,12 @@ impl ProfileDescriptor {
             relaxed_simd_deterministic: true,
             shared_memory: false,
             host_concurrency: false,
+            guest_address_bits: 64,
+            maximum_linear_memory: MAX_LINEAR_MEMORY,
             memory_reservation: 4 * 1024 * 1024,
-            memory_reservation_for_growth: 0,
+            memory_reservation_for_growth: 1024 * 1024,
             memory_guard_size: 64 * 1024,
-            memory_may_move: false,
+            memory_may_move: true,
             memory_init_cow: false,
             memory_guaranteed_dense_image_size: 0,
             maximum_wasm_stack: 512 * 1024,
@@ -193,6 +214,10 @@ impl ProfileDescriptor {
         bytes.extend_from_slice(&self.schema_version.to_le_bytes());
         string(&mut bytes, self.profile_id);
         string(&mut bytes, self.wasmtime_commit);
+        string(
+            &mut bytes,
+            include_str!("../../../patches/wasm64/sources.json"),
+        );
         string(&mut bytes, self.target_triple);
         string(&mut bytes, self.cpu_feature_mask);
         bytes.extend_from_slice(&self.wasm_feature_bits.to_le_bytes());
@@ -201,6 +226,8 @@ impl ProfileDescriptor {
         bytes.push(u8::from(self.relaxed_simd_deterministic));
         bytes.push(u8::from(self.shared_memory));
         bytes.push(u8::from(self.host_concurrency));
+        bytes.push(self.guest_address_bits);
+        bytes.extend_from_slice(&self.maximum_linear_memory.to_le_bytes());
         bytes.extend_from_slice(&self.memory_reservation.to_le_bytes());
         bytes.extend_from_slice(&self.memory_reservation_for_growth.to_le_bytes());
         bytes.extend_from_slice(&self.memory_guard_size.to_le_bytes());
@@ -309,6 +336,8 @@ fn first_mismatch(descriptor: &ProfileDescriptor) -> Option<&'static str> {
     compare!(relaxed_simd_deterministic);
     compare!(shared_memory);
     compare!(host_concurrency);
+    compare!(guest_address_bits);
+    compare!(maximum_linear_memory);
     compare!(memory_reservation);
     compare!(memory_reservation_for_growth);
     compare!(memory_guard_size);
@@ -429,14 +458,14 @@ mod tests {
             feature = "descriptor",
             not(any(feature = "runtime-sgx", feature = "aot"))
         ))]
-        assert_eq!(ProfileDescriptor::canonical().schema_version, 2);
+        assert_eq!(ProfileDescriptor::canonical().schema_version, 3);
     }
 
     #[test]
     fn canonical_descriptor_encoding_is_stable() {
         let bytes = ProfileDescriptor::canonical().to_canonical_bytes();
-        assert_eq!(&bytes[..6], b"HWTP\x02\x00");
-        assert_eq!(bytes.len(), 316);
+        assert_eq!(&bytes[..6], b"HWTP\x03\x00");
+        assert_eq!(bytes.len(), 1067);
         assert_eq!(
             ProfileDescriptor::canonical().wasm_feature_bits,
             WASM_FEATURE_BITS
@@ -444,9 +473,9 @@ mod tests {
         assert_eq!(
             profile_digest(),
             [
-                0xca, 0x6d, 0x25, 0x81, 0xa7, 0x1d, 0xe3, 0x10, 0x8f, 0xd4, 0xc7, 0x04, 0x36, 0xd6,
-                0xbe, 0x6e, 0x7c, 0x05, 0xeb, 0xc2, 0xeb, 0xd7, 0xf7, 0xe8, 0xad, 0xef, 0xc4, 0xde,
-                0x53, 0xb8, 0xaa, 0xa1,
+                0xce, 0x8d, 0x3a, 0x43, 0xe6, 0xc5, 0x6a, 0x74, 0xd9, 0xd7, 0xad, 0xd6, 0xce, 0x23,
+                0xf3, 0xfd, 0x4f, 0xe7, 0x7d, 0xd5, 0x2e, 0xb0, 0xf5, 0x41, 0x8f, 0xf6, 0x81, 0x90,
+                0x63, 0x18, 0x7b, 0xbb
             ]
         );
     }

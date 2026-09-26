@@ -1,0 +1,363 @@
+diff --git a/crates/wasmparser/src/validator/component.rs b/crates/wasmparser/src/validator/component.rs
+index 7f33229..959a222 100644
+--- a/crates/wasmparser/src/validator/component.rs
++++ b/crates/wasmparser/src/validator/component.rs
+@@ -255,10 +255,25 @@ impl Concurrency {
+     }
+ }
+ 
++#[derive(Clone, Copy)]
++pub(crate) enum PtrSize {
++    Ptr32,
++    Ptr64,
++}
++
++impl PtrSize {
++    pub(crate) fn core_type(&self) -> ValType {
++        match self {
++            PtrSize::Ptr32 => ValType::I32,
++            PtrSize::Ptr64 => ValType::I64,
++        }
++    }
++}
++
+ #[derive(Clone, Copy)]
+ pub(crate) struct CanonicalOptions {
+     pub(crate) string_encoding: StringEncoding,
+-    pub(crate) memory: Option<u32>,
++    pub(crate) memory: Option<(u32, PtrSize)>,
+     pub(crate) realloc: Option<u32>,
+     pub(crate) post_return: Option<u32>,
+     pub(crate) concurrency: Concurrency,
+@@ -2716,8 +2731,8 @@ impl ComponentState {
+                 CanonicalOption::Memory(idx) => {
+                     memory = match memory {
+                         None => {
+-                            self.cabi_memory_at(*idx, offset)?;
+-                            Some(*idx)
++                            let ptr_size = self.cabi_memory_at(*idx, offset)?;
++                            Some((*idx, ptr_size))
+                         }
+                         Some(_) => {
+                             return Err(BinaryReaderError::new(
+@@ -2858,8 +2873,8 @@ impl ComponentState {
+ 
+         // Validate `realloc`
+         if let Some(realloc_idx) = realloc {
+-            let mty = match memory {
+-                Some(i) => self.memory_at(i, offset)?,
++            let addr_type = match memory {
++                Some((_, ptr_size)) => ptr_size.core_type(),
+                 None => {
+                     return Err(BinaryReaderError::new(
+                         "canonical option `realloc` requires `memory` to also be specified",
+@@ -2867,10 +2882,6 @@ impl ComponentState {
+                     ));
+                 }
+             };
+-            let addr_type = match mty.memory64 {
+-                true => ValType::I64,
+-                false => ValType::I32,
+-            };
+             let ty_id = self.core_function_at(realloc_idx, offset)?;
+             let func_ty = types[ty_id].unwrap_func();
+             if func_ty.params() != [addr_type, addr_type, addr_type, addr_type]
+@@ -4474,7 +4485,7 @@ impl ComponentState {
+     ///
+     /// At this time this requires that the memory is a plain 32-bit or 64-bit linear
+     /// memory. Notably this disallows shared memory.
+-    fn cabi_memory_at(&self, idx: u32, offset: usize) -> Result<()> {
++    fn cabi_memory_at(&self, idx: u32, offset: usize) -> Result<PtrSize> {
+         let ty = self.memory_at(idx, offset)?;
+         let valid_memory_type = MemoryType {
+             initial: 0,
+@@ -4489,7 +4500,12 @@ impl ComponentState {
+                 "64-bit memories require the `cm64` feature to be enabled"
+             );
+         }
+-        SubtypeCx::memory_type(ty, &valid_memory_type, offset)
++        SubtypeCx::memory_type(ty, &valid_memory_type, offset)?;
++        Ok(if ty.memory64 {
++            PtrSize::Ptr64
++        } else {
++            PtrSize::Ptr32
++        })
+     }
+ 
+     /// Completes the translation of this component, performing final
+diff --git a/crates/wasmparser/src/validator/component_types.rs b/crates/wasmparser/src/validator/component_types.rs
+index 32deb68..96d7692 100644
+--- a/crates/wasmparser/src/validator/component_types.rs
++++ b/crates/wasmparser/src/validator/component_types.rs
+@@ -3,6 +3,7 @@
+ use super::component::ExternKind;
+ use super::{CanonicalOptions, Concurrency};
+ use crate::validator::StringEncoding;
++use crate::validator::component::PtrSize;
+ use crate::validator::names::KebabString;
+ use crate::validator::types::{
+     CoreTypeId, EntityType, SnapshotList, TypeAlloc, TypeData, TypeIdentifier, TypeInfo, TypeList,
+@@ -302,7 +303,11 @@ impl PrimitiveValType {
+     }
+ }
+ 
+-fn push_primitive_wasm_types(ty: &PrimitiveValType, lowered_types: &mut LoweredTypes) -> bool {
++fn push_primitive_wasm_types(
++    ptr_size: PtrSize,
++    ty: &PrimitiveValType,
++    lowered_types: &mut LoweredTypes,
++) -> bool {
+     match ty {
+         PrimitiveValType::Bool
+         | PrimitiveValType::S8
+@@ -317,7 +322,8 @@ fn push_primitive_wasm_types(ty: &PrimitiveValType, lowered_types: &mut LoweredT
+         PrimitiveValType::F32 => lowered_types.try_push(ValType::F32),
+         PrimitiveValType::F64 => lowered_types.try_push(ValType::F64),
+         PrimitiveValType::String => {
+-            lowered_types.try_push(ValType::I32) && lowered_types.try_push(ValType::I32)
++            lowered_types.try_push(ptr_size.core_type())
++                && lowered_types.try_push(ptr_size.core_type())
+         }
+     }
+ }
+@@ -731,10 +737,15 @@ impl ComponentValType {
+         }
+     }
+ 
+-    fn push_wasm_types(&self, types: &TypeList, lowered_types: &mut LoweredTypes) -> bool {
++    fn push_wasm_types(
++        &self,
++        ptr_size: PtrSize,
++        types: &TypeList,
++        lowered_types: &mut LoweredTypes,
++    ) -> bool {
+         match self {
+-            Self::Primitive(ty) => push_primitive_wasm_types(ty, lowered_types),
+-            Self::Type(id) => types[*id].push_wasm_types(types, lowered_types),
++            Self::Primitive(ty) => push_primitive_wasm_types(ptr_size, ty, lowered_types),
++            Self::Type(id) => types[*id].push_wasm_types(ptr_size, types, lowered_types),
+         }
+     }
+ 
+@@ -1211,6 +1222,11 @@ impl ComponentFuncType {
+             return self.lower_gc(types, abi, options, offset);
+         }
+ 
++        let ptr_size = match options.memory {
++            None => PtrSize::Ptr32,
++            Some((_, ptr_size)) => ptr_size,
++        };
++
+         if abi == Abi::Lower && options.concurrency.is_async() {
+             sig.params.max = MAX_FLAT_ASYNC_PARAMS;
+         }
+@@ -1231,12 +1247,12 @@ impl ComponentFuncType {
+                 }
+             }
+ 
+-            if !ty.push_wasm_types(types, &mut sig.params) {
++            if !ty.push_wasm_types(ptr_size, types, &mut sig.params) {
+                 // Too many parameters to pass directly
+                 // Function will have a single pointer parameter to pass the arguments
+                 // via linear memory
+                 sig.params.clear();
+-                assert!(sig.params.try_push(ValType::I32));
++                assert!(sig.params.try_push(ptr_size.core_type()));
+                 options.require_memory(offset)?;
+ 
+                 // We need realloc as well when lifting a function
+@@ -1258,7 +1274,7 @@ impl ComponentFuncType {
+                         abi == Abi::Lower && ty.contains_ptr(types)
+                     })?;
+ 
+-                    if !ty.push_wasm_types(types, &mut sig.results) {
++                    if !ty.push_wasm_types(ptr_size, types, &mut sig.results) {
+                         // Too many results to return directly, either a retptr
+                         // parameter will be used (import) or a single pointer
+                         // will be returned (export).
+@@ -1267,10 +1283,10 @@ impl ComponentFuncType {
+                         match abi {
+                             Abi::Lower => {
+                                 sig.params.max = MAX_LOWERED_TYPES;
+-                                assert!(sig.params.try_push(ValType::I32));
++                                assert!(sig.params.try_push(ptr_size.core_type()));
+                             }
+                             Abi::Lift => {
+-                                assert!(sig.results.try_push(ValType::I32));
++                                assert!(sig.results.try_push(ptr_size.core_type()));
+                             }
+                         }
+                     }
+@@ -1295,8 +1311,11 @@ impl ComponentFuncType {
+                     // Note that the return type itself has no effect on the
+                     // expected core signature of the lifted function.
+ 
+-                    let overflow =
+-                        !ty.push_wasm_types(types, &mut LoweredTypes::new(MAX_FLAT_FUNC_PARAMS));
++                    let overflow = !ty.push_wasm_types(
++                        ptr_size,
++                        types,
++                        &mut LoweredTypes::new(MAX_FLAT_FUNC_PARAMS),
++                    );
+ 
+                     options.require_memory_if(offset, || overflow || ty.contains_ptr(types))?;
+                 }
+@@ -1562,28 +1581,35 @@ impl ComponentDefinedType {
+         }
+     }
+ 
+-    fn push_wasm_types(&self, types: &TypeList, lowered_types: &mut LoweredTypes) -> bool {
++    fn push_wasm_types(
++        &self,
++        ptr_size: PtrSize,
++        types: &TypeList,
++        lowered_types: &mut LoweredTypes,
++    ) -> bool {
+         match self {
+-            Self::Primitive(ty) => push_primitive_wasm_types(ty, lowered_types),
++            Self::Primitive(ty) => push_primitive_wasm_types(ptr_size, ty, lowered_types),
+             Self::Record(r) => r
+                 .fields
+                 .iter()
+-                .all(|(_, ty)| ty.push_wasm_types(types, lowered_types)),
++                .all(|(_, ty)| ty.push_wasm_types(ptr_size, types, lowered_types)),
+             Self::Variant(v) => Self::push_variant_wasm_types(
+                 v.cases.iter().filter_map(|(_, case)| case.ty.as_ref()),
++                ptr_size,
+                 types,
+                 lowered_types,
+             ),
+             Self::List(_) | Self::Map(_, _) => {
+-                lowered_types.try_push(ValType::I32) && lowered_types.try_push(ValType::I32)
++                lowered_types.try_push(ptr_size.core_type())
++                    && lowered_types.try_push(ptr_size.core_type())
+             }
+             Self::FixedLengthList(ty, length) => {
+-                (0..*length).all(|_n| ty.push_wasm_types(types, lowered_types))
++                (0..*length).all(|_n| ty.push_wasm_types(ptr_size, types, lowered_types))
+             }
+             Self::Tuple(t) => t
+                 .types
+                 .iter()
+-                .all(|ty| ty.push_wasm_types(types, lowered_types)),
++                .all(|ty| ty.push_wasm_types(ptr_size, types, lowered_types)),
+             Self::Flags(names) => {
+                 (0..(names.len() + 31) / 32).all(|_| lowered_types.try_push(ValType::I32))
+             }
+@@ -1591,16 +1617,20 @@ impl ComponentDefinedType {
+                 lowered_types.try_push(ValType::I32)
+             }
+             Self::Option(ty) => {
+-                Self::push_variant_wasm_types([ty].into_iter(), types, lowered_types)
+-            }
+-            Self::Result { ok, err } => {
+-                Self::push_variant_wasm_types(ok.iter().chain(err.iter()), types, lowered_types)
++                Self::push_variant_wasm_types([ty].into_iter(), ptr_size, types, lowered_types)
+             }
++            Self::Result { ok, err } => Self::push_variant_wasm_types(
++                ok.iter().chain(err.iter()),
++                ptr_size,
++                types,
++                lowered_types,
++            ),
+         }
+     }
+ 
+     fn push_variant_wasm_types<'a>(
+         cases: impl Iterator<Item = &'a ComponentValType>,
++        ptr_size: PtrSize,
+         types: &TypeList,
+         lowered_types: &mut LoweredTypes,
+     ) -> bool {
+@@ -1614,7 +1644,7 @@ impl ComponentDefinedType {
+         for ty in cases {
+             let mut temp = LoweredTypes::new(lowered_types.max);
+ 
+-            if !ty.push_wasm_types(types, &mut temp) {
++            if !ty.push_wasm_types(ptr_size, types, &mut temp) {
+                 return false;
+             }
+ 
+diff --git a/crates/wit-component/Cargo.toml b/crates/wit-component/Cargo.toml
+index 86b0a5c..16ab91d 100644
+--- a/crates/wit-component/Cargo.toml
++++ b/crates/wit-component/Cargo.toml
+@@ -48,6 +48,8 @@ wasm-metadata = { workspace = true, features = ['oci'] }
+ wasmtime = { workspace = true }
+ 
+ [features]
++# Closed memory64 encoding mode for the EHDS migration.
++memory64 = []
+ dummy-module = ['dep:wat']
+ wat = ['dep:wast', 'dep:wat']
+ semver-check = ['dummy-module']
+diff --git a/crates/wit-component/src/encoding.rs b/crates/wit-component/src/encoding.rs
+index 8f7a405..ab47626 100644
+--- a/crates/wit-component/src/encoding.rs
++++ b/crates/wit-component/src/encoding.rs
+@@ -110,9 +110,21 @@ fn to_val_type(ty: &WasmType) -> ValType {
+         WasmType::I64 => ValType::I64,
+         WasmType::F32 => ValType::F32,
+         WasmType::F64 => ValType::F64,
+-        WasmType::Pointer => ValType::I32,
++        WasmType::Pointer => {
++            if cfg!(feature = "memory64") {
++                ValType::I64
++            } else {
++                ValType::I32
++            }
++        }
+         WasmType::PointerOrI64 => ValType::I64,
+-        WasmType::Length => ValType::I32,
++        WasmType::Length => {
++            if cfg!(feature = "memory64") {
++                ValType::I64
++            } else {
++                ValType::I32
++            }
++        }
+     }
+ }
+ 
+diff --git a/crates/wit-component/src/validation.rs b/crates/wit-component/src/validation.rs
+index c330900..a3ff695 100644
+--- a/crates/wit-component/src/validation.rs
++++ b/crates/wit-component/src/validation.rs
+@@ -24,9 +24,21 @@ fn wasm_sig_to_func_type(signature: WasmSignature) -> FuncType {
+             WasmType::I64 => ValType::I64,
+             WasmType::F32 => ValType::F32,
+             WasmType::F64 => ValType::F64,
+-            WasmType::Pointer => ValType::I32,
++            WasmType::Pointer => {
++                if cfg!(feature = "memory64") {
++                    ValType::I64
++                } else {
++                    ValType::I32
++                }
++            }
+             WasmType::PointerOrI64 => ValType::I64,
+-            WasmType::Length => ValType::I32,
++            WasmType::Length => {
++                if cfg!(feature = "memory64") {
++                    ValType::I64
++                } else {
++                    ValType::I32
++                }
++            }
+         }
+     }
+ 
+@@ -1225,7 +1237,12 @@ impl ExportMap {
+ 
+         // Handle a few special-cased names first.
+         if name == names.export_realloc() {
+-            let expected = FuncType::new([ValType::I32; 4], [ValType::I32]);
++            let pointer = if cfg!(feature = "memory64") {
++                ValType::I64
++            } else {
++                ValType::I32
++            };
++            let expected = FuncType::new([pointer; 4], [pointer]);
+             validate_func_sig(name, &expected, ty)?;
+             return Ok(Some(Export::GeneralPurposeRealloc));
+         } else if name == names.export_initialize() {

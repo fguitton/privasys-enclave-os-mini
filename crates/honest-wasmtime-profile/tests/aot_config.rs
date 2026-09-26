@@ -20,6 +20,30 @@ fn canonical_descriptor_is_role_independent() {
 
     assert_eq!(envelope.descriptor(), descriptor);
     assert_eq!(envelope.descriptor_bytes(), descriptor.to_canonical_bytes());
+
+    use honest_wasmtime_profile::memory64_proposal as memory64;
+    let proposal = memory64::Descriptor::canonical();
+    assert_eq!(&proposal.to_canonical_bytes()[..6], b"HW64\x03\x00");
+    assert_eq!(
+        memory64::profile_digest(),
+        [
+            0x9e, 0x8e, 0x2c, 0x0c, 0x1b, 0x98, 0xa1, 0x77, 0x62, 0x12, 0xaf, 0xea, 0x56, 0x19,
+            0x51, 0xd6, 0x36, 0x42, 0x37, 0x5e, 0x8a, 0xea, 0x40, 0x35, 0x71, 0xb3, 0xe7, 0xba,
+            0xb6, 0x37, 0x4a, 0x26
+        ]
+    );
+    let engine = honest_wasmtime_profile::Engine::new(&memory64::canonical_config()).unwrap();
+    assert!(engine.get_wasm_features().memory64());
+    assert!(engine.get_memory_may_move());
+    assert_eq!(engine.get_memory_reservation_for_growth(), memory64::CHUNK);
+    assert_eq!(engine.get_memory_reservation(), 4 * memory64::CHUNK);
+    assert!(!engine.get_signals_based_traps());
+    assert!(!engine.get_memory_init_cow());
+    assert!(engine.get_consume_fuel());
+    assert!(engine.get_epoch_interruption());
+    assert!(memory64::store_limits(memory64::MAX_MEMORY).is_ok());
+    assert!(memory64::store_limits(0).is_err());
+    assert!(memory64::store_limits(memory64::MAX_MEMORY + 1).is_err());
 }
 
 #[test]
@@ -60,6 +84,8 @@ fn every_compatibility_field_mutation_is_rejected() {
     mutate_bool!(relaxed_simd_deterministic);
     mutate_bool!(shared_memory);
     mutate_bool!(host_concurrency);
+    mutate_integer!(guest_address_bits);
+    mutate_integer!(maximum_linear_memory);
     mutate_integer!(memory_reservation);
     mutate_integer!(memory_reservation_for_growth);
     mutate_integer!(memory_guard_size);
@@ -97,6 +123,24 @@ fn every_compatibility_field_mutation_is_rejected() {
     mutate_integer!(canonical_trap_version);
     mutate_integer!(transcript_version);
     mutate_string!(builder_profile_id);
+
+    use honest_wasmtime_profile::memory64_proposal as memory64;
+    macro_rules! mutate_memory64 {
+        ($field:ident) => {{
+            let mut changed = memory64::Descriptor::canonical();
+            changed.$field += 1;
+            assert!(memory64::build_config(&changed).is_err());
+        }};
+    }
+    mutate_memory64!(schema_version);
+    mutate_memory64!(address_bits);
+    mutate_memory64!(memory_reservation);
+    mutate_memory64!(memory_reservation_for_growth);
+    mutate_memory64!(maximum_memory);
+    mutate_memory64!(maximum_host_transfer);
+    let mut changed = memory64::Descriptor::canonical();
+    changed.memory_may_move = false;
+    assert!(memory64::build_config(&changed).is_err());
 }
 
 #[test]

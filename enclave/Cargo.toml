@@ -107,3 +107,10 @@ strip = "symbols"       # strip debug symbols from .a
 
 [build-dependencies]
 cc = "1"
+
+# Closed memory64 toolchain reconstructed from Mini patches/wasm64.
+[patch."https://github.com/Privasys/wasmtime"]
+wasmtime = { path = "../third_party/wasm64/wasmtime/crates/wasmtime" }
+
+[patch.crates-io]
+wasmparser = { path = "../third_party/wasm64/wasm-tools/crates/wasmparser" }

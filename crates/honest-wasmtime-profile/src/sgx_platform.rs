@@ -78,12 +78,16 @@ static CODE_POOL_OFFSET: AtomicUsize = AtomicUsize::new(0);
 /// Allocate `size` bytes from the RWX code pool (page-aligned).
 /// Returns null on exhaustion.
 unsafe fn code_pool_alloc(size: usize) -> *mut u8 {
-    let aligned = page_align(size);
+    let Some(aligned) = page_align(size) else {
+        return ptr::null_mut();
+    };
     let pool_start = &_wasm_code_pool_start as *const u8 as usize;
 
     loop {
         let current = CODE_POOL_OFFSET.load(Ordering::Relaxed);
-        let new_offset = current + aligned;
+        let Some(new_offset) = current.checked_add(aligned) else {
+            return ptr::null_mut();
+        };
         if new_offset > CODE_POOL_SIZE {
             return ptr::null_mut(); // Pool exhausted
         }
@@ -111,13 +115,17 @@ unsafe fn is_code_pool(addr: *const u8) -> bool {
 //  Heap allocation helpers (for data/linear memory)
 // =========================================================================
 
-fn page_align(size: usize) -> usize {
-    (size + 4095) & !4095
+fn page_align(size: usize) -> Option<usize> {
+    size.checked_add(4095)
+        .map(|n| n & !4095)
+        .filter(|n| *n != 0 && *n <= isize::MAX as usize)
 }
 
 /// Allocate page-aligned memory from the enclave heap.
 unsafe fn heap_alloc_pages(size: usize) -> *mut u8 {
-    let layout = alloc::alloc::Layout::from_size_align_unchecked(size, 4096);
+    let Ok(layout) = alloc::alloc::Layout::from_size_align(size, 4096) else {
+        return ptr::null_mut();
+    };
     alloc::alloc::alloc_zeroed(layout)
 }
 
@@ -194,7 +202,9 @@ pub unsafe extern "C" fn wasmtime_mmap_new(
     _prot_flags: u32,
     ret_addr: *mut *mut u8,
 ) -> i32 {
-    let aligned = page_align(size);
+    let Some(aligned) = page_align(size) else {
+        return -1;
+    };
 
     // Strategy: code segments are typically < 1MB, linear memory is >= 4MB.
     let use_code_pool = aligned <= 1024 * 1024;
@@ -202,12 +212,8 @@ pub unsafe extern "C" fn wasmtime_mmap_new(
     let addr = if use_code_pool {
         let ptr = code_pool_alloc(aligned);
         if ptr.is_null() {
-            // Code pool exhausted, fall back to heap
-            enclave_os_common::enclave_log_info!(
-                "[sgx_platform] mmap: code pool exhausted, falling back to heap for {} bytes",
-                aligned
-            );
-            heap_alloc_pages(aligned)
+            // Heap pages cannot become executable in this SGX mapping model.
+            return -1;
         } else {
             enclave_os_common::enclave_log_info!(
                 "[sgx_platform] mmap: code pool alloc {} bytes at {:p}",
@@ -233,15 +239,16 @@ pub unsafe extern "C" fn wasmtime_mmap_new(
     0
 }
 
-/// Remap memory (resize). Zero the new region.
+/// Replace an existing mapping with zero bytes, matching the three-argument
+/// Wasmtime custom-platform ABI. This operation does not resize allocations.
 #[no_mangle]
-pub unsafe extern "C" fn wasmtime_mmap_remap(
-    addr: *mut u8,
-    _old_size: usize,
-    new_size: usize,
-    _prot_flags: u32,
-) -> i32 {
-    let aligned = page_align(new_size);
+pub unsafe extern "C" fn wasmtime_mmap_remap(addr: *mut u8, size: usize, _prot_flags: u32) -> i32 {
+    let Some(aligned) = page_align(size) else {
+        return -1;
+    };
+    if addr.is_null() {
+        return -1;
+    }
     ptr::write_bytes(addr, 0, aligned);
     0
 }
@@ -252,7 +259,9 @@ pub unsafe extern "C" fn wasmtime_mmap_remap(
 /// Heap memory is properly deallocated.
 #[no_mangle]
 pub unsafe extern "C" fn wasmtime_munmap(ptr: *mut u8, size: usize) -> i32 {
-    let aligned = page_align(size);
+    let Some(aligned) = page_align(size) else {
+        return -1;
+    };
     if is_code_pool(ptr) {
         // Code pool: can't free individual allocations from bump allocator.
         // The memory stays allocated until enclave teardown.
@@ -279,8 +288,13 @@ pub unsafe extern "C" fn wasmtime_munmap(ptr: *mut u8, size: usize) -> i32 {
 /// but since our pool is already RWX, no action is needed.
 #[no_mangle]
 pub unsafe extern "C" fn wasmtime_mprotect(ptr: *mut u8, size: usize, prot_flags: u32) -> i32 {
-    let aligned = page_align(size);
+    let Some(aligned) = page_align(size) else {
+        return -1;
+    };
     let in_pool = is_code_pool(ptr);
+    if prot_flags & 4 != 0 && !in_pool {
+        return -1;
+    }
     enclave_os_common::enclave_log_info!(
         "[sgx_platform] mprotect: addr={:p} size={} prot={} pool={} (no-op)",
         ptr,

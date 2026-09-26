@@ -34,3 +34,6 @@ Thumbs.db
 *.csr
 # Standalone dev lockfile (release builds use enclave/Cargo.lock)
 crates/enclave-os-vault/Cargo.lock
+
+# Reconstructed, pinned memory64 toolchain sources.
+/third_party/wasm64/

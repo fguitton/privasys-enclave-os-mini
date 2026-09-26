@@ -21,7 +21,7 @@ aot = ["wasmtime/cranelift", "wasmtime/parallel-compilation"]
 [dependencies]
 sha2 = { version = "=0.11.0", default-features = false }
 wasmtime = { git = "https://github.com/Privasys/wasmtime", rev = "6d01615eaf52d4e70010290f8444a8ec285d01ae", default-features = false, features = [
-    "component-model",
+    "component-model-memory64-only",
     "runtime",
     "std",
     "gc-drc",
@@ -32,3 +32,10 @@ enclave-os-common = { path = "../../common" }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_vendor, values("teaclave"))'] }
+
+# Closed memory64 toolchain reconstructed from Mini patches/wasm64.
+[patch."https://github.com/Privasys/wasmtime"]
+wasmtime = { path = "../../third_party/wasm64/wasmtime/crates/wasmtime" }
+
+[patch.crates-io]
+wasmparser = { path = "../../third_party/wasm64/wasm-tools/crates/wasmparser" }
