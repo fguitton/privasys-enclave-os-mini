@@ -40,6 +40,25 @@ include(cmake/SgxConfig.cmake)
 include(cmake/RustBuild.cmake)
 
 # =============================================================================
+# Memory64 toolchain sources
+# =============================================================================
+# The reconstructed Wasmtime, wasm-tools and wit-bindgen trees are path
+# dependencies, outside Cargo's lockfile checksums. Refuse to configure against
+# a tree whose files differ from the digests pinned in sources.json.
+if(EXISTS "${CMAKE_SOURCE_DIR}/patches/wasm64/sources.json")
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    execute_process(
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/scripts/acquire-wasm64.py" --verify-only
+        RESULT_VARIABLE WASM64_SOURCES_STATUS
+    )
+    if(NOT WASM64_SOURCES_STATUS EQUAL 0)
+        message(FATAL_ERROR
+            "memory64 sources differ from patches/wasm64/sources.json; "
+            "run scripts/acquire-wasm64.py")
+    endif()
+endif()
+
+# =============================================================================
 # Resolve Teaclave checkout (same logic as build_all.sh's resolve_teaclave)
 # =============================================================================
 # The Cargo.lock in the workspace pins the teaclave-sgx-sdk commit hash.

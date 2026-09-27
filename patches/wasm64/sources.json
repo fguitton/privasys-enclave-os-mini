@@ -2,18 +2,21 @@
   {
     "name": "wasmtime",
     "url": "https://github.com/fguitton/honest-wasmtime",
-    "revision": "135e3f6cf84770ab1284636c55dfb17533541f4e"
+    "revision": "0c1ee0eace7cb50ad068c693766c76bd2a5cea4b",
+    "files_sha256": "b626c88a06dfd128a7144dabc562ac6cb8a06b7abb5be118a75ea8284bd46e8d"
   },
   {
     "name": "wasm-tools",
     "url": "https://github.com/bytecodealliance/wasm-tools",
     "revision": "d66d4364c441d8b0122628509be52bd53c352a6e",
-    "patch_sha256": "f0228265b629785ffb9276cb8c1f2e40b7b2f6d605e513713daca598c0e80295"
+    "patch_sha256": "f0228265b629785ffb9276cb8c1f2e40b7b2f6d605e513713daca598c0e80295",
+    "files_sha256": "def4c9700a43edf0b12e8da3eb63687a6042b7426526d34f39d5ee6d4e0ea5a1"
   },
   {
     "name": "wit-bindgen",
     "url": "https://github.com/bytecodealliance/wit-bindgen",
     "revision": "32bcc3c00bfe987364d1eccd8c89f7d86ef53389",
-    "patch_sha256": "5e341ea60a47fe67722afe6c6dd97b944bff11b5b2edf6462a84949ca8219ac0"
+    "patch_sha256": "5e341ea60a47fe67722afe6c6dd97b944bff11b5b2edf6462a84949ca8219ac0",
+    "files_sha256": "2e987e0a8b0c784c773f5e37d4b8cf117d380e8e8d579b0c4d8fbad2d9e4ec8f"
   }
 ]

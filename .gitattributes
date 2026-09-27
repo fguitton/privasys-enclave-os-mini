@@ -1,0 +1,3 @@
+# The profile digest hashes sources.json and the acquisition checks each patch
+# by digest; neither may gain carriage returns on a Windows checkout.
+/patches/wasm64/** -text
