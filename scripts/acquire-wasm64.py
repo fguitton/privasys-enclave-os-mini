@@ -76,7 +76,8 @@ def main():
     parser.add_argument('--print-digests', action='store_true',
                         help='print each materialized digest instead of requiring the pin')
     args = parser.parse_args()
-    DESTINATION.mkdir(parents=True, exist_ok=True)
+    if not args.verify_only:
+        DESTINATION.mkdir(parents=True, exist_ok=True)
     for source in json.loads((PATCHES / 'sources.json').read_text(encoding='utf-8')):
         name = source['name']
         if not re.fullmatch(r'[a-z0-9][a-z0-9-]*', name):
@@ -102,19 +103,26 @@ def main():
             git('checkout', '--detach', 'FETCH_HEAD', cwd=dest)
             if digest is not None:
                 git('apply', '-', cwd=dest, stdin=expected)
-        if git('rev-parse', 'HEAD', cwd=dest).decode().strip() != source['revision']:
-            raise ValueError(f'{name}: source revision mismatch')
-        actual = git('diff', 'HEAD', '--binary', '--no-ext-diff', '--no-textconv',
-                     f'--abbrev={abbreviation(expected)}', cwd=dest)
-        if actual != expected:
-            raise ValueError(f'{name}: source patch differs; refusing to overwrite')
+        # A tree exported without its Git metadata, as a sandboxed build copies
+        # it, is verified by its file digest alone.
+        exported = not (dest / '.git').exists()
+        if exported and not args.verify_only:
+            raise ValueError(f'{name}: an exported tree can only be verified')
+        if not exported:
+            if git('rev-parse', 'HEAD', cwd=dest).decode().strip() != source['revision']:
+                raise ValueError(f'{name}: source revision mismatch')
+            actual = git('diff', 'HEAD', '--binary', '--no-ext-diff', '--no-textconv',
+                         f'--abbrev={abbreviation(expected)}', cwd=dest)
+            if actual != expected:
+                raise ValueError(f'{name}: source patch differs; refusing to overwrite')
         materialized = files_digest(dest)
         if args.print_digests:
             print(f'WASM64-SOURCE DIGEST {name} {materialized}')
             continue
         if materialized != source['files_sha256']:
             raise ValueError(f'{name}: materialized files differ from the pinned digest')
-        print(f'WASM64-SOURCE PASS {name} {source["revision"]} {digest or "fork"} {materialized}')
+        form = 'exported' if exported else 'checkout'
+        print(f'WASM64-SOURCE PASS {name} {source["revision"]} {digest or "fork"} {materialized} {form}')
 
 
 if __name__ == '__main__':
