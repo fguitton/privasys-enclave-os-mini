@@ -72,3 +72,14 @@ The initial native attempt failed on the missing macro import, and then on an
 unregistered native logging table; both failures are retained. The corrected
 three-body run passes with profiling enabled. Parent diagnostic images opt in
 through their existing guarded `transfer-profile` feature.
+
+Socket-write acknowledgements are now cumulative in 256 KiB quanta, with any
+short tail flushed before orderly close. Previously every short socket write
+inserted another input message before the next adopter-maintenance turn. The
+quantum is below the 2 MiB outstanding window and the 64 KiB minimum producer
+credit, so withholding a sub-quantum tail cannot exhaust an otherwise drained
+window. The host never acknowledges unwritten bytes. The existing drain test
+checks the threshold, short tail, duplicate suppression, overflow and ordered
+credit/close notifications. All 27 host tests pass on this working tree; the
+parent records the exact committed build and hardware comparison. This changes
+no wire encoding or enclave authority, and can be compared on the same image.

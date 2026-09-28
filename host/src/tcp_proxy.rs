@@ -87,8 +87,34 @@ struct ConnState {
     origin: ConnectionOrigin,
     write_buffer: Vec<u8>,
     write_offset: usize,
-    write_credit: Option<u64>,
+    write_credit: Option<WrittenCredit>,
     close_after_write: bool,
+}
+
+/// Cumulative socket-write acknowledgement, coalesced independently of time.
+/// This quantum is one eighth of the enclave's 2 MiB outstanding-byte window.
+/// With less than a quantum unreported, at least 1.75 MiB can still be sent;
+/// a producer requiring at most 64 KiB of credit cannot deadlock on this delay.
+const WRITE_CREDIT_QUANTUM: u64 = 256 * 1024;
+
+#[derive(Default)]
+struct WrittenCredit {
+    total: u64,
+    reported: u64,
+}
+
+impl WrittenCredit {
+    fn record(&mut self, written: usize, closing: bool) -> Result<Option<u64>, ()> {
+        self.total = self.total.checked_add(written as u64).ok_or(())?;
+        if self.total - self.reported >= WRITE_CREDIT_QUANTUM
+            || (closing && self.total != self.reported)
+        {
+            self.reported = self.total;
+            Ok(Some(self.total))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 enum ConnectionOrigin {
@@ -752,7 +778,7 @@ impl TcpProxy {
                                     && conn.write_credit.is_none()
                                     && conn.write_buffer.is_empty()
                                 {
-                                    conn.write_credit = Some(0);
+                                    conn.write_credit = Some(WrittenCredit::default());
                                 } else {
                                     self.connections.remove(&conn_id);
                                     self.send_to_enclave(channel::encode_tcp_close(conn_id));
@@ -882,12 +908,13 @@ impl TcpProxy {
             })
             .unwrap_or(false);
         if remove_now {
-            if self
-                .connections
-                .remove(&conn_id)
-                .is_some_and(|conn| conn.write_credit.is_some())
-            {
-                self.send_to_enclave(channel::encode_tcp_close(conn_id));
+            if let Some(mut conn) = self.connections.remove(&conn_id) {
+                if let Some(credit) = &mut conn.write_credit {
+                    if let Ok(Some(total)) = credit.record(0, true) {
+                        self.send_to_enclave(channel::encode_tcp_write_credit(conn_id, total));
+                    }
+                    self.send_to_enclave(channel::encode_tcp_close(conn_id));
+                }
             }
         }
     }
@@ -1109,13 +1136,17 @@ impl TcpProxy {
                     to_close.push((conn_id, true));
                 }
                 Ok(written) => {
-                    if let Some(total) = conn.write_credit {
-                        let Some(next) = total.checked_add(written as u64) else {
-                            to_close.push((conn_id, true));
-                            continue;
-                        };
-                        conn.write_credit = Some(next);
-                        credits.push((conn_id, next));
+                    if let Some(credit) = &mut conn.write_credit {
+                        let closing = conn.close_after_write
+                            && written == conn.write_buffer.len() - conn.write_offset;
+                        match credit.record(written, closing) {
+                            Ok(Some(total)) => credits.push((conn_id, total)),
+                            Ok(None) => {}
+                            Err(()) => {
+                                to_close.push((conn_id, true));
+                                continue;
+                            }
+                        }
                     }
                     conn.write_offset += written;
                     conn.last_activity = Instant::now();
@@ -1629,6 +1660,23 @@ mod tests {
 
     #[test]
     fn enclave_close_drains_buffered_ciphertext_before_socket_close() {
+        // Frequent small writes grant only their actual cumulative byte count.
+        // Crossing the quantum makes progress without any timer or close;
+        // a short final write is acknowledged before the close notification.
+        let mut credit = WrittenCredit::default();
+        assert_eq!(credit.record(1, false), Ok(None));
+        assert_eq!(
+            credit.record(WRITE_CREDIT_QUANTUM as usize - 2, false),
+            Ok(None)
+        );
+        assert_eq!(credit.record(1, false), Ok(Some(WRITE_CREDIT_QUANTUM)));
+        assert_eq!(credit.record(17, false), Ok(None));
+        assert_eq!(credit.record(0, true), Ok(Some(WRITE_CREDIT_QUANTUM + 17)));
+        assert_eq!(credit.record(0, true), Ok(None));
+        credit.total = u64::MAX;
+        credit.reported = u64::MAX;
+        assert_eq!(credit.record(1, false), Err(()));
+
         let mut host_to_enclave = QueueMemory::new();
         let mut enclave_to_host = QueueMemory::new();
         let data_tx = host_to_enclave.producer();
@@ -1653,7 +1701,7 @@ mod tests {
             },
         );
 
-        proxy.connections.get_mut(&7).unwrap().write_credit = Some(0);
+        proxy.connections.get_mut(&7).unwrap().write_credit = Some(WrittenCredit::default());
         proxy.write_to_socket(7, b"encrypted response");
         proxy.close_from_enclave(7);
         assert!(proxy.connections.contains_key(&7));
