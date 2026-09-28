@@ -44,9 +44,10 @@ pub fn new_store<T: 'static>(engine: &wasmtime::Engine, data: T) -> wasmtime::St
 }
 
 /// Frozen semantic profile identity.
-pub const PROFILE_ID: &str = "honest-s2-x86_64-sgx-memory64-v1";
-/// Pinned Wasmtime source used by both complementary build roles.
-pub const WASMTIME_COMMIT: &str = "6d01615eaf52d4e70010290f8444a8ec285d01ae";
+pub const PROFILE_ID: &str = "honest-s2-x86_64-sgx-memory64-v2";
+/// Pinned Wasmtime source used by both complementary build roles: the
+/// memory64 fork revision that `patches/wasm64/sources.json` pins.
+pub const WASMTIME_COMMIT: &str = "6283b30763ad65427205fb00ee321185259deb06";
 /// Explicit AOT target. Supplying it disables host-native feature inference.
 pub const TARGET_TRIPLE: &str = "x86_64-unknown-linux-gnu";
 /// Conservative x86-64 baseline: architectural SSE2 only, no inferred extras.
@@ -57,7 +58,9 @@ pub const WIT_PACKAGE_SHA256: [u8; 32] = [
     0xc1, 0x55, 0x5e, 0xd9, 0x2f, 0x70, 0x73, 0xc6, 0x1b, 0x8c, 0x38, 0x53, 0x90, 0xb6, 0x98, 0x82,
 ];
 /// Fuel schedule is part of semantic compatibility, not a local tuning knob.
-pub const FUEL_SCHEDULE_ID: &str = "wasmtime-47-default-fuel-v1";
+/// v2 carries the v49.0.1 fuel fixes: fuel across `call_ref` and `try_table`,
+/// and host allocation for component `Val` records.
+pub const FUEL_SCHEDULE_ID: &str = "wasmtime-47-default-fuel-v2";
 /// Closed host ABI/linker family selected by WIT v0.2.
 pub const HOST_LINKER_PROFILE_ID: &str = "honest-stage-host-v0.2.0";
 /// Builder/toolchain identity bound by the S2 source lock.
