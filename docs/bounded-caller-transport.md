@@ -111,3 +111,10 @@ pairs at ten lengths, including staging boundaries, and checks both destination
 guards and every byte. Existing wrap, contention, capacity and mutation bodies
 remain unchanged. All 123 common and 27 host bodies pass on the working tree.
 Hardware speed and the linked optimized copy path are checked by the parent.
+
+Linked-code inspection caught the first staging build being excluded: the
+sysroot composition uses common's std feature with target_vendor=teaclave,
+not the historical no_std sgx feature. The selection now includes that explicit
+custom-target vendor and registers it with Rust's cfg checker. The first image
+is retained as NOT-EXERCISED for alignment optimization; it cannot count as a
+performance validation of staging. Native tests alone did not catch this.

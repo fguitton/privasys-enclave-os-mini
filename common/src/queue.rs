@@ -233,7 +233,7 @@ impl SpscProducer {
 /// Safety: `destination` must be writable for exactly data.len() bytes and
 /// must not overlap `data`. This is the same contract as copy_nonoverlapping.
 unsafe fn copy_to_shared(data: &[u8], destination: *mut u8) {
-    #[cfg(any(feature = "sgx", test))]
+    #[cfg(any(feature = "sgx", target_vendor = "teaclave", test))]
     if data.len() >= 64 && ((data.as_ptr() as usize ^ destination as usize) & 7) != 0 {
         // Chunks have a multiple-of-eight stride; the matching prefix remains
         // constant. Padding is never written to the ring or made part of a frame.

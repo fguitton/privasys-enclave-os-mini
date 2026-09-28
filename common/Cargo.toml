@@ -30,3 +30,6 @@ base64     = { version = "0.21", default-features = false, features = ["alloc"],
 [dev-dependencies]
 ring = "0.17"
 base64 = "0.21"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_vendor, values("teaclave"))'] }
