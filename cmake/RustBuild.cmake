@@ -58,6 +58,25 @@ else()
     set(CARGO_OUT_DIR "debug")
 endif()
 
+# A named correctness profile is an explicit SIM-only enclave choice. Keep the
+# host and hardware build-type mapping above unchanged.
+set(RUST_ENCLAVE_CARGO_PROFILE "" CACHE STRING
+    "Optional custom Cargo profile for SIM enclaves only (not dev or release)")
+set(CARGO_ENCLAVE_BUILD_TYPE ${CARGO_BUILD_TYPE})
+set(CARGO_ENCLAVE_OUT_DIR "${CARGO_OUT_DIR}")
+if(NOT "${RUST_ENCLAVE_CARGO_PROFILE}" STREQUAL "")
+    if(NOT SGX_MODE STREQUAL "SIM")
+        message(FATAL_ERROR "RUST_ENCLAVE_CARGO_PROFILE requires SGX_MODE=SIM")
+    endif()
+    if(RUST_ENCLAVE_CARGO_PROFILE STREQUAL "dev" OR
+       RUST_ENCLAVE_CARGO_PROFILE STREQUAL "release" OR
+       NOT RUST_ENCLAVE_CARGO_PROFILE MATCHES "^[A-Za-z0-9][A-Za-z0-9_-]*$")
+        message(FATAL_ERROR "RUST_ENCLAVE_CARGO_PROFILE must name a custom Cargo profile, not dev or release")
+    endif()
+    set(CARGO_ENCLAVE_BUILD_TYPE --profile "${RUST_ENCLAVE_CARGO_PROFILE}")
+    set(CARGO_ENCLAVE_OUT_DIR "${RUST_ENCLAVE_CARGO_PROFILE}")
+endif()
+
 # ---------------------------------------------------------------------------
 # rust_build_host(CRATE_DIR OUTPUT_NAME)
 #   Build a host-side Rust crate and produce a binary.
@@ -143,7 +162,7 @@ function(rust_build_enclave CRATE_DIR OUTPUT_NAME FEATURES)
     endif()
 
     set(_ENCLAVE_STATIC_LIB
-        "${_ENCLAVE_TARGET_DIR}/${RUST_ENCLAVE_TARGET}/${CARGO_OUT_DIR}/lib${OUTPUT_NAME}.a")
+        "${_ENCLAVE_TARGET_DIR}/${RUST_ENCLAVE_TARGET}/${CARGO_ENCLAVE_OUT_DIR}/lib${OUTPUT_NAME}.a")
 
     add_custom_target(${OUTPUT_NAME} ALL
         COMMAND ${CMAKE_COMMAND} -E env
@@ -158,7 +177,7 @@ function(rust_build_enclave CRATE_DIR OUTPUT_NAME FEATURES)
             "CXX=${CMAKE_CXX_COMPILER}"
             "RUSTFLAGS=${_ENCLAVE_RUSTFLAGS}"
             ${CARGO_EXECUTABLE} build
-                ${CARGO_BUILD_TYPE}
+                ${CARGO_ENCLAVE_BUILD_TYPE}
                 -Zjson-target-spec
                 --locked
                 --manifest-path "${CRATE_DIR}/Cargo.toml"
