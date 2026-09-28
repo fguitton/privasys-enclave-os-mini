@@ -55,3 +55,10 @@ include the complete small-reply oracle followed by a configuration replacement,
 as well as revocation partway through the 5 MiB response. Three selected bodies
 PASS in `bounded-tls-control-turn.log` under the parent's private evidence root;
 SIM integration of this correction is still pending at this commit.
+
+The output scheduler now permits at most eight bounded progress steps before
+processing the next incoming message and adopter opportunity (at most 256 KiB
+of new plaintext). Each step retains round-robin scheduling, lease checks and
+credit accounting. This amortizes maintenance over a bounded burst and never
+turns an admitted response into an unbounded drain. Its hardware gain remains
+NOT-RUN at this commit; the parent records the controlled comparison.

@@ -532,7 +532,16 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
     while !crate::is_shutdown() {
         if let Ok(mut st) = crate::state().lock() {
             if let Some(ref mut srv) = st.ingress_server {
-                let _ = srv.progress_output();
+                // Amortize the adopter's maintenance pass over a bounded
+                // output burst. Each step preserves round-robin selection,
+                // configuration currentness and socket/channel write credit.
+                // At most 256 KiB of plaintext is encrypted before incoming
+                // control traffic and the adopter get another opportunity.
+                for _ in 0..8 {
+                    if !srv.progress_output() || srv.is_shutdown() {
+                        break;
+                    }
+                }
                 if let Some(reason) = srv.shutdown_reason() {
                     enclave_log_error!("MINI-CONTROL-SHUTDOWN: reason=Ingress({:?})", reason);
                     let origin = match reason {
