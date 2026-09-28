@@ -17,6 +17,8 @@ name = "enclave_os_enclave"
 crate-type = ["staticlib", "rlib"]
 
 [features]
+# Untrusted elapsed observations only; disabled in product builds.
+diagnostic-transfer-profile = []
 default = ["sgx", "default-ecall"]
 sgx = []
 # Provides the default ecall_run implementation.

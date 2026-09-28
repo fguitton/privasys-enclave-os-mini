@@ -61,7 +61,16 @@ pub struct RaTlsSession {
 
 /// Own the admitted body once, and encrypt at most 32 KiB per control turn.
 /// HTTP and TLS never materialize additional whole-body copies.
+#[cfg(feature = "diagnostic-transfer-profile")]
+struct ResponseCost {
+    started: std::time::Instant,
+    encryption_ns: u128,
+    steps: u64,
+    tls_bytes: usize,
+}
 struct PendingResponse {
+    #[cfg(feature = "diagnostic-transfer-profile")]
+    cost: Option<ResponseCost>,
     head: Vec<u8>,
     body: Vec<u8>,
     offset: usize,
@@ -306,6 +315,13 @@ impl RaTlsSession {
             return Err("response headers too large");
         }
         self.response = Some(PendingResponse {
+            #[cfg(feature = "diagnostic-transfer-profile")]
+            cost: (body.len() >= 1024 * 1024).then(|| ResponseCost {
+                started: std::time::Instant::now(),
+                encryption_ns: 0,
+                steps: 0,
+                tls_bytes: 0,
+            }),
             head,
             body,
             offset: 0,
@@ -320,6 +336,8 @@ impl RaTlsSession {
     pub fn progress_http_response(&mut self) -> Result<(Vec<u8>, bool, bool), &'static str> {
         self.require_current_configuration()?;
         let mut response = self.response.take().ok_or("no pending response")?;
+        #[cfg(feature = "diagnostic-transfer-profile")]
+        let step_started = response.cost.as_ref().map(|_| std::time::Instant::now());
         let mut output = Vec::new();
         let mut remaining = 32 * 1024;
         if !response.head.is_empty() {
@@ -337,7 +355,25 @@ impl RaTlsSession {
         if output.len() > 64 * 1024 {
             return Err("bounded TLS response exceeded credit");
         }
+        #[cfg(feature = "diagnostic-transfer-profile")]
+        if let (Some(cost), Some(started)) = (&mut response.cost, step_started) {
+            cost.encryption_ns += started.elapsed().as_nanos();
+            cost.steps += 1;
+            cost.tls_bytes += output.len();
+        }
         if response.offset == response.body.len() {
+            #[cfg(feature = "diagnostic-transfer-profile")]
+            if let Some(cost) = response.cost {
+                let message = format!(
+                    "MINI-BOUNDED-COST body_bytes={} tls_bytes={} steps={} encrypt_ns={} span_ns={} suite={:?} clock=UNTRUSTED-DIAGNOSTIC",
+                    response.body.len(), cost.tls_bytes, cost.steps, cost.encryption_ns,
+                    cost.started.elapsed().as_nanos(), self.tls_conn.negotiated_cipher_suite().map(|suite| suite.suite())
+                );
+                #[cfg(target_env = "sgx")]
+                enclave_os_common::enclave_log_info!("{}", message);
+                #[cfg(not(target_env = "sgx"))]
+                eprintln!("{}", message);
+            }
             Ok((output, response.close, response.shutdown))
         } else {
             self.response = Some(response);

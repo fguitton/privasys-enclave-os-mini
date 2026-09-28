@@ -13,6 +13,8 @@ description = "HTTPS egress module for enclave-os — outbound TLS from inside S
 name = "enclave_os_egress"
 
 [features]
+# Untrusted elapsed observations only; disabled in product builds.
+diagnostic-transfer-profile = []
 # Mock mode — accepts MOCK_QUOTE: prefixed quotes without verification.
 # Only enable for development/testing on platforms without SGX hardware.
 mock = []

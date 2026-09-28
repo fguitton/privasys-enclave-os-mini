@@ -62,3 +62,13 @@ of new plaintext). Each step retains round-robin scheduling, lease checks and
 credit accounting. This amortizes maintenance over a bounded burst and never
 turns an admitted response into an unbounded drain. Its hardware gain remains
 NOT-RUN at this commit; the parent records the controlled comparison.
+
+Optional `diagnostic-transfer-profile` records large-response TLS encryption
+steps separately from total queued-response elapsed time and identifies the
+negotiated cipher suite. It changes neither cipher selection nor authority;
+all clocks remain untrusted observations. It is disabled by default. Native
+TLS tests use stderr for these diagnostics; SGX uses the registered OCALL log.
+The initial native attempt failed on the missing macro import, and then on an
+unregistered native logging table; both failures are retained. The corrected
+three-body run passes with profiling enabled. Parent diagnostic images opt in
+through their existing guarded `transfer-profile` feature.
