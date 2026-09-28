@@ -83,3 +83,9 @@ checks the threshold, short tail, duplicate suppression, overflow and ordered
 credit/close notifications. All 27 host tests pass on this working tree; the
 parent records the exact committed build and hardware comparison. This changes
 no wire encoding or enclave authority, and can be compared on the same image.
+
+The same optional profile also attributes queued-response time to adopter
+control opportunities. Counters are saturating and diagnostic only; production
+without this feature performs the original callback with no added clock reads.
+Native TLS session checks still pass; the parent retains actual hardware
+measurements, including time outside both encryption and maintenance.

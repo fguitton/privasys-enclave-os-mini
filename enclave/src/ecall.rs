@@ -514,6 +514,20 @@ impl ControlLoopHook for NoopControlLoopHook {
     }
 }
 
+fn control_opportunity(
+    hook: &mut dyn ControlLoopHook,
+    opportunity: ControlLoopOpportunity,
+) -> ControlLoopAction {
+    #[cfg(feature = "diagnostic-transfer-profile")]
+    {
+        crate::ratls::session::measure_control(|| hook.on_opportunity(opportunity))
+    }
+    #[cfg(not(feature = "diagnostic-transfer-profile"))]
+    {
+        hook.on_opportunity(opportunity)
+    }
+}
+
 fn apply_control_action(action: ControlLoopAction) {
     if action == ControlLoopAction::Shutdown {
         enclave_log_error!("MINI-CONTROL-SHUTDOWN: reason=AdopterHook");
@@ -589,9 +603,10 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
                                     break;
                                 }
                             }
-                            apply_control_action(
-                                hook.on_opportunity(ControlLoopOpportunity::DataChannelProgress),
-                            );
+                            apply_control_action(control_opportunity(
+                                hook,
+                                ControlLoopOpportunity::DataChannelProgress,
+                            ));
                             continue;
                         }
                         if !hook.on_data_channel_message(msg_type, conn_id, payload) {
@@ -627,9 +642,10 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
                             }
                             drop(st);
                         }
-                        apply_control_action(
-                            hook.on_opportunity(ControlLoopOpportunity::DataChannelProgress),
-                        );
+                        apply_control_action(control_opportunity(
+                            hook,
+                            ControlLoopOpportunity::DataChannelProgress,
+                        ));
                     }
                     None => {
                         enclave_log_error!(
@@ -640,13 +656,13 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
                 }
             }
             None => {
-                apply_control_action(hook.on_opportunity(ControlLoopOpportunity::Idle));
+                apply_control_action(control_opportunity(hook, ControlLoopOpportunity::Idle));
                 core::hint::spin_loop();
             }
         }
     }
 
-    let _ = hook.on_opportunity(ControlLoopOpportunity::Shutdown);
+    let _ = control_opportunity(hook, ControlLoopOpportunity::Shutdown);
     crate::signal_shutdown();
     if let Some(state) = crate::try_state() {
         if let Ok(mut st) = state.lock() {

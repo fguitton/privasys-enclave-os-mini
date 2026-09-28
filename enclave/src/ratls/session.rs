@@ -59,12 +59,42 @@ pub struct RaTlsSession {
     fido2_identity: Option<FidoIdentity>,
 }
 
+#[cfg(feature = "diagnostic-transfer-profile")]
+static CONTROL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "diagnostic-transfer-profile")]
+static CONTROL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(all(feature = "diagnostic-transfer-profile", target_env = "sgx"))]
+pub(crate) fn measure_control<T>(action: impl FnOnce() -> T) -> T {
+    use std::sync::atomic::Ordering;
+    let start = std::time::Instant::now();
+    let result = action();
+    let elapsed = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let _ = CONTROL_NS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+        Some(old.saturating_add(elapsed))
+    });
+    let _ = CONTROL_CALLS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+        Some(old.saturating_add(1))
+    });
+    result
+}
+
+#[cfg(feature = "diagnostic-transfer-profile")]
+fn control_cost() -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        CONTROL_NS.load(Ordering::Relaxed),
+        CONTROL_CALLS.load(Ordering::Relaxed),
+    )
+}
+
 /// Own the admitted body once, and encrypt at most 32 KiB per control turn.
 /// HTTP and TLS never materialize additional whole-body copies.
 #[cfg(feature = "diagnostic-transfer-profile")]
 struct ResponseCost {
     started: std::time::Instant,
     encryption_ns: u128,
+    control_at_open: (u64, u64),
     steps: u64,
     tls_bytes: usize,
 }
@@ -319,6 +349,7 @@ impl RaTlsSession {
             cost: (body.len() >= 1024 * 1024).then(|| ResponseCost {
                 started: std::time::Instant::now(),
                 encryption_ns: 0,
+                control_at_open: control_cost(),
                 steps: 0,
                 tls_bytes: 0,
             }),
@@ -364,10 +395,13 @@ impl RaTlsSession {
         if response.offset == response.body.len() {
             #[cfg(feature = "diagnostic-transfer-profile")]
             if let Some(cost) = response.cost {
+                let control = control_cost();
                 let message = format!(
-                    "MINI-BOUNDED-COST body_bytes={} tls_bytes={} steps={} encrypt_ns={} span_ns={} suite={:?} clock=UNTRUSTED-DIAGNOSTIC",
+                    "MINI-BOUNDED-COST body_bytes={} tls_bytes={} steps={} encrypt_ns={} span_ns={} control_ns={} control_calls={} suite={:?} clock=UNTRUSTED-DIAGNOSTIC",
                     response.body.len(), cost.tls_bytes, cost.steps, cost.encryption_ns,
-                    cost.started.elapsed().as_nanos(), self.tls_conn.negotiated_cipher_suite().map(|suite| suite.suite())
+                    cost.started.elapsed().as_nanos(),
+                    control.0.saturating_sub(cost.control_at_open.0),
+                    control.1.saturating_sub(cost.control_at_open.1), self.tls_conn.negotiated_cipher_suite().map(|suite| suite.suite())
                 );
                 #[cfg(target_env = "sgx")]
                 enclave_os_common::enclave_log_info!("{}", message);
