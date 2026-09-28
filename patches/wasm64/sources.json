@@ -2,8 +2,8 @@
   {
     "name": "wasmtime",
     "url": "https://github.com/fguitton/honest-wasmtime",
-    "revision": "6283b30763ad65427205fb00ee321185259deb06",
-    "files_sha256": "49f2bfa9b7e3970608f3690d61a9c608063b7b8acf52f29c7f917550a3db197f"
+    "revision": "8394beddfe533f17f836c04a52aefc4b188f009e",
+    "files_sha256": "2d137499fb40e292a67dbed342fc2abf267e76592d224a4f361238e76f450578"
   },
   {
     "name": "wasm-tools",

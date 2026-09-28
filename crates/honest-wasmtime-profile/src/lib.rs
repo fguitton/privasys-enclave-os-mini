@@ -47,7 +47,7 @@ pub fn new_store<T: 'static>(engine: &wasmtime::Engine, data: T) -> wasmtime::St
 pub const PROFILE_ID: &str = "honest-s2-x86_64-sgx-memory64-v2";
 /// Pinned Wasmtime source used by both complementary build roles: the
 /// memory64 fork revision that `patches/wasm64/sources.json` pins.
-pub const WASMTIME_COMMIT: &str = "6283b30763ad65427205fb00ee321185259deb06";
+pub const WASMTIME_COMMIT: &str = "8394beddfe533f17f836c04a52aefc4b188f009e";
 /// Explicit AOT target. Supplying it disables host-native feature inference.
 pub const TARGET_TRIPLE: &str = "x86_64-unknown-linux-gnu";
 /// Conservative x86-64 baseline: architectural SSE2 only, no inferred extras.
@@ -476,9 +476,9 @@ mod tests {
         assert_eq!(
             profile_digest(),
             [
-                0xaa, 0xe3, 0x56, 0xd3, 0x90, 0xbd, 0x7b, 0xad, 0xf0, 0x7a, 0x83, 0xb7, 0x33, 0xa6,
-                0xca, 0x29, 0xb3, 0xa0, 0x69, 0x1d, 0x95, 0x50, 0xe1, 0xf3, 0xea, 0x97, 0x66, 0x7d,
-                0x40, 0x9e, 0x7e, 0xb6
+                0x3f, 0xf0, 0x0e, 0xb9, 0xe8, 0x4c, 0x2d, 0x02, 0x8b, 0xf0, 0x5b, 0xc1, 0x27, 0x80,
+                0xb3, 0xb1, 0x9a, 0xf7, 0xc9, 0x22, 0xce, 0xaf, 0x92, 0xf3, 0x8e, 0x4e, 0x6c, 0x66,
+                0xfa, 0x9d, 0x07, 0xf6
             ]
         );
     }
