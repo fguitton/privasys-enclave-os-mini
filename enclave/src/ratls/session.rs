@@ -321,17 +321,18 @@ impl RaTlsSession {
         self.require_current_configuration()?;
         let mut response = self.response.take().ok_or("no pending response")?;
         let mut output = Vec::new();
+        let mut remaining = 32 * 1024;
         if !response.head.is_empty() {
             self.write_plaintext_chunked(&response.head, &mut output)?;
+            remaining -= response.head.len();
             response.head.clear();
-        } else {
-            let end = response
-                .body
-                .len()
-                .min(response.offset.saturating_add(32 * 1024));
-            self.write_plaintext_chunked(&response.body[response.offset..end], &mut output)?;
-            response.offset = end;
         }
+        let end = response
+            .body
+            .len()
+            .min(response.offset.saturating_add(remaining));
+        self.write_plaintext_chunked(&response.body[response.offset..end], &mut output)?;
+        response.offset = end;
         output.extend_from_slice(&self.collect_tls_output()?);
         if output.len() > 64 * 1024 {
             return Err("bounded TLS response exceeded credit");

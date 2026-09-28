@@ -25,8 +25,8 @@
 //! separate RPC channel.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
 use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet};
 use std::string::String;
 use std::sync::Arc;
 use std::vec::Vec;
@@ -95,6 +95,9 @@ pub struct IngressServer {
     sessions: BTreeMap<u32, SessionState>,
     write_windows: RefCell<BTreeMap<u32, channel::TcpWriteWindow>>,
     output_cursor: u32,
+    /// One deferred parse turn after a response completes, including a small
+    /// response completed synchronously during dispatch.
+    pending_dispatch: BTreeSet<u32>,
     /// Enclave-visible route class for each multiplexed TLS connection.
     /// This remains routing metadata and never substitutes for authorization.
     ingress_classes: BTreeMap<u32, enclave_os_common::modules::IngressClass>,
@@ -148,6 +151,7 @@ impl IngressServer {
             sessions: BTreeMap::new(),
             write_windows: RefCell::new(BTreeMap::new()),
             output_cursor: 0,
+            pending_dispatch: BTreeSet::new(),
             ingress_classes: BTreeMap::new(),
             ca,
             data_tx,
@@ -201,6 +205,7 @@ impl IngressServer {
                 });
                 if !valid {
                     self.sessions.remove(&conn_id);
+                    self.pending_dispatch.remove(&conn_id);
                     self.ingress_classes.remove(&conn_id);
                     self.write_windows.borrow_mut().remove(&conn_id);
                     self.send_close(conn_id);
@@ -211,6 +216,7 @@ impl IngressServer {
             }
 
             ChannelMsgType::TcpClose => {
+                self.pending_dispatch.remove(&conn_id);
                 self.ingress_classes.remove(&conn_id);
                 self.write_windows.borrow_mut().remove(&conn_id);
                 if let Some(state) = self.sessions.remove(&conn_id) {
@@ -275,7 +281,7 @@ impl IngressServer {
         // Round robin among response producers. A slow socket cannot prevent
         // another connection or the control hook from making bounded progress.
         let eligible = |id: &u32, state: &SessionState| {
-            matches!(state, SessionState::Established(session) if session.has_pending_response())
+            matches!(state, SessionState::Established(session) if session.has_pending_response() || self.pending_dispatch.contains(id))
                 && self
                     .write_windows
                     .borrow()
@@ -298,7 +304,27 @@ impl IngressServer {
         let Some(SessionState::Established(mut session)) = self.sessions.remove(&conn_id) else {
             return false;
         };
-        let keep = match session.progress_http_response() {
+        let keep = if session.has_pending_response() {
+            self.flush_response(conn_id, &mut session)
+        } else {
+            self.dispatch_requests(conn_id, &mut session)
+        };
+        if keep {
+            self.sessions
+                .insert(conn_id, SessionState::Established(session));
+        } else {
+            self.pending_dispatch.remove(&conn_id);
+            self.write_windows.borrow_mut().remove(&conn_id);
+            self.ingress_classes.remove(&conn_id);
+        }
+        true
+    }
+
+    /// Produce at most 32 KiB of plaintext and 64 KiB of TLS. Small control
+    /// replies complete in the dispatch turn, before a later hook can retire
+    /// their configuration. Every write still requires the current lease.
+    fn flush_response(&mut self, conn_id: u32, session: &mut RaTlsSession) -> bool {
+        match session.progress_http_response() {
             Ok((bytes, close, shutdown)) => {
                 if !bytes.is_empty() {
                     self.send_to_proxy(conn_id, &bytes);
@@ -308,25 +334,19 @@ impl IngressServer {
                 }
                 if close || shutdown {
                     self.send_close(conn_id);
-                    false
-                } else {
-                    session.has_pending_response() || self.dispatch_requests(conn_id, &mut session)
+                    return false;
                 }
+                if !session.has_pending_response() {
+                    self.pending_dispatch.insert(conn_id);
+                }
+                true
             }
             Err(error) => {
                 enclave_log_error!("bounded response failed conn_id={}: {}", conn_id, error);
                 self.send_close(conn_id);
                 false
             }
-        };
-        if keep {
-            self.sessions
-                .insert(conn_id, SessionState::Established(session));
-        } else {
-            self.write_windows.borrow_mut().remove(&conn_id);
-            self.ingress_classes.remove(&conn_id);
         }
-        true
     }
 
     /// Invalidate cached cert for a hostname (called when an app is
@@ -464,6 +484,7 @@ impl IngressServer {
 
     /// Process all complete HTTP/1.1 requests from a session.
     fn dispatch_requests(&mut self, conn_id: u32, session: &mut RaTlsSession) -> bool {
+        self.pending_dispatch.remove(&conn_id);
         if session.has_pending_response() {
             return true;
         }
@@ -539,7 +560,12 @@ impl IngressServer {
                     self.send_close(conn_id);
                     return false;
                 }
-                return true;
+                let credit = self
+                    .write_windows
+                    .borrow()
+                    .get(&conn_id)
+                    .is_some_and(|window| window.available() >= 64 * 1024);
+                return !credit || self.flush_response(conn_id, session);
             }
             Ok(None) => return true, // no more complete requests
             Err(e) => {

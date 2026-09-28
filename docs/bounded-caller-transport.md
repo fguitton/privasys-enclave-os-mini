@@ -42,3 +42,16 @@ These are development observations, not exact-commit or physical qualification.
 The parent branch's `docs/bounded-caller-delivery.md` records final commits,
 commands, failures, measurements and remaining work. Full physical matrix and
 SIM integration are NOT-RUN at this checkpoint.
+
+The first parent's tier-3 run exposed a deferred-control-reply regression:
+recovery activation retires its certificate at the next adopter hook, and a
+reply deferred across that hook correctly fails configuration currentness.
+Small replies now emit their complete bounded TLS flight during dispatch;
+large replies emit at most 32 KiB of plaintext then continue on write credit.
+A separate one-turn pending-dispatch set preserves pipelined request progress
+without recursive dispatch or an unbounded synchronous loop. Configuration
+revocation before a write still rejects it. Existing TLS session predicates
+include the complete small-reply oracle followed by a configuration replacement,
+as well as revocation partway through the 5 MiB response. Three selected bodies
+PASS in `bounded-tls-control-turn.log` under the parent's private evidence root;
+SIM integration of this correction is still pending at this commit.

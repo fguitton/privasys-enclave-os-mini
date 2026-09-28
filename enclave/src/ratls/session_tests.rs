@@ -219,4 +219,31 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
     assert!(b.progress_http_response().is_err());
     assert!(!b.has_pending_response());
     assert!(b.collect_tls_output().unwrap().is_empty());
+
+    // A bounded control reply fits in its dispatch turn. A configuration
+    // transition at the next hook cannot truncate that already written reply,
+    // while subsequent traffic on the old lease is still rejected.
+    register(&store, "control.test");
+    let (mut client, mut control) = pair(&store, "control.test");
+    handshake(&mut client, &mut control);
+    let body = b"{\"runtime_active\":true}";
+    control
+        .queue_http_response(200, "application/json", &[], body.to_vec(), false, false)
+        .unwrap();
+    let (flight, close, shutdown) = control.progress_http_response().unwrap();
+    assert!(!control.has_pending_response());
+    assert!(!close && !shutdown);
+    client.read_tls(&mut Cursor::new(flight)).unwrap();
+    client.process_new_packets().unwrap();
+    let mut received = [0; 1024];
+    let count = std::io::Read::read(&mut client.reader(), &mut received).unwrap();
+    assert_eq!(
+        &received[..count],
+        &enclave_os_common::protocol::format_http_response(200, body, false)
+    );
+    register(&store, "control.test");
+    assert!(control
+        .queue_http_response(200, "application/json", &[], vec![1], false, false)
+        .is_err());
+    assert!(control.collect_tls_output().unwrap().is_empty());
 }
