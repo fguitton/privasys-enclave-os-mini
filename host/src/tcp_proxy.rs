@@ -1122,6 +1122,8 @@ impl TcpProxy {
                 MAX_PENDING_TO_ENCLAVE
             );
             self.shutdown.store(true, Ordering::Release);
+            // RPC consumers may be asleep when the proxy fails closed.
+            crate::ocall_impl::ocall_notify();
             return;
         }
         self.pending_to_enclave_bytes += message.len();

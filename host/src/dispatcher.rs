@@ -12,9 +12,8 @@
 //! # Threading model
 //!
 //! The dispatcher runs on a dedicated host thread (or the main thread).
-//! It spin-polls the `enc_to_host` queue with exponential backoff.
-//! When the enclave calls `ocall_notify()`, the host can optionally
-//! wake immediately, but spinning is fine for high-throughput workloads.
+//! It drains the `enc_to_host` queue, then waits on a retained wake signal.
+//! Queue publication and shutdown notify both independent dispatchers.
 
 use log::{debug, error, info, trace, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,6 +22,7 @@ use std::sync::Arc;
 use enclave_os_common::queue::{SpscConsumer, SpscProducer};
 use enclave_os_common::rpc::{self, HonestRpcIdentity, RpcMethod, RpcRole};
 
+use crate::dispatcher_wake::DispatcherWake;
 use crate::kvstore;
 use crate::net;
 
@@ -59,6 +59,7 @@ pub struct RpcDispatcher {
     response_tx: SpscProducer,
     /// Shutdown flag.
     shutdown: Arc<AtomicBool>,
+    wake: Arc<DispatcherWake>,
 }
 
 impl RpcDispatcher {
@@ -72,12 +73,14 @@ impl RpcDispatcher {
         request_rx: SpscConsumer,
         response_tx: SpscProducer,
         shutdown: Arc<AtomicBool>,
+        wake: Arc<DispatcherWake>,
     ) -> Self {
         Self {
             role,
             request_rx,
             response_tx,
             shutdown,
+            wake,
         }
     }
 
@@ -85,10 +88,8 @@ impl RpcDispatcher {
     pub fn run(&self) {
         info!("{} RPC dispatcher started", role_name(self.role));
 
-        let mut backoff = Backoff::new();
-
         loop {
-            if self.shutdown.load(Ordering::Relaxed) {
+            if self.shutdown.load(Ordering::Acquire) {
                 info!(
                     "{} RPC dispatcher: shutdown requested",
                     role_name(self.role)
@@ -98,11 +99,10 @@ impl RpcDispatcher {
 
             match self.request_rx.try_recv() {
                 Some(msg) => {
-                    backoff.reset();
                     self.dispatch(&msg);
                 }
                 None => {
-                    backoff.spin();
+                    self.wake.wait(self.role, &self.shutdown);
                 }
             }
         }
@@ -247,7 +247,7 @@ impl RpcDispatcher {
             // ---- Lifecycle ----
             RpcMethod::Shutdown => {
                 info!("RPC: Shutdown requested by enclave");
-                self.shutdown.store(true, Ordering::Relaxed);
+                self.wake.shutdown(&self.shutdown);
                 (0, Vec::new())
             }
         }
@@ -548,42 +548,6 @@ impl RpcDispatcher {
     }
 }
 
-// ---------------------------------------------------------------------------
-//  Exponential backoff spinner
-// ---------------------------------------------------------------------------
-
-/// Simple exponential backoff for the polling loop.
-struct Backoff {
-    spin_count: u32,
-}
-
-impl Backoff {
-    fn new() -> Self {
-        Self { spin_count: 0 }
-    }
-
-    fn reset(&mut self) {
-        self.spin_count = 0;
-    }
-
-    fn spin(&mut self) {
-        if self.spin_count < 6 {
-            // Hot spin with CPU hint (1-64 iterations)
-            for _ in 0..(1 << self.spin_count) {
-                core::hint::spin_loop();
-            }
-            self.spin_count += 1;
-        } else if self.spin_count < 10 {
-            // Yield to OS scheduler
-            std::thread::yield_now();
-            self.spin_count += 1;
-        } else {
-            // Sleep briefly (1ms) — the enclave will call ocall_notify to wake us
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicBool;
@@ -645,6 +609,7 @@ mod tests {
             request_rx,
             response_tx,
             Arc::new(AtomicBool::new(false)),
+            Arc::new(crate::dispatcher_wake::DispatcherWake::new()),
         );
         let identity = HonestRpcIdentity {
             role: RpcRole::Execution,

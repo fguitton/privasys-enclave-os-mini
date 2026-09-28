@@ -14,6 +14,7 @@ mod c3_endpoints;
 #[cfg(all(target_os = "linux", not(sgx_mode_sim), not(feature = "mock")))]
 mod dcap;
 mod dispatcher;
+mod dispatcher_wake;
 mod enclave;
 mod kvstore;
 mod net;
@@ -28,7 +29,7 @@ use clap::{Parser, ValueEnum};
 use log::{error, info};
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::thread;
 
@@ -414,11 +415,13 @@ fn main() -> Result<()> {
     // Set up shared shutdown flag
     let shutdown = Arc::new(AtomicBool::new(false));
 
-    // Store notify flag for the OCALL handler
-    ocall_impl::set_notify_flag(shutdown.clone());
+    // Install retained notifications before either dispatcher or ECALL starts.
+    let dispatcher_wake = Arc::new(dispatcher_wake::DispatcherWake::new());
+    ocall_impl::set_dispatcher_wake(dispatcher_wake.clone());
 
     // Spawn one named dispatcher per RPC pair.
     let shutdown_clone = shutdown.clone();
+    let wake = dispatcher_wake.clone();
     let control_dispatcher_handle = thread::Builder::new()
         .name("control-rpc-dispatcher".into())
         .spawn(move || {
@@ -427,12 +430,14 @@ fn main() -> Result<()> {
                 control_request_rx,
                 control_response_tx,
                 shutdown_clone,
+                wake,
             );
             dispatcher.run();
         })?;
     info!("Control RPC dispatcher thread started");
 
     let shutdown_clone = shutdown.clone();
+    let wake = dispatcher_wake.clone();
     let execution_dispatcher_handle = thread::Builder::new()
         .name("execution-rpc-dispatcher".into())
         .spawn(move || {
@@ -441,6 +446,7 @@ fn main() -> Result<()> {
                 execution_request_rx,
                 execution_response_tx,
                 shutdown_clone,
+                wake,
             );
             dispatcher.run();
         })?;
@@ -711,7 +717,7 @@ fn main() -> Result<()> {
     let ecall_result = validate_long_lived_ecall_results(control_ret, execution_ret);
 
     // Signal dispatcher and proxy to stop
-    shutdown.store(true, Ordering::Relaxed);
+    dispatcher_wake.shutdown(&shutdown);
 
     // Both long-lived ECALLs have returned through the in-band lifecycle.
     info!("Waiting for control dispatcher thread...");
