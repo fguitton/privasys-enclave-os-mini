@@ -93,3 +93,21 @@ measurements, including time outside both encryption and maintenance.
 The first control-attribution SGX build failed because this custom sysroot
 target does not set `target_env=sgx`. The helper now follows the explicit
 diagnostic feature, matching its call site; the failed build remains evidence.
+
+The linked Intel SDK 2.30 memcpy implementation explains the remaining large
+response cost: when an enclave source and external destination differ modulo
+eight, memcpy_verw performs VERW/MFENCE/LFENCE for each byte. Queue length and
+channel headers naturally create that mismatch. Common's SGX producer now
+stages mismatched large copies in a fixed 4,104-byte, eight-aligned stack buffer,
+matching the destination's low address bits. Every external write still goes
+through the original SDK memcpy; its prefix/tail mitigations remain. There is
+no custom external-store assembly, widened access, padding on the wire, queue
+format change or altered publication ordering. Matching/small copies are direct.
+The compiler barrier preserves this performance choice; correctness and
+mitigation remain intact even if it had no effect.
+
+The existing variable-size queue body covers all 64 source/destination alignment
+pairs at ten lengths, including staging boundaries, and checks both destination
+guards and every byte. Existing wrap, contention, capacity and mutation bodies
+remain unchanged. All 123 common and 27 host bodies pass on the working tree.
+Hardware speed and the linked optimized copy path are checked by the parent.

@@ -212,26 +212,45 @@ impl SpscProducer {
     fn write_bytes(&self, offset: u64, data: &[u8]) {
         let cap = self.capacity as usize;
         let start = (offset & (self.capacity - 1)) as usize;
-        let end = start + data.len();
-
-        if end <= cap {
-            // No wrap
-            unsafe {
-                core::ptr::copy_nonoverlapping(data.as_ptr(), self.buf_ptr.add(start), data.len());
-            }
-        } else {
-            // Wraps around
-            let first_chunk = cap - start;
-            unsafe {
-                core::ptr::copy_nonoverlapping(data.as_ptr(), self.buf_ptr.add(start), first_chunk);
-                core::ptr::copy_nonoverlapping(
-                    data.as_ptr().add(first_chunk),
-                    self.buf_ptr,
-                    data.len() - first_chunk,
-                );
+        let first = data.len().min(cap - start);
+        // The producer's available-space check owns exactly these ring bytes.
+        // Staging changes neither framing nor the Release publication boundary.
+        unsafe {
+            copy_to_shared(&data[..first], self.buf_ptr.add(start));
+            if first < data.len() {
+                copy_to_shared(&data[first..], self.buf_ptr);
             }
         }
     }
+}
+
+/// Copy into an exclusively reserved shared ring segment, without widening
+/// its range. Intel SDK 2.30's memcpy_verw uses per-byte mitigation when source
+/// and destination have different alignment modulo eight. Match that alignment
+/// using a fixed trusted staging buffer; the SDK still handles every external
+/// write, including all unaligned prefix/tail bytes. No mitigation is bypassed.
+///
+/// Safety: `destination` must be writable for exactly data.len() bytes and
+/// must not overlap `data`. This is the same contract as copy_nonoverlapping.
+unsafe fn copy_to_shared(data: &[u8], destination: *mut u8) {
+    #[cfg(any(feature = "sgx", test))]
+    if data.len() >= 64 && ((data.as_ptr() as usize ^ destination as usize) & 7) != 0 {
+        // Chunks have a multiple-of-eight stride; the matching prefix remains
+        // constant. Padding is never written to the ring or made part of a frame.
+        #[repr(align(8))]
+        struct Aligned([u8; 4096 + 8]);
+        let mut staging = Aligned([0; 4096 + 8]);
+        let prefix = destination as usize & 7;
+        for (index, chunk) in data.chunks(4096).enumerate() {
+            staging.0[prefix..prefix + chunk.len()].copy_from_slice(chunk);
+            // Preserve the explicit staging allocation across optimization.
+            // This is a compiler barrier only, not a memory-ordering substitute.
+            let source = core::hint::black_box(staging.0.as_ptr().add(prefix));
+            core::ptr::copy_nonoverlapping(source, destination.add(index * 4096), chunk.len());
+        }
+        return;
+    }
+    core::ptr::copy_nonoverlapping(data.as_ptr(), destination, data.len());
 }
 
 // ---------------------------------------------------------------------------
@@ -673,6 +692,25 @@ mod tests {
 
     #[test]
     fn test_variable_size_messages() {
+        // All alignment pairs, staging boundaries and short tails retain the
+        // exact source bytes and leave both destination guard regions intact.
+        for source_offset in 0..8 {
+            let source: Vec<u8> = (0..8208).map(|i| (i * 31) as u8).collect();
+            for destination_offset in 0..8 {
+                for length in [0, 1, 7, 8, 63, 64, 4095, 4096, 4097, 8193] {
+                    let data = &source[source_offset..source_offset + length];
+                    let mut destination = vec![0xa5; length + 24];
+                    let start = 8 + destination_offset;
+                    unsafe { copy_to_shared(data, destination.as_mut_ptr().add(start)) };
+                    assert!(destination[..start].iter().all(|byte| *byte == 0xa5));
+                    assert_eq!(&destination[start..start + length], data);
+                    assert!(destination[start + length..]
+                        .iter()
+                        .all(|byte| *byte == 0xa5));
+                }
+            }
+        }
+
         let (producer, consumer) = alloc_test_queue(1 << 16); // 64 KiB
         let sizes = [
             0, 1, 7, 15, 16, 31, 32, 63, 64, 127, 128, 255, 256, 500, 1000, 4000,
