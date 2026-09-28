@@ -408,3 +408,9 @@ pub fn run_execution_worker(worker_id: u32) -> i32 {
         }
     }
 }
+
+/// Signed enclave heap capacity, used only to bound local transfer admission.
+/// It does not change consensus authority or advertise available EPC.
+pub fn enclave_heap_bytes() -> usize {
+    sgx_trts::trts::MmLayout::heap_size()
+}

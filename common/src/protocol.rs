@@ -492,6 +492,20 @@ pub fn format_http_response_with_headers(
     body: &[u8],
     close: bool,
 ) -> Vec<u8> {
+    let mut response =
+        format_http_response_head(status, content_type, extra_headers, body.len(), close);
+    response.extend_from_slice(body);
+    response
+}
+
+/// Format only the bounded HTTP head, without copying a potentially large body.
+pub fn format_http_response_head(
+    status: u16,
+    content_type: &str,
+    extra_headers: &[(String, String)],
+    content_length: usize,
+    close: bool,
+) -> Vec<u8> {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -520,17 +534,10 @@ pub fn format_http_response_with_headers(
 
     let header = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}{}\r\n",
-        status,
-        reason,
-        content_type,
-        body.len(),
-        extras,
-        conn_header,
+        status, reason, content_type, content_length, extras, conn_header,
     );
 
-    let mut resp = header.into_bytes();
-    resp.extend_from_slice(body);
-    resp
+    header.into_bytes()
 }
 
 // ---------------------------------------------------------------------------

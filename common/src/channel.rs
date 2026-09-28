@@ -125,6 +125,9 @@ pub enum ChannelMsgType {
     PeerTcpConnected = 0x0A,
     /// Untrusted scheduling tick, conn_id zero and empty payload.
     Tick = 0x0B,
+    /// Enclave opts in with zero before output; host returns the cumulative
+    /// bytes actually written to this socket. Untrusted flow control only.
+    TcpWriteCredit = 0x0C,
 }
 
 /// Bounded, non-sensitive reason for an asynchronous connect failure.
@@ -164,6 +167,7 @@ impl ChannelMsgType {
             0x09 => Some(Self::PeerTcpConnect),
             0x0A => Some(Self::PeerTcpConnected),
             0x0B => Some(Self::Tick),
+            0x0C => Some(Self::TcpWriteCredit),
             _ => None,
         }
     }
@@ -253,6 +257,51 @@ pub fn encode_local_control_new(conn_id: u32) -> Vec<u8> {
 #[inline]
 pub fn encode_tcp_data(conn_id: u32, data: &[u8]) -> Vec<u8> {
     encode_channel_msg(ChannelMsgType::TcpData, conn_id, data)
+}
+
+/// Maximum unacknowledged TLS bytes on an opted-in ingress connection.
+pub const TCP_WRITE_WINDOW: u64 = 2 * 1024 * 1024;
+
+/// Cumulative counters reject replayed, over-issued and overflowing credits.
+/// Credits cannot authenticate data, advance authority or certify durability.
+#[derive(Default, Debug)]
+pub struct TcpWriteWindow {
+    sent: u64,
+    written: u64,
+}
+impl TcpWriteWindow {
+    pub fn available(&self) -> u64 {
+        TCP_WRITE_WINDOW - (self.sent - self.written)
+    }
+    pub fn send(&mut self, bytes: u64) -> bool {
+        if bytes > self.available() {
+            return false;
+        }
+        let Some(next) = self.sent.checked_add(bytes) else {
+            return false;
+        };
+        self.sent = next;
+        true
+    }
+    pub fn acknowledge(&mut self, written: u64) -> bool {
+        if written < self.written || written > self.sent {
+            return false;
+        }
+        self.written = written;
+        true
+    }
+}
+
+pub fn encode_tcp_write_credit(conn_id: u32, written: u64) -> Vec<u8> {
+    encode_channel_msg(
+        ChannelMsgType::TcpWriteCredit,
+        conn_id,
+        &written.to_le_bytes(),
+    )
+}
+
+pub fn decode_tcp_write_credit(payload: &[u8]) -> Option<u64> {
+    Some(u64::from_le_bytes(payload.try_into().ok()?))
 }
 
 /// Convenience: encode a TcpClose message.
@@ -359,6 +408,26 @@ mod tests {
         assert_eq!(typ, ChannelMsgType::TcpData);
         assert_eq!(id, 99);
         assert_eq!(payload, &data[..]);
+        let mut window = TcpWriteWindow::default();
+        assert!(!window.acknowledge(1));
+        assert!(window.send(TCP_WRITE_WINDOW));
+        assert!(!window.send(1));
+        assert!(window.acknowledge(17));
+        assert!(window.acknowledge(17)); // duplicate adds no credit
+        assert_eq!(window.available(), 17);
+        assert!(!window.acknowledge(16));
+        assert!(window.send(17));
+        assert_eq!(window.available(), 0);
+        assert!(!window.acknowledge(TCP_WRITE_WINDOW + 18));
+        let encoded = encode_tcp_write_credit(99, TCP_WRITE_WINDOW);
+        let (kind, id, payload) = decode_channel_msg(&encoded).unwrap();
+        assert_eq!((kind, id), (ChannelMsgType::TcpWriteCredit, 99));
+        assert_eq!(decode_tcp_write_credit(payload), Some(TCP_WRITE_WINDOW));
+        assert!(decode_tcp_write_credit(&[0; 7]).is_none());
+        assert!(decode_tcp_write_credit(&[0; 9]).is_none());
+        window.sent = u64::MAX;
+        window.written = u64::MAX;
+        assert!(!window.send(1));
     }
 
     #[test]

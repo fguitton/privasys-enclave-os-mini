@@ -93,6 +93,8 @@ pub enum IngressShutdownReasonV1 {
 pub struct IngressServer {
     /// Per-connection state, keyed by conn_id from the TCP proxy.
     sessions: BTreeMap<u32, SessionState>,
+    write_windows: RefCell<BTreeMap<u32, channel::TcpWriteWindow>>,
+    output_cursor: u32,
     /// Enclave-visible route class for each multiplexed TLS connection.
     /// This remains routing metadata and never substitutes for authorization.
     ingress_classes: BTreeMap<u32, enclave_os_common::modules::IngressClass>,
@@ -144,6 +146,8 @@ impl IngressServer {
     pub fn new(ca: Arc<CaContext>, data_tx: &'static SpscProducer) -> Self {
         Self {
             sessions: BTreeMap::new(),
+            write_windows: RefCell::new(BTreeMap::new()),
+            output_cursor: 0,
             ingress_classes: BTreeMap::new(),
             ca,
             data_tx,
@@ -175,6 +179,10 @@ impl IngressServer {
                 };
                 enclave_log_info!("New connection conn_id={} from {}", conn_id, peer_addr);
                 self.ingress_classes.insert(conn_id, ingress_class);
+                self.write_windows
+                    .borrow_mut()
+                    .insert(conn_id, channel::TcpWriteWindow::default());
+                self.queue_to_proxy(channel::encode_tcp_write_credit(conn_id, 0));
                 self.sessions.insert(
                     conn_id,
                     SessionState::Pending {
@@ -184,12 +192,27 @@ impl IngressServer {
                 );
             }
 
+            ChannelMsgType::TcpWriteCredit => {
+                let valid = channel::decode_tcp_write_credit(payload).is_some_and(|written| {
+                    self.write_windows
+                        .borrow_mut()
+                        .get_mut(&conn_id)
+                        .is_some_and(|window| window.acknowledge(written))
+                });
+                if !valid {
+                    self.sessions.remove(&conn_id);
+                    self.ingress_classes.remove(&conn_id);
+                    self.write_windows.borrow_mut().remove(&conn_id);
+                    self.send_close(conn_id);
+                }
+            }
             ChannelMsgType::TcpData => {
                 self.handle_tcp_data(conn_id, payload);
             }
 
             ChannelMsgType::TcpClose => {
                 self.ingress_classes.remove(&conn_id);
+                self.write_windows.borrow_mut().remove(&conn_id);
                 if let Some(state) = self.sessions.remove(&conn_id) {
                     if let SessionState::Established(mut session)
                     | SessionState::Handshaking(mut session) = state
@@ -236,17 +259,73 @@ impl IngressServer {
     /// Flush at most one queued enclave→host channel message.
     ///
     /// This is called from Mini's control loop during bounded idle progress.
-    pub fn progress_output(&self) -> bool {
-        let mut pending = self.pending_output.borrow_mut();
-        let Some(message) = pending.front() else {
+    pub fn progress_output(&mut self) -> bool {
+        {
+            let mut pending = self.pending_output.borrow_mut();
+            if let Some(message) = pending.front() {
+                if self.data_tx.try_send(message).is_err() {
+                    return false;
+                }
+                let sent = pending.pop_front().expect("front existed");
+                self.pending_output_bytes
+                    .set(self.pending_output_bytes.get() - sent.len());
+                return true;
+            }
+        }
+        // Round robin among response producers. A slow socket cannot prevent
+        // another connection or the control hook from making bounded progress.
+        let eligible = |id: &u32, state: &SessionState| {
+            matches!(state, SessionState::Established(session) if session.has_pending_response())
+                && self
+                    .write_windows
+                    .borrow()
+                    .get(id)
+                    .is_some_and(|window| window.available() >= 64 * 1024)
+        };
+        let next = self
+            .sessions
+            .range((
+                std::ops::Bound::Excluded(self.output_cursor),
+                std::ops::Bound::Unbounded,
+            ))
+            .find(|(id, state)| eligible(id, state))
+            .or_else(|| self.sessions.iter().find(|(id, state)| eligible(id, state)))
+            .map(|(id, _)| *id);
+        let Some(conn_id) = next else {
             return false;
         };
-        if self.data_tx.try_send(message).is_err() {
+        self.output_cursor = conn_id;
+        let Some(SessionState::Established(mut session)) = self.sessions.remove(&conn_id) else {
             return false;
+        };
+        let keep = match session.progress_http_response() {
+            Ok((bytes, close, shutdown)) => {
+                if !bytes.is_empty() {
+                    self.send_to_proxy(conn_id, &bytes);
+                }
+                if shutdown {
+                    self.shutdown = true;
+                }
+                if close || shutdown {
+                    self.send_close(conn_id);
+                    false
+                } else {
+                    session.has_pending_response() || self.dispatch_requests(conn_id, &mut session)
+                }
+            }
+            Err(error) => {
+                enclave_log_error!("bounded response failed conn_id={}: {}", conn_id, error);
+                self.send_close(conn_id);
+                false
+            }
+        };
+        if keep {
+            self.sessions
+                .insert(conn_id, SessionState::Established(session));
+        } else {
+            self.write_windows.borrow_mut().remove(&conn_id);
+            self.ingress_classes.remove(&conn_id);
         }
-        let sent = pending.pop_front().expect("front existed");
-        self.pending_output_bytes
-            .set(self.pending_output_bytes.get() - sent.len());
         true
     }
 
@@ -385,45 +464,48 @@ impl IngressServer {
 
     /// Process all complete HTTP/1.1 requests from a session.
     fn dispatch_requests(&mut self, conn_id: u32, session: &mut RaTlsSession) -> bool {
+        if session.has_pending_response() {
+            return true;
+        }
         // Capture both v2 proof legs from this enclave-resident TLS session.
         //
         // OIDC claims are populated per-request in handle_http_request()
         // because different requests in the same session may carry
         // different tokens (or none — e.g. GET /healthz).
-        loop {
-            match session.recv_http_request() {
-                Ok(Some(http_req)) => {
-                    let mut close = http_req.connection_close;
-                    if session.attestation_failed() {
-                        self.send_close(conn_id);
-                        return false;
-                    }
-                    // RA-TLS v2 evidence endpoint: served here, where the TLS
-                    // session (its exporter, its peer certificate) is at hand.
-                    // Every other request sees the peer evidence accepted so
-                    // far on this connection and the connection's tag.
-                    let result = if http_req.path == enclave_os_common::attest::ATTEST_PATH {
-                        let result = self.handle_attest(session, &http_req);
-                        if result.status >= 400 {
-                            session.fail_attestation();
-                            close = true;
-                        }
-                        result
-                    } else if (session.server_name()
-                        == Some(enclave_os_common::modules::HONEST_PEER_SNI)
-                        || session
-                            .peer_cert_der()
-                            .is_some_and(|der| leaf_claims_enclave_identity(&der)))
-                        && session.peer_evidence().is_none()
-                    {
+        match session.recv_http_request() {
+            Ok(Some(http_req)) => {
+                let mut close = http_req.connection_close;
+                if session.attestation_failed() {
+                    self.send_close(conn_id);
+                    return false;
+                }
+                // RA-TLS v2 evidence endpoint: served here, where the TLS
+                // session (its exporter, its peer certificate) is at hand.
+                // Every other request sees the peer evidence accepted so
+                // far on this connection and the connection's tag.
+                let result = if http_req.path == enclave_os_common::attest::ATTEST_PATH {
+                    let result = self.handle_attest(session, &http_req);
+                    if result.status >= 400 {
                         session.fail_attestation();
                         close = true;
-                        HttpHandleResult::err(
-                            403,
-                            "mutual evidence required before application traffic",
-                        )
-                    } else {
-                        let base_ctx = enclave_os_common::modules::RequestContext {
+                    }
+                    result
+                } else if (session.server_name()
+                    == Some(enclave_os_common::modules::HONEST_PEER_SNI)
+                    || session
+                        .peer_cert_der()
+                        .is_some_and(|der| leaf_claims_enclave_identity(&der)))
+                    && session.peer_evidence().is_none()
+                {
+                    session.fail_attestation();
+                    close = true;
+                    HttpHandleResult::err(
+                        403,
+                        "mutual evidence required before application traffic",
+                    )
+                } else {
+                    let base_ctx =
+                        enclave_os_common::modules::RequestContext {
                             ingress_class: self.ingress_classes.get(&conn_id).copied().unwrap_or(
                                 enclave_os_common::modules::IngressClass::ExternalNetwork,
                             ),
@@ -438,60 +520,39 @@ impl IngressServer {
                             attestation: session.attestation().to_string(),
                             oidc_claims: None,
                         };
-                        handle_http_request_with_session(&http_req, &base_ctx)
-                    };
+                    handle_http_request_with_session(&http_req, &base_ctx)
+                };
 
-                    // Send HTTP response
-                    let send_close = close || result.shutdown;
-                    let ct = result.content_type.as_deref().unwrap_or("application/json");
-                    match session.send_http_response_with_headers(
-                        result.status,
-                        ct,
-                        &result.extra_headers,
-                        &result.body,
-                        send_close,
-                    ) {
-                        Ok(tls_bytes) => {
-                            if !tls_bytes.is_empty() {
-                                self.send_to_proxy(conn_id, &tls_bytes);
-                            }
-                        }
-                        Err(e) => {
-                            enclave_log_error!(
-                                "send_http_response failed conn_id={}: {}",
-                                conn_id,
-                                e
-                            );
-                            self.send_close(conn_id);
-                            return false;
-                        }
-                    }
-
-                    if result.shutdown {
-                        enclave_log_info!("Shutdown requested by conn_id={}", conn_id);
-                        self.shutdown = true;
-                        self.send_close(conn_id);
-                        return false;
-                    }
-
-                    if close {
-                        self.send_close(conn_id);
-                        return false;
-                    }
-                }
-                Ok(None) => return true, // no more complete requests
-                Err(e) => {
-                    enclave_log_error!("recv_http_request error conn_id={}: {}", conn_id, e);
-                    // Send a 400 Bad Request before closing
-                    let err_body = b"{\"error\":\"malformed request\"}";
-                    if let Ok(tls_bytes) = session.send_http_response(400, err_body, true) {
-                        if !tls_bytes.is_empty() {
-                            self.send_to_proxy(conn_id, &tls_bytes);
-                        }
-                    }
+                // Move the body into a bounded producer; do not construct
+                // either a second HTTP body or a whole-response TLS buffer.
+                let send_close = close || result.shutdown;
+                let ct = result.content_type.as_deref().unwrap_or("application/json");
+                if let Err(error) = session.queue_http_response(
+                    result.status,
+                    ct,
+                    &result.extra_headers,
+                    result.body,
+                    send_close,
+                    result.shutdown,
+                ) {
+                    enclave_log_error!("queue response failed conn_id={}: {}", conn_id, error);
                     self.send_close(conn_id);
                     return false;
                 }
+                return true;
+            }
+            Ok(None) => return true, // no more complete requests
+            Err(e) => {
+                enclave_log_error!("recv_http_request error conn_id={}: {}", conn_id, e);
+                // Send a 400 Bad Request before closing
+                let err_body = b"{\"error\":\"malformed request\"}";
+                if let Ok(tls_bytes) = session.send_http_response(400, err_body, true) {
+                    if !tls_bytes.is_empty() {
+                        self.send_to_proxy(conn_id, &tls_bytes);
+                    }
+                }
+                self.send_close(conn_id);
+                return false;
             }
         }
     }
@@ -639,6 +700,12 @@ impl IngressServer {
     /// `MAX_CHANNEL_PAYLOAD` (1 MiB) — the host-side decoder rejects
     /// anything larger.
     fn send_to_proxy(&self, conn_id: u32, tls_bytes: &[u8]) {
+        if let Some(window) = self.write_windows.borrow_mut().get_mut(&conn_id) {
+            if !window.send(tls_bytes.len() as u64) {
+                self.send_close(conn_id);
+                return;
+            }
+        }
         // Leave room for the 5-byte channel message header.
         const CHUNK: usize = channel::MAX_CHANNEL_PAYLOAD;
         for chunk in tls_bytes.chunks(CHUNK) {

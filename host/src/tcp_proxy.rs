@@ -87,6 +87,7 @@ struct ConnState {
     origin: ConnectionOrigin,
     write_buffer: Vec<u8>,
     write_offset: usize,
+    write_credit: Option<u64>,
     close_after_write: bool,
 }
 
@@ -421,6 +422,7 @@ impl TcpProxy {
                     origin: ConnectionOrigin::Inbound,
                     write_buffer: Vec::new(),
                     write_offset: 0,
+                    write_credit: None,
                     close_after_write: false,
                 },
             );
@@ -464,6 +466,7 @@ impl TcpProxy {
                             origin: ConnectionOrigin::LocalControl,
                             write_buffer: Vec::new(),
                             write_offset: 0,
+                            write_credit: None,
                             close_after_write: false,
                         },
                     );
@@ -639,6 +642,7 @@ impl TcpProxy {
                     origin: ConnectionOrigin::Outbound,
                     write_buffer: Vec::new(),
                     write_offset: 0,
+                    write_credit: None,
                     close_after_write: false,
                 },
             );
@@ -742,6 +746,19 @@ impl TcpProxy {
                         continue;
                     }
                     match channel::decode_channel_msg(&msg) {
+                        Some((ChannelMsgType::TcpWriteCredit, conn_id, payload)) => {
+                            if let Some(conn) = self.connections.get_mut(&conn_id) {
+                                if channel::decode_tcp_write_credit(payload) == Some(0)
+                                    && conn.write_credit.is_none()
+                                    && conn.write_buffer.is_empty()
+                                {
+                                    conn.write_credit = Some(0);
+                                } else {
+                                    self.connections.remove(&conn_id);
+                                    self.send_to_enclave(channel::encode_tcp_close(conn_id));
+                                }
+                            }
+                        }
                         Some((ChannelMsgType::TcpData, conn_id, payload)) => {
                             self.write_to_socket(conn_id, payload);
                         }
@@ -865,7 +882,13 @@ impl TcpProxy {
             })
             .unwrap_or(false);
         if remove_now {
-            self.connections.remove(&conn_id);
+            if self
+                .connections
+                .remove(&conn_id)
+                .is_some_and(|conn| conn.write_credit.is_some())
+            {
+                self.send_to_enclave(channel::encode_tcp_close(conn_id));
+            }
         }
     }
 
@@ -985,6 +1008,7 @@ impl TcpProxy {
                         origin,
                         write_buffer: Vec::new(),
                         write_offset: 0,
+                        write_credit: None,
                         close_after_write: false,
                     },
                 );
@@ -1071,6 +1095,7 @@ impl TcpProxy {
 
     fn flush_socket_writes(&mut self) -> bool {
         let mut did_work = false;
+        let mut credits = Vec::new();
         let mut to_close = Vec::new();
         for (&conn_id, conn) in &mut self.connections {
             if matches!(conn.origin, ConnectionOrigin::OutboundConnecting { .. })
@@ -1084,6 +1109,14 @@ impl TcpProxy {
                     to_close.push((conn_id, true));
                 }
                 Ok(written) => {
+                    if let Some(total) = conn.write_credit {
+                        let Some(next) = total.checked_add(written as u64) else {
+                            to_close.push((conn_id, true));
+                            continue;
+                        };
+                        conn.write_credit = Some(next);
+                        credits.push((conn_id, next));
+                    }
                     conn.write_offset += written;
                     conn.last_activity = Instant::now();
                     did_work = true;
@@ -1091,7 +1124,7 @@ impl TcpProxy {
                         conn.write_buffer.clear();
                         conn.write_offset = 0;
                         if conn.close_after_write {
-                            to_close.push((conn_id, false));
+                            to_close.push((conn_id, conn.write_credit.is_some()));
                         }
                     }
                 }
@@ -1101,6 +1134,9 @@ impl TcpProxy {
                     to_close.push((conn_id, true));
                 }
             }
+        }
+        for (conn_id, total) in credits {
+            self.send_to_enclave(channel::encode_tcp_write_credit(conn_id, total));
         }
         for (conn_id, notify_enclave) in to_close {
             self.connections.remove(&conn_id);
@@ -1612,15 +1648,24 @@ mod tests {
                 origin: ConnectionOrigin::Inbound,
                 write_buffer: Vec::new(),
                 write_offset: 0,
+                write_credit: None,
                 close_after_write: false,
             },
         );
 
+        proxy.connections.get_mut(&7).unwrap().write_credit = Some(0);
         proxy.write_to_socket(7, b"encrypted response");
         proxy.close_from_enclave(7);
         assert!(proxy.connections.contains_key(&7));
         assert!(proxy.flush_socket_writes());
         assert!(!proxy.connections.contains_key(&7));
+        let consumer = host_to_enclave.consumer();
+        assert_eq!(
+            consumer.try_recv().unwrap(),
+            channel::encode_tcp_write_credit(7, 18)
+        );
+        assert_eq!(consumer.try_recv().unwrap(), channel::encode_tcp_close(7));
+        assert!(consumer.try_recv().is_none());
 
         let mut received = [0_u8; 18];
         client.read_exact(&mut received).unwrap();

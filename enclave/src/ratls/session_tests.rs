@@ -173,8 +173,50 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
         b"GET /data HTTP/1.1\r\nHost: b.test\r\n\r\n",
     );
     assert!(b.recv_http_request().unwrap().is_some());
-    assert!(!b
-        .send_http_response(200, b"current", false)
-        .unwrap()
-        .is_empty());
+    // Drain a body larger than both old transport caps, without making a
+    // whole-response TLS buffer. Check every byte against an independent
+    // HTTP oracle while the receiver accepts only bounded flights.
+    let body: Vec<u8> = (0..5 * 1024 * 1024).map(|n| (n % 251) as u8).collect();
+    let expected = enclave_os_common::protocol::format_http_response(200, &body, false);
+    b.queue_http_response(200, "application/json", &[], body, false, false)
+        .unwrap();
+    assert!(b
+        .queue_http_response(200, "application/json", &[], vec![], false, false)
+        .is_err());
+    let mut received = Vec::new();
+    while b.has_pending_response() {
+        let (flight, close, shutdown) = b.progress_http_response().unwrap();
+        assert!(flight.len() <= 64 * 1024);
+        assert!(!close && !shutdown);
+        let mut input = Cursor::new(flight);
+        while input.position() < input.get_ref().len() as u64 {
+            b_client.read_tls(&mut input).unwrap();
+            b_client.process_new_packets().unwrap();
+            let mut chunk = [0; 8192];
+            loop {
+                match std::io::Read::read(&mut b_client.reader(), &mut chunk) {
+                    Ok(0) => break,
+                    Ok(count) => received.extend_from_slice(&chunk[..count]),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("read response: {error}"),
+                }
+            }
+        }
+    }
+    assert_eq!(received, expected);
+    b.queue_http_response(
+        200,
+        "application/octet-stream",
+        &[],
+        vec![9; 1024 * 1024],
+        false,
+        false,
+    )
+    .unwrap();
+    assert!(!b.progress_http_response().unwrap().0.is_empty());
+    assert!(b.has_pending_response());
+    assert!(store.unregister("b.test"));
+    assert!(b.progress_http_response().is_err());
+    assert!(!b.has_pending_response());
+    assert!(b.collect_tls_output().unwrap().is_empty());
 }

@@ -36,6 +36,7 @@ pub struct RaTlsSession {
     tls_conn: rustls::ServerConnection,
     /// Accumulation buffer for incomplete application-level frames.
     read_buf: Vec<u8>,
+    response: Option<PendingResponse>,
     /// Exact v2 leaf served on this connection (evidence is exchanged separately).
     local_cert_der: Vec<u8>,
     /// SNI and endpoint identity selected with the served leaf.
@@ -56,6 +57,16 @@ pub struct RaTlsSession {
     /// session.  When present, subsequent requests on this TLS session
     /// are authenticated without tokens.
     fido2_identity: Option<FidoIdentity>,
+}
+
+/// Own the admitted body once, and encrypt at most 32 KiB per control turn.
+/// HTTP and TLS never materialize additional whole-body copies.
+struct PendingResponse {
+    head: Vec<u8>,
+    body: Vec<u8>,
+    offset: usize,
+    close: bool,
+    shutdown: bool,
 }
 
 /// Identity extracted from a successful FIDO2 registration or
@@ -90,6 +101,7 @@ impl RaTlsSession {
         Self {
             tls_conn,
             read_buf: Vec::new(),
+            response: None,
             local_cert_der,
             server_name,
             attested_endpoint,
@@ -266,6 +278,72 @@ impl RaTlsSession {
         Ok(all_output)
     }
 
+    pub fn has_pending_response(&self) -> bool {
+        self.response.is_some()
+    }
+
+    pub fn queue_http_response(
+        &mut self,
+        status: u16,
+        content_type: &str,
+        extra_headers: &[(String, String)],
+        body: Vec<u8>,
+        close: bool,
+        shutdown: bool,
+    ) -> Result<(), &'static str> {
+        self.require_current_configuration()?;
+        if self.response.is_some() {
+            return Err("response already pending");
+        }
+        let head = protocol::format_http_response_head(
+            status,
+            content_type,
+            extra_headers,
+            body.len(),
+            close,
+        );
+        if head.len() > 32 * 1024 {
+            return Err("response headers too large");
+        }
+        self.response = Some(PendingResponse {
+            head,
+            body,
+            offset: 0,
+            close,
+            shutdown,
+        });
+        Ok(())
+    }
+
+    /// Caller reserves 64 KiB of socket credit before each step. Configuration
+    /// revocation is checked even while a previously admitted body is draining.
+    pub fn progress_http_response(&mut self) -> Result<(Vec<u8>, bool, bool), &'static str> {
+        self.require_current_configuration()?;
+        let mut response = self.response.take().ok_or("no pending response")?;
+        let mut output = Vec::new();
+        if !response.head.is_empty() {
+            self.write_plaintext_chunked(&response.head, &mut output)?;
+            response.head.clear();
+        } else {
+            let end = response
+                .body
+                .len()
+                .min(response.offset.saturating_add(32 * 1024));
+            self.write_plaintext_chunked(&response.body[response.offset..end], &mut output)?;
+            response.offset = end;
+        }
+        output.extend_from_slice(&self.collect_tls_output()?);
+        if output.len() > 64 * 1024 {
+            return Err("bounded TLS response exceeded credit");
+        }
+        if response.offset == response.body.len() {
+            Ok((output, response.close, response.shutdown))
+        } else {
+            self.response = Some(response);
+            Ok((output, false, false))
+        }
+    }
+
     /// Drain all available decrypted plaintext from the TLS reader into
     /// the internal accumulation buffer.
     fn drain_plaintext(&mut self) -> Result<(), &'static str> {
@@ -275,7 +353,12 @@ impl RaTlsSession {
             use std::io::Read;
             match reader.read(&mut buf) {
                 Ok(0) => break,
-                Ok(n) => self.read_buf.extend_from_slice(&buf[..n]),
+                Ok(n) => {
+                    if self.read_buf.len().saturating_add(n) > protocol::MAX_BODY_SIZE + 64 * 1024 {
+                        return Err("pending HTTP input exceeded bound");
+                    }
+                    self.read_buf.extend_from_slice(&buf[..n]);
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) => {
                     enclave_log_error!("reader.read error: kind={:?} msg={}", e.kind(), e);
@@ -474,6 +557,7 @@ impl RaTlsSession {
             self.fail_attestation();
             self.fido2_identity = None;
             self.read_buf.clear();
+            self.response = None;
             return Err("certificate configuration changed; reconnect required");
         }
         Ok(())
