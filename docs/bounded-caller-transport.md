@@ -89,3 +89,7 @@ control opportunities. Counters are saturating and diagnostic only; production
 without this feature performs the original callback with no added clock reads.
 Native TLS session checks still pass; the parent retains actual hardware
 measurements, including time outside both encryption and maintenance.
+
+The first control-attribution SGX build failed because this custom sysroot
+target does not set `target_env=sgx`. The helper now follows the explicit
+diagnostic feature, matching its call site; the failed build remains evidence.

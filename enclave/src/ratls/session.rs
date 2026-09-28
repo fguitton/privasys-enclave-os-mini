@@ -64,8 +64,8 @@ static CONTROL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 #[cfg(feature = "diagnostic-transfer-profile")]
 static CONTROL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-#[cfg(all(feature = "diagnostic-transfer-profile", target_env = "sgx"))]
-pub(crate) fn measure_control<T>(action: impl FnOnce() -> T) -> T {
+#[cfg(feature = "diagnostic-transfer-profile")]
+pub fn measure_control<T>(action: impl FnOnce() -> T) -> T {
     use std::sync::atomic::Ordering;
     let start = std::time::Instant::now();
     let result = action();
