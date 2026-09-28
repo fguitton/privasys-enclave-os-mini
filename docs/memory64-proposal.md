@@ -1,7 +1,8 @@
 # Shared memory64 component profile
 
-The `feat/wasm64-pipeline` branch changes the canonical profile to
-`honest-s2-x86_64-sgx-memory64-v1`, schema 3. Both complementary Cargo roles use
+The canonical profile is `honest-s2-x86_64-sgx-memory64-v2`, schema 3. It pins
+the Wasmtime fork at its v49.0.1 backports, whose fuel fixes the fuel schedule
+`wasmtime-47-default-fuel-v2` names. Both complementary Cargo roles use
 identical descriptor bytes. Memory64 canonical pointers/layouts, the patched
 source manifest, movable memory and a 1-TiB per-memory ceiling are authenticated.
 The initial reservation remains 4 MiB, with 1 MiB growth headroom. Fuel, epochs,
