@@ -47,8 +47,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// (the enclave emits its TLS ClientHello before the connect completes).
 const MAX_PENDING_CONNECT_WRITE: usize = 256 * 1024;
 
-/// Raft tick cadence (sent to the enclave when a peer port is set).
+/// Scheduling hint cadence shared with the adopter.
 const TICK_INTERVAL: Duration = Duration::from_millis(channel::SCHEDULING_TICK_INTERVAL_MILLIS);
+
+fn scheduling_tick_due(elapsed: Duration, congested: bool) -> bool {
+    !congested && elapsed >= TICK_INTERVAL
+}
 
 /// Errno for a non-blocking connect in progress. The host only runs on
 /// Linux (SGX); `WouldBlock` covers other platforms as a fallback.
@@ -194,7 +198,7 @@ pub struct TcpProxy {
     /// Bounded credit backlog when the enclave's SPSC queue is full.
     pending_to_enclave: VecDeque<Vec<u8>>,
     pending_to_enclave_bytes: usize,
-    /// Last raft tick sent (peer-port mode only).
+    /// Last scheduling tick offered, including ingress-only deployments.
     last_tick: Instant,
 }
 
@@ -338,7 +342,7 @@ impl TcpProxy {
         }
 
         // Clean up: close all connections
-        for (&conn_id, _) in &self.connections {
+        for &conn_id in self.connections.keys() {
             debug!("Closing connection conn_id={} on shutdown", conn_id);
         }
         self.connections.clear();
@@ -349,7 +353,10 @@ impl TcpProxy {
 
     /// Offer one scheduling tick without building a backlog under backpressure.
     fn send_tick_if_due(&mut self) -> bool {
-        if !self.pending_to_enclave.is_empty() || self.last_tick.elapsed() < TICK_INTERVAL {
+        if !scheduling_tick_due(
+            self.last_tick.elapsed(),
+            !self.pending_to_enclave.is_empty(),
+        ) {
             return false;
         }
         self.send_to_enclave(channel::encode_channel_msg(ChannelMsgType::Tick, 0, &[]));
@@ -1386,6 +1393,11 @@ mod tests {
 
     #[test]
     fn scheduling_ticks_work_without_peer_listener_and_respect_queue_credit() {
+        assert!(!scheduling_tick_due(Duration::ZERO, false));
+        assert!(!scheduling_tick_due(Duration::from_millis(9), false));
+        assert!(scheduling_tick_due(Duration::from_millis(10), false));
+        assert!(scheduling_tick_due(Duration::from_millis(20), false));
+        assert!(!scheduling_tick_due(Duration::from_secs(1), true));
         let mut fixture = TransportFixture::new();
         fixture.proxy.peer_listener = None;
         let due = Instant::now() - TICK_INTERVAL;

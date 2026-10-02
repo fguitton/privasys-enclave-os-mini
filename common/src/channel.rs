@@ -77,7 +77,9 @@ pub const CHANNEL_MSG_HEADER: usize = 5;
 pub const MAX_CHANNEL_PAYLOAD: usize = 1024 * 1024;
 /// Nominal host scheduling cadence. Ticks are untrusted hints, never time
 /// evidence or consensus authority, and may be delayed by queue backpressure.
-pub const SCHEDULING_TICK_INTERVAL_MILLIS: u64 = 100;
+// Ten-millisecond retry hints must not wait for a hundred-millisecond tick.
+// Both host and adopter derive their nominal counter from this exact constant.
+pub const SCHEDULING_TICK_INTERVAL_MILLIS: u64 = 10;
 const CONNECT_REQUEST_ID_BYTES: usize = 8;
 
 // ========================================================================
