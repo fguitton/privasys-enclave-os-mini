@@ -345,6 +345,67 @@ pub enum HttpParseError {
 /// bytes consumed from the front of `buf`, or `Err(Incomplete)` if the
 /// buffer does not yet contain a complete request.
 pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseError> {
+    parse_http_request_with_body_limit(buf, MAX_BODY_SIZE)
+}
+
+/// Parsed request metadata, available before the declared body is buffered.
+///
+/// Parsing a head does not authorize or allocate its body. A transport must
+/// obtain a live, owned resource reservation before exceeding its ordinary
+/// input bound. The request returned by [`Self::request`] has an empty body.
+#[derive(Debug)]
+pub struct HttpRequestHead {
+    request: HttpRequest,
+    header_bytes: usize,
+    body_bytes: usize,
+}
+
+impl HttpRequestHead {
+    pub fn request(&self) -> &HttpRequest {
+        &self.request
+    }
+
+    pub fn header_bytes(&self) -> usize {
+        self.header_bytes
+    }
+
+    pub fn body_bytes(&self) -> usize {
+        self.body_bytes
+    }
+}
+
+/// Parse using a caller-owned resource limit, without changing the default.
+///
+/// `body_limit` must come from trusted admission, never from request headers.
+/// This function copies the complete body; its reservation must account for
+/// both input buffering and the returned body. It does not supply authority,
+/// manage reservations, or enable larger bodies in the RA-TLS server.
+pub fn parse_http_request_with_body_limit(
+    buf: &[u8],
+    body_limit: usize,
+) -> Result<(HttpRequest, usize), HttpParseError> {
+    let head = parse_http_request_head(buf)?;
+    if head.body_bytes > body_limit {
+        return Err(HttpParseError::BodyTooLarge);
+    }
+    let total = head
+        .header_bytes
+        .checked_add(head.body_bytes)
+        .filter(|total| *total <= isize::MAX.unsigned_abs())
+        .ok_or(HttpParseError::BodyTooLarge)?;
+    if buf.len() < total {
+        return Err(HttpParseError::Incomplete);
+    }
+    let mut request = head.request;
+    request.body = buf[head.header_bytes..total].to_vec();
+    Ok((request, total))
+}
+
+/// Decode only request metadata and the declared body length.
+/// No body-sized allocation is made, including for a partial or large body.
+/// Existing method, header-count and header-value parsing stays unchanged.
+/// The transport must separately bound header bytes before calling this parser.
+pub fn parse_http_request_head(buf: &[u8]) -> Result<HttpRequestHead, HttpParseError> {
     let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
     let mut req = httparse::Request::new(&mut headers);
 
@@ -431,23 +492,15 @@ pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseE
         // All other headers are silently ignored.
     }
 
-    // Body
+    // Inspect length only. The caller must admit it before buffering the body.
     let body_len = content_length.unwrap_or(0);
+    header_len
+        .checked_add(body_len)
+        .filter(|total| *total <= isize::MAX.unsigned_abs())
+        .ok_or(HttpParseError::BodyTooLarge)?;
 
-    if body_len > MAX_BODY_SIZE {
-        return Err(HttpParseError::BodyTooLarge);
-    }
-
-    let total = header_len + body_len;
-
-    if buf.len() < total {
-        return Err(HttpParseError::Incomplete);
-    }
-
-    let body = buf[header_len..total].to_vec();
-
-    Ok((
-        HttpRequest {
+    Ok(HttpRequestHead {
+        request: HttpRequest {
             method,
             path,
             authorization,
@@ -456,12 +509,13 @@ pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseE
             privasys_session,
             content_type,
             host,
-            body,
+            body: Vec::new(),
             connection_close,
             edge_terminated,
         },
-        total,
-    ))
+        header_bytes: header_len,
+        body_bytes: body_len,
+    })
 }
 
 /// Format a minimal HTTP/1.1 response.
@@ -636,6 +690,20 @@ mod tests {
         assert_eq!(req.path, "/data");
         assert_eq!(req.body, body);
         assert_eq!(consumed, raw.len());
+        let head = parse_http_request_head(raw.as_bytes()).unwrap();
+        assert_eq!(head.body_bytes(), body.len());
+        assert_eq!(head.header_bytes() + head.body_bytes(), consumed);
+        assert_eq!(head.request().method, HttpMethod::Post);
+        assert_eq!(head.request().path, "/data");
+        assert!(head.request().body.is_empty());
+        assert!(matches!(
+            parse_http_request_with_body_limit(raw.as_bytes(), body.len() - 1),
+            Err(HttpParseError::BodyTooLarge)
+        ));
+        let (bounded, bounded_consumed) =
+            parse_http_request_with_body_limit(raw.as_bytes(), body.len()).unwrap();
+        assert_eq!(bounded.body, body);
+        assert_eq!(bounded_consumed, consumed);
     }
 
     #[test]
@@ -659,6 +727,10 @@ mod tests {
             parse_http_request(raw),
             Err(HttpParseError::Incomplete)
         ));
+        assert!(matches!(
+            parse_http_request_head(raw),
+            Err(HttpParseError::Incomplete)
+        ));
     }
 
     #[test]
@@ -668,6 +740,39 @@ mod tests {
             parse_http_request(raw),
             Err(HttpParseError::Incomplete)
         ));
+        let head = parse_http_request_head(raw).unwrap();
+        assert_eq!(head.body_bytes(), 100);
+        assert!(head.request().body.is_empty());
+        // Only the small header is present. A large declared length must not
+        // allocate its body or silently relax the ordinary parser's limit.
+        for body_len in [MAX_BODY_SIZE, MAX_BODY_SIZE + 1, 69_213_196] {
+            let raw = format!("POST /data HTTP/1.1\r\nContent-Length: {body_len}\r\n\r\n");
+            let head = parse_http_request_head(raw.as_bytes()).unwrap();
+            assert_eq!(head.body_bytes(), body_len);
+            assert!(head.request().body.is_empty());
+            assert_eq!(head.header_bytes(), raw.len());
+            let ordinary = parse_http_request(raw.as_bytes());
+            if body_len <= MAX_BODY_SIZE {
+                assert!(matches!(ordinary, Err(HttpParseError::Incomplete)));
+            } else {
+                assert!(matches!(ordinary, Err(HttpParseError::BodyTooLarge)));
+            }
+            assert!(matches!(
+                parse_http_request_with_body_limit(raw.as_bytes(), body_len),
+                Err(HttpParseError::Incomplete)
+            ));
+        }
+        for body_len in [isize::MAX.unsigned_abs(), usize::MAX] {
+            let raw = format!("POST /data HTTP/1.1\r\nContent-Length: {body_len}\r\n\r\n");
+            assert!(matches!(
+                parse_http_request_head(raw.as_bytes()),
+                Err(HttpParseError::BodyTooLarge)
+            ));
+            assert!(matches!(
+                parse_http_request_with_body_limit(raw.as_bytes(), usize::MAX),
+                Err(HttpParseError::BodyTooLarge)
+            ));
+        }
     }
 
     #[test]
