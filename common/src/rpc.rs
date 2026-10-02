@@ -587,6 +587,12 @@ pub fn decode_kv_multi_get_resp(p: &[u8]) -> Option<Vec<Option<Vec<u8>>>> {
     Some(values)
 }
 
+mod bounded_kv;
+pub use bounded_kv::{
+    bounded_kv_limits_valid, decode_kv_multi_get_resp_bounded, MAX_BOUNDED_KV_BYTES,
+    MAX_BOUNDED_KV_ITEMS,
+};
+
 // -- KvScan --
 /// Request payload:
 /// `[u16 table_len] [table] [u32 limit] [u32 start_len] [start] [end]`
@@ -1093,6 +1099,28 @@ mod tests {
         let encoded = encode_kv_multi_get_resp(&values);
         let decoded = decode_kv_multi_get_resp(&encoded).unwrap();
         assert_eq!(decoded, values);
+        assert_eq!(
+            decode_kv_multi_get_resp_bounded(&encoded, &[2, 1, 1]),
+            Some(values)
+        );
+        for maxima in [&[][..], &[2, 1][..], &[1, 1, 1][..], &[2, 0, 1][..]] {
+            assert!(decode_kv_multi_get_resp_bounded(&encoded, maxima).is_none());
+        }
+        for length in 0..encoded.len() {
+            assert!(decode_kv_multi_get_resp_bounded(&encoded[..length], &[2, 1, 1]).is_none());
+        }
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(decode_kv_multi_get_resp_bounded(&trailing, &[2, 1, 1]).is_none());
+        let mut substituted = encoded;
+        substituted[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_kv_multi_get_resp_bounded(&substituted, &[2, 1, 1]).is_none());
+        assert!(!bounded_kv_limits_valid(&[1; MAX_BOUNDED_KV_ITEMS + 1]));
+        assert!(!bounded_kv_limits_valid(&[usize::MAX]));
+        assert!(!bounded_kv_limits_valid(
+            &[crate::types::KV_MAX_VALUE_SIZE; 2]
+        ));
+        assert!(bounded_kv_limits_valid(&[512 * 1024; 3]));
     }
 
     #[test]

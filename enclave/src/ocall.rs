@@ -109,6 +109,15 @@ pub fn kv_store_multi_get(table: &[u8], keys: &[&[u8]]) -> Result<Vec<Option<Vec
     rpc().kv_multi_get(table, keys)
 }
 
+/// Request-bound batches; missing values remain explicit for the trusted owner.
+pub fn kv_store_multi_get_bounded(
+    table: &[u8],
+    keys: &[&[u8]],
+    maxima: &[usize],
+) -> Result<Vec<Option<Vec<u8>>>, i32> {
+    rpc().kv_multi_get_bounded(table, keys, maxima)
+}
+
 /// Range scan `[start, end)` returning key-value pairs, ascending.
 pub fn kv_store_scan(
     table: &[u8],

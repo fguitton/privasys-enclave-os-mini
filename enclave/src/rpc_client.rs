@@ -510,6 +510,29 @@ impl RpcClient {
         }
     }
 
+    /// Small opaque-value batches with request-bound allocation and shape.
+    pub fn kv_multi_get_bounded(
+        &self,
+        table: &[u8],
+        keys: &[&[u8]],
+        maxima: &[usize],
+    ) -> Result<Vec<Option<Vec<u8>>>, i32> {
+        if table.is_empty()
+            || table.len() > 256
+            || keys.len() != maxima.len()
+            || !rpc::bounded_kv_limits_valid(maxima)
+            || keys.iter().any(|key| key.is_empty() || key.len() > 256)
+        {
+            return Err(-22);
+        }
+        let payload = rpc::encode_kv_multi_get_req(table, keys);
+        let (status, response) = self.call(RpcMethod::KvMultiGet, &payload);
+        if status != 0 {
+            return Err(status);
+        }
+        rpc::decode_kv_multi_get_resp_bounded(&response, maxima).ok_or(-1)
+    }
+
     /// Range scan `[start, end)`, ascending, up to `limit` entries.
     pub fn kv_scan(
         &self,
