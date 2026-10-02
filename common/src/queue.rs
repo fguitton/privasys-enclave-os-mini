@@ -224,6 +224,32 @@ impl SpscProducer {
     }
 }
 
+/// Copy an already bounded shared ring segment into trusted storage. The
+/// linked SDK memcpy uses repeated small external reads when source and
+/// destination alignment modulo eight differ. A fixed trusted staging buffer
+/// matches the source alignment; every external read still uses SDK memcpy.
+/// No padding or additional ring bytes are copied, and publication is unchanged.
+///
+/// Safety: `source` must be readable for exactly out.len() bytes and must not
+/// overlap `out`. The caller retains its existing SPSC reservation and bounds.
+unsafe fn copy_from_shared(source: *const u8, out: &mut [u8]) {
+    #[cfg(any(feature = "sgx", target_vendor = "teaclave", test))]
+    if out.len() >= 64 && ((source as usize ^ out.as_ptr() as usize) & 7) != 0 {
+        #[repr(align(8))]
+        struct Aligned([u8; 4096 + 8]);
+        let mut staging = Aligned([0; 4096 + 8]);
+        let prefix = source as usize & 7;
+        for (index, chunk) in out.chunks_mut(4096).enumerate() {
+            // Preserve the staging allocation and SDK call across optimization.
+            let destination = core::hint::black_box(staging.0.as_mut_ptr().add(prefix));
+            core::ptr::copy_nonoverlapping(source.add(index * 4096), destination, chunk.len());
+            chunk.copy_from_slice(&staging.0[prefix..prefix + chunk.len()]);
+        }
+        return;
+    }
+    core::ptr::copy_nonoverlapping(source, out.as_mut_ptr(), out.len());
+}
+
 /// Copy into an exclusively reserved shared ring segment, without widening
 /// its range. Intel SDK 2.30's memcpy_verw uses per-byte mitigation when source
 /// and destination have different alignment modulo eight. Match that alignment
@@ -342,25 +368,13 @@ impl SpscConsumer {
 
         if end <= cap {
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    self.buf_ptr.add(start),
-                    out.as_mut_ptr(),
-                    out.len(),
-                );
+                copy_from_shared(self.buf_ptr.add(start), out);
             }
         } else {
             let first_chunk = cap - start;
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    self.buf_ptr.add(start),
-                    out.as_mut_ptr(),
-                    first_chunk,
-                );
-                core::ptr::copy_nonoverlapping(
-                    self.buf_ptr,
-                    out.as_mut_ptr().add(first_chunk),
-                    out.len() - first_chunk,
-                );
+                copy_from_shared(self.buf_ptr.add(start), &mut out[..first_chunk]);
+                copy_from_shared(self.buf_ptr, &mut out[first_chunk..]);
             }
         }
     }
@@ -702,6 +716,15 @@ mod tests {
                     let mut destination = vec![0xa5; length + 24];
                     let start = 8 + destination_offset;
                     unsafe { copy_to_shared(data, destination.as_mut_ptr().add(start)) };
+                    assert!(destination[..start].iter().all(|byte| *byte == 0xa5));
+                    assert_eq!(&destination[start..start + length], data);
+                    assert!(destination[start + length..]
+                        .iter()
+                        .all(|byte| *byte == 0xa5));
+                    destination.fill(0xa5);
+                    unsafe {
+                        copy_from_shared(data.as_ptr(), &mut destination[start..start + length]);
+                    }
                     assert!(destination[..start].iter().all(|byte| *byte == 0xa5));
                     assert_eq!(&destination[start..start + length], data);
                     assert!(destination[start + length..]
