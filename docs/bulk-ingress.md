@@ -64,7 +64,7 @@ ingress handling and idle progress. The required order is `ENCLAVE_STATE` then
 adopter Live then the independent resource ledger. Callbacks and receiver/charge
 Drop must never reenter `crate::state()` directly or through a helper. The direct
 native session harness omits that outer lock and does not establish its order.
-Allocation-before-refund is proved by source field/drop order; balanced native
+Buffer deallocation before refund is proved by source field/drop order; balanced native
 ledger counts do not themselves observe allocator deallocation order.
 
 This is an unactivated runtime capability. Application decoder/SDK adoption,
