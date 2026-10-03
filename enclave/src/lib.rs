@@ -104,6 +104,7 @@ pub type HonestIngressHook = fn(
     context: &enclave_os_common::modules::RequestContext,
 ) -> HonestIngressResponse;
 static HONEST_INGRESS_HOOK: OnceLock<HonestIngressHook> = OnceLock::new();
+static BULK_INGRESS_HOOK: OnceLock<ratls::bulk_ingress::BulkIngressHook> = OnceLock::new();
 
 /// Bounded response returned by the adopter-owned Honest ingress handler.
 pub struct HonestIngressResponse {
@@ -317,6 +318,19 @@ pub fn register_honest_ingress_hook(hook: HonestIngressHook) -> Result<(), i32> 
         return Err(-1);
     }
     HONEST_INGRESS_HOOK.set(hook).map_err(|_| -1)
+}
+
+/// Install optional incremental pre-body admission once before ingress starts.
+/// This alone changes no body cap, application authority or signed Open policy.
+pub fn register_bulk_ingress_hook(hook: ratls::bulk_ingress::BulkIngressHook) -> Result<(), i32> {
+    if CORE_PHASE.load() != CorePhase::Initialising {
+        return Err(-1);
+    }
+    BULK_INGRESS_HOOK.set(hook).map_err(|_| -1)
+}
+
+pub(crate) fn bulk_ingress_hook() -> Option<ratls::bulk_ingress::BulkIngressHook> {
+    BULK_INGRESS_HOOK.get().copied()
 }
 
 pub(crate) fn dispatch_honest_ingress(

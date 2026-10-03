@@ -35,7 +35,7 @@ use crate::modules;
 use crate::ocall;
 use crate::ratls::attestation::{self, CaContext, LeafKey};
 use crate::ratls::cert_store;
-use crate::ratls::session::RaTlsSession;
+use crate::ratls::session::{IngressRequest, RaTlsSession};
 use crate::{enclave_log_error, enclave_log_info};
 
 use enclave_os_common::channel::{self, ChannelMsgType};
@@ -95,6 +95,7 @@ pub struct IngressServer {
     sessions: BTreeMap<u32, SessionState>,
     write_windows: RefCell<BTreeMap<u32, channel::TcpWriteWindow>>,
     output_cursor: u32,
+    resource_cursor: u32,
     /// One deferred parse turn after a response completes, including a small
     /// response completed synchronously during dispatch.
     pending_dispatch: BTreeSet<u32>,
@@ -151,6 +152,7 @@ impl IngressServer {
             sessions: BTreeMap::new(),
             write_windows: RefCell::new(BTreeMap::new()),
             output_cursor: 0,
+            resource_cursor: 0,
             pending_dispatch: BTreeSet::new(),
             ingress_classes: BTreeMap::new(),
             ca,
@@ -266,6 +268,37 @@ impl IngressServer {
     ///
     /// This is called from Mini's control loop during bounded idle progress.
     pub fn progress_output(&mut self) -> bool {
+        // Check one established session per idle turn, before output backlog.
+        // Host time cannot authorize; this only cancels a resource reservation.
+        let timeout_id = self
+            .sessions
+            .range((
+                std::ops::Bound::Excluded(self.resource_cursor),
+                std::ops::Bound::Unbounded,
+            ))
+            .find(|(_, state)| matches!(state, SessionState::Established(_)))
+            .or_else(|| {
+                self.sessions
+                    .iter()
+                    .find(|(_, state)| matches!(state, SessionState::Established(_)))
+            })
+            .map(|(id, _)| *id);
+        if let Some(id) = timeout_id {
+            self.resource_cursor = id;
+            if let Some(SessionState::Established(mut session)) = self.sessions.remove(&id) {
+                if session
+                    .check_bulk_deadline(std::time::Instant::now())
+                    .is_err()
+                {
+                    self.pending_dispatch.remove(&id);
+                    self.ingress_classes.remove(&id);
+                    self.write_windows.borrow_mut().remove(&id);
+                    self.send_close(id);
+                    return true;
+                }
+                self.sessions.insert(id, SessionState::Established(session));
+            }
+        }
         {
             let mut pending = self.pending_output.borrow_mut();
             if let Some(message) = pending.front() {
@@ -493,8 +526,22 @@ impl IngressServer {
         // OIDC claims are populated per-request in handle_http_request()
         // because different requests in the same session may carry
         // different tokens (or none — e.g. GET /healthz).
-        match session.recv_http_request() {
-            Ok(Some(http_req)) => {
+        match session.recv_ingress_request() {
+            Ok(Some(IngressRequest::Bulk(response, close))) => {
+                if session.attestation_failed()
+                    || session.queue_bulk_response(response, close).is_err()
+                {
+                    self.send_close(conn_id);
+                    return false;
+                }
+                let credit = self
+                    .write_windows
+                    .borrow()
+                    .get(&conn_id)
+                    .is_some_and(|window| window.available() >= 64 * 1024);
+                !credit || self.flush_response(conn_id, session)
+            }
+            Ok(Some(IngressRequest::Ordinary(http_req))) => {
                 let mut close = http_req.connection_close;
                 if session.attestation_failed() {
                     self.send_close(conn_id);
@@ -650,6 +697,14 @@ impl IngressServer {
             hello.sni,
             tls_result.attested_endpoint,
             tls_result.configuration,
+        );
+        session.set_bulk_ingress(
+            conn_id,
+            self.ingress_classes
+                .get(&conn_id)
+                .copied()
+                .unwrap_or(enclave_os_common::modules::IngressClass::ExternalNetwork),
+            crate::bulk_ingress_hook(),
         );
         session.feed_tls_bytes(&[]).map_err(str::to_owned)?;
 

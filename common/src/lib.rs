@@ -19,6 +19,7 @@ pub mod channel;
 pub mod core_phase;
 pub mod dependencies;
 pub mod hex;
+pub mod ingress;
 pub mod modules;
 pub mod ocall;
 pub mod oids;

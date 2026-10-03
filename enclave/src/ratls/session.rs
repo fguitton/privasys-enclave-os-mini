@@ -12,6 +12,11 @@
 //! - Decouples TLS logic from transport (testable, composable)
 //! - Supports future multi-threading (sessions are `Send`)
 
+use super::bulk_ingress::{
+    AdmittedBulkIngress, BulkIngressContext, BulkIngressHook, BulkIngressResponse,
+    BULK_PLAINTEXT_PIECE_BYTES, BULK_PLAINTEXT_TURN_BYTES, MAX_BULK_HEADER_BYTES,
+    MAX_BULK_LOOKAHEAD_BYTES,
+};
 use super::cert_store::ConfigurationLease;
 use crate::enclave_log_error;
 use enclave_os_common::protocol;
@@ -36,6 +41,14 @@ pub struct RaTlsSession {
     tls_conn: rustls::ServerConnection,
     /// Accumulation buffer for incomplete application-level frames.
     read_buf: Vec<u8>,
+    bulk_hook: Option<BulkIngressHook>,
+    bulk: Option<PendingBulkIngress>,
+    ordinary_head: bool,
+    connection_id: u32,
+    ingress_class: enclave_os_common::modules::IngressClass,
+    plaintext_remaining: usize,
+    callback_remaining: usize,
+    bulk_failed: bool,
     response: Option<PendingResponse>,
     /// Exact v2 leaf served on this connection (evidence is exchanged separately).
     local_cert_der: Vec<u8>,
@@ -102,10 +115,39 @@ struct PendingResponse {
     #[cfg(feature = "diagnostic-transfer-profile")]
     cost: Option<ResponseCost>,
     head: Vec<u8>,
-    body: Vec<u8>,
+    body: ResponseBody,
     offset: usize,
     close: bool,
     shutdown: bool,
+}
+
+enum ResponseBody {
+    Ordinary(Vec<u8>),
+    Bulk(enclave_os_common::ingress::ChargedBytes),
+}
+impl ResponseBody {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Ordinary(body) => body,
+            Self::Bulk(body) => body.as_slice(),
+        }
+    }
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+}
+
+struct PendingBulkIngress {
+    head: protocol::HttpRequestHead,
+    admitted: AdmittedBulkIngress,
+    received: usize,
+    deadline: std::time::Instant,
+}
+
+/// Complete bulk response or ordinary request; bulk never uses Clone HttpRequest.
+pub enum IngressRequest {
+    Ordinary(protocol::HttpRequest),
+    Bulk(BulkIngressResponse, bool),
 }
 
 /// Identity extracted from a successful FIDO2 registration or
@@ -140,6 +182,14 @@ impl RaTlsSession {
         Self {
             tls_conn,
             read_buf: Vec::new(),
+            bulk_hook: None,
+            bulk: None,
+            ordinary_head: false,
+            connection_id: 0,
+            ingress_class: enclave_os_common::modules::IngressClass::ExternalNetwork,
+            plaintext_remaining: BULK_PLAINTEXT_TURN_BYTES,
+            callback_remaining: BULK_PLAINTEXT_TURN_BYTES,
+            bulk_failed: false,
             response: None,
             local_cert_der,
             server_name,
@@ -172,7 +222,26 @@ impl RaTlsSession {
     ///
     /// Returns an error on fatal TLS protocol errors.
     pub fn feed_tls_bytes(&mut self, data: &[u8]) -> Result<(), &'static str> {
+        if self.bulk_failed {
+            return Err("bulk ingress connection failed");
+        }
         self.require_current_configuration()?;
+        self.check_bulk_deadline(std::time::Instant::now())?;
+        self.plaintext_remaining = BULK_PLAINTEXT_TURN_BYTES;
+        self.callback_remaining = BULK_PLAINTEXT_TURN_BYTES;
+        let result = self.feed_tls_bytes_inner(data);
+        if result.is_err() {
+            self.cancel_bulk_ingress();
+            self.bulk_failed = self.bulk_hook.is_some();
+        }
+        result
+    }
+
+    fn feed_tls_bytes_inner(&mut self, data: &[u8]) -> Result<(), &'static str> {
+        if self.bulk_hook.is_some() && data.len() > enclave_os_common::channel::MAX_CHANNEL_PAYLOAD
+        {
+            return Err("bulk ciphertext event exceeded bound");
+        }
         if data.is_empty() {
             return Ok(());
         }
@@ -246,12 +315,19 @@ impl RaTlsSession {
     /// - `Err` — fatal TLS or parse error
     pub fn recv_http_request(&mut self) -> Result<Option<protocol::HttpRequest>, &'static str> {
         self.require_current_configuration()?;
+        if self.bulk.is_some() {
+            return Err("bulk request requires owned dispatch");
+        }
         // Drain any available decrypted plaintext into read_buf
         self.drain_plaintext()?;
 
         match protocol::parse_http_request(&self.read_buf) {
             Ok((request, consumed)) => {
                 self.read_buf.drain(..consumed);
+                if self.bulk_hook.is_some() && self.read_buf.is_empty() {
+                    self.read_buf = Vec::new();
+                }
+                self.ordinary_head = false;
                 Ok(Some(request))
             }
             Err(protocol::HttpParseError::Incomplete) => Ok(None),
@@ -259,6 +335,115 @@ impl RaTlsSession {
             Err(protocol::HttpParseError::BodyTooLarge) => Err("HTTP body too large"),
             Err(_) => Err("malformed HTTP request"),
         }
+    }
+
+    /// Install session routing and the immutable init-time hook before input.
+    /// Session identity is supplied independently by the TLS exporter/leaf.
+    pub(crate) fn set_bulk_ingress(
+        &mut self,
+        connection_id: u32,
+        ingress_class: enclave_os_common::modules::IngressClass,
+        hook: Option<BulkIngressHook>,
+    ) {
+        self.connection_id = connection_id;
+        self.ingress_class = ingress_class;
+        self.bulk_hook = hook;
+    }
+
+    fn bulk_context(&self) -> BulkIngressContext {
+        BulkIngressContext {
+            request: enclave_os_common::modules::RequestContext {
+                ingress_class: self.ingress_class,
+                connection_id: self.connection_id,
+                server_name: self.server_name().map(str::to_owned),
+                attested_endpoint: self.attested_endpoint(),
+                local_cert_der: self.local_cert_der(),
+                local_evidence: self.local_evidence().cloned(),
+                channel_binder: self.channel_binder(),
+                peer_cert_der: self.peer_cert_der(),
+                peer_evidence: self.peer_evidence().cloned(),
+                attestation: self.attestation().to_owned(),
+                oidc_claims: None,
+            },
+            input_capacity: self.read_buf.capacity(),
+            plaintext_scratch_capacity: BULK_PLAINTEXT_PIECE_BYTES,
+        }
+    }
+
+    pub fn recv_ingress_request(&mut self) -> Result<Option<IngressRequest>, &'static str> {
+        if self.bulk_failed {
+            return Err("bulk ingress connection failed");
+        }
+        self.require_current_configuration()?;
+        self.check_bulk_deadline(std::time::Instant::now())?;
+        // Dispatch is a separate bounded service operation; deferred pipeline
+        // bytes are charged here even though TLS decrypted them on an old turn.
+        self.callback_remaining = BULK_PLAINTEXT_TURN_BYTES;
+        if self.bulk_hook.is_some()
+            && self.bulk.is_none()
+            && !self.ordinary_head
+            && !self.read_buf.is_empty()
+        {
+            // A pipelined successor must get its own header admission; it
+            // never inherits the completed receiver or falls through ordinary.
+            if let Err(error) = self.consume_bulk_plaintext(&[]) {
+                self.cancel_bulk_ingress();
+                self.bulk_failed = true;
+                return Err(error);
+            }
+        }
+        if let Some(bulk) = self.bulk.as_ref() {
+            if bulk.received < bulk.head.body_bytes() {
+                return Ok(None);
+            }
+            let context = self.bulk_context();
+            let bulk = self.bulk.take().expect("bulk was present");
+            let close = bulk.head.request().connection_close;
+            let max_response = bulk.admitted.max_response_capacity;
+            let response = match bulk.admitted.receiver.finish(&bulk.head, &context) {
+                Ok(response) => response,
+                Err(error) => {
+                    self.cancel_bulk_ingress();
+                    self.bulk_failed = true;
+                    return Err(error);
+                }
+            };
+            self.require_current_configuration()?;
+            if response.body.reserved_capacity() > max_response {
+                self.cancel_bulk_ingress();
+                self.bulk_failed = true;
+                return Err("bulk response exceeded charged capacity policy");
+            }
+            return Ok(Some(IngressRequest::Bulk(response, close)));
+        }
+        self.recv_http_request()
+            .map(|request| request.map(IngressRequest::Ordinary))
+    }
+
+    /// Resource deadline only. A bounded idle poll uses the same absolute
+    /// deadline as feed/finalization; tiny progress never renews it.
+    pub(crate) fn check_bulk_deadline(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Result<(), &'static str> {
+        if self.bulk.is_some() && !self.configuration.is_current() {
+            return self.require_current_configuration();
+        }
+        if self.bulk.as_ref().is_some_and(|bulk| now >= bulk.deadline) {
+            self.cancel_bulk_ingress();
+            self.bulk_failed = true;
+            return Err("bulk ingress resource deadline expired");
+        }
+        Ok(())
+    }
+
+    fn cancel_bulk_ingress(&mut self) {
+        // Free transport buffers first. Receiver Drop must free staged allocations
+        // before refunding its independent charge. The control loop holds STATE;
+        // receiver/charge Drop must not reenter STATE or adopter Live.
+        self.read_buf = Vec::new();
+        self.bulk = None;
+        self.ordinary_head = false;
     }
 
     /// Encrypt and send an HTTP/1.1 response.
@@ -330,6 +515,40 @@ impl RaTlsSession {
         close: bool,
         shutdown: bool,
     ) -> Result<(), &'static str> {
+        self.queue_owned_response(
+            status,
+            content_type,
+            extra_headers,
+            ResponseBody::Ordinary(body),
+            close,
+            shutdown,
+        )
+    }
+
+    pub fn queue_bulk_response(
+        &mut self,
+        response: BulkIngressResponse,
+        close: bool,
+    ) -> Result<(), &'static str> {
+        self.queue_owned_response(
+            response.status,
+            response.content_type,
+            &[],
+            ResponseBody::Bulk(response.body),
+            close,
+            false,
+        )
+    }
+
+    fn queue_owned_response(
+        &mut self,
+        status: u16,
+        content_type: &str,
+        extra_headers: &[(String, String)],
+        body: ResponseBody,
+        close: bool,
+        shutdown: bool,
+    ) -> Result<(), &'static str> {
         self.require_current_configuration()?;
         if self.response.is_some() {
             return Err("response already pending");
@@ -380,7 +599,7 @@ impl RaTlsSession {
             .body
             .len()
             .min(response.offset.saturating_add(remaining));
-        self.write_plaintext_chunked(&response.body[response.offset..end], &mut output)?;
+        self.write_plaintext_chunked(&response.body.as_slice()[response.offset..end], &mut output)?;
         response.offset = end;
         output.extend_from_slice(&self.collect_tls_output()?);
         if output.len() > 64 * 1024 {
@@ -425,6 +644,14 @@ impl RaTlsSession {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    if self.bulk_hook.is_some() {
+                        self.plaintext_remaining = self
+                            .plaintext_remaining
+                            .checked_sub(n)
+                            .ok_or("bulk plaintext turn quota exceeded")?;
+                        self.consume_bulk_plaintext(&buf[..n])?;
+                        continue;
+                    }
                     if self.read_buf.len().saturating_add(n) > protocol::MAX_BODY_SIZE + 64 * 1024 {
                         return Err("pending HTTP input exceeded bound");
                     }
@@ -437,6 +664,110 @@ impl RaTlsSession {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn consume_bulk_plaintext(&mut self, mut bytes: &[u8]) -> Result<(), &'static str> {
+        self.check_bulk_deadline(std::time::Instant::now())?;
+        if let Some(bulk) = self.bulk.as_mut() {
+            while bulk.received < bulk.head.body_bytes() && !bytes.is_empty() {
+                if std::time::Instant::now() >= bulk.deadline {
+                    return Err("bulk ingress resource deadline expired");
+                }
+                let remaining = bulk.head.body_bytes() - bulk.received;
+                let count = remaining.min(bytes.len()).min(BULK_PLAINTEXT_PIECE_BYTES);
+                self.callback_remaining = self
+                    .callback_remaining
+                    .checked_sub(count)
+                    .ok_or("bulk callback turn quota exceeded")?;
+                // Every piece is bounded by the TLS scratch, exact remaining
+                // body and the independently enforced plaintext turn quota.
+                bulk.admitted.receiver.receive(&bytes[..count])?;
+                if bulk.admitted.receiver.charged_capacity() > bulk.admitted.max_staged_capacity {
+                    return Err("bulk staged capacity exceeded resource policy");
+                }
+                bulk.received += count;
+                bytes = &bytes[count..];
+            }
+            if !bytes.is_empty() {
+                self.append_bounded_input(bytes, MAX_BULK_LOOKAHEAD_BYTES)?;
+            }
+            return Ok(());
+        }
+        if self.ordinary_head {
+            return self
+                .append_bounded_input(bytes, protocol::MAX_BODY_SIZE + MAX_BULK_LOOKAHEAD_BYTES);
+        }
+        // A single bounded TLS piece may contain a header and first body bytes.
+        // Header admission happens immediately, before the next record drains.
+        if !bytes.is_empty() {
+            self.append_bounded_input(bytes, MAX_BULK_HEADER_BYTES + BULK_PLAINTEXT_PIECE_BYTES)?;
+        }
+        let head = match protocol::parse_http_request_head(&self.read_buf) {
+            Ok(head) => head,
+            Err(protocol::HttpParseError::Incomplete)
+                if self.read_buf.len() <= MAX_BULK_HEADER_BYTES =>
+            {
+                return Ok(())
+            }
+            Err(_) => return Err("malformed or oversized HTTP header"),
+        };
+        if head.header_bytes() > MAX_BULK_HEADER_BYTES {
+            return Err("bulk HTTP header exceeded bound");
+        }
+        let context = self.bulk_context();
+        let acquired = std::time::Instant::now();
+        let admitted = self.bulk_hook.expect("hook selected")(&head, &context)?;
+        let Some(admitted) = admitted else {
+            if head.body_bytes() > protocol::MAX_BODY_SIZE {
+                return Err("HTTP body too large without admission");
+            }
+            self.ordinary_head = true;
+            return Ok(());
+        };
+        if head.require_bulk_framing().is_err() {
+            self.read_buf = Vec::new();
+            return Err("ambiguous bulk HTTP framing");
+        }
+        if head.body_bytes() > admitted.max_body_bytes
+            || admitted.max_body_bytes > isize::MAX.unsigned_abs()
+            || admitted.max_staged_capacity > isize::MAX.unsigned_abs()
+            || admitted.receiver.charged_capacity() > admitted.max_staged_capacity
+            || admitted.max_response_capacity > protocol::MAX_BODY_SIZE
+            || admitted.resource_timeout.is_zero()
+        {
+            self.read_buf = Vec::new();
+            return Err("invalid bulk ingress resource terms");
+        }
+        let Some(deadline) = acquired.checked_add(admitted.resource_timeout) else {
+            self.read_buf = Vec::new();
+            return Err("bulk ingress deadline overflow");
+        };
+        let buffered = std::mem::take(&mut self.read_buf);
+        let header_bytes = head.header_bytes();
+        self.bulk = Some(PendingBulkIngress {
+            head,
+            admitted,
+            received: 0,
+            deadline,
+        });
+        self.consume_bulk_plaintext(&buffered[header_bytes..])
+    }
+
+    fn append_bounded_input(&mut self, bytes: &[u8], limit: usize) -> Result<(), &'static str> {
+        let needed = self
+            .read_buf
+            .len()
+            .checked_add(bytes.len())
+            .filter(|needed| *needed <= limit)
+            .ok_or("pending HTTP lookahead exceeded bound")?;
+        self.read_buf
+            .try_reserve_exact(needed - self.read_buf.len())
+            .map_err(|_| "HTTP lookahead allocation failed")?;
+        if self.read_buf.capacity() > limit {
+            return Err("HTTP lookahead capacity exceeded bound");
+        }
+        self.read_buf.extend_from_slice(bytes);
         Ok(())
     }
 
@@ -535,6 +866,10 @@ impl RaTlsSession {
 
     /// Start a new proof exchange without retaining a previous client's admission.
     pub fn begin_attestation(&mut self) {
+        if self.bulk.is_some() {
+            self.cancel_bulk_ingress();
+            self.bulk_failed = true;
+        }
         self.attestation = "none";
         self.client_context = None;
         self.peer_evidence = None;
@@ -618,6 +953,9 @@ impl RaTlsSession {
     /// Returns the raw TLS bytes to send to the peer. The caller should
     /// send these via the data channel, then close the connection.
     pub fn close_notify(&mut self) -> Vec<u8> {
+        self.cancel_bulk_ingress();
+        self.response = None;
+        self.bulk_failed = self.bulk_hook.is_some();
         self.tls_conn.send_close_notify();
         self.collect_tls_output().unwrap_or_default()
     }
@@ -628,6 +966,7 @@ impl RaTlsSession {
             self.fail_attestation();
             self.fido2_identity = None;
             self.read_buf.clear();
+            self.cancel_bulk_ingress();
             self.response = None;
             return Err("certificate configuration changed; reconnect required");
         }

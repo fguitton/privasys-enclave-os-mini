@@ -358,6 +358,8 @@ pub struct HttpRequestHead {
     request: HttpRequest,
     header_bytes: usize,
     body_bytes: usize,
+    content_length_count: usize,
+    transfer_encoding: bool,
 }
 
 impl HttpRequestHead {
@@ -371,6 +373,15 @@ impl HttpRequestHead {
 
     pub fn body_bytes(&self) -> usize {
         self.body_bytes
+    }
+
+    /// Bulk framing is strict while ordinary parsing keeps its old rules.
+    /// These facts come from the exact admitted header, not reparsed body data.
+    pub fn require_bulk_framing(&self) -> Result<(), HttpParseError> {
+        if self.content_length_count != 1 || self.transfer_encoding {
+            return Err(HttpParseError::Malformed);
+        }
+        Ok(())
     }
 }
 
@@ -426,6 +437,8 @@ pub fn parse_http_request_head(buf: &[u8]) -> Result<HttpRequestHead, HttpParseE
 
     // Extract relevant headers
     let mut content_length: Option<usize> = None;
+    let mut content_length_count = 0;
+    let mut transfer_encoding = false;
     let mut authorization: Option<String> = None;
     let mut app_auth: Option<String> = None;
     let mut billing_approved: Option<String> = None;
@@ -437,6 +450,7 @@ pub fn parse_http_request_head(buf: &[u8]) -> Result<HttpRequestHead, HttpParseE
 
     for h in req.headers.iter() {
         if h.name.eq_ignore_ascii_case("content-length") {
+            content_length_count += 1;
             let val =
                 core::str::from_utf8(h.value).map_err(|_| HttpParseError::InvalidContentLength)?;
             content_length = Some(
@@ -444,6 +458,8 @@ pub fn parse_http_request_head(buf: &[u8]) -> Result<HttpRequestHead, HttpParseE
                     .parse()
                     .map_err(|_| HttpParseError::InvalidContentLength)?,
             );
+        } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
+            transfer_encoding = true;
         } else if h.name.eq_ignore_ascii_case("authorization") {
             if let Ok(val) = core::str::from_utf8(h.value) {
                 if let Some(token) = val.strip_prefix("Bearer ") {
@@ -500,6 +516,8 @@ pub fn parse_http_request_head(buf: &[u8]) -> Result<HttpRequestHead, HttpParseE
         .ok_or(HttpParseError::BodyTooLarge)?;
 
     Ok(HttpRequestHead {
+        content_length_count,
+        transfer_encoding,
         request: HttpRequest {
             method,
             path,
@@ -773,6 +791,92 @@ mod tests {
                 Err(HttpParseError::BodyTooLarge)
             ));
         }
+        // Strict framing facts are retained by the exact header; ordinary
+        // parsing deliberately keeps its existing duplicate/TE behavior.
+        let head =
+            parse_http_request_head(b"POST /bulk HTTP/1.1\r\nContent-Length: 1\r\n\r\n").unwrap();
+        assert!(head.require_bulk_framing().is_ok());
+        for raw in [
+            &b"POST /bulk HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx"[..],
+            &b"POST /bulk HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 1\r\n\r\nx"[..],
+            &b"POST /bulk HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\nx"[..],
+        ] {
+            assert!(parse_http_request(raw).is_ok());
+            assert!(parse_http_request_head(raw)
+                .unwrap()
+                .require_bulk_framing()
+                .is_err());
+        }
+        charged_capacity_lifetime();
+    }
+
+    fn charged_capacity_lifetime() {
+        use crate::ingress::{CapacityCharge, ChargedBytes};
+        use alloc::boxed::Box;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        struct Charge {
+            used: Arc<AtomicUsize>,
+            capacity: usize,
+            limit: usize,
+        }
+        impl CapacityCharge for Charge {
+            fn reserve(&mut self, capacity: usize) -> Result<(), &'static str> {
+                if capacity > self.limit {
+                    return Err("budget unavailable");
+                }
+                self.used.store(capacity, Ordering::SeqCst);
+                self.capacity = capacity;
+                Ok(())
+            }
+        }
+        impl Drop for Charge {
+            fn drop(&mut self) {
+                self.used.fetch_sub(self.capacity, Ordering::SeqCst);
+            }
+        }
+        let used = Arc::new(AtomicUsize::new(0));
+        let mut bytes = ChargedBytes::try_new(
+            4,
+            16,
+            Box::new(Charge {
+                used: used.clone(),
+                capacity: 0,
+                limit: 16,
+            }),
+        )
+        .unwrap();
+        bytes.try_extend_from_slice(b"12345").unwrap();
+        assert_eq!(bytes.as_slice(), b"12345");
+        assert_eq!(used.load(Ordering::SeqCst), bytes.reserved_capacity());
+        assert!(bytes.reserved_capacity() >= 4 + bytes.capacity());
+        assert!(bytes.try_extend_from_slice(&[0; 16]).is_err());
+        assert_eq!(bytes.as_slice(), b"12345");
+        drop(bytes);
+        assert_eq!(used.load(Ordering::SeqCst), 0);
+        assert!(ChargedBytes::try_new(
+            17,
+            17,
+            Box::new(Charge {
+                used: used.clone(),
+                capacity: 0,
+                limit: 16
+            })
+        )
+        .is_err());
+        assert!(ChargedBytes::try_new(
+            usize::MAX,
+            usize::MAX,
+            Box::new(Charge {
+                used: used.clone(),
+                capacity: 0,
+                limit: 16
+            })
+        )
+        .is_err());
+        assert_eq!(used.load(Ordering::SeqCst), 0);
     }
 
     #[test]

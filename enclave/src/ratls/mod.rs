@@ -7,6 +7,7 @@
 //! connection-bound evidence and reusable identity certificates.
 
 pub mod attestation;
+pub mod bulk_ingress;
 pub mod cert_store;
 mod client_auth;
 pub mod server;
