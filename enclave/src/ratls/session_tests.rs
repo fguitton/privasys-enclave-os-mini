@@ -265,6 +265,7 @@ struct BulkLedger {
     peak: AtomicUsize,
     commits: AtomicUsize,
     receives: AtomicUsize,
+    received_bytes: AtomicUsize,
     acquired: AtomicUsize,
     epoch: AtomicUsize,
     limit: usize,
@@ -276,6 +277,7 @@ impl BulkLedger {
             peak: AtomicUsize::new(0),
             commits: AtomicUsize::new(0),
             receives: AtomicUsize::new(0),
+            received_bytes: AtomicUsize::new(0),
             acquired: AtomicUsize::new(0),
             epoch: AtomicUsize::new(1),
             limit,
@@ -333,6 +335,9 @@ impl BulkIngressReceiver for BulkReceiver {
     fn receive(&mut self, bytes: &[u8]) -> Result<(), &'static str> {
         assert!(bytes.len() <= super::BULK_PLAINTEXT_PIECE_BYTES);
         self.ledger.receives.fetch_add(1, Ordering::SeqCst);
+        self.ledger
+            .received_bytes
+            .fetch_add(bytes.len(), Ordering::SeqCst);
         self.bytes.try_extend_from_slice(bytes)
     }
     fn finish(
@@ -398,8 +403,8 @@ fn bulk_hook(
             endpoint: context.request.attested_endpoint,
             leaf: context.request.local_cert_der.clone(),
         }),
-        max_body_bytes: enclave_os_common::protocol::MAX_BODY_SIZE + 1,
-        max_staged_capacity: enclave_os_common::protocol::MAX_BODY_SIZE + 1,
+        max_body_bytes: 20 * 1024 * 1024,
+        max_staged_capacity: 20 * 1024 * 1024,
         max_response_capacity: 2,
         resource_timeout: std::time::Duration::from_secs(60),
     }))
@@ -451,6 +456,44 @@ fn bulk_header_and_lifetime_boundaries() {
         .write_all(b"POST /bulk HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc")
         .unwrap();
     assert!(session.feed_tls_bytes(&flight(&mut client)).is_err());
+    assert_eq!(ledger.capacity.load(Ordering::SeqCst), 0);
+    // Authenticated header alone cannot reserve a larger body than its credit.
+    let length = 20 * 1024 * 1024;
+    let (_, mut client, mut session, ledger) = bulk_pair(1024 * 1024);
+    client
+        .writer()
+        .write_all(format!("POST /bulk HTTP/1.1\r\nContent-Length: {length}\r\n\r\n").as_bytes())
+        .unwrap();
+    assert!(session.feed_tls_bytes(&flight(&mut client)).is_err());
+    assert_eq!(ledger.acquired.load(Ordering::SeqCst), 1);
+    assert_eq!(ledger.received_bytes.load(Ordering::SeqCst), 0);
+    assert_eq!(ledger.commits.load(Ordering::SeqCst), 0);
+    assert_eq!(ledger.capacity.load(Ordering::SeqCst), 0);
+    assert_eq!(session.read_buf.capacity(), 0);
+    assert!(session.recv_ingress_request().is_err());
+    // The same geometry remains rejected over real TLS with no optional hook.
+    let store = CertStore::new();
+    register(&store, "a.test");
+    let (mut client, mut session) = pair(&store, "a.test");
+    handshake(&mut client, &mut session);
+    write_requests(
+        &mut client,
+        &mut session,
+        format!("POST /bulk HTTP/1.1\r\nContent-Length: {length}\r\n\r\n").as_bytes(),
+    );
+    assert!(session.recv_http_request().is_err());
+    assert!(session.read_buf.capacity() <= super::MAX_BULK_LOOKAHEAD_BYTES);
+    // Installing a hook that selects ordinary None does not expand that cap.
+    let (_, mut client, mut session, ledger) = bulk_pair(length);
+    client
+        .writer()
+        .write_all(
+            format!("POST /ordinary HTTP/1.1\r\nContent-Length: {length}\r\n\r\n").as_bytes(),
+        )
+        .unwrap();
+    assert!(session.feed_tls_bytes(&flight(&mut client)).is_err());
+    assert_eq!(ledger.acquired.load(Ordering::SeqCst), 0);
+    assert_eq!(ledger.received_bytes.load(Ordering::SeqCst), 0);
     assert_eq!(ledger.capacity.load(Ordering::SeqCst), 0);
     // Disconnect drops a partial body's allocation and unique permit.
     let (_, mut client, mut session, ledger) = bulk_pair(32);
@@ -534,7 +577,8 @@ fn bulk_revocation_timeout_and_final_currentness() {
     assert_eq!(ledger.capacity.load(Ordering::SeqCst), 0);
 }
 fn bulk_streaming_and_pipeline() {
-    let length = enclave_os_common::protocol::MAX_BODY_SIZE + 1;
+    let length = 20 * 1024 * 1024;
+    assert!(length > enclave_os_common::protocol::MAX_BODY_SIZE);
     let (_, mut client, mut session, ledger) = bulk_pair(length);
     write_requests(
         &mut client,
@@ -548,8 +592,13 @@ fn bulk_streaming_and_pipeline() {
         format!("gth: {length}\r\n\r\n").as_bytes(),
     );
     assert_eq!(ledger.acquired.load(Ordering::SeqCst), 1);
-    for _ in 0..length / 8192 {
-        write_requests(&mut client, &mut session, &[0x21; 8192]);
+    let piece = [0x21; 8192];
+    let mut remaining = length - 1;
+    while remaining != 0 {
+        let count = remaining.min(piece.len());
+        write_requests(&mut client, &mut session, &piece[..count]);
+        assert!(session.read_buf.capacity() <= super::MAX_BULK_LOOKAHEAD_BYTES);
+        remaining -= count;
     }
     write_requests(
         &mut client,
@@ -558,6 +607,7 @@ fn bulk_streaming_and_pipeline() {
     );
     assert!(session.read_buf.capacity() <= super::MAX_BULK_LOOKAHEAD_BYTES);
     assert_eq!(ledger.commits.load(Ordering::SeqCst), 0);
+    assert_eq!(ledger.received_bytes.load(Ordering::SeqCst), length);
     let super::IngressRequest::Bulk(response, close) =
         session.recv_ingress_request().unwrap().unwrap()
     else {
