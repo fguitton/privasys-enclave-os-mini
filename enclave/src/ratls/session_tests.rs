@@ -146,8 +146,23 @@ fn replacement_rejects_buffered_requests_and_re_attestation() {
     assert!(session.collect_tls_output().unwrap().is_empty());
 }
 
+struct BodyOwner(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for BodyOwner {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+fn owned_body(
+    bytes: Vec<u8>,
+    drops: &Arc<std::sync::atomic::AtomicUsize>,
+) -> crate::HttpResponseBody {
+    crate::HttpResponseBody::with_owner(bytes, Arc::new(BodyOwner(Arc::clone(drops))))
+}
+
 #[test]
 fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
+    let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let owner_drop_count = || drops.load(std::sync::atomic::Ordering::SeqCst);
     let store = CertStore::new();
     register(&store, "a.test");
     register(&store, "b.test");
@@ -178,11 +193,30 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
     // HTTP oracle while the receiver accepts only bounded flights.
     let body: Vec<u8> = (0..5 * 1024 * 1024).map(|n| (n % 251) as u8).collect();
     let expected = enclave_os_common::protocol::format_http_response(200, &body, false);
-    b.queue_http_response(200, "application/json", &[], body, false, false)
-        .unwrap();
+    b.queue_http_response(
+        200,
+        "application/json",
+        &[],
+        owned_body(body, &drops),
+        false,
+        false,
+    )
+    .unwrap();
     assert!(b
-        .queue_http_response(200, "application/json", &[], vec![], false, false)
+        .queue_http_response(
+            200,
+            "application/json",
+            &[],
+            owned_body(vec![], &drops),
+            false,
+            false
+        )
         .is_err());
+    assert_eq!(
+        owner_drop_count(),
+        1,
+        "failed queue drops only its own body admission"
+    );
     let mut received = Vec::new();
     while b.has_pending_response() {
         let (flight, close, shutdown) = b.progress_http_response().unwrap();
@@ -204,20 +238,35 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
         }
     }
     assert_eq!(received, expected);
+    assert_eq!(
+        owner_drop_count(),
+        2,
+        "successful complete drain releases the body admission"
+    );
     b.queue_http_response(
         200,
         "application/octet-stream",
         &[],
-        vec![9; 1024 * 1024],
+        owned_body(vec![9; 1024 * 1024], &drops),
         false,
         false,
     )
     .unwrap();
     assert!(!b.progress_http_response().unwrap().0.is_empty());
     assert!(b.has_pending_response());
+    assert_eq!(
+        owner_drop_count(),
+        2,
+        "partial TLS drain retains the body admission"
+    );
     assert!(store.unregister("b.test"));
     assert!(b.progress_http_response().is_err());
     assert!(!b.has_pending_response());
+    assert_eq!(
+        owner_drop_count(),
+        3,
+        "configuration revocation drops the retained body"
+    );
     assert!(b.collect_tls_output().unwrap().is_empty());
 
     // A bounded control reply fits in its dispatch turn. A configuration
@@ -243,7 +292,39 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
     );
     register(&store, "control.test");
     assert!(control
-        .queue_http_response(200, "application/json", &[], vec![1], false, false)
+        .queue_http_response(
+            200,
+            "application/json",
+            &[],
+            owned_body(vec![1], &drops),
+            false,
+            false
+        )
         .is_err());
     assert!(control.collect_tls_output().unwrap().is_empty());
+    assert_eq!(
+        owner_drop_count(),
+        4,
+        "revoked configuration rejects and drops new admission"
+    );
+    register(&store, "teardown.test");
+    let (mut teardown_client, mut teardown) = pair(&store, "teardown.test");
+    handshake(&mut teardown_client, &mut teardown);
+    teardown
+        .queue_http_response(
+            200,
+            "application/json",
+            &[],
+            owned_body(vec![7; 1024 * 1024], &drops),
+            false,
+            false,
+        )
+        .unwrap();
+    assert_eq!(owner_drop_count(), 4);
+    drop(teardown);
+    assert_eq!(
+        owner_drop_count(),
+        5,
+        "session teardown releases an undrained body"
+    );
 }

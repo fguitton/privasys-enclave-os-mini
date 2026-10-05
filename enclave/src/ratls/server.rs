@@ -855,7 +855,7 @@ fn build_tls_config(
 /// Result of handling an HTTP request.
 struct HttpHandleResult {
     status: u16,
-    body: Vec<u8>,
+    body: crate::HttpResponseBody,
     shutdown: bool,
     /// Optional Content-Type override (defaults to `application/json`).
     content_type: Option<String>,
@@ -867,7 +867,7 @@ impl HttpHandleResult {
     fn ok(body: Vec<u8>) -> Self {
         Self {
             status: 200,
-            body,
+            body: body.into(),
             shutdown: false,
             content_type: None,
             extra_headers: Vec::new(),
@@ -876,7 +876,7 @@ impl HttpHandleResult {
     fn err(status: u16, msg: &str) -> Self {
         Self {
             status,
-            body: format!("{{\"error\":\"{}\"}}", msg).into_bytes(),
+            body: format!("{{\"error\":\"{}\"}}", msg).into_bytes().into(),
             shutdown: false,
             content_type: None,
             extra_headers: Vec::new(),
@@ -885,7 +885,7 @@ impl HttpHandleResult {
     fn shutdown() -> Self {
         Self {
             status: 200,
-            body: b"{}".to_vec(),
+            body: b"{}".to_vec().into(),
             shutdown: true,
             content_type: None,
             extra_headers: Vec::new(),
@@ -1088,6 +1088,12 @@ fn handle_http_request_with_session(
         return handle_http_request(http_req, base_ctx);
     }
 
+    // Honest endpoints use their direct RA-TLS channel. Session wrapping would
+    // replace a leased body with a new allocation without adopter admission.
+    if crate::honest_ingress_profile_selected() {
+        return HttpHandleResult::err(403, "honest-session-relay-unavailable");
+    }
+
     let session_id = match http_req.privasys_session.as_deref() {
         Some(s) if !s.is_empty() => s,
         _ => return HttpHandleResult::err(401, "missing PrivasysSession"),
@@ -1130,7 +1136,7 @@ fn handle_http_request_with_session(
 
     HttpHandleResult {
         status: inner_result.status,
-        body: sealed,
+        body: sealed.into(),
         shutdown: inner_result.shutdown,
         content_type: Some(crate::sessionrelay::SEALED_CONTENT_TYPE.to_string()),
         extra_headers: Vec::new(),
@@ -1548,7 +1554,7 @@ fn handle_data_request_http(
             Response::Data(data) => HttpHandleResult::ok(data),
             Response::Error(msg) => HttpHandleResult {
                 status: 400,
-                body: msg,
+                body: msg.into(),
                 shutdown: false,
                 content_type: None,
                 extra_headers: Vec::new(),
@@ -1890,7 +1896,7 @@ fn transform_mcp_tools_response(result: HttpHandleResult) -> HttpHandleResult {
                 .unwrap_or("error");
             HttpHandleResult {
                 status: 400,
-                body: serde_json::to_vec(&serde_json::json!({"error": msg})).unwrap_or_default(),
+                body: serde_json::to_vec(&serde_json::json!({"error": msg})).unwrap_or_default().into(),
                 shutdown: false,
                 content_type: None,
                 extra_headers: Vec::new(),
@@ -1944,7 +1950,7 @@ fn transform_mcp_call_response(result: HttpHandleResult) -> HttpHandleResult {
                 .unwrap_or("error");
             HttpHandleResult {
                 status: 400,
-                body: serde_json::to_vec(&serde_json::json!({"error": msg})).unwrap_or_default(),
+                body: serde_json::to_vec(&serde_json::json!({"error": msg})).unwrap_or_default().into(),
                 shutdown: false,
                 content_type: None,
                 extra_headers: Vec::new(),
@@ -1966,7 +1972,7 @@ fn dispatch_and_respond(
             Response::Data(data) => HttpHandleResult::ok(data),
             Response::Error(msg) => HttpHandleResult {
                 status: 400,
-                body: msg,
+                body: msg.into(),
                 shutdown: false,
                 content_type: None,
                 extra_headers: Vec::new(),
@@ -2476,7 +2482,7 @@ impl IngressServer {
                 });
                 HttpHandleResult {
                     status: 204,
-                    body: Vec::new(),
+                    body: Vec::new().into(),
                     shutdown: false,
                     content_type: None,
                     extra_headers: Vec::new(),

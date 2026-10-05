@@ -53,6 +53,9 @@ compile_error!("mock and sgx-sim-attestation are mutually exclusive");
 extern crate sgx_trts;
 extern crate sgx_types;
 
+mod http_response;
+pub use http_response::HttpResponseBody;
+
 pub mod config_merkle;
 pub mod cpuid_cache;
 pub mod crypto;
@@ -109,7 +112,7 @@ static HONEST_INGRESS_HOOK: OnceLock<HonestIngressHook> = OnceLock::new();
 pub struct HonestIngressResponse {
     pub status: u16,
     pub content_type: &'static str,
-    pub body: std::vec::Vec<u8>,
+    pub body: HttpResponseBody,
 }
 
 /// Optional adopter-owned execution worker.

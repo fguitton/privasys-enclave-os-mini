@@ -102,7 +102,7 @@ struct PendingResponse {
     #[cfg(feature = "diagnostic-transfer-profile")]
     cost: Option<ResponseCost>,
     head: Vec<u8>,
-    body: Vec<u8>,
+    body: crate::HttpResponseBody,
     offset: usize,
     close: bool,
     shutdown: bool,
@@ -326,10 +326,13 @@ impl RaTlsSession {
         status: u16,
         content_type: &str,
         extra_headers: &[(String, String)],
-        body: Vec<u8>,
+        body: impl Into<crate::HttpResponseBody>,
         close: bool,
         shutdown: bool,
     ) -> Result<(), &'static str> {
+        // Join allocation and owner before any fallible operation. An error
+        // drops the body first; TLS drain/teardown retain the same owner.
+        let body = body.into();
         self.require_current_configuration()?;
         if self.response.is_some() {
             return Err("response already pending");
