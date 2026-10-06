@@ -388,7 +388,8 @@ impl RaTlsSession {
         #[cfg(feature = "diagnostic-transfer-profile")]
         let step_started = response.cost.as_ref().map(|_| std::time::Instant::now());
         let mut output = Vec::new();
-        let mut remaining = 32 * 1024;
+        // Keep 4 KiB of the admitted 64 KiB socket step for TLS framing.
+        let mut remaining = 60 * 1024;
         if !response.head.is_empty() {
             self.write_plaintext_chunked(&response.head, &mut output)?;
             remaining -= response.head.len();

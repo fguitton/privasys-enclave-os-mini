@@ -269,7 +269,7 @@ impl IngressServer {
     /// Flush at most one queued enclave→host channel message.
     ///
     /// This is called from Mini's control loop during bounded idle progress.
-    pub fn progress_output(&mut self) -> bool {
+    pub fn progress_output(&mut self, dispatch_budget: &mut usize) -> bool {
         {
             let mut pending = self.pending_output.borrow_mut();
             if let Some(message) = pending.front() {
@@ -285,7 +285,7 @@ impl IngressServer {
         // Round robin among response producers. A slow socket cannot prevent
         // another connection or the control hook from making bounded progress.
         let eligible = |id: &u32, state: &SessionState| {
-            matches!(state, SessionState::Established(session) if session.has_pending_response() || self.pending_dispatch.contains(id))
+            matches!(state, SessionState::Established(session) if session.has_pending_response() || (*dispatch_budget > 0 && self.pending_dispatch.contains(id)))
                 && self
                     .write_windows
                     .borrow()
@@ -311,6 +311,9 @@ impl IngressServer {
         let keep = if session.has_pending_response() {
             self.flush_response(conn_id, &mut session)
         } else {
+            // One request-handler turn uses one of the unchanged eight
+            // dispatch opportunities; larger bursts only extend pure output.
+            *dispatch_budget -= 1;
             self.dispatch_requests(conn_id, &mut session)
         };
         if keep {

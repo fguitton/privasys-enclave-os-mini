@@ -218,6 +218,7 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
         "failed queue drops only its own body admission"
     );
     let mut received = Vec::new();
+    let mut response_steps = 0usize;
     let mut window = enclave_os_common::channel::TcpWriteWindow::default();
     assert_eq!(super::response_credit(&[0; 7], Some(&mut window), Some(&b)), (false, false));
     assert_eq!(super::response_credit(&0u64.to_le_bytes(), None, Some(&b)), (false, false), "absent/foreign window cannot classify as cheap");
@@ -225,6 +226,7 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
     assert_eq!(super::response_credit(&17u64.to_le_bytes(), Some(&mut window), None), (true, false), "absent/handshaking session stays full");
     let mut sent = 17u64;
     while b.has_pending_response() {
+        response_steps += 1;
         let (flight, close, shutdown) = b.progress_http_response().unwrap();
         assert!(flight.len() <= 64 * 1024);
         assert!(!close && !shutdown);
@@ -251,6 +253,8 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
         }
     }
     assert_eq!(received, expected);
+    assert_eq!(response_steps, expected.len().div_ceil(60 * 1024), "actual admitted TLS flights use the larger bounded plaintext quantum");
+    assert!(response_steps < expected.len().div_ceil(32 * 1024));
     assert!(!b.has_pending_response());
     assert!(window.send(1));
     assert_eq!(super::response_credit(&(sent + 1).to_le_bytes(), Some(&mut window), Some(&b)), (true, false), "finished response remains full");

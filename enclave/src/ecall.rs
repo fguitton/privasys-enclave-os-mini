@@ -552,10 +552,13 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
                 // Amortize the adopter's maintenance pass over a bounded
                 // output burst. Each step preserves round-robin selection,
                 // configuration currentness and socket/channel write credit.
-                // At most 256 KiB of plaintext is encrypted before incoming
+                // At most 1920 KiB of plaintext is encrypted before incoming
                 // control traffic and the adopter get another opportunity.
-                for _ in 0..8 {
-                    if !srv.progress_output() || srv.is_shutdown() {
+                // Keep request-handler dispatch bounded separately from
+                // cheap immutable response encryption/channel output.
+                let mut dispatch_budget = 8;
+                for _ in 0..32 {
+                    if !srv.progress_output(&mut dispatch_budget) || srv.is_shutdown() {
                         break;
                     }
                 }
