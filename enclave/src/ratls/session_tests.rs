@@ -161,6 +161,12 @@ fn owned_body(
 
 #[test]
 fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
+    #[cfg(feature="native-deferred-fixture")]
+    crate::actual_workflow_budget::check_continuation_for_native();
+    #[cfg(feature="native-deferred-fixture")]
+    crate::deferred_ingress::check_pending_for_native();
+    #[cfg(feature="native-deferred-fixture")]
+    crate::actual_deferred_selector::check_selector_for_native();
     let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let owner_drop_count = || drops.load(std::sync::atomic::Ordering::SeqCst);
     let store = CertStore::new();
@@ -202,6 +208,15 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
         false,
     )
     .unwrap();
+    let failed_owner = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (reason, returned) = b.queue_http_response_owned(200, "application/json", &[],
+        owned_body(vec![9; 7], &failed_owner), false, false).err().unwrap();
+    assert_eq!(reason, "response already pending");
+    assert_eq!(returned.len(), 7);
+    assert_eq!(failed_owner.load(std::sync::atomic::Ordering::SeqCst), 0,
+        "failed queue returns body ownership to the outside-STATE caller");
+    drop(returned);
+    assert_eq!(failed_owner.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(b
         .queue_http_response(
             200,

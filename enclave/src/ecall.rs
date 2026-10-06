@@ -538,6 +538,30 @@ fn apply_control_action(action: ControlLoopAction) {
     }
 }
 
+/// One nonblocking completion quantum. No adopter callback owns Mini STATE.
+fn progress_deferred_ingress() {
+    let Some((_, _, poll, cancel)) = crate::HONEST_DEFERRED_INGRESS_HOOK.get() else { return; };
+    // A coalesced publication services each reserved nonce at most once. Poll
+    // None cannot create an idle hot loop or starve another ready session.
+    let mut seen = Vec::with_capacity(crate::MAX_DEFERRED_INGRESS_REQUESTS);
+    for _ in 0..crate::MAX_DEFERRED_INGRESS_REQUESTS {
+        let terminal = crate::deferred_ingress::take_terminal();
+        if let Some(token) = terminal { cancel(token); }
+        let cancelled = crate::state().lock().ok().and_then(|mut state|
+            state.ingress_server.as_mut().and_then(|server| server.take_cancelled_deferred()));
+        if let Some(token) = cancelled { cancel(token); }
+        let work = crate::state().lock().ok().and_then(|mut state|
+            state.ingress_server.as_mut().and_then(|server| server.take_deferred(&seen)));
+        let Some(work) = work else { if cancelled.is_none() && terminal.is_none() { break; } else { continue; } };
+        seen.push(work.nonce);
+        let mut response = work.context.as_ref().and_then(|context| poll(work.token, context));
+        let retained = crate::state().lock().ok().is_some_and(|mut state|
+            state.ingress_server.as_mut().is_some_and(|server| server.finish_deferred(&work, &mut response)));
+        if !retained { cancel(work.token); }
+        drop(response);
+    }
+}
+
 /// Run the control event loop after [`initialise_runtime_and_ingress`].
 pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
     if crate::core_phase() != enclave_os_common::core_phase::CorePhase::Running {
@@ -546,7 +570,12 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
 
     // Main event loop: read from data channel, dispatch to IngressServer
     let data_rx = crate::data_rx();
+    let mut deferred_event = true;
     while !crate::is_shutdown() {
+        let published = crate::deferred_ingress::take_deferred_revision();
+        if deferred_event || published {
+            progress_deferred_ingress(); deferred_event = false;
+        }
         if let Ok(mut st) = crate::state().lock() {
             if let Some(ref mut srv) = st.ingress_server {
                 // Amortize the adopter's maintenance pass over a bounded
@@ -584,9 +613,12 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
         // Try to receive a data channel message
         match data_rx.try_recv() {
             Some(msg) => {
+                // Tick is a finite deadline fallback; data progress uses the
+                // independently retained adopter revision, not idle polling.
                 // Decode the channel message
                 match channel::decode_channel_msg(&msg) {
                     Some((msg_type, conn_id, payload)) => {
+                        if msg_type == channel::ChannelMsgType::Tick { deferred_event = true; }
                         // Honest's host-assigned connections reach the adopter
                         // hook in the ingress range. Reject other incoming
                         // connections; the former optional peer link is removed.
@@ -673,10 +705,16 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
 
     let _ = control_opportunity(hook, ControlLoopOpportunity::Shutdown);
     crate::signal_shutdown();
+    let mut cancelled = Vec::new();
     if let Some(state) = crate::try_state() {
         if let Ok(mut st) = state.lock() {
+            if let Some(server) = st.ingress_server.as_mut() { cancelled = server.drain_deferred_tokens(); }
             st.ingress_server = None;
         }
+    }
+    if let Some((_, _, _, cancel)) = crate::HONEST_DEFERRED_INGRESS_HOOK.get() {
+        for token in cancelled { cancel(token); }
+        for _ in 0..crate::MAX_DEFERRED_INGRESS_REQUESTS { if let Some(token)=crate::deferred_ingress::take_terminal() { cancel(token); } else { break; } }
     }
     enclave_log_info!("Event loop exited");
     crate::shutdown_return_code()
