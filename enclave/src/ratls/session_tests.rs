@@ -218,10 +218,23 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
         "failed queue drops only its own body admission"
     );
     let mut received = Vec::new();
+    let mut window = enclave_os_common::channel::TcpWriteWindow::default();
+    assert_eq!(super::response_credit(&[0; 7], Some(&mut window), Some(&b)), (false, false));
+    assert_eq!(super::response_credit(&0u64.to_le_bytes(), None, Some(&b)), (false, false), "absent/foreign window cannot classify as cheap");
+    assert!(window.send(17));
+    assert_eq!(super::response_credit(&17u64.to_le_bytes(), Some(&mut window), None), (true, false), "absent/handshaking session stays full");
+    let mut sent = 17u64;
     while b.has_pending_response() {
         let (flight, close, shutdown) = b.progress_http_response().unwrap();
         assert!(flight.len() <= 64 * 1024);
         assert!(!close && !shutdown);
+        assert!(window.send(flight.len() as u64));
+        sent += flight.len() as u64;
+        let pending = b.has_pending_response();
+        assert_eq!(super::response_credit(&sent.to_le_bytes(), Some(&mut window), Some(&b)), (true, pending), "actual advancing credit is cheap only while this response drains");
+        assert_eq!(super::response_credit(&sent.to_le_bytes(), Some(&mut window), Some(&b)), (true, false), "duplicate credit never creates progress");
+        assert_eq!(super::response_credit(&(sent - 1).to_le_bytes(), Some(&mut window), Some(&b)), (false, false));
+        assert_eq!(super::response_credit(&(sent + 1).to_le_bytes(), Some(&mut window), Some(&b)), (false, false));
         let mut input = Cursor::new(flight);
         while input.position() < input.get_ref().len() as u64 {
             b_client.read_tls(&mut input).unwrap();
@@ -238,6 +251,9 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
         }
     }
     assert_eq!(received, expected);
+    assert!(!b.has_pending_response());
+    assert!(window.send(1));
+    assert_eq!(super::response_credit(&(sent + 1).to_le_bytes(), Some(&mut window), Some(&b)), (true, false), "finished response remains full");
     assert_eq!(
         owner_drop_count(),
         2,

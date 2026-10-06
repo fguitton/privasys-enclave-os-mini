@@ -473,6 +473,9 @@ pub fn initialise_runtime_and_ingress(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ControlLoopOpportunity {
     DataChannelProgress,
+    /// Actual advancing server credit, validated by Mini, while an existing
+    /// response is still draining. This scheduling hint confers no authority.
+    IngressWriteCredit(u32),
     Idle,
     Shutdown,
 }
@@ -609,6 +612,7 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
                             ));
                             continue;
                         }
+                        let mut opportunity = ControlLoopOpportunity::DataChannelProgress;
                         if !hook.on_data_channel_message(msg_type, conn_id, payload) {
                             let mut st = match crate::state().lock() {
                                 Ok(st) => st,
@@ -623,7 +627,9 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
                                 }
                             };
                             if let Some(ref mut srv) = st.ingress_server {
-                                srv.handle_message(msg_type, conn_id, payload);
+                                if srv.handle_message(msg_type, conn_id, payload) {
+                                    opportunity = ControlLoopOpportunity::IngressWriteCredit(conn_id);
+                                }
                                 if let Some(reason) = srv.shutdown_reason() {
                                     enclave_log_error!(
                                         "MINI-CONTROL-SHUTDOWN: reason=Ingress({:?})",
@@ -644,7 +650,7 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
                         }
                         apply_control_action(control_opportunity(
                             hook,
-                            ControlLoopOpportunity::DataChannelProgress,
+                            opportunity,
                         ));
                     }
                     None => {

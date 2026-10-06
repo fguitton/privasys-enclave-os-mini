@@ -170,7 +170,8 @@ impl IngressServer {
     ///
     /// Called from the enclave event loop for each message received on
     /// the `data_host_to_enc` queue.
-    pub fn handle_message(&mut self, msg_type: ChannelMsgType, conn_id: u32, payload: &[u8]) {
+    pub fn handle_message(&mut self, msg_type: ChannelMsgType, conn_id: u32, payload: &[u8]) -> bool {
+        let mut advancing_response_credit = false;
         match msg_type {
             ChannelMsgType::TcpNew | ChannelMsgType::LocalControlNew => {
                 let peer_addr = core::str::from_utf8(payload)
@@ -197,12 +198,14 @@ impl IngressServer {
             }
 
             ChannelMsgType::TcpWriteCredit => {
-                let valid = channel::decode_tcp_write_credit(payload).is_some_and(|written| {
-                    self.write_windows
-                        .borrow_mut()
-                        .get_mut(&conn_id)
-                        .is_some_and(|window| window.acknowledge(written))
-                });
+                let established = match self.sessions.get(&conn_id) {
+                    Some(SessionState::Established(session)) => Some(session),
+                    _ => None,
+                };
+                let (valid, advancing) = super::session::response_credit(
+                    payload, self.write_windows.borrow_mut().get_mut(&conn_id), established,
+                );
+                advancing_response_credit = advancing;
                 if !valid {
                     self.sessions.remove(&conn_id);
                     self.pending_dispatch.remove(&conn_id);
@@ -244,6 +247,7 @@ impl IngressServer {
                 enclave_log_error!("Unexpected outbound connection event conn_id={}", conn_id);
             }
         }
+        advancing_response_credit
     }
 
     /// Are we shutting down?

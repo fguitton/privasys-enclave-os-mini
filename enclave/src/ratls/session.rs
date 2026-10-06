@@ -17,6 +17,21 @@ use crate::enclave_log_error;
 use enclave_os_common::protocol;
 use std::vec::Vec;
 
+/// Validated credit bookkeeping only. An absent/handshaking session is passed
+/// as None by the server; callers still perform its original invalid teardown.
+pub(crate) fn response_credit(
+    payload: &[u8],
+    window: Option<&mut enclave_os_common::channel::TcpWriteWindow>,
+    established: Option<&RaTlsSession>,
+) -> (bool, bool) {
+    let Some(written) = enclave_os_common::channel::decode_tcp_write_credit(payload) else { return (false, false); };
+    let Some(window) = window else { return (false, false); };
+    let before = window.available();
+    let valid = window.acknowledge(written);
+    (valid, valid && window.available() > before
+        && established.is_some_and(RaTlsSession::has_pending_response))
+}
+
 #[cfg(test)]
 #[path = "session_tests.rs"]
 mod tests;
