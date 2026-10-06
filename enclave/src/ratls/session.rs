@@ -345,23 +345,19 @@ impl RaTlsSession {
         close: bool,
         shutdown: bool,
     ) -> Result<(), &'static str> {
-        // Join allocation and owner before any fallible operation. An error
-        // drops the body first; TLS drain/teardown retain the same owner.
-        let body = body.into();
-        self.require_current_configuration()?;
-        if self.response.is_some() {
-            return Err("response already pending");
-        }
-        let head = protocol::format_http_response_head(
-            status,
-            content_type,
-            extra_headers,
-            body.len(),
-            close,
-        );
-        if head.len() > 32 * 1024 {
-            return Err("response headers too large");
-        }
+        self.queue_http_response_owned(status, content_type, extra_headers, body.into(), close, shutdown)
+            .map_err(|(error, _body)| error)
+    }
+
+    /// Keep an unconsumed body available for its owner to drop outside STATE.
+    pub(crate) fn queue_http_response_owned(
+        &mut self, status: u16, content_type: &str, extra_headers: &[(String, String)],
+        body: crate::HttpResponseBody, close: bool, shutdown: bool,
+    ) -> Result<(), (&'static str, crate::HttpResponseBody)> {
+        if let Err(error) = self.require_current_configuration() { return Err((error, body)); }
+        if self.response.is_some() { return Err(("response already pending", body)); }
+        let head = protocol::format_http_response_head(status, content_type, extra_headers, body.len(), close);
+        if head.len() > 32 * 1024 { return Err(("response headers too large", body)); }
         self.response = Some(PendingResponse {
             #[cfg(feature = "diagnostic-transfer-profile")]
             cost: (body.len() >= 1024 * 1024).then(|| ResponseCost {
@@ -578,6 +574,22 @@ impl RaTlsSession {
         self.local_evidence = Some(evidence);
     }
 
+    /// Conservative capacities of every dynamically cloned context field.
+    pub(crate) fn context_allocation_bound(&self) -> Option<usize> {
+        fn evidence(value: &enclave_os_common::modules::PeerEvidence) -> Option<usize> {
+            value.tee.capacity().checked_add(value.quote.capacity())?
+                .checked_add(value.quote_time.capacity())?
+                .checked_add(value.gpu_evidence.as_ref().map_or(0, Vec::capacity))
+        }
+        let mut bytes = 1024usize.checked_add(self.local_cert_der.capacity())?
+            .checked_add(self.server_name.as_ref().map_or(0, String::capacity))?
+            .checked_add(self.tls_conn.peer_certificates().and_then(|certs| certs.first()).map_or(0, |cert| cert.as_ref().len()))?;
+        for value in [&self.local_evidence, &self.peer_evidence].into_iter().flatten() {
+            bytes = bytes.checked_add(evidence(value)?)?;
+        }
+        Some(bytes)
+    }
+
     pub fn channel_binder(&self) -> Option<Vec<u8>> {
         self.export_hctx(b"EXPORTER-honest-peer-channel-v2", &[])
             .ok()
@@ -642,7 +654,7 @@ impl RaTlsSession {
     }
     /// Check at ingress and before each decoded request/response. Buffered
     /// requests must not cross a workload replacement within one TLS flight.
-    fn require_current_configuration(&mut self) -> Result<(), &'static str> {
+    pub(crate) fn require_current_configuration(&mut self) -> Result<(), &'static str> {
         if !self.configuration.is_current() {
             self.fail_attestation();
             self.fido2_identity = None;

@@ -98,6 +98,11 @@ pub struct IngressServer {
     /// One deferred parse turn after a response completes, including a small
     /// response completed synchronously during dispatch.
     pending_dispatch: BTreeSet<u32>,
+    /// Fixed charged slots survive extraction until exact nonce/session join.
+    deferred: BTreeMap<u32, crate::deferred_ingress::PendingSession>,
+    cancelled_deferred: VecDeque<crate::HonestPendingIngress>,
+    next_deferred: u64,
+    deferred_cursor: u32,
     /// Enclave-visible route class for each multiplexed TLS connection.
     /// This remains routing metadata and never substitutes for authorization.
     ingress_classes: BTreeMap<u32, enclave_os_common::modules::IngressClass>,
@@ -152,6 +157,10 @@ impl IngressServer {
             write_windows: RefCell::new(BTreeMap::new()),
             output_cursor: 0,
             pending_dispatch: BTreeSet::new(),
+            deferred: BTreeMap::new(),
+            cancelled_deferred: VecDeque::new(),
+            next_deferred: 0,
+            deferred_cursor: 0,
             ingress_classes: BTreeMap::new(),
             ca,
             data_tx,
@@ -208,6 +217,7 @@ impl IngressServer {
                 advancing_response_credit = advancing;
                 if !valid {
                     self.sessions.remove(&conn_id);
+                        self.invalidate_deferred(conn_id);
                     self.pending_dispatch.remove(&conn_id);
                     self.ingress_classes.remove(&conn_id);
                     self.write_windows.borrow_mut().remove(&conn_id);
@@ -285,7 +295,7 @@ impl IngressServer {
         // Round robin among response producers. A slow socket cannot prevent
         // another connection or the control hook from making bounded progress.
         let eligible = |id: &u32, state: &SessionState| {
-            matches!(state, SessionState::Established(session) if session.has_pending_response() || (*dispatch_budget > 0 && self.pending_dispatch.contains(id)))
+            matches!(state, SessionState::Established(session) if session.has_pending_response() || (*dispatch_budget > 0 && self.pending_dispatch.contains(id) && !self.deferred.contains_key(id)))
                 && self
                     .write_windows
                     .borrow()
@@ -490,7 +500,114 @@ impl IngressServer {
     }
 
     /// Process all complete HTTP/1.1 requests from a session.
+    fn invalidate_deferred(&mut self, id: u32) {
+        if let Some(slot) = self.deferred.remove(&id) {
+            if let Some(token) = slot.token { self.cancelled_deferred.push_back(token); }
+        }
+        crate::notify_deferred_ingress();
+    }
+    pub(crate) fn take_cancelled_deferred(&mut self) -> Option<crate::HonestPendingIngress> {
+        self.cancelled_deferred.pop_front()
+    }
+
+    fn close_deferred_transport(&mut self, id: u32) {
+        // The extracted token is cancelled after releasing STATE.
+        self.sessions.remove(&id);
+        self.pending_dispatch.remove(&id);
+        self.ingress_classes.remove(&id);
+        self.write_windows.borrow_mut().remove(&id);
+        self.send_close(id);
+    }
+
+    pub(crate) fn drain_deferred_tokens(&mut self) -> Vec<crate::HonestPendingIngress> {
+        std::mem::take(&mut self.deferred).into_values().filter_map(|slot| slot.token)
+            .chain(self.cancelled_deferred.drain(..)).collect()
+    }
+
+    /// Extract one fixed slot after an event. The marker stays reserved while
+    /// the adopter progresses outside STATE, including disconnect races.
+    pub(crate) fn take_deferred(&mut self, seen: &[u64]) -> Option<crate::deferred_ingress::DeferredWork> {
+        let id = self.deferred.range((std::ops::Bound::Excluded(self.deferred_cursor), std::ops::Bound::Unbounded))
+            .find(|(_, slot)| slot.token.is_some() && !seen.contains(&slot.nonce)).or_else(|| self.deferred.iter().find(|(_, slot)| slot.token.is_some() && !seen.contains(&slot.nonce)))
+            .map(|(id, _)| *id)?;
+        self.deferred_cursor = id;
+        let slot = self.deferred.get_mut(&id)?;
+        let token = slot.token.take()?;
+        let (nonce, binding) = (slot.nonce, slot.binding);
+        let expired = slot.started.elapsed() >= std::time::Duration::from_secs(60);
+        let mut context_charge = None;
+        let context = match self.sessions.get_mut(&id) {
+            Some(SessionState::Established(session)) if !expired => {
+                if session.require_current_configuration().is_err() || session.attestation_failed()
+                    || session.channel_binder().as_deref() != Some(binding.as_slice()) {
+                    None
+                } else {
+                    context_charge = session.context_allocation_bound().and_then(crate::deferred_ingress::ContextCharge::reserve);
+                    if context_charge.is_none() { return Some(crate::deferred_ingress::DeferredWork { connection:id, nonce, binding, token, context:None, context_charge:None }); }
+                    Some(fresh_context(id, self.ingress_classes.get(&id).copied()
+                        .unwrap_or(enclave_os_common::modules::IngressClass::ExternalNetwork), session))
+                }
+            }
+            _ => None,
+        };
+        Some(crate::deferred_ingress::DeferredWork { connection: id, nonce, binding, token, context, context_charge })
+    }
+
+    /// Ready bytes are queued only after the exact retained marker and current
+    /// session/configuration join. False means cancel the adopter token outside
+    /// STATE; any unqueued body also drops outside STATE.
+    pub(crate) fn finish_deferred(&mut self, work: &crate::deferred_ingress::DeferredWork,
+        response: &mut Option<crate::HonestIngressResponse>) -> bool {
+        let id = work.connection;
+        let valid_marker = self.deferred.get(&id).is_some_and(|slot|
+            slot.nonce == work.nonce && slot.binding == work.binding && slot.token.is_none()
+                && slot.started.elapsed() < std::time::Duration::from_secs(60));
+        if !valid_marker {
+            if self.deferred.get(&id).is_some_and(|slot| slot.nonce == work.nonce) { self.deferred.remove(&id); self.close_deferred_transport(id); }
+            return false;
+        }
+        let valid_session = work.context.is_some() && matches!(self.sessions.get_mut(&id),
+            Some(SessionState::Established(session)) if session.require_current_configuration().is_ok()
+                && !session.attestation_failed()
+                && session.channel_binder().as_deref() == Some(work.binding.as_slice()));
+        if !valid_session {
+            self.deferred.remove(&id); self.close_deferred_transport(id);
+            return false;
+        }
+        if response.is_none() {
+            self.deferred.get_mut(&id).unwrap().token = Some(work.token);
+            return true;
+        }
+        let slot = self.deferred.remove(&id).unwrap();
+        let Some(SessionState::Established(mut session)) = self.sessions.remove(&id) else { return false; };
+        let ready = response.take().unwrap();
+        let keep = match session.queue_http_response_owned(ready.status, ready.content_type,
+            &[], ready.body, slot.close, false) {
+            Ok(()) => { self.pending_dispatch.insert(id); true }
+            Err((_, body)) => {
+                *response = Some(crate::HonestIngressResponse { status:ready.status, content_type:ready.content_type, body });
+                self.send_close(id); false
+            }
+        };
+        if keep { self.sessions.insert(id, SessionState::Established(session)); }
+        else { self.pending_dispatch.remove(&id); self.write_windows.borrow_mut().remove(&id); self.ingress_classes.remove(&id); }
+        false
+    }
+
+    fn queue_deferred_ready(&mut self, conn_id: u32, session: &mut RaTlsSession,
+        response: crate::HonestIngressResponse, close: bool) -> bool {
+        if session.queue_http_response(response.status, response.content_type, &[],
+            response.body, close, false).is_err() {
+            self.send_close(conn_id); return false;
+        }
+        self.pending_dispatch.insert(conn_id);
+        let credit = self.write_windows.borrow().get(&conn_id)
+            .is_some_and(|window| window.available() >= 64 * 1024);
+        !credit || self.flush_response(conn_id, session)
+    }
+
     fn dispatch_requests(&mut self, conn_id: u32, session: &mut RaTlsSession) -> bool {
+        if self.deferred.contains_key(&conn_id) { return true; }
         self.pending_dispatch.remove(&conn_id);
         if session.has_pending_response() {
             return true;
@@ -548,6 +665,43 @@ impl IngressServer {
                             attestation: session.attestation().to_string(),
                             oidc_claims: None,
                         };
+                    if crate::honest_ingress_profile_selected()
+                        && matches!(enclave_os_common::modules::classify_honest_ingress(
+                            &http_req.method, &http_req.path, &base_ctx),
+                            enclave_os_common::modules::HonestIngressRoute::Peer
+                            | enclave_os_common::modules::HonestIngressRoute::Proposal
+                            | enclave_os_common::modules::HonestIngressRoute::LocalControl
+                            | enclave_os_common::modules::HonestIngressRoute::Bootstrap
+                            | enclave_os_common::modules::HonestIngressRoute::ComponentStaging)
+                        && http_req.body.len() <= crate::MAX_DEFERRED_INGRESS_REQUEST_BYTES
+                    {
+                        if let Some((_, start, _, _)) = crate::HONEST_DEFERRED_INGRESS_HOOK.get().filter(|(eligible, _, _, _)| eligible(&http_req, &base_ctx)) {
+                            if self.deferred.len() + self.cancelled_deferred.len() >= crate::MAX_DEFERRED_INGRESS_REQUESTS {
+                                return self.queue_deferred_ready(conn_id, session, crate::HonestIngressResponse {
+                                    status: 429, content_type: "application/octet-stream", body: Vec::new().into(),
+                                }, close);
+                            }
+                            let Some(binding) = base_ctx.channel_binder.as_deref()
+                                .and_then(|value| <[u8; 32]>::try_from(value).ok()) else { return false; };
+                            let Some(nonce) = self.next_deferred.checked_add(1) else { return false; };
+                            self.next_deferred = nonce;
+                            // Reserve before the adopter may allocate its bounded request.
+                            self.deferred.insert(conn_id, crate::deferred_ingress::PendingSession {
+                                nonce, binding, token: None, close, started: std::time::Instant::now(),
+                            });
+                            match start(&http_req, &base_ctx) {
+                                Some(crate::HonestIngressStart::Pending(token)) => {
+                                    self.deferred.get_mut(&conn_id).unwrap().token = Some(token);
+                                    return true;
+                                }
+                                Some(crate::HonestIngressStart::Ready(response)) => {
+                                    self.deferred.remove(&conn_id);
+                                    return self.queue_deferred_ready(conn_id, session, response, close);
+                                }
+                                None => { self.deferred.remove(&conn_id); }
+                            }
+                        }
+                    }
                     handle_http_request_with_session(&http_req, &base_ctx)
                 };
 
@@ -853,6 +1007,18 @@ fn build_tls_config(
         attested_endpoint: app.and_then(|app| app.attested_endpoint),
         configuration,
     })
+}
+
+fn fresh_context(conn_id: u32, ingress_class: enclave_os_common::modules::IngressClass,
+    session: &RaTlsSession) -> enclave_os_common::modules::RequestContext {
+    enclave_os_common::modules::RequestContext {
+        ingress_class, connection_id: conn_id,
+        server_name: session.server_name().map(str::to_owned),
+        attested_endpoint: session.attested_endpoint(), local_cert_der: session.local_cert_der(),
+        local_evidence: session.local_evidence().cloned(), channel_binder: session.channel_binder(),
+        peer_cert_der: session.peer_cert_der(), peer_evidence: session.peer_evidence().cloned(),
+        attestation: session.attestation().to_string(), oidc_claims: None,
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -202,6 +202,15 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
         false,
     )
     .unwrap();
+    let failed_owner = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (reason, returned) = b.queue_http_response_owned(200, "application/json", &[],
+        owned_body(vec![9; 7], &failed_owner), false, false).err().unwrap();
+    assert_eq!(reason, "response already pending");
+    assert_eq!(returned.len(), 7);
+    assert_eq!(failed_owner.load(std::sync::atomic::Ordering::SeqCst), 0,
+        "failed queue returns body ownership to the outside-STATE caller");
+    drop(returned);
+    assert_eq!(failed_owner.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(b
         .queue_http_response(
             200,
