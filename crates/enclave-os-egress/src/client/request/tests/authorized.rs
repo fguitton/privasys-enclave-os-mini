@@ -17,6 +17,10 @@ struct Wire {
     port: u16,
     stream: Option<TcpStream>,
     closed: bool,
+    send_limit: usize,
+    sends: usize,
+    maximum_send: usize,
+    maximum_receive: usize,
 }
 impl InterruptibleBlockingNetIo for Wire {
     fn tcp_connect(&mut self, host: &str, port: u16) -> Result<i32, i32> {
@@ -29,15 +33,22 @@ impl InterruptibleBlockingNetIo for Wire {
     }
     fn send(&mut self, fd: i32, bytes: &[u8]) -> Result<usize, i32> {
         assert_eq!(fd, 1);
+        self.sends += 1;
+        self.maximum_send = self.maximum_send.max(bytes.len());
         self.stream
             .as_mut()
             .unwrap()
-            .write(&bytes[..bytes.len().min(257)])
+            .write(&bytes[..bytes.len().min(self.send_limit)])
             .map_err(|_| -1)
     }
     fn recv(&mut self, fd: i32, out: &mut [u8]) -> Result<usize, i32> {
         assert_eq!(fd, 1);
-        let count = out.len().min(73);
+        self.maximum_receive = self.maximum_receive.max(out.len());
+        let count = out.len().min(if self.send_limit == usize::MAX {
+            out.len()
+        } else {
+            73
+        });
         self.stream
             .as_mut()
             .unwrap()
@@ -78,7 +89,7 @@ pub(super) fn check_authorization_boundary() {
     let config = Arc::new(config);
     // Valid current certificate, explicit authority denial, committed time before
     // the certificate existed, and connection loss after a real request write.
-    for selection in 0..8 {
+    for selection in 0..12 {
         let bulk = selection >= 4;
         let scenario = selection % 4;
         let mut body = if bulk {
@@ -130,6 +141,10 @@ pub(super) fn check_authorization_boundary() {
             port,
             stream: None,
             closed: false,
+            send_limit: if selection >= 8 { usize::MAX } else { 257 },
+            sends: 0,
+            maximum_send: 0,
+            maximum_receive: 0,
         };
         let mut calls = 0;
         let mut authorize = |chain: &crate::TlsPeerCertificateChain| {
@@ -176,6 +191,16 @@ pub(super) fn check_authorization_boundary() {
                 assert_eq!(response.status, 201);
                 assert_eq!(response.body, if bulk { body.clone() } else { vec![] });
                 assert!(received.ends_with(&body));
+                if selection >= 8 {
+                    assert!(wire.maximum_send > 256 * 1024);
+                    assert!(wire.maximum_send <= super::super::TLS_OUTPUT_WINDOW);
+                    assert_eq!(wire.maximum_receive, super::super::TLS_OUTPUT_WINDOW);
+                    assert!(
+                        wire.sends < 32,
+                        "bulk TLS records must share transport calls"
+                    );
+                    println!("BULK-TLS-AGGREGATION: bytes={} sends={} max_send={} max_recv={} FULL-BYTE PASS", body.len(), wire.sends, wire.maximum_send, wire.maximum_receive);
+                }
             }
             1 | 2 => {
                 let error = result.unwrap_err();

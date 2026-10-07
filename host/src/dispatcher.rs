@@ -25,6 +25,8 @@ use enclave_os_common::rpc::{self, HonestRpcIdentity, RpcMethod, RpcRole};
 use crate::dispatcher_wake::DispatcherWake;
 use crate::kvstore;
 use crate::net;
+#[path = "response_publication.rs"]
+mod response_publication;
 
 fn legacy_role_allows_method(role: RpcRole, method: RpcMethod) -> bool {
     !matches!(method, RpcMethod::KvPutDurable) || role == RpcRole::Control
@@ -158,23 +160,11 @@ impl RpcDispatcher {
     }
 
     fn try_send_honest_response(&self, identity: HonestRpcIdentity, status: i32, payload: &[u8]) {
-        let response = match rpc::encode_honest_response(identity, status, payload) {
-            Ok(response) => response,
-            Err(error) => {
-                error!(
-                    "{} Honest RPC response rejected: {:?}",
-                    role_name(self.role),
-                    error
-                );
-                return;
-            }
-        };
-        if self.response_tx.try_send(&response).is_err() {
-            error!(
-                "{} Honest RPC response queue saturated for operation {}",
-                role_name(self.role),
-                identity.operation_id
-            );
+        if let Err(error) = response_publication::publish(
+            self.role, &self.response_tx, &self.wake, identity, status, payload,
+        ) {
+            error!("{} Honest RPC response publication failed for operation {}: {}",
+                role_name(self.role), identity.operation_id, error);
         }
     }
 

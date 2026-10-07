@@ -8,10 +8,33 @@ use crate::queue::{SpscConsumer, SpscProducer, SpscQueueHeader};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
-// These native fixtures poll their queues; no SGX OCALL is invoked.
+// Native ABI stubs supply scheduling hints only; no SGX OCALL bridge executes.
+thread_local! {
+    static WAIT_RESULT: std::cell::Cell<(u32, i32)> = const { std::cell::Cell::new((0, 0)) };
+    static WAIT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 #[no_mangle]
 extern "C" fn ocall_notify() -> u32 {
     0
+}
+
+#[no_mangle]
+extern "C" fn ocall_notify_execution_waiter() -> u32 {
+    0
+}
+
+#[no_mangle]
+extern "C" fn ocall_wait_execution_response(result: *mut i32, maximum_micros: u64) -> u32 {
+    assert!((1..=1_000).contains(&maximum_micros));
+    WAIT_CALLS.with(|calls| calls.set(calls.get() + 1));
+    let (transport, hint) = WAIT_RESULT.with(std::cell::Cell::get);
+    if transport == 0 {
+        // SAFETY: production caller supplies its writable local scalar result.
+        unsafe {
+            result.write(hint);
+        }
+    }
+    transport
 }
 
 fn queue() -> (SpscProducer, SpscConsumer) {
@@ -42,6 +65,8 @@ pub(super) fn check_synchronous_ownership() {
     check_synchronous_pair(true);
     check_polled_owner();
     check_failed_acknowledgement();
+    check_completion_wait();
+    check_rejected_wait();
 }
 
 fn check_synchronous_pair(durable_first: bool) {
@@ -147,4 +172,73 @@ fn check_failed_acknowledgement() {
         );
         host.join().unwrap();
     }
+}
+
+fn check_completion_wait() {
+    for hint in [0, 1] {
+        WAIT_RESULT.with(|value| value.set((0, hint)));
+        let (tx, host_rx) = queue();
+        let (host_tx, rx) = queue();
+        let rpc = client::RpcClient::new(tx, rx);
+        let pending = rpc.try_execution_net_close(3, 8, 7).unwrap();
+        let request = receive(&host_rx);
+        let identity = decode_honest_request(&request).unwrap().identity;
+        assert!(rpc.poll_execution_rpc(&pending).unwrap().is_none());
+        rpc.wait_execution_rpc(&pending, 1_000).unwrap();
+        assert!(
+            rpc.poll_execution_rpc(&pending).unwrap().is_none(),
+            "host hint creates no response"
+        );
+        host_tx.send(&encode_honest_response(identity, 0, b"exact frame").unwrap());
+        let result = rpc.poll_execution_rpc(&pending).unwrap().unwrap();
+        assert_eq!(result.status(), 0);
+        assert_eq!(result.payload(), b"exact frame");
+        assert_eq!(
+            rpc.wait_execution_rpc(&pending, 1_000),
+            Err(client::PolledExecutionRpcError::NotPending)
+        );
+    }
+    let (tx, host_rx) = queue();
+    let (host_tx, rx) = queue();
+    let rpc = client::RpcClient::new(tx, rx);
+    let pending = rpc.try_execution_net_close(3, 8, 7).unwrap();
+    let request = receive(&host_rx);
+    let mut identity = decode_honest_request(&request).unwrap().identity;
+    identity.operation_id += 1;
+    host_tx.send(&encode_honest_response(identity, 0, &[]).unwrap());
+    assert!(matches!(
+        rpc.poll_execution_rpc(&pending),
+        Err(client::PolledExecutionRpcError::UnexpectedResponse)
+    ));
+    assert_eq!(
+        rpc.wait_execution_rpc(&pending, 1_000),
+        Err(client::PolledExecutionRpcError::NotPending)
+    );
+    println!("EXECUTION-RPC-WAIT: exact token, empty hints, timeout hints, substituted identity PASS; native ABI stubs, SGX bridge separate");
+}
+
+fn check_rejected_wait() {
+    for (transport, hint) in [(1, 0), (0, -1), (0, 2)] {
+        WAIT_RESULT.with(|value| value.set((transport, hint)));
+        let (tx, host_rx) = queue();
+        let (_host_tx, rx) = queue();
+        let rpc = client::RpcClient::new(tx, rx);
+        let pending = rpc.try_execution_net_close(3, 8, 7).unwrap();
+        receive(&host_rx);
+        let before = WAIT_CALLS.with(std::cell::Cell::get);
+        for maximum in [0, 1_001] {
+            assert_eq!(
+                rpc.wait_execution_rpc(&pending, maximum),
+                Err(client::PolledExecutionRpcError::InvalidRequest)
+            );
+        }
+        assert_eq!(WAIT_CALLS.with(std::cell::Cell::get), before);
+        assert_eq!(
+            rpc.wait_execution_rpc(&pending, 1_000),
+            Err(client::PolledExecutionRpcError::WaitUnavailable)
+        );
+        assert!(rpc.poll_execution_rpc(&pending).unwrap().is_none());
+        rpc.abandon_execution_rpc(pending).unwrap();
+    }
+    WAIT_RESULT.with(|value| value.set((0, 0)));
 }

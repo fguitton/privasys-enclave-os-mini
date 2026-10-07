@@ -119,17 +119,21 @@ enclave {
 
     untrusted {
         /* ================================================================
-         *  Notify (the ONLY OCALL)
+         *  Request and completion hints (no response payload)
          * ================================================================
          *
          * A lightweight signal from enclave to host: "I put something in
          * the enc_to_host queue, please process it."
          *
-         * This is optional — the host can spin-poll the queue instead.
+         * Queue publication is authoritative; these hints support bounded waiting.
          * Using it lets the host sleep when idle, saving CPU.
          *
          * The OCALL carries no data; all data flows through the queue.
          */
         void ocall_notify();
+        /* Retained response-publication hint; bounded cancellation wait only.
+         * The exact response identity and bytes remain in the shared queue. */
+        int ocall_wait_execution_response(uint64_t maximum_micros);
+        void ocall_notify_execution_waiter();
     };
 };

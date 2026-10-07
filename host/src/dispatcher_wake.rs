@@ -12,10 +12,13 @@
 use enclave_os_common::rpc::RpcRole;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 pub struct DispatcherWake {
     pending: Mutex<[bool; 2]>,
     ready: Condvar,
+    responses: Mutex<([bool; 2], bool)>,
+    response_ready: Condvar,
 }
 
 impl DispatcherWake {
@@ -23,6 +26,8 @@ impl DispatcherWake {
         Self {
             pending: Mutex::new([false; 2]),
             ready: Condvar::new(),
+            responses: Mutex::new(([false; 2], false)),
+            response_ready: Condvar::new(),
         }
     }
 
@@ -53,7 +58,51 @@ impl DispatcherWake {
         pending[index] = false;
     }
 
+    /// Called only after successful response-ring publication. The retained
+    /// bit closes the race between the worker's empty-ring check and its OCALL.
+    pub fn notify_response(&self, role: RpcRole) {
+        let index = usize::from(role == RpcRole::Execution);
+        let mut state = self
+            .responses
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.0[index] = true;
+        self.response_ready.notify_all();
+    }
+
+    /// A scheduling hint only. Callers must check their exact queue operation
+    /// again; an old/coalesced/spurious hint grants neither bytes nor authority.
+    /// Timeout is solely a finite fence/cancellation boundary, not pacing.
+    pub fn wait_response(&self, role: RpcRole, maximum: Duration) -> i32 {
+        let index = usize::from(role == RpcRole::Execution);
+        let state = self
+            .responses
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (mut state, _) = self
+            .response_ready
+            .wait_timeout_while(state, maximum, |state| !state.0[index] && !state.1)
+            .unwrap_or_else(|error| error.into_inner());
+        if state.1 {
+            return -1;
+        }
+        if state.0[index] {
+            state.0[index] = false;
+            0
+        } else {
+            1
+        }
+    }
+
     pub fn shutdown(&self, shutdown: &AtomicBool) {
+        {
+            let mut state = self
+                .responses
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.1 = true;
+            self.response_ready.notify_all();
+        }
         shutdown.store(true, Ordering::Release);
         self.notify();
     }
@@ -128,6 +177,58 @@ mod tests {
             worker.join().unwrap();
             assert_eq!(premature, Err(mpsc::RecvTimeoutError::Timeout));
             completed.unwrap();
+        }
+    }
+
+    #[test]
+    fn response_publication_between_empty_check_and_wait_is_retained() {
+        let wake = Arc::new(DispatcherWake::new());
+        let shutdown = AtomicBool::new(false);
+        for _ in 0..128 {
+            wake.notify_response(RpcRole::Execution);
+            wake.notify_response(RpcRole::Execution);
+            assert_eq!(
+                wake.wait_response(RpcRole::Execution, Duration::from_secs(1)),
+                0
+            );
+            assert_eq!(wake.wait_response(RpcRole::Control, Duration::ZERO), 1);
+            assert_eq!(wake.wait_response(RpcRole::Execution, Duration::ZERO), 1);
+        }
+        wake.shutdown(&shutdown);
+        assert_eq!(
+            wake.wait_response(RpcRole::Execution, Duration::from_secs(1)),
+            -1
+        );
+    }
+
+    #[test]
+    fn response_wait_wakes_on_real_publication_and_stop_without_spurious_completion() {
+        for stopping in [false, true] {
+            let wake = Arc::new(DispatcherWake::new());
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let start = Arc::new(Barrier::new(2));
+            let (tx, rx) = mpsc::channel();
+            let worker = {
+                let (wake, start) = (wake.clone(), start.clone());
+                thread::spawn(move || {
+                    start.wait();
+                    tx.send(wake.wait_response(RpcRole::Execution, Duration::from_secs(2)))
+                        .unwrap();
+                })
+            };
+            start.wait();
+            wake.response_ready.notify_all();
+            assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
+            if stopping {
+                wake.shutdown(&shutdown);
+            } else {
+                wake.notify_response(RpcRole::Execution);
+            }
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                if stopping { -1 } else { 0 }
+            );
+            worker.join().unwrap();
         }
     }
 
