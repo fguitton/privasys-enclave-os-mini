@@ -21,7 +21,17 @@ pub enum HonestIngressStart {
 
 /// Side-effect-free selector; operation eligibility is never authorization.
 pub type HonestDeferredIngressEligible = fn(&HttpRequest, &RequestContext) -> bool;
+/// Upper bound of metadata retained by the adopter, checked before admission.
+/// Original wire/body storage remains separately bounded by the HTTP parser.
+pub type HonestDeferredIngressMetadata = fn(&HttpRequest, &RequestContext) -> Option<usize>;
 
+pub(crate) fn legacy_metadata(request: &HttpRequest, _: &RequestContext) -> Option<usize> {
+    Some(request.body.len())
+}
+
+pub(crate) fn metadata_fits(bytes: Option<usize>) -> bool {
+    bytes.is_some_and(|bytes| bytes <= MAX_DEFERRED_INGRESS_REQUEST_BYTES)
+}
 /// Called only after Mini reserves a session slot; None must have no effects.
 pub type HonestDeferredIngressHook =
     fn(&HttpRequest, &RequestContext) -> Option<HonestIngressStart>;
@@ -95,6 +105,14 @@ impl PendingSession {
 #[cfg(test)]
 pub(crate) fn check_pending_for_native() {
     use std::collections::BTreeMap;
+    assert!(metadata_fits(Some(256)));
+    assert!(metadata_fits(Some(4096)));
+    assert!(!metadata_fits(Some(4097)));
+    assert!(!metadata_fits(None));
+    // Legacy admission retains its original wire bound; compact metadata can
+    // fit even when the independently bounded original request is 4220 bytes.
+    assert!(!metadata_fits(Some(4220)));
+
     let mut slots=BTreeMap::new();
     for id in 1..=16 { slots.insert(id,PendingSession { nonce:id as u64, binding:[id as u8;32],
         token:Some(HonestPendingIngress(id as u64)),close:false,started:std::time::Instant::now() }); }

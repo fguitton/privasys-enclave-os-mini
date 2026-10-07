@@ -685,9 +685,9 @@ impl IngressServer {
                             | enclave_os_common::modules::HonestIngressRoute::LocalControl
                             | enclave_os_common::modules::HonestIngressRoute::Bootstrap
                             | enclave_os_common::modules::HonestIngressRoute::ComponentStaging)
-                        && http_req.body.len() <= crate::MAX_DEFERRED_INGRESS_REQUEST_BYTES
+
                     {
-                        if let Some((_, start, _, _)) = crate::HONEST_DEFERRED_INGRESS_HOOK.get().filter(|(eligible, _, _, _)| eligible(&http_req, &base_ctx)) {
+                        if let Some((_, _, start, _, _)) = crate::HONEST_DEFERRED_INGRESS_HOOK.get().filter(|(eligible, metadata, _, _, _)| eligible(&http_req, &base_ctx) && crate::deferred_ingress::metadata_fits(metadata(&http_req, &base_ctx))) {
                             if !crate::deferred_ingress::pending_capacity(self.deferred_owner.pending.len(), self.deferred_owner.cancelled.len() + crate::deferred_ingress::terminal_count()) {
                                 return self.queue_deferred_ready(conn_id, session, crate::HonestIngressResponse {
                                     status: 429, content_type: "application/octet-stream", body: Vec::new().into(),

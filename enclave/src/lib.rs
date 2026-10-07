@@ -110,21 +110,27 @@ static HONEST_INGRESS_HOOK: OnceLock<HonestIngressHook> = OnceLock::new();
 
 mod deferred_ingress;
 pub use deferred_ingress::{
-    HonestDeferredIngressEligible, HonestDeferredIngressHook, HonestDeferredIngressPoll, HonestDeferredIngressCancel,
+    HonestDeferredIngressEligible, HonestDeferredIngressMetadata, HonestDeferredIngressHook, HonestDeferredIngressPoll, HonestDeferredIngressCancel,
     HonestIngressStart, HonestPendingIngress, notify_deferred_ingress,
     MAX_DEFERRED_INGRESS_REQUEST_BYTES, MAX_DEFERRED_INGRESS_REQUESTS,
 };
-static HONEST_DEFERRED_INGRESS_HOOK: OnceLock<(HonestDeferredIngressEligible, HonestDeferredIngressHook, HonestDeferredIngressPoll, HonestDeferredIngressCancel)> = OnceLock::new();
+static HONEST_DEFERRED_INGRESS_HOOK: OnceLock<(HonestDeferredIngressEligible, HonestDeferredIngressMetadata, HonestDeferredIngressHook, HonestDeferredIngressPoll, HonestDeferredIngressCancel)> = OnceLock::new();
 
 /// Install the optional data-request continuation during initialisation.
 pub fn register_honest_deferred_ingress_hook(
     eligible: HonestDeferredIngressEligible, hook: HonestDeferredIngressHook,
     poll: HonestDeferredIngressPoll, cancel: HonestDeferredIngressCancel,
 ) -> Result<(), i32> {
-    if CORE_PHASE.load() != CorePhase::Initialising {
-        return Err(-1);
-    }
-    HONEST_DEFERRED_INGRESS_HOOK.set((eligible, hook, poll, cancel)).map_err(|_| -1)
+    register_honest_deferred_ingress_hook_with_metadata(eligible, deferred_ingress::legacy_metadata, hook, poll, cancel)
+}
+
+/// Register an adopter that retains compact, bounded operation metadata.
+pub fn register_honest_deferred_ingress_hook_with_metadata(
+    eligible: HonestDeferredIngressEligible, metadata: HonestDeferredIngressMetadata,
+    hook: HonestDeferredIngressHook, poll: HonestDeferredIngressPoll, cancel: HonestDeferredIngressCancel,
+) -> Result<(), i32> {
+    if CORE_PHASE.load() != CorePhase::Initialising { return Err(-1); }
+    HONEST_DEFERRED_INGRESS_HOOK.set((eligible, metadata, hook, poll, cancel)).map_err(|_| -1)
 }
 
 /// Bounded response returned by the adopter-owned Honest ingress handler.

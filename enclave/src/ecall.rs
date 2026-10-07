@@ -543,7 +543,7 @@ fn apply_control_action(action: ControlLoopAction) {
 
 /// One nonblocking completion quantum. No adopter callback owns Mini STATE.
 fn progress_deferred_ingress() {
-    let Some((_, _, poll, cancel)) = crate::HONEST_DEFERRED_INGRESS_HOOK.get() else { return; };
+    let Some((_, _, _, poll, cancel)) = crate::HONEST_DEFERRED_INGRESS_HOOK.get() else { return; };
     // A coalesced publication services each reserved nonce at most once. Poll
     // None cannot create an idle hot loop or starve another ready session.
     let mut seen = Vec::with_capacity(crate::MAX_DEFERRED_INGRESS_REQUESTS);
@@ -719,7 +719,7 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
             st.ingress_server = None;
         }
     }
-    if let Some((_, _, _, cancel)) = crate::HONEST_DEFERRED_INGRESS_HOOK.get() {
+    if let Some((_, _, _, _, cancel)) = crate::HONEST_DEFERRED_INGRESS_HOOK.get() {
         for token in cancelled { cancel(token); }
         for _ in 0..crate::MAX_DEFERRED_INGRESS_REQUESTS { if let Some(token)=crate::deferred_ingress::take_terminal() { cancel(token); } else { break; } }
     }
