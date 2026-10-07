@@ -162,6 +162,8 @@ fn owned_body(
 #[test]
 fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
     #[cfg(feature="native-deferred-fixture")]
+    crate::actual_control_wake::check();
+    #[cfg(feature="native-deferred-fixture")]
     crate::actual_workflow_budget::check_continuation_for_native();
     #[cfg(feature="native-deferred-fixture")]
     crate::deferred_ingress::check_pending_for_native();
@@ -174,8 +176,12 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
     register(&store, "b.test");
     let (mut a_client, mut a) = pair(&store, "a.test");
     let (mut b_client, mut b) = pair(&store, "b.test");
+    assert!(!super::current_data_session(None));
+    assert!(!super::current_data_session(Some(&mut a)), "handshake has no current data binding");
     handshake(&mut a_client, &mut a);
     handshake(&mut b_client, &mut b);
+    assert!(super::current_data_session(Some(&mut a)));
+    assert!(super::current_data_session(Some(&mut b)));
     write_requests(
         &mut a_client,
         &mut a,
@@ -184,6 +190,7 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
     assert!(a.recv_http_request().unwrap().is_some());
     // A synchronous request handler unloads A before returning its response.
     assert!(store.unregister("a.test"));
+    assert!(!super::current_data_session(Some(&mut a)), "revocation keeps control work on the full path");
     assert!(a
         .send_http_response(200, b"old configuration", false)
         .is_err());

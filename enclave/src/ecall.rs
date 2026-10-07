@@ -476,6 +476,9 @@ pub enum ControlLoopOpportunity {
     /// Actual advancing server credit, validated by Mini, while an existing
     /// response is still draining. This scheduling hint confers no authority.
     IngressWriteCredit(u32),
+    /// A data feed that retained a current established TLS session. The adopter
+    /// may coalesce bookkeeping for an already admitted caller operation.
+    IngressDataProgress(u32),
     Idle,
     Shutdown,
 }
@@ -664,6 +667,10 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
                             if let Some(ref mut srv) = st.ingress_server {
                                 if srv.handle_message(msg_type, conn_id, payload) {
                                     opportunity = ControlLoopOpportunity::IngressWriteCredit(conn_id);
+                                } else if msg_type == channel::ChannelMsgType::TcpData
+                                    && srv.current_data_session(conn_id)
+                                {
+                                    opportunity = ControlLoopOpportunity::IngressDataProgress(conn_id);
                                 }
                                 if let Some(reason) = srv.shutdown_reason() {
                                     enclave_log_error!(

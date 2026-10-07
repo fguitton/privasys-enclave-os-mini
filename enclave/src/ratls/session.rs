@@ -19,6 +19,16 @@ use std::vec::Vec;
 
 /// Validated credit bookkeeping only. An absent/handshaking session is passed
 /// as None by the server; callers still perform its original invalid teardown.
+/// Scheduling only, after an actual TLS feed. Missing, handshaking, revoked or
+/// failed sessions never suppress an adopter control opportunity.
+pub(crate) fn current_data_session(session: Option<&mut RaTlsSession>) -> bool {
+    session.is_some_and(|session| {
+        session.require_current_configuration().is_ok()
+            && !session.attestation_failed()
+            && session.channel_binder().is_some()
+    })
+}
+
 pub(crate) fn response_credit(
     payload: &[u8],
     window: Option<&mut enclave_os_common::channel::TcpWriteWindow>,
