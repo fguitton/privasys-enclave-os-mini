@@ -173,6 +173,15 @@ impl IngressServer {
         }
     }
 
+    /// Inspect the session retained by the completed TLS feed, without granting
+    /// operation authority or renewing any authenticated request.
+    pub(crate) fn current_data_session(&mut self, connection: u32) -> bool {
+        match self.sessions.get_mut(&connection) {
+            Some(SessionState::Established(session)) => super::session::current_data_session(Some(session)),
+            _ => false,
+        }
+    }
+
     /// Process a single data channel message.
     ///
     /// Called from the enclave event loop for each message received on
