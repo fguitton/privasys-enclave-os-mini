@@ -56,6 +56,8 @@ pub fn notify_execution_waiter() {
 
 /// Global request ID counter (monotonically increasing).
 static NEXT_REQ_ID: AtomicU64 = AtomicU64::new(1);
+/// Maximum queue polls in one immediate execution readiness turn.
+pub const EXECUTION_READY_RECHECK_POLLS: u64 = 64;
 
 fn next_req_id() -> Option<u64> {
     NEXT_REQ_ID
@@ -313,6 +315,31 @@ impl RpcClient {
             status: response.status,
             payload: response.payload.to_vec(),
         }))
+    }
+
+    /// A finite immediate readiness turn before host parking. The count is
+    /// actual queue reads; callers reserve the maximum before entering and may
+    /// refund only reads that were never attempted. Errors retain all charges.
+    pub fn recheck_execution_rpc(
+        &self,
+        pending: &PendingExecutionRpc,
+        maximum_polls: u64,
+    ) -> Result<(u64, Option<ExecutionRpcCompletion>), PolledExecutionRpcError> {
+        self.recheck_execution_rpc_with(pending, maximum_polls, core::hint::spin_loop)
+    }
+
+    pub(crate) fn recheck_execution_rpc_with(
+        &self,
+        pending: &PendingExecutionRpc,
+        maximum_polls: u64,
+        mut empty: impl FnMut(),
+    ) -> Result<(u64, Option<ExecutionRpcCompletion>), PolledExecutionRpcError> {
+        if maximum_polls==0 || maximum_polls>EXECUTION_READY_RECHECK_POLLS { return Err(PolledExecutionRpcError::InvalidRequest); }
+        for polls in 1..=maximum_polls {
+            if let Some(completion)=self.poll_execution_rpc(pending)? { return Ok((polls, Some(completion))); }
+            empty();
+        }
+        Ok((maximum_polls,None))
     }
 
     /// Wait only for an untrusted retained publication hint. The caller polls

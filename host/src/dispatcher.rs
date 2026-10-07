@@ -63,6 +63,12 @@ fn execution_network_error_status(error: &anyhow::Error) -> i32 {
     }
 }
 
+fn worker_data_target(table: &[u8], key: &[u8]) -> bool {
+    const DATA: &[u8] = b"honest/retained-data/v1/";
+    table == b"honest.accepted-artifact-chunks-v1" && key.starts_with(DATA)
+        && key.len()>DATA.len()+32 && key.len()<=512
+}
+
 /// RPC dispatcher that bridges enclave requests to host services.
 pub struct RpcDispatcher {
     /// Stable physical role of this dispatcher and its queue pair.
@@ -390,6 +396,14 @@ impl RpcDispatcher {
         let Some((operation, payload)) = rpc::decode_worker_storage_request(bytes) else {
             return (-22, Vec::new());
         };
+        if operation == Operation::PutBatch {
+            let Some((table, records)) = rpc::decode_worker_storage_put_batch(payload) else { return (-22, Vec::new()); };
+            if records.iter().any(|(key,_)| !worker_data_target(table,key)) { return (-13, Vec::new()); }
+            let operations=records.iter().map(|(key,value)| (*key,Some(*value))).collect::<Vec<_>>();
+            return match kvstore::write_batch("honest.accepted-artifact-chunks-v1", &operations) {
+                Ok(()) => (0,Vec::new()), Err(_) => (-1,Vec::new()),
+            };
+        }
         let target = match operation {
             Operation::Get | Operation::Delete => {
                 rpc::decode_kv_get_req(payload)
@@ -398,23 +412,18 @@ impl RpcDispatcher {
             Operation::DurablePut => {
                 rpc::decode_durable_kv_put_req(payload).map(|(table, key, _)| (table, key))
             }
+            Operation::PutBatch => unreachable!("handled before scalar decode"),
         };
         let Some((table, key)) = target else {
             return (-13, Vec::new());
         };
-        const DATA: &[u8] = b"honest/retained-data/v1/";
-        if table != b"honest.accepted-artifact-chunks-v1"
-            || !key.starts_with(DATA)
-            || key.len() <= DATA.len() + 32
-            || key.len() > 512
-        {
-            return (-13, Vec::new());
-        }
+        if !worker_data_target(table,key) { return (-13,Vec::new()); }
         match operation {
             Operation::Get => self.handle_kv_get(payload),
             Operation::Put => self.handle_kv_put(payload),
             Operation::DurablePut => self.handle_kv_put_durable(payload),
             Operation::Delete => self.handle_kv_delete(payload),
+            Operation::PutBatch => unreachable!("handled before scalar decode"),
         }
     }
 
@@ -834,6 +843,23 @@ mod tests {
         crate::kvstore::init(directory.path().to_str().unwrap()).unwrap();
         let table = b"honest.accepted-artifact-chunks-v1";
         let key = [b"honest/retained-data/v1/".as_slice(), &[7; 32], b"/leaf"].concat();
+        let other=[b"honest/retained-data/v1/".as_slice(), &[7;32], b"/node"].concat();
+        let batch=rpc::encode_worker_storage_put_batch(table,&[(&key,b"batch leaf"),(&other,b"batch node")]).unwrap();
+        let payload=rpc::encode_worker_storage_request(rpc::WorkerStorageOperation::PutBatch,&batch).unwrap();
+        dispatcher.dispatch(&rpc::encode_honest_request(identity,&payload).unwrap());
+        let response=response_rx.try_recv().unwrap();
+        assert_eq!(rpc::decode_honest_response_for(&response,identity).unwrap().status,0);
+        assert_eq!(crate::kvstore::get("honest.accepted-artifact-chunks-v1",&other).unwrap().unwrap(),b"batch node");
+        let forbidden=rpc::encode_worker_storage_put_batch(table,&[(&key,b"replacement"),(b"honest/retained-scope/v1/catalog",b"denied")]).unwrap();
+        let payload=rpc::encode_worker_storage_request(rpc::WorkerStorageOperation::PutBatch,&forbidden).unwrap();
+        dispatcher.dispatch(&rpc::encode_honest_request(identity,&payload).unwrap());
+        let response=response_rx.try_recv().unwrap();assert_eq!(rpc::decode_honest_response_for(&response,identity).unwrap().status,-13);
+        assert_eq!(crate::kvstore::get("honest.accepted-artifact-chunks-v1",&key).unwrap().unwrap(),b"batch leaf","entire namespace group validated before mutation");
+        for cut in 0..batch.len() {assert!(rpc::decode_worker_storage_put_batch(&batch[..cut]).is_none());}
+        let mut trailing=batch.clone();trailing.push(0);assert!(rpc::decode_worker_storage_put_batch(&trailing).is_none());
+        assert!(rpc::encode_worker_storage_put_batch(table,&[(key.as_slice(),[1u8;1].as_slice());65]).is_none());
+        assert!(rpc::encode_worker_storage_put_batch(table,&[(&key,&vec![1;rpc::MAX_WORKER_STORAGE_BATCH_BYTES])]).is_none());
+
         for (operation, payload, expected) in [
             (
                 rpc::WorkerStorageOperation::Put,

@@ -68,6 +68,7 @@ pub(super) fn check_synchronous_ownership() {
     check_completion_wait();
     check_rejected_wait();
     check_worker_storage_reservation();
+    check_ready_recheck();
 }
 
 fn check_synchronous_pair(durable_first: bool) {
@@ -288,4 +289,28 @@ fn check_worker_storage_reservation() {
     )
     .is_err());
     println!("WORKER-STORAGE-RPC: actual framedtoken/role/size/nestedBusy/releasednetworkreservation PASS");
+}
+
+fn check_ready_recheck() {
+    WAIT_CALLS.with(|value|value.set(0));
+    let (tx,host_rx)=queue();let (host_tx,rx)=queue();let rpc=client::RpcClient::new(tx,rx);
+    let pending=rpc.try_execution_storage(3,8,WorkerStorageOperation::Get,b"bounded").unwrap();
+    let message=receive(&host_rx);let identity=decode_honest_request(&message).unwrap().identity;
+    let mut empty=0;
+    let ready=rpc.recheck_execution_rpc_with(&pending,64,||{
+        empty+=1;
+        if empty==3 {host_tx.send(&encode_honest_response(identity,0,b"ready sealed value").unwrap());}
+    }).unwrap();
+    assert_eq!(ready.0,4,"only four actual polls consumed");
+    let ready=ready.1.unwrap();
+    assert_eq!(ready.payload(),b"ready sealed value");assert_eq!(empty,3);
+    assert_eq!(WAIT_CALLS.with(std::cell::Cell::get),0,"fast ready frame never parks or calls wait OCALL");
+    let pending=rpc.try_execution_net_close(3,8,7).unwrap();let message=receive(&host_rx);let identity=decode_honest_request(&message).unwrap().identity;
+    let mut empty=0;assert!(rpc.recheck_execution_rpc_with(&pending,64,||empty+=1).unwrap().1.is_none());
+    assert_eq!(empty,usize::try_from(client::EXECUTION_READY_RECHECK_POLLS).unwrap());
+    rpc.wait_execution_rpc(&pending,1000).unwrap();assert_eq!(WAIT_CALLS.with(std::cell::Cell::get),1);
+    host_tx.send(&encode_honest_response(identity,0,b"event completed").unwrap());
+    assert_eq!(rpc.recheck_execution_rpc(&pending,64).unwrap().1.unwrap().payload(),b"event completed");
+    assert!(matches!(rpc.recheck_execution_rpc(&pending,64),Err(client::PolledExecutionRpcError::NotPending)));
+    println!("EXECUTION-READY-RECHECK: actual exact queue fastcompletion skipsOCALL, finiteempty64 thenretainedwait, eventcompletion PASS");
 }
