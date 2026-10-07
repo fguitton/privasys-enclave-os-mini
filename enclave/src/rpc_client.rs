@@ -93,6 +93,11 @@ pub struct PendingExecutionRpc {
     identity: HonestRpcIdentity,
 }
 
+impl PendingExecutionRpc {
+    /// Inert diagnostic join key; exposes no polling or submission authority.
+    pub const fn diagnostic_operation_id(&self)->u64 {self.identity.operation_id}
+}
+
 /// One bounded execution response returned by a single non-blocking poll.
 #[derive(Debug)]
 pub struct ExecutionRpcCompletion {

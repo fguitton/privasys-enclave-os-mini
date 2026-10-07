@@ -29,6 +29,7 @@ sgx_urts  = { git = "https://github.com/Privasys/teaclave-sgx-sdk", rev = "2330b
 tempfile = "3"
 
 [features]
+diagnostic-worker-storage-rpc = []
 mock = []
 
 [build-dependencies]

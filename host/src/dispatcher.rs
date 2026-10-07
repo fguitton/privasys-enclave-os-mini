@@ -80,6 +80,8 @@ pub struct RpcDispatcher {
     /// Shutdown flag.
     shutdown: Arc<AtomicBool>,
     wake: Arc<DispatcherWake>,
+    #[cfg(feature="diagnostic-worker-storage-rpc")]
+    storage_profile:std::sync::Mutex<crate::storage_rpc_profile::Profile>,
 }
 
 impl RpcDispatcher {
@@ -96,6 +98,8 @@ impl RpcDispatcher {
         wake: Arc<DispatcherWake>,
     ) -> Self {
         Self {
+            #[cfg(feature="diagnostic-worker-storage-rpc")]
+            storage_profile:std::sync::Mutex::new(crate::storage_rpc_profile::Profile::new()),
             role,
             request_rx,
             response_tx,
@@ -127,11 +131,22 @@ impl RpcDispatcher {
             }
         }
 
+        #[cfg(feature="diagnostic-worker-storage-rpc")]
+        if self.role==RpcRole::Execution {
+            let (_,tail)=self.response_tx.diagnostic_positions();
+            let mut profile=self.storage_profile.lock().unwrap_or_else(|x|x.into_inner());
+            profile.observe(tail,"shutdown");profile.report();
+        }
         info!("{} RPC dispatcher stopped", role_name(self.role));
     }
 
     /// Dispatch a single RPC request message.
     fn dispatch(&self, raw_msg: &[u8]) {
+        #[cfg(feature="diagnostic-worker-storage-rpc")]
+        if self.role==RpcRole::Execution {
+            let (_,tail)=self.response_tx.diagnostic_positions();
+            self.storage_profile.lock().unwrap_or_else(|x|x.into_inner()).observe(tail,"next-request");
+        }
         if rpc::has_honest_rpc_magic(raw_msg) {
             self.dispatch_honest(raw_msg);
         } else {
@@ -161,6 +176,9 @@ impl RpcDispatcher {
             identity.method,
             request.payload.len()
         );
+        #[cfg(feature="diagnostic-worker-storage-rpc")]
+        let diagnostic=(identity.role==RpcRole::Execution && self.role==RpcRole::Execution && identity.method==RpcMethod::WorkerStorage)
+            .then(||self.storage_profile.lock().unwrap_or_else(|x|x.into_inner()).start());
         let (status, payload) = if identity.role != self.role
             || !rpc::honest_role_allows_method(self.role, identity.method)
         {
@@ -178,10 +196,21 @@ impl RpcDispatcher {
                 self.dispatch_method(identity.method, request.payload)
             }
         };
-        self.try_send_honest_response(identity, status, &payload);
+        #[cfg(feature="diagnostic-worker-storage-rpc")]
+        let handler=diagnostic.map(|start|self.storage_profile.lock().unwrap_or_else(|x|x.into_inner()).handler_done(start));
+        #[cfg(feature="diagnostic-worker-storage-rpc")]
+        let publish=handler.map(|_|std::time::Instant::now());
+        let published=self.try_send_honest_response(identity, status, &payload);
+        #[cfg(not(feature="diagnostic-worker-storage-rpc"))]
+        let _=published;
+        #[cfg(feature="diagnostic-worker-storage-rpc")]
+        if let (Some(handler),Some(publish))=(handler,publish) {
+            let (end,tail)=self.response_tx.diagnostic_positions();
+            self.storage_profile.lock().unwrap_or_else(|x|x.into_inner()).record(crate::storage_rpc_profile::Sample{identity,kind:request.payload.first().copied().unwrap_or(255),request:raw_msg.len(),response:payload.len(),status,handler,publish,end,tail,ok:published});
+        }
     }
 
-    fn try_send_honest_response(&self, identity: HonestRpcIdentity, status: i32, payload: &[u8]) {
+    fn try_send_honest_response(&self, identity: HonestRpcIdentity, status: i32, payload: &[u8]) -> bool {
         if let Err(error) = response_publication::publish(
             self.role,
             &self.response_tx,
@@ -196,7 +225,8 @@ impl RpcDispatcher {
                 identity.operation_id,
                 error
             );
-        }
+            false
+        } else {true}
     }
 
     fn dispatch_legacy(&self, raw_msg: &[u8]) {
@@ -897,5 +927,7 @@ mod tests {
             RpcMethod::KvPutDurable
         ));
         println!("WORKER-STORAGE-HOST: actual framed accepted-data put/durable/get; BFT/scratch/catalogue refusals; control-only durable policy PASS");
-    }
+            #[cfg(feature="diagnostic-worker-storage-rpc")]
+        {let (_,tail)=dispatcher.response_tx.diagnostic_positions();let mut profile=dispatcher.storage_profile.lock().unwrap();profile.observe(tail,"next-request");profile.check();}
+}
 }

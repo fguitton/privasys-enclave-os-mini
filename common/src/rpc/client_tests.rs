@@ -268,6 +268,7 @@ fn check_worker_storage_reservation() {
     let message = receive(&host_rx);
     let request = decode_honest_request(&message).unwrap();
     assert_eq!(request.identity.method, RpcMethod::WorkerStorage);
+    assert_eq!(pending.diagnostic_operation_id(),request.identity.operation_id);
     assert_eq!(
         decode_worker_storage_request(request.payload),
         Some((WorkerStorageOperation::Get, payload.as_slice()))
