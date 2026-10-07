@@ -53,6 +53,6 @@ pub extern "C" fn ocall_wait_execution_response(maximum_micros: u64) -> i32 {
 #[no_mangle]
 pub extern "C" fn ocall_notify_execution_waiter() {
     if let Some(wake) = DISPATCHER_WAKE.get() {
-        wake.notify_response(enclave_os_common::rpc::RpcRole::Execution);
+        wake.notify_execution_cancel();
     }
 }

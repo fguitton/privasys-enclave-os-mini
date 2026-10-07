@@ -10,7 +10,7 @@
 //! acquire the same mutex. Spurious wakes only recheck the predicate.
 
 use enclave_os_common::rpc::RpcRole;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
@@ -19,15 +19,41 @@ pub struct DispatcherWake {
     ready: Condvar,
     responses: Mutex<([bool; 2], bool)>,
     response_ready: Condvar,
+    cancellation_revision: AtomicU64,
+    #[cfg(test)]
+    execution_waits: AtomicU64,
+    #[cfg(unix)]
+    cancellation_read: std::os::unix::net::UnixDatagram,
+    #[cfg(unix)]
+    cancellation_write: std::os::unix::net::UnixDatagram,
 }
 
 impl DispatcherWake {
     pub fn new() -> Self {
+        #[cfg(unix)]
+        let (cancellation_read, cancellation_write) = {
+            let pair =
+                std::os::unix::net::UnixDatagram::pair().expect("execution cancellation channel");
+            pair.0
+                .set_nonblocking(true)
+                .expect("nonblocking cancellation reader");
+            pair.1
+                .set_nonblocking(true)
+                .expect("nonblocking cancellation writer");
+            pair
+        };
         Self {
             pending: Mutex::new([false; 2]),
             ready: Condvar::new(),
             responses: Mutex::new(([false; 2], false)),
             response_ready: Condvar::new(),
+            cancellation_revision: AtomicU64::new(0),
+            #[cfg(test)]
+            execution_waits: AtomicU64::new(0),
+            #[cfg(unix)]
+            cancellation_read,
+            #[cfg(unix)]
+            cancellation_write,
         }
     }
 
@@ -94,6 +120,51 @@ impl DispatcherWake {
         }
     }
 
+    pub fn notify_execution_cancel(&self) {
+        self.cancellation_revision.fetch_add(1, Ordering::AcqRel);
+        #[cfg(unix)]
+        {
+            // A saturated datagram queue is already readable. Revision checks
+            // still detect cancellation if another waiter drains the byte.
+            let _ = self.cancellation_write.send(&[1]);
+        }
+        self.notify_response(RpcRole::Execution);
+    }
+
+    #[cfg(test)]
+    pub fn record_execution_wait(&self) {
+        self.execution_waits.fetch_add(1, Ordering::Release);
+    }
+    #[cfg(test)]
+    pub fn execution_waits(&self) -> u64 {
+        self.execution_waits.load(Ordering::Acquire)
+    }
+
+    pub fn execution_revision(&self) -> u64 {
+        self.cancellation_revision.load(Ordering::Acquire)
+    }
+
+    #[cfg(unix)]
+    pub fn execution_cancel_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self.cancellation_read.as_raw_fd()
+    }
+
+    #[cfg(unix)]
+    pub fn drain_execution_cancel(&self) {
+        let mut byte = [0];
+        // One datagram per scheduling turn. Concurrent cancellation cannot
+        // keep us draining forever before revision/deadline/fence checks.
+        let _ = self.cancellation_read.recv(&mut byte);
+    }
+
+    pub fn execution_cancelled(&self) -> bool {
+        self.responses
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .1
+    }
+
     pub fn shutdown(&self, shutdown: &AtomicBool) {
         {
             let mut state = self
@@ -103,6 +174,7 @@ impl DispatcherWake {
             state.1 = true;
             self.response_ready.notify_all();
         }
+        self.notify_execution_cancel();
         shutdown.store(true, Ordering::Release);
         self.notify();
     }

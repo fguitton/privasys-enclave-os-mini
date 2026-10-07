@@ -110,6 +110,14 @@ pub fn tcp_connect(host: &str, port: u16) -> Result<i32> {
     Ok(fd)
 }
 
+/// Own the same OS socket before a readiness wait. The shared table guard is
+/// released here; close/replacement cannot switch this operation to another fd.
+pub(super) fn owned_stream(fd: i32) -> Result<TcpStream> {
+    SOCKET_TABLE.lock().unwrap().streams.get(&fd)
+        .ok_or_else(|| anyhow::anyhow!("Invalid stream fd {}", fd))?
+        .try_clone().map_err(Into::into)
+}
+
 /// Send data on a connected socket.
 pub fn tcp_send(fd: i32, data: &[u8]) -> Result<usize> {
     let mut table = SOCKET_TABLE.lock().unwrap();
@@ -138,4 +146,12 @@ pub fn tcp_close(fd: i32) {
     table.listeners.remove(&fd);
     table.streams.remove(&fd);
     // Rust's Drop will close the underlying OS socket
+}
+
+#[cfg(test)]
+pub(crate) fn install_for_readiness_test(stream: TcpStream) -> i32 {
+    let mut table = SOCKET_TABLE.lock().unwrap();
+    let fd = table.alloc_fd();
+    table.streams.insert(fd, stream);
+    fd
 }

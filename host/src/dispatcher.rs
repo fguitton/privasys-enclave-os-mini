@@ -51,6 +51,17 @@ fn network_error_status(error: &anyhow::Error) -> i32 {
     })
 }
 
+fn execution_network_error_status(error: &anyhow::Error) -> i32 {
+    if error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.raw_os_error() == Some(125))
+    {
+        -125
+    } else {
+        network_error_status(error)
+    }
+}
+
 /// RPC dispatcher that bridges enclave requests to host services.
 pub struct RpcDispatcher {
     /// Stable physical role of this dispatcher and its queue pair.
@@ -161,10 +172,19 @@ impl RpcDispatcher {
 
     fn try_send_honest_response(&self, identity: HonestRpcIdentity, status: i32, payload: &[u8]) {
         if let Err(error) = response_publication::publish(
-            self.role, &self.response_tx, &self.wake, identity, status, payload,
+            self.role,
+            &self.response_tx,
+            &self.wake,
+            identity,
+            status,
+            payload,
         ) {
-            error!("{} Honest RPC response publication failed for operation {}: {}",
-                role_name(self.role), identity.operation_id, error);
+            error!(
+                "{} Honest RPC response publication failed for operation {}: {}",
+                role_name(self.role),
+                identity.operation_id,
+                error
+            );
         }
     }
 
@@ -299,11 +319,23 @@ impl RpcDispatcher {
             Some(r) => r,
             None => return (-1, Vec::new()),
         };
-        match net::tcp_send(fd, data) {
+        let result = if self.role == RpcRole::Execution {
+            net::execution_send(fd, data, &self.wake)
+        } else {
+            net::tcp_send(fd, data)
+        };
+        match result {
             Ok(n) => (0, rpc::encode_i32(n as i32)),
             Err(e) => {
                 error!("NetSend failed: {}", e);
-                (network_error_status(&e), Vec::new())
+                (
+                    if self.role == RpcRole::Execution {
+                        execution_network_error_status(&e)
+                    } else {
+                        network_error_status(&e)
+                    },
+                    Vec::new(),
+                )
             }
         }
     }
@@ -314,12 +346,24 @@ impl RpcDispatcher {
             None => return (-1, Vec::new()),
         };
         let mut buf = vec![0u8; max_len as usize];
-        match net::tcp_recv(fd, &mut buf) {
+        let result = if self.role == RpcRole::Execution {
+            net::execution_receive(fd, &mut buf, &self.wake)
+        } else {
+            net::tcp_recv(fd, &mut buf)
+        };
+        match result {
             Ok(n) => {
                 buf.truncate(n);
                 (0, buf)
             }
-            Err(error) => (network_error_status(&error), Vec::new()),
+            Err(error) => (
+                if self.role == RpcRole::Execution {
+                    execution_network_error_status(&error)
+                } else {
+                    network_error_status(&error)
+                },
+                Vec::new(),
+            ),
         }
     }
 
@@ -592,6 +636,10 @@ mod tests {
 
     #[test]
     fn honest_dispatcher_echoes_identity_and_denies_wrong_physical_role() {
+        #[cfg(unix)]
+        check_encoded_execution_cancel();
+        #[cfg(unix)]
+        crate::net::check_execution_readiness();
         let (_unused_request_tx, request_rx) = queue();
         let (response_tx, response_rx) = queue();
         let dispatcher = RpcDispatcher::new(
@@ -643,5 +691,66 @@ mod tests {
         dispatcher.dispatch(&rpc::encode_request(15, RpcMethod::KvPutDurable, &[]));
         let response = response_rx.try_recv().expect("legacy durable write denial");
         assert_eq!(rpc::decode_response(&response).unwrap().1, -13);
+    }
+    #[cfg(unix)]
+    fn check_encoded_execution_cancel() {
+        use std::net::{Ipv4Addr, TcpListener, TcpStream};
+        use std::time::{Duration, Instant};
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let _peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let fd = crate::net::listener::install_for_readiness_test(stream);
+        let (_, request_rx) = queue();
+        let (response_tx, response_rx) = queue();
+        let wake = Arc::new(crate::dispatcher_wake::DispatcherWake::new());
+        let identity = HonestRpcIdentity {
+            role: RpcRole::Execution,
+            node_id: 3,
+            node_generation: 8,
+            operation_id: 27,
+            method: RpcMethod::NetRecv,
+        };
+        let payload = rpc::encode_net_recv_req(fd, 1);
+        let request = rpc::encode_honest_request(identity, &payload).unwrap();
+        let worker = {
+            let wake = wake.clone();
+            std::thread::spawn(move || {
+                let dispatcher = RpcDispatcher::new(
+                    RpcRole::Execution,
+                    request_rx,
+                    response_tx,
+                    Arc::new(AtomicBool::new(false)),
+                    wake,
+                );
+                dispatcher.dispatch(&request);
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while wake.execution_waits() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "dispatcher never entered readiness"
+            );
+            std::thread::yield_now();
+        }
+        wake.notify_execution_cancel();
+        worker.join().unwrap();
+        let bytes = response_rx
+            .try_recv()
+            .expect("actual cancellation response frame");
+        let response = rpc::decode_honest_response_for(&bytes, identity).unwrap();
+        assert_eq!(
+            response.status, -125,
+            "execution cancellation must reach trusted fence check"
+        );
+        assert!(response.payload.is_empty());
+        assert_eq!(
+            super::network_error_status(&std::io::Error::from_raw_os_error(125).into()),
+            -1,
+            "ordinary control error mapping stays unchanged"
+        );
+        crate::net::tcp_close(fd);
+        println!("EXECUTION-SOCKET-CANCEL-FRAME: actual dispatcher exactidentity status=-125 emptybody PASS");
     }
 }
