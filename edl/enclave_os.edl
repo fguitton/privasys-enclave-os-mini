@@ -30,6 +30,8 @@ enclave {
     from "sgx_backtrace.edl" import *;
     from "sgx_cpuid.edl"  import *;
     from "sgx_process.edl" import *;
+    /* Append completion hints after the stable imported SDK OCALL prefix. */
+    from "execution_response.edl" import *;
 
     trusted {
         /* ================================================================
@@ -131,9 +133,6 @@ enclave {
          * The OCALL carries no data; all data flows through the queue.
          */
         void ocall_notify();
-        /* Retained response-publication hint; bounded cancellation wait only.
-         * The exact response identity and bytes remain in the shared queue. */
-        int ocall_wait_execution_response(uint64_t maximum_micros);
-        void ocall_notify_execution_waiter();
+
     };
 };

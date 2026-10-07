@@ -6,6 +6,7 @@
 # the trusted stub into an object file for linking into the enclave.
 
 set(EDL_FILE "${CMAKE_CURRENT_SOURCE_DIR}/enclave_os.edl")
+set(EXECUTION_RESPONSE_EDL "${CMAKE_CURRENT_SOURCE_DIR}/execution_response.edl")
 set(EDL_OUTPUT_DIR "${CMAKE_BINARY_DIR}/edl")
 file(MAKE_DIRECTORY "${EDL_OUTPUT_DIR}")
 
@@ -19,10 +20,11 @@ set(EDL_U_H "${EDL_OUTPUT_DIR}/enclave_os_u.h")
 add_custom_command(
     OUTPUT "${EDL_T_C}" "${EDL_T_H}"
     COMMAND ${SGX_EDGER8R} --trusted "${EDL_FILE}"
+        --search-path "${CMAKE_CURRENT_SOURCE_DIR}"
         --search-path "${TEACLAVE_EDL_DIR}"
         --search-path "${TEACLAVE_INC_DIR}"
         --trusted-dir "${EDL_OUTPUT_DIR}"
-    DEPENDS "${EDL_FILE}"
+    DEPENDS "${EDL_FILE}" "${EXECUTION_RESPONSE_EDL}"
     COMMENT "edger8r --trusted enclave_os.edl"
 )
 
@@ -30,10 +32,11 @@ add_custom_command(
 add_custom_command(
     OUTPUT "${EDL_U_C}" "${EDL_U_H}"
     COMMAND ${SGX_EDGER8R} --untrusted "${EDL_FILE}"
+        --search-path "${CMAKE_CURRENT_SOURCE_DIR}"
         --search-path "${TEACLAVE_EDL_DIR}"
         --search-path "${TEACLAVE_INC_DIR}"
         --untrusted-dir "${EDL_OUTPUT_DIR}"
-    DEPENDS "${EDL_FILE}"
+    DEPENDS "${EDL_FILE}" "${EXECUTION_RESPONSE_EDL}"
     COMMENT "edger8r --untrusted enclave_os.edl"
 )
 

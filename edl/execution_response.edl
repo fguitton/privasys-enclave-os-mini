@@ -1,0 +1,8 @@
+/* Scheduling-only completion hints. Imported after all existing SDK OCALLs
+ * so legacy enclave images retain their exact original table indices. */
+enclave {
+    untrusted {
+        int ocall_wait_execution_response(uint64_t maximum_micros);
+        void ocall_notify_execution_waiter();
+    };
+};
