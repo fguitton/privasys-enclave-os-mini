@@ -255,6 +255,47 @@ pub fn honest_role_allows_method(role: RpcRole, method: RpcMethod) -> bool {
                 | RpcMethod::NetSend
                 | RpcMethod::NetRecv
                 | RpcMethod::NetClose
+                | RpcMethod::WorkerStorage
         ),
     }
+}
+
+/// Private scratch storage operation class. Durability is a private-storage
+/// barrier, never a BFT journal acknowledgement or accepted artifact authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WorkerStorageOperation {
+    Get = 0,
+    Put = 1,
+    DurablePut = 2,
+    Delete = 3,
+}
+
+pub fn encode_worker_storage_request(
+    operation: WorkerStorageOperation,
+    payload: &[u8],
+) -> Result<Vec<u8>, HonestRpcFrameError> {
+    let length = payload
+        .len()
+        .checked_add(1)
+        .ok_or(HonestRpcFrameError::PayloadBound)?;
+    if length > MAX_HONEST_RPC_PAYLOAD_BYTES {
+        return Err(HonestRpcFrameError::PayloadBound);
+    }
+    let mut bytes = Vec::with_capacity(length);
+    bytes.push(operation as u8);
+    bytes.extend_from_slice(payload);
+    Ok(bytes)
+}
+
+pub fn decode_worker_storage_request(bytes: &[u8]) -> Option<(WorkerStorageOperation, &[u8])> {
+    let (operation, payload) = bytes.split_first()?;
+    let operation = match operation {
+        0 => WorkerStorageOperation::Get,
+        1 => WorkerStorageOperation::Put,
+        2 => WorkerStorageOperation::DurablePut,
+        3 => WorkerStorageOperation::Delete,
+        _ => return None,
+    };
+    Some((operation, payload))
 }

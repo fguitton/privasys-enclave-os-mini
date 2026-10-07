@@ -29,7 +29,8 @@ use crate::net;
 mod response_publication;
 
 fn legacy_role_allows_method(role: RpcRole, method: RpcMethod) -> bool {
-    !matches!(method, RpcMethod::KvPutDurable) || role == RpcRole::Control
+    method != RpcMethod::WorkerStorage
+        && (!matches!(method, RpcMethod::KvPutDurable) || role == RpcRole::Control)
 }
 
 const fn role_name(role: RpcRole) -> &'static str {
@@ -165,7 +166,11 @@ impl RpcDispatcher {
             );
             (-13, Vec::new())
         } else {
-            self.dispatch_method(identity.method, request.payload)
+            if identity.method == RpcMethod::WorkerStorage {
+                self.handle_worker_storage(request.payload)
+            } else {
+                self.dispatch_method(identity.method, request.payload)
+            }
         };
         self.try_send_honest_response(identity, status, &payload);
     }
@@ -245,6 +250,7 @@ impl RpcDispatcher {
             RpcMethod::KvWriteBatch => self.handle_kv_write_batch(payload),
             RpcMethod::KvMultiGet => self.handle_kv_multi_get(payload),
             RpcMethod::KvScan => self.handle_kv_scan(payload),
+            RpcMethod::WorkerStorage => (-13, Vec::new()),
 
             // ---- Utility ----
             RpcMethod::GetCurrentTime => self.handle_get_current_time(),
@@ -378,6 +384,39 @@ impl RpcDispatcher {
     // ====================================================================
     //  KV store handlers
     // ====================================================================
+
+    fn handle_worker_storage(&self, bytes: &[u8]) -> (i32, Vec<u8>) {
+        use rpc::WorkerStorageOperation as Operation;
+        let Some((operation, payload)) = rpc::decode_worker_storage_request(bytes) else {
+            return (-22, Vec::new());
+        };
+        let target = match operation {
+            Operation::Get | Operation::Delete => {
+                rpc::decode_kv_get_req(payload)
+            }
+            Operation::Put => rpc::decode_kv_put_req(payload).map(|(table, key, _)| (table, key)),
+            Operation::DurablePut => {
+                rpc::decode_durable_kv_put_req(payload).map(|(table, key, _)| (table, key))
+            }
+        };
+        let Some((table, key)) = target else {
+            return (-13, Vec::new());
+        };
+        const DATA: &[u8] = b"honest/retained-data/v1/";
+        if table != b"honest.accepted-artifact-chunks-v1"
+            || !key.starts_with(DATA)
+            || key.len() <= DATA.len() + 32
+            || key.len() > 512
+        {
+            return (-13, Vec::new());
+        }
+        match operation {
+            Operation::Get => self.handle_kv_get(payload),
+            Operation::Put => self.handle_kv_put(payload),
+            Operation::DurablePut => self.handle_kv_put_durable(payload),
+            Operation::Delete => self.handle_kv_delete(payload),
+        }
+    }
 
     fn handle_kv_put(&self, payload: &[u8]) -> (i32, Vec<u8>) {
         let (table, key, value) = match rpc::decode_kv_put_req(payload) {
@@ -636,6 +675,7 @@ mod tests {
 
     #[test]
     fn honest_dispatcher_echoes_identity_and_denies_wrong_physical_role() {
+        check_worker_storage_namespace();
         #[cfg(unix)]
         check_encoded_execution_cancel();
         #[cfg(unix)]
@@ -752,5 +792,84 @@ mod tests {
         );
         crate::net::tcp_close(fd);
         println!("EXECUTION-SOCKET-CANCEL-FRAME: actual dispatcher exactidentity status=-125 emptybody PASS");
+    }
+    fn check_worker_storage_namespace() {
+        let (_, request_rx) = queue();
+        let (response_tx, response_rx) = queue();
+        let dispatcher = RpcDispatcher::new(
+            RpcRole::Execution,
+            request_rx,
+            response_tx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(crate::dispatcher_wake::DispatcherWake::new()),
+        );
+        let identity = HonestRpcIdentity {
+            role: RpcRole::Execution,
+            node_id: 3,
+            node_generation: 8,
+            operation_id: 51,
+            method: RpcMethod::WorkerStorage,
+        };
+        for table in [
+            b"honest.bft-runtime".as_slice(),
+            b"honest.guest-writer-scratch-v1".as_slice(),
+            b"honest.accepted-artifact-chunks-v1".as_slice(),
+        ] {
+            // The last table is valid, but its catalogue key remains control-owned.
+            let payload = rpc::encode_worker_storage_request(
+                rpc::WorkerStorageOperation::Get,
+                &rpc::encode_kv_get_req(table, b"honest/retained-scope/v1/catalog"),
+            )
+            .unwrap();
+            dispatcher.dispatch(&rpc::encode_honest_request(identity, &payload).unwrap());
+            let bytes = response_rx.try_recv().unwrap();
+            assert_eq!(
+                rpc::decode_honest_response_for(&bytes, identity)
+                    .unwrap()
+                    .status,
+                -13
+            );
+        }
+        let directory = tempfile::tempdir().unwrap();
+        crate::kvstore::init(directory.path().to_str().unwrap()).unwrap();
+        let table = b"honest.accepted-artifact-chunks-v1";
+        let key = [b"honest/retained-data/v1/".as_slice(), &[7; 32], b"/leaf"].concat();
+        for (operation, payload, expected) in [
+            (
+                rpc::WorkerStorageOperation::Put,
+                rpc::encode_kv_put_req(table, &key, b"sealed bytes"),
+                Vec::new(),
+            ),
+            (
+                rpc::WorkerStorageOperation::DurablePut,
+                rpc::encode_durable_kv_put_req(table, &key, b"sealed bytes").unwrap(),
+                Vec::new(),
+            ),
+            (
+                rpc::WorkerStorageOperation::Get,
+                rpc::encode_kv_get_req(table, &key),
+                b"sealed bytes".to_vec(),
+            ),
+        ] {
+            let payload = rpc::encode_worker_storage_request(operation, &payload).unwrap();
+            dispatcher.dispatch(&rpc::encode_honest_request(identity, &payload).unwrap());
+            let bytes = response_rx.try_recv().unwrap();
+            let response = rpc::decode_honest_response_for(&bytes, identity).unwrap();
+            assert_eq!(response.status, 0);
+            assert_eq!(response.payload, expected);
+        }
+        assert!(!legacy_role_allows_method(
+            RpcRole::Execution,
+            RpcMethod::WorkerStorage
+        ));
+        assert!(!rpc::honest_role_allows_method(
+            RpcRole::Execution,
+            RpcMethod::KvPutDurable
+        ));
+        assert!(rpc::honest_role_allows_method(
+            RpcRole::Control,
+            RpcMethod::KvPutDurable
+        ));
+        println!("WORKER-STORAGE-HOST: actual framed accepted-data put/durable/get; BFT/scratch/catalogue refusals; control-only durable policy PASS");
     }
 }

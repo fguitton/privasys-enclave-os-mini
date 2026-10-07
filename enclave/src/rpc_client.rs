@@ -240,6 +240,20 @@ impl RpcClient {
         )
     }
 
+    /// Submit one explicitly execution-owned private storage operation. It
+    /// reserves the same worker endpoint as network I/O, so nesting is Busy.
+    pub fn try_execution_storage(
+        &self,
+        node_id: u64,
+        node_generation: u64,
+        operation: rpc::WorkerStorageOperation,
+        payload: &[u8],
+    ) -> Result<PendingExecutionRpc, PolledExecutionRpcError> {
+        let payload = rpc::encode_worker_storage_request(operation, payload)
+            .map_err(|_| PolledExecutionRpcError::InvalidRequest)?;
+        self.try_execution_request(node_id, node_generation, RpcMethod::WorkerStorage, &payload)
+    }
+
     /// Try to submit one execution-owned bounded receive.
     pub fn try_execution_net_recv(
         &self,

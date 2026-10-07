@@ -67,6 +67,7 @@ pub(super) fn check_synchronous_ownership() {
     check_failed_acknowledgement();
     check_completion_wait();
     check_rejected_wait();
+    check_worker_storage_reservation();
 }
 
 fn check_synchronous_pair(durable_first: bool) {
@@ -241,4 +242,50 @@ fn check_rejected_wait() {
         rpc.abandon_execution_rpc(pending).unwrap();
     }
     WAIT_RESULT.with(|value| value.set((0, 0)));
+}
+
+fn check_worker_storage_reservation() {
+    assert!(!honest_role_allows_method(
+        RpcRole::Control,
+        RpcMethod::WorkerStorage
+    ));
+    assert!(!honest_role_allows_method(
+        RpcRole::Execution,
+        RpcMethod::KvPutDurable
+    ));
+    let (tx, host_rx) = queue();
+    let (host_tx, rx) = queue();
+    let rpc = client::RpcClient::new(tx, rx);
+    let payload = encode_kv_get_req(b"honest.accepted-artifact-chunks-v1", b"exact scoped key");
+    let pending = rpc
+        .try_execution_storage(3, 8, WorkerStorageOperation::Get, &payload)
+        .unwrap();
+    assert!(matches!(
+        rpc.try_execution_net_close(3, 8, 7),
+        Err(client::PolledExecutionRpcError::Busy)
+    ));
+    let message = receive(&host_rx);
+    let request = decode_honest_request(&message).unwrap();
+    assert_eq!(request.identity.method, RpcMethod::WorkerStorage);
+    assert_eq!(
+        decode_worker_storage_request(request.payload),
+        Some((WorkerStorageOperation::Get, payload.as_slice()))
+    );
+    host_tx.send(&encode_honest_response(request.identity, 0, b"sealed value").unwrap());
+    assert_eq!(
+        rpc.poll_execution_rpc(&pending).unwrap().unwrap().payload(),
+        b"sealed value"
+    );
+    let network = rpc.try_execution_net_close(3, 8, 7).unwrap();
+    let message = receive(&host_rx);
+    let request = decode_honest_request(&message).unwrap();
+    host_tx.send(&encode_honest_response(request.identity, 0, &[]).unwrap());
+    rpc.poll_execution_rpc(&network).unwrap().unwrap();
+    assert!(decode_worker_storage_request(&[255]).is_none());
+    assert!(encode_worker_storage_request(
+        WorkerStorageOperation::Get,
+        &vec![0; MAX_HONEST_RPC_PAYLOAD_BYTES]
+    )
+    .is_err());
+    println!("WORKER-STORAGE-RPC: actual framedtoken/role/size/nestedBusy/releasednetworkreservation PASS");
 }
