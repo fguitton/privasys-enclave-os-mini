@@ -425,7 +425,11 @@ pub fn initialise_runtime_and_ingress(
     // dynamically (e.g. WASM) will call cert_store().register()
     // at runtime.
     {
-        let store = crate::ratls::cert_store::CertStore::new();
+        let store = if crate::honest_ingress_profile_selected() {
+            crate::ratls::cert_store::CertStore::new_honest_profile()
+        } else {
+            crate::ratls::cert_store::CertStore::new()
+        };
         let identities = crate::modules::collect_app_identities();
         let count = identities.len();
         for identity in identities {

@@ -161,6 +161,7 @@ fn owned_body(
 
 #[test]
 fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
+    fixed_peer_configuration_boundary();
     #[cfg(feature="native-deferred-fixture")]
     crate::actual_control_wake::check();
     #[cfg(feature="native-deferred-fixture")]
@@ -369,4 +370,70 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
         5,
         "session teardown releases an undrained body"
     );
+}
+
+fn fixed_peer_configuration_boundary() {
+    let store = CertStore::new_honest_profile();
+    let name = enclave_os_common::modules::HONEST_PEER_SNI;
+    let (mut client, mut session) = pair(&store, name);
+    handshake(&mut client, &mut session);
+    let binder = session.export_hctx(b"fixed-peer-test", &[]).unwrap();
+    write_requests(
+        &mut client,
+        &mut session,
+        b"GET /first HTTP/1.1\r\nHost: peer.s1.invalid\r\n\r\nGET /second HTTP/1.1\r\nHost: peer.s1.invalid\r\n\r\n",
+    );
+    assert_eq!(session.recv_http_request().unwrap().unwrap().path, "/first");
+    register(&store, "workflow.test");
+    assert_eq!(session.recv_http_request().unwrap().unwrap().path, "/second");
+    assert_eq!(session.export_hctx(b"fixed-peer-test", &[]).unwrap(), binder);
+
+    let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let body: Vec<_> = (0..256 * 1024).map(|n| (n % 251) as u8).collect();
+    let expected = enclave_os_common::protocol::format_http_response(200, &body, false);
+    session.queue_http_response(200, "application/json", &[], owned_body(body, &drops), false, false).unwrap();
+    let mut actual = Vec::new();
+    let mut steps = 0;
+    while session.has_pending_response() {
+        let (bytes, close, shutdown) = session.progress_http_response().unwrap();
+        assert!(!close && !shutdown && bytes.len() <= 64 * 1024);
+        if !bytes.is_empty() {
+            let mut input = Cursor::new(bytes);
+            while input.position() < input.get_ref().len() as u64 {
+                client.read_tls(&mut input).unwrap();
+                client.process_new_packets().unwrap();
+                let mut plaintext = [0; 16 * 1024];
+                loop {
+                    match std::io::Read::read(&mut client.reader(), &mut plaintext) {
+                        Ok(0) => break,
+                        Ok(length) => actual.extend_from_slice(&plaintext[..length]),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(error) => panic!("peer response read failed: {error}"),
+                    }
+                }
+            }
+        }
+        if steps == 0 {
+            register(&store, "workflow.test");
+            assert!(store.unregister("workflow.test"));
+        }
+        steps += 1;
+        assert!(steps < 32, "bounded peer response must complete");
+    }
+    assert_eq!(actual, expected, "unrelated endpoint churn preserves exact partial peer response");
+    assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    session.queue_http_response(200, "application/json", &[], owned_body(vec![7; 256 * 1024], &drops), false, false).unwrap();
+    let (bytes, _, _) = session.progress_http_response().unwrap();
+    assert!(!bytes.is_empty() && session.has_pending_response());
+    store.invalidate(name);
+    assert!(session.progress_http_response().is_err());
+    assert!(!session.has_pending_response());
+    assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 2, "explicit peer revocation releases remaining body ownership once");
+    assert!(session.export_hctx(b"fixed-peer-test", &[]).is_err());
+    assert!(session.recv_http_request().is_err());
+    let (mut replacement_client, mut replacement) = pair(&store, name);
+    handshake(&mut replacement_client, &mut replacement);
+    assert!(replacement.export_hctx(b"fixed-peer-test", &[]).is_ok());
+    assert!(session.export_hctx(b"fixed-peer-test", &[]).is_err(), "replacement cannot resurrect old peer session");
 }
