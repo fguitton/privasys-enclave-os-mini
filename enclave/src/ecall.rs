@@ -514,6 +514,18 @@ pub trait ControlLoopHook {
     }
 
     fn on_opportunity(&mut self, opportunity: ControlLoopOpportunity) -> ControlLoopAction;
+
+    /// Validate/advance one transport event without running a full owner scan.
+    /// The default preserves the existing composition behaviour.
+    fn on_transport_opportunity(&mut self, opportunity: ControlLoopOpportunity) -> ControlLoopAction {
+        self.on_opportunity(opportunity)
+    }
+
+    /// One finite semantic-service opportunity after bounded input/output work.
+    /// Retained wake publications must survive light transport calls.
+    fn on_control_quantum(&mut self) -> ControlLoopAction {
+        ControlLoopAction::Continue
+    }
 }
 
 struct NoopControlLoopHook;
@@ -536,6 +548,19 @@ fn control_opportunity(
     {
         hook.on_opportunity(opportunity)
     }
+}
+
+fn transport_opportunity(hook: &mut dyn ControlLoopHook, opportunity: ControlLoopOpportunity) -> ControlLoopAction {
+    #[cfg(feature = "diagnostic-transfer-profile")]
+    { crate::ratls::session::measure_control(|| hook.on_transport_opportunity(opportunity)) }
+    #[cfg(not(feature = "diagnostic-transfer-profile"))]
+    { hook.on_transport_opportunity(opportunity) }
+}
+fn semantic_opportunity(hook: &mut dyn ControlLoopHook) -> ControlLoopAction {
+    #[cfg(feature = "diagnostic-transfer-profile")]
+    { crate::ratls::session::measure_control(|| hook.on_control_quantum()) }
+    #[cfg(not(feature = "diagnostic-transfer-profile"))]
+    { hook.on_control_quantum() }
 }
 
 fn apply_control_action(action: ControlLoopAction) {
@@ -569,20 +594,10 @@ fn progress_deferred_ingress() {
     }
 }
 
-/// Run the control event loop after [`initialise_runtime_and_ingress`].
-pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
-    if crate::core_phase() != enclave_os_common::core_phase::CorePhase::Running {
-        return -24;
-    }
-
-    // Main event loop: read from data channel, dispatch to IngressServer
-    let data_rx = crate::data_rx();
-    let mut deferred_event = true;
-    while !crate::is_shutdown() {
-        let published = crate::deferred_ingress::take_deferred_revision();
-        if deferred_event || published {
-            progress_deferred_ingress(); deferred_event = false;
-        }
+/// Unchanged per-quantum bounds: at most32 output steps and8 handler dispatches.
+/// Every step still checks current TLS configuration and exact write credit.
+fn progress_control_output(output_budget: &mut usize, dispatch_budget: &mut usize) {
+    if crate::is_shutdown() { return; }
         if let Ok(mut st) = crate::state().lock() {
             if let Some(ref mut srv) = st.ingress_server {
                 // Amortize the adopter's maintenance pass over a bounded
@@ -592,11 +607,12 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
                 // control traffic and the adopter get another opportunity.
                 // Keep request-handler dispatch bounded separately from
                 // cheap immutable response encryption/channel output.
-                let mut dispatch_budget = 8;
-                for _ in 0..32 {
-                    if !srv.progress_output(&mut dispatch_budget) || srv.is_shutdown() {
+                while *output_budget > 0 && !crate::is_shutdown() {
+                    if srv.is_shutdown() { break; }
+                    if !srv.progress_output(dispatch_budget) || srv.is_shutdown() {
                         break;
                     }
+                    *output_budget -= 1;
                 }
                 if let Some(reason) = srv.shutdown_reason() {
                     enclave_log_error!("MINI-CONTROL-SHUTDOWN: reason=Ingress({:?})", reason);
@@ -614,9 +630,38 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
         } else {
             enclave_log_error!("MINI-CONTROL-SHUTDOWN: reason=StateLockUnavailable");
             crate::signal_shutdown_with_origin(ShutdownOriginV1::StateLockUnavailable);
-            break;
+            return;
         }
 
+}
+
+/// Run the control event loop after [`initialise_runtime_and_ingress`].
+pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
+    if crate::core_phase() != enclave_os_common::core_phase::CorePhase::Running {
+        return -24;
+    }
+
+    // Main event loop: read from data channel, dispatch to IngressServer
+    let data_rx = crate::data_rx();
+    let mut deferred_event = true;
+    while !crate::is_shutdown() {
+        let published = crate::deferred_ingress::take_deferred_revision();
+        if deferred_event || published {
+            progress_deferred_ingress(); deferred_event = false;
+        }
+        if crate::is_shutdown() { break; }
+        let mut output_budget = 32;
+        let mut dispatch_budget = 8;
+        progress_control_output(&mut output_budget, &mut dispatch_budget);
+        if crate::is_shutdown() { break; }
+
+        // At most8 decoded input opportunities. An unclaimed ingress data
+        // feed may immediately dispatch one handler, so end this input quantum
+        // after that feed: at most1 immediate plus8 queued handlers, the
+        // original combined bound. Credit and outbound fragments coalesce.
+        for _ in 0..8 {
+        if crate::is_shutdown() { break; }
+        let mut immediate_ingress_feed = false;
         // Try to receive a data channel message
         match data_rx.try_recv() {
             Some(msg) => {
@@ -636,6 +681,7 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
                                 // Scheduling hints also belong to the adopter;
                                 // the adopter owns consensus scheduling.
                                 hook.on_data_channel_message(msg_type, conn_id, payload);
+                                if crate::is_shutdown() { break; }
                             }
                             if msg_type == channel::ChannelMsgType::TcpNew {
                                 if crate::data_tx()
@@ -648,14 +694,18 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
                                     break;
                                 }
                             }
-                            apply_control_action(control_opportunity(
+                            apply_control_action(transport_opportunity(
                                 hook,
                                 ControlLoopOpportunity::DataChannelProgress,
                             ));
+                            if crate::is_shutdown() { break; }
                             continue;
                         }
                         let mut opportunity = ControlLoopOpportunity::DataChannelProgress;
-                        if !hook.on_data_channel_message(msg_type, conn_id, payload) {
+                        let claimed = hook.on_data_channel_message(msg_type, conn_id, payload);
+                        if crate::is_shutdown() { break; }
+                        if !claimed {
+                            immediate_ingress_feed = msg_type == channel::ChannelMsgType::TcpData;
                             let mut st = match crate::state().lock() {
                                 Ok(st) => st,
                                 Err(_) => {
@@ -694,7 +744,8 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
                             }
                             drop(st);
                         }
-                        apply_control_action(control_opportunity(
+                        if crate::is_shutdown() { break; }
+                        apply_control_action(transport_opportunity(
                             hook,
                             opportunity,
                         ));
@@ -708,10 +759,21 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
                 }
             }
             None => {
-                apply_control_action(control_opportunity(hook, ControlLoopOpportunity::Idle));
+                apply_control_action(transport_opportunity(hook, ControlLoopOpportunity::Idle));
                 core::hint::spin_loop();
+                break;
             }
         }
+        if crate::is_shutdown() { break; }
+        // Advance queued bytes after processing actual credit, before an
+        // expensive semantic callback. This uses the same remaining32 steps.
+        progress_control_output(&mut output_budget, &mut dispatch_budget);
+        if crate::is_shutdown() || immediate_ingress_feed { break; }
+        }
+        if crate::is_shutdown() { break; }
+        // Finite service even with continuousC2 input; never postpone the
+        // semantic owner beyond this quantum. Consume pending wake before it.
+        apply_control_action(semantic_opportunity(hook));
     }
 
     let _ = control_opportunity(hook, ControlLoopOpportunity::Shutdown);
