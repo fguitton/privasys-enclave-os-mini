@@ -61,6 +61,8 @@ pub struct RaTlsSession {
     tls_conn: rustls::ServerConnection,
     /// Accumulation buffer for incomplete application-level frames.
     read_buf: Vec<u8>,
+    read_offset:usize,
+    stream_chunks:Option<std::collections::VecDeque<(Vec<u8>,usize)>>,
     response: Option<PendingResponse>,
     /// Exact v2 leaf served on this connection (evidence is exchanged separately).
     local_cert_der: Vec<u8>,
@@ -164,7 +166,7 @@ impl RaTlsSession {
     ) -> Self {
         Self {
             tls_conn,
-            read_buf: Vec::new(),
+            read_buf: Vec::new(),read_offset:0,stream_chunks:None,
             response: None,
             local_cert_der,
             server_name,
@@ -274,9 +276,9 @@ impl RaTlsSession {
         // Drain any available decrypted plaintext into read_buf
         self.drain_plaintext()?;
 
-        match protocol::parse_http_request(&self.read_buf) {
+        match protocol::parse_http_request(&self.read_buf[self.read_offset..]) {
             Ok((request, consumed)) => {
-                self.read_buf.drain(..consumed);
+                self.read_offset+=consumed;
                 Ok(Some(request))
             }
             Err(protocol::HttpParseError::Incomplete) => Ok(None),
@@ -285,6 +287,67 @@ impl RaTlsSession {
             Err(_) => Err("malformed HTTP request"),
         }
     }
+
+    pub(crate) fn stream_head(&mut self)->Result<Option<(protocol::HttpRequest,usize,usize)>,&'static str> {
+        self.require_current_configuration()?;
+        match protocol::peek_http_stream_request_head(&self.read_buf[self.read_offset..]) {
+            Ok(value)=>Ok(Some(value)),
+            Err(protocol::HttpParseError::Incomplete)=>Ok(None),
+            Err(_)=>Err("malformed streaming HTTP header"),
+        }
+    }
+    pub(crate) fn validate_stream_head(&self)->bool {protocol::parse_http_stream_request_head(&self.read_buf[self.read_offset..]).is_ok()}
+    // Reuse the old parser Vec plus full-body copy allowance. This is a
+    // physical capacity bound; unread bytes keep the original separate cap.
+    pub(crate) const STREAM_INPUT_CAPACITY:usize=(protocol::MAX_BODY_SIZE+64*1024).next_power_of_two()+protocol::MAX_BODY_SIZE;
+    pub(crate) fn consume_stream_head(&mut self,bytes:usize)->Result<(),&'static str> {
+        let offset=self.read_offset.checked_add(bytes).ok_or("stream header overflow")?;
+        if offset>self.read_buf.len() || self.read_buf.capacity()>(protocol::MAX_BODY_SIZE+64*1024).next_power_of_two(){return Err("stream inherited input capacity exceeded bound");}
+        let bytes=std::mem::take(&mut self.read_buf);self.read_offset=0;
+        let mut chunks=std::collections::VecDeque::new();
+        if bytes.len()>offset {chunks.push_back((bytes,offset));}
+        self.stream_chunks=Some(chunks);Ok(())
+    }
+    pub(crate) fn stream_fragment(&mut self,maximum:usize)->Vec<u8> {
+        let maximum=maximum.min(crate::MAX_STREAM_INGRESS_FRAGMENT);
+        let Some(chunks)=self.stream_chunks.as_mut() else{return Vec::new();};
+        let mut result=Vec::with_capacity(maximum);
+        while result.len()<maximum {
+            let Some((bytes,offset))=chunks.front_mut() else{break;};
+            let take=(maximum-result.len()).min(bytes.len()-*offset);
+            result.extend_from_slice(&bytes[*offset..*offset+take]);*offset+=take;
+            if *offset==bytes.len(){chunks.pop_front();}
+        }
+        result
+    }
+    pub(crate) fn stream_input_bytes(&self)->usize {
+        self.stream_chunks.as_ref().map_or(self.read_buf.len()-self.read_offset,|chunks|chunks.iter().map(|(b,o)|b.len()-o).sum())
+    }
+    pub(crate) fn stream_has_input(&self)->bool {
+        self.stream_chunks.as_ref().map_or(self.read_offset<self.read_buf.len(),|q|!q.is_empty())
+    }
+    pub(crate) fn finish_stream_input(&mut self)->Result<(),&'static str> {
+        let Some(mut chunks)=self.stream_chunks.take() else{return Ok(());};
+        let Some((mut buffer,offset))=chunks.pop_front() else{return Ok(());};
+        // Compact once, at the stream-to-legacy boundary, reusing the inherited
+        // allocation rather than holding two potentially32MiB buffers.
+        buffer.drain(..offset);
+        let total=buffer.len()+chunks.iter().map(|(b,o)|b.len()-o).sum::<usize>();
+        if buffer.capacity()<total {
+            // Before one exact reserve, consume/drop enough existing small
+            // segments to keep old+new allocations within the original charge.
+            while buffer.capacity()+total+chunks.iter().map(|(b,_)|b.capacity()).sum::<usize>()>Self::STREAM_INPUT_CAPACITY {
+                let Some((bytes,offset))=chunks.pop_front() else{return Err("stream terminal input capacity exceeded bound");};
+                if buffer.len()+bytes.len()-offset>buffer.capacity(){return Err("stream terminal input requires uncharged allocation");}
+                buffer.extend_from_slice(&bytes[offset..]);
+            }
+            buffer.reserve_exact(total-buffer.len());
+        }
+        if buffer.capacity()+chunks.iter().map(|(b,_)|b.capacity()).sum::<usize>()>Self::STREAM_INPUT_CAPACITY{return Err("stream terminal input capacity exceeded bound");}
+        for (bytes,offset) in chunks {buffer.extend_from_slice(&bytes[offset..]);}
+        self.read_buf=buffer;self.read_offset=0;Ok(())
+    }
+
 
     /// Encrypt and send an HTTP/1.1 response.
     ///
@@ -450,6 +513,32 @@ impl RaTlsSession {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    if let Some(chunks)=self.stream_chunks.as_mut() {
+                        let unread:usize=chunks.iter().map(|(v,o)|v.len()-o).sum();
+                        if unread.saturating_add(n)>protocol::MAX_BODY_SIZE+64*1024 {return Err("stream unread input exceeded bound");}
+                        let capacity:usize=chunks.iter().map(|(v,_)|v.capacity()).sum();
+                        if chunks.back().is_none_or(|(v,_)|v.len()==v.capacity()) {
+                            if capacity+crate::MAX_STREAM_INGRESS_FRAGMENT>Self::STREAM_INPUT_CAPACITY {return Err("stream input capacity exceeded bound");}
+                            chunks.push_back((Vec::with_capacity(crate::MAX_STREAM_INGRESS_FRAGMENT),0));
+                        }
+                        let mut input=&buf[..n];
+                        while !input.is_empty(){
+                            let (last,_)=chunks.back_mut().unwrap();let take=input.len().min(last.capacity()-last.len());last.extend_from_slice(&input[..take]);input=&input[take..];
+                            if !input.is_empty(){
+                                let capacity:usize=chunks.iter().map(|(v,_)|v.capacity()).sum();
+                                if capacity+crate::MAX_STREAM_INGRESS_FRAGMENT>Self::STREAM_INPUT_CAPACITY {return Err("stream input capacity exceeded bound");}
+                                chunks.push_back((Vec::with_capacity(crate::MAX_STREAM_INGRESS_FRAGMENT),0));
+                            }
+                        }
+                        continue;
+                    }
+                    // Compact only after consuming at least the remaining
+                    // suffix, or to maintain the unchanged physical buffer cap.
+                    // Every byte moves amortized once, never per64KiB fragment.
+                    if self.read_offset>0 && (self.read_offset>=self.read_buf.len()-self.read_offset
+                        || self.read_buf.len().saturating_add(n)>protocol::MAX_BODY_SIZE+64*1024) {
+                        self.read_buf.drain(..self.read_offset);self.read_offset=0;
+                    }
                     if self.read_buf.len().saturating_add(n) > protocol::MAX_BODY_SIZE + 64 * 1024 {
                         return Err("pending HTTP input exceeded bound");
                     }
@@ -668,7 +757,7 @@ impl RaTlsSession {
         if !self.configuration.is_current() {
             self.fail_attestation();
             self.fido2_identity = None;
-            self.read_buf.clear();
+            self.read_buf.clear();self.read_offset=0;self.stream_chunks=None;
             self.response = None;
             return Err("certificate configuration changed; reconnect required");
         }

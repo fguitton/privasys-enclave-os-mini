@@ -25,6 +25,9 @@ use serde::{Deserialize, Serialize};
 
 /// Maximum HTTP request body: 16 MiB.
 pub const MAX_BODY_SIZE: usize = 16 * 1024 * 1024;
+/// Optional header-only streamed ceiling: eight canonical8MiB frames plus
+/// bounded AEAD/header/page/group overhead. Never used by the legacy parser.
+pub const MAX_STREAM_BODY_SIZE:usize=12+8*(4+92+32*1024+8*1024*1024+16);
 
 /// Maximum HTTP header section: 8 KiB (enforced via header count).
 pub const MAX_HEADERS: usize = 32;
@@ -345,6 +348,40 @@ pub enum HttpParseError {
 /// bytes consumed from the front of `buf`, or `Err(Incomplete)` if the
 /// buffer does not yet contain a complete request.
 pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseError> {
+    let (mut request,header_len,body_len)=parse_http_metadata(buf,false,MAX_BODY_SIZE)?;
+    let total=header_len+body_len;
+    if buf.len()<total { return Err(HttpParseError::Incomplete); }
+    request.body=buf[header_len..total].to_vec();
+    Ok((request,total))
+}
+/// Header-only framing for an optional charged input adopter. Returns no body
+/// and allocates only bounded header metadata. No application authority follows.
+/// Unlike the legacy parser, this route rejects duplicate length or transfer
+/// encoding rather than allowing ambiguous streaming ownership.
+pub fn parse_http_request_head(buf:&[u8])->Result<(HttpRequest,usize,usize),HttpParseError> {
+    if buf.windows(4).position(|w|w==b"\r\n\r\n").is_none_or(|n|n+4>16*1024) {
+        return if buf.len()>16*1024 {Err(HttpParseError::TooManyHeaders)} else {Err(HttpParseError::Incomplete)};
+    }
+    parse_http_metadata(buf,true,MAX_BODY_SIZE)
+}
+/// Inert bounded header peek; preserves legacy framing semantics for selectors.
+pub fn peek_http_request_head(buf:&[u8])->Result<(HttpRequest,usize,usize),HttpParseError> {
+    if buf.windows(4).position(|w|w==b"\r\n\r\n").is_none_or(|n|n+4>16*1024) {return Err(HttpParseError::Incomplete);}
+    parse_http_metadata(buf,false,MAX_BODY_SIZE)
+}
+/// Optional header-only route. Its inert maximum grants no admission or body
+/// allocation; the adopter independently validates negotiated geometry/authority.
+pub fn parse_http_stream_request_head(buf:&[u8])->Result<(HttpRequest,usize,usize),HttpParseError>{
+    if buf.windows(4).position(|w|w==b"\r\n\r\n").is_none_or(|n|n+4>16*1024){return if buf.len()>16*1024{Err(HttpParseError::TooManyHeaders)}else{Err(HttpParseError::Incomplete)};}
+    parse_http_metadata(buf,true,MAX_STREAM_BODY_SIZE)
+}
+/// Header selector peek with the optional stream ceiling; ordinary parsing
+/// still applies its original16MiB body limit if no adopter claims this request.
+pub fn peek_http_stream_request_head(buf:&[u8])->Result<(HttpRequest,usize,usize),HttpParseError>{
+    if buf.windows(4).position(|w|w==b"\r\n\r\n").is_none_or(|n|n+4>16*1024){return Err(HttpParseError::Incomplete);}
+    parse_http_metadata(buf,false,MAX_STREAM_BODY_SIZE)
+}
+fn parse_http_metadata(buf:&[u8],strict:bool,maximum_body:usize)->Result<(HttpRequest,usize,usize),HttpParseError> {
     let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
     let mut req = httparse::Request::new(&mut headers);
 
@@ -375,7 +412,9 @@ pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseE
     let mut edge_terminated = false;
 
     for h in req.headers.iter() {
+        if strict && h.name.eq_ignore_ascii_case("transfer-encoding") { return Err(HttpParseError::Malformed); }
         if h.name.eq_ignore_ascii_case("content-length") {
+            if strict && content_length.is_some() { return Err(HttpParseError::InvalidContentLength); }
             let val =
                 core::str::from_utf8(h.value).map_err(|_| HttpParseError::InvalidContentLength)?;
             content_length = Some(
@@ -434,17 +473,9 @@ pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseE
     // Body
     let body_len = content_length.unwrap_or(0);
 
-    if body_len > MAX_BODY_SIZE {
+    if body_len > maximum_body {
         return Err(HttpParseError::BodyTooLarge);
     }
-
-    let total = header_len + body_len;
-
-    if buf.len() < total {
-        return Err(HttpParseError::Incomplete);
-    }
-
-    let body = buf[header_len..total].to_vec();
 
     Ok((
         HttpRequest {
@@ -456,11 +487,11 @@ pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseE
             privasys_session,
             content_type,
             host,
-            body,
+            body:Vec::new(),
             connection_close,
             edge_terminated,
         },
-        total,
+        header_len,body_len,
     ))
 }
 
@@ -602,6 +633,7 @@ mod tests {
 
     #[test]
     fn test_parse_get_request() {
+        header_only_stream_framing();
         let raw = b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n";
         let (req, consumed) = parse_http_request(raw).unwrap();
         assert_eq!(req.method, HttpMethod::Get);
@@ -740,4 +772,23 @@ mod tests {
         let (req, _) = parse_http_request(raw).unwrap();
         assert!(req.billing_approved.is_none());
     }
+    fn header_only_stream_framing() {
+        let raw=b"POST /upload HTTP/1.1\r\nContent-Length: 4\r\n\r\nab";
+        assert_eq!(parse_http_request(raw).unwrap_err(),HttpParseError::Incomplete);
+        let large=format!("POST /stream HTTP/1.1\r\nContent-Length: {}\r\n\r\n",MAX_STREAM_BODY_SIZE);
+        let(head,_,length)=parse_http_stream_request_head(large.as_bytes()).unwrap();assert_eq!(length,67_371_916);assert!(head.body.is_empty());
+        assert!(matches!(parse_http_request_head(large.as_bytes()),Err(HttpParseError::BodyTooLarge)));
+        assert!(matches!(parse_http_request(large.as_bytes()),Err(HttpParseError::BodyTooLarge)));
+        let excess=format!("POST /stream HTTP/1.1\r\nContent-Length: {}\r\n\r\n",MAX_STREAM_BODY_SIZE+1);assert!(matches!(parse_http_stream_request_head(excess.as_bytes()),Err(HttpParseError::BodyTooLarge)));
+        let(head,used,length)=parse_http_request_head(raw).unwrap();
+        assert!(head.body.is_empty());assert_eq!(length,4);assert_eq!(&raw[used..],b"ab");
+        for raw in [b"POST /upload HTTP/1.1\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\nabcd".as_slice(),b"POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice()] {
+            assert!(peek_http_request_head(raw).is_ok());
+            assert!(parse_http_request_head(raw).is_err());
+            assert!(parse_http_request(raw).is_ok(),"legacy fallback framing remains unchanged");
+        }
+        let oversized=b"POST /upload HTTP/1.1\r\nContent-Length: 999999999\r\n\r\n";
+        assert_eq!(parse_http_request_head(oversized).unwrap_err(),HttpParseError::BodyTooLarge);
+    }
+
 }

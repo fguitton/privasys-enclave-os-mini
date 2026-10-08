@@ -19,6 +19,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
+use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -92,6 +93,8 @@ struct ConnState {
     write_buffer: Vec<u8>,
     write_offset: usize,
     write_credit: Option<WrittenCredit>,
+    read_control:Option<(u64,bool)>,
+    connection_generation:u64,
     close_after_write: bool,
 }
 
@@ -148,6 +151,23 @@ impl ProxyStream {
         }
     }
 
+    // Observe only terminal socket readiness while payload reads are parked.
+    // Writes/enclave-close remain serviced; no parked data is consumed or fed.
+    fn disconnected_ready(&self)->bool {
+        let fd=match self{Self::Tcp(stream)=>stream.as_raw_fd(),Self::Unix(stream)=>stream.as_raw_fd()};
+        let mut descriptor=libc::pollfd{fd,events:libc::POLLHUP|libc::POLLERR|libc::POLLRDHUP,revents:0};
+        // Safety: one initialized descriptor is valid for this nonblocking call.
+        let ready=unsafe{libc::poll(&mut descriptor,1,0)};
+        if ready<=0{return false;}
+        if descriptor.revents&(libc::POLLERR|libc::POLLNVAL)!=0{return true;}
+        if descriptor.revents&(libc::POLLHUP|libc::POLLRDHUP)==0{return false;}
+        // Orderly read-half closure must not discard buffered request bytes.
+        // Inspect one byte without consuming it; rearm drains the original body.
+        let mut byte=0u8;
+        let pending=unsafe{libc::recv(fd,(&mut byte as *mut u8).cast(),1,libc::MSG_PEEK|libc::MSG_DONTWAIT)};
+        pending==0
+    }
+
     fn tcp(&self) -> Option<&TcpStream> {
         match self {
             Self::Tcp(stream) => Some(stream),
@@ -183,6 +203,7 @@ pub struct TcpProxy {
     pending_connects: HashMap<u32, PendingConn>,
     /// Next ingress connection ID to assign.
     next_conn_id: u32,
+    next_read_generation:u64,
     /// Next peer-port connection ID to assign.
     next_peer_conn_id: u32,
     /// Producer for `data_host_to_enc` — sends TCP data to the enclave.
@@ -273,7 +294,7 @@ impl TcpProxy {
             local_control_path,
             connections: HashMap::new(),
             pending_connects: HashMap::new(),
-            next_conn_id: 1,
+            next_conn_id: 1,next_read_generation:0,
             next_peer_conn_id: CONN_ID_PEER_IN_BASE,
             data_tx,
             data_rx,
@@ -443,6 +464,9 @@ impl TcpProxy {
                 self.connections.len() + 1
             );
 
+            let generation=if cfg!(feature="stream-read-credit"){
+                let Some(value)=self.next_read_generation.checked_add(1)else{continue;};self.next_read_generation=value;value
+            }else{0};
             // Send TcpNew to enclave
             let msg = channel::encode_tcp_new(conn_id, &peer_addr);
             self.send_to_enclave(msg);
@@ -455,10 +479,11 @@ impl TcpProxy {
                     origin: ConnectionOrigin::Inbound,
                     write_buffer: Vec::new(),
                     write_offset: 0,
-                    write_credit: None,
+                    write_credit: None,read_control:None,connection_generation:generation,
                     close_after_write: false,
                 },
             );
+            if generation!=0{self.send_to_enclave(channel::encode_tcp_read_identity(conn_id,generation));}
             accepted = true;
         }
         accepted
@@ -499,7 +524,7 @@ impl TcpProxy {
                             origin: ConnectionOrigin::LocalControl,
                             write_buffer: Vec::new(),
                             write_offset: 0,
-                            write_credit: None,
+                            write_credit: None,read_control:None,connection_generation:0,
                             close_after_write: false,
                         },
                     );
@@ -675,7 +700,7 @@ impl TcpProxy {
                     origin: ConnectionOrigin::Outbound,
                     write_buffer: Vec::new(),
                     write_offset: 0,
-                    write_credit: None,
+                    write_credit: None,read_control:None,connection_generation:0,
                     close_after_write: false,
                 },
             );
@@ -700,6 +725,10 @@ impl TcpProxy {
 
         for (&conn_id, conn) in self.connections.iter_mut() {
             if matches!(conn.origin, ConnectionOrigin::OutboundConnecting { .. }) {
+                continue;
+            }
+            if conn.read_control.is_some_and(|(_,paused)|paused){
+                if conn.stream.disconnected_ready(){to_close.push(conn_id);}
                 continue;
             }
             match conn.stream.read(buf) {
@@ -790,6 +819,13 @@ impl TcpProxy {
                                     self.connections.remove(&conn_id);
                                     self.send_to_enclave(channel::encode_tcp_close(conn_id));
                                 }
+                            }
+                        }
+                        Some((ChannelMsgType::TcpReadControl,conn_id,payload))=>{
+                            if let Some(conn)=self.connections.get_mut(&conn_id){
+                                if let Some((generation,revision,paused))=channel::decode_tcp_read_control(payload){
+                                    if generation==conn.connection_generation && conn.read_control.is_none_or(|(previous,_)|revision>previous){conn.read_control=Some((revision,paused));}
+                                }else{self.connections.remove(&conn_id);self.send_to_enclave(channel::encode_tcp_close(conn_id));}
                             }
                         }
                         Some((ChannelMsgType::TcpData, conn_id, payload)) => {
@@ -1042,7 +1078,7 @@ impl TcpProxy {
                         origin,
                         write_buffer: Vec::new(),
                         write_offset: 0,
-                        write_credit: None,
+                        write_credit: None,read_control:None,connection_generation:0,
                         close_after_write: false,
                     },
                 );
@@ -1358,6 +1394,7 @@ mod tests {
                 self.proxy.read_sockets(&mut [0; 1024]);
                 self.proxy.flush_pending_to_enclave();
                 while let Some(message) = self.from_host.try_recv() {
+                    if let Some((ChannelMsgType::TcpReadIdentity,_,payload))=channel::decode_channel_msg(&message){assert!(channel::decode_tcp_read_identity(payload).is_some());continue;}
                     messages.push(message);
                 }
                 assert!(Instant::now() < deadline, "TCP proxy message deadline");
@@ -1672,6 +1709,8 @@ mod tests {
 
     #[test]
     fn enclave_close_drains_buffered_ciphertext_before_socket_close() {
+        #[cfg(feature="stream-read-credit")]
+        read_pause_rearm_isolated_and_revision_bound();
         // Frequent small writes grant only their actual cumulative byte count.
         // Crossing the quantum makes progress without any timer or close;
         // a short final write is acknowledged before the close notification.
@@ -1708,7 +1747,7 @@ mod tests {
                 origin: ConnectionOrigin::Inbound,
                 write_buffer: Vec::new(),
                 write_offset: 0,
-                write_credit: None,
+                write_credit: None,read_control:None,connection_generation:0,
                 close_after_write: false,
             },
         );
@@ -1733,4 +1772,49 @@ mod tests {
         let mut eof = [0_u8; 1];
         assert_eq!(client.read(&mut eof).unwrap(), 0);
     }
+    #[cfg(feature="stream-read-credit")]
+    fn read_pause_rearm_isolated_and_revision_bound(){
+        let mut fixture=TransportFixture::new();
+        let mut held=TcpStream::connect(fixture.proxy.listener.local_addr().unwrap()).unwrap();
+        held.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        fixture.proxy.accept_connections();let first=fixture.messages(1);let(_,id,_)=channel::decode_channel_msg(&first[0]).unwrap();
+        let mut other=TcpStream::connect(fixture.proxy.listener.local_addr().unwrap()).unwrap();
+        fixture.proxy.accept_connections();let second=fixture.messages(1);let(_,other_id,_)=channel::decode_channel_msg(&second[0]).unwrap();assert_ne!(id,other_id);
+        let generation=fixture.proxy.connections[&id].connection_generation;assert_ne!(generation,0);
+        fixture.to_host.try_send(&channel::encode_tcp_read_control(id,generation,1,true)).unwrap();fixture.proxy.drain_enclave_output();
+        held.write_all(b"held body").unwrap();other.write_all(b"other body").unwrap();
+        let messages=fixture.messages(1);let(kind,got,payload)=channel::decode_channel_msg(&messages[0]).unwrap();
+        assert_eq!((kind,got,payload),(ChannelMsgType::TcpData,other_id,b"other body".as_slice()));
+        fixture.to_host.try_send(&channel::encode_tcp_data(id,b"write while parked")).unwrap();fixture.proxy.drain_enclave_output();fixture.proxy.flush_socket_writes();
+        let mut output=[0;18];held.read_exact(&mut output).unwrap();assert_eq!(&output,b"write while parked");
+        fixture.to_host.try_send(&channel::encode_tcp_read_control(id,generation,1,false)).unwrap();fixture.proxy.drain_enclave_output();
+        assert_eq!(fixture.proxy.connections[&id].read_control,Some((1,true)),"stale/equal resume cannot undo pause");
+        fixture.proxy.read_sockets(&mut [0;1024]);assert!(fixture.from_host.try_recv().is_none());
+        fixture.to_host.try_send(&channel::encode_tcp_read_control(id,generation,2,false)).unwrap();
+        let messages=fixture.messages(1);let(kind,got,payload)=channel::decode_channel_msg(&messages[0]).unwrap();
+        assert_eq!((kind,got,payload),(ChannelMsgType::TcpData,id,b"held body".as_slice()),"actual rearm feeds held bytes once");
+        fixture.to_host.try_send(&channel::encode_tcp_read_control(id,generation,3,true)).unwrap();fixture.proxy.drain_enclave_output();
+        drop(held);assert_eq!(fixture.messages(1),[channel::encode_tcp_close(id)],"parked socket disconnect remains observed");
+        fixture.to_host.try_send(&channel::encode_tcp_read_control(id,generation,4,false)).unwrap();fixture.proxy.drain_enclave_output();
+        assert!(!fixture.proxy.connections.contains_key(&id));assert!(fixture.proxy.connections.contains_key(&other_id));
+        // Reuse the actual old ID for a new socket. Delayed old-generation
+        // controls must not acquire its initial read state.
+        fixture.proxy.next_conn_id=id;
+        let mut replacement=TcpStream::connect(fixture.proxy.listener.local_addr().unwrap()).unwrap();
+        replacement.set_read_timeout(Some(Duration::from_secs(5))).unwrap();fixture.proxy.accept_connections();
+        let event=fixture.messages(1);assert_eq!(channel::decode_channel_msg(&event[0]).unwrap().1,id);
+        let current=fixture.proxy.connections[&id].connection_generation;assert_ne!(current,generation);
+        fixture.to_host.try_send(&channel::encode_tcp_read_control(id,generation,99,true)).unwrap();fixture.proxy.drain_enclave_output();
+        assert!(fixture.proxy.connections[&id].read_control.is_none(),"old incarnation cannot pause replacement");
+        fixture.to_host.try_send(&channel::encode_tcp_read_control(id,current,1,true)).unwrap();fixture.proxy.drain_enclave_output();
+        replacement.write_all(b"half closed body").unwrap();replacement.shutdown(std::net::Shutdown::Write).unwrap();
+        fixture.proxy.read_sockets(&mut [0;1024]);assert!(fixture.proxy.connections.contains_key(&id));assert!(fixture.from_host.try_recv().is_none(),"RDHUP does not discard buffered input");
+        fixture.to_host.try_send(&channel::encode_tcp_data(id,b"response")).unwrap();fixture.proxy.drain_enclave_output();fixture.proxy.flush_socket_writes();
+        let mut response=[0;8];replacement.read_exact(&mut response).unwrap();assert_eq!(&response,b"response");
+        fixture.to_host.try_send(&channel::encode_tcp_read_control(id,current,2,false)).unwrap();
+        let body=fixture.messages(1);let(kind,got,payload)=channel::decode_channel_msg(&body[0]).unwrap();assert_eq!((kind,got,payload),(ChannelMsgType::TcpData,id,b"half closed body".as_slice()));
+
+        println!("SOURCE-STREAM-HOST-READ-CREDIT pause=no_payload_read rearm=exact_once stale=denied foreign=isolated write=live disconnect=live");
+    }
+
 }

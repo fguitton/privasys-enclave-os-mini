@@ -594,6 +594,30 @@ fn progress_deferred_ingress() {
     }
 }
 
+/// One bounded input quantum. Hashing/application work and receiver destruction
+/// happen after STATE is released; each ready nonce advances at most once.
+fn progress_stream_ingress() {
+    if !crate::stream_ingress::take_revision(){return;}
+    if crate::stream_ingress::take_credit_ready(){
+        if let Ok(mut state)=crate::state().lock(){if let Some(server)=state.ingress_server.as_mut(){server.stream_credit_ready();}}
+    }
+    let Some((_,begin))=crate::HONEST_STREAM_INGRESS_HOOK.get() else{return;};
+    let mut seen=Vec::with_capacity(crate::MAX_STREAM_INGRESS_SESSIONS);
+    for _ in 0..crate::MAX_STREAM_INGRESS_SESSIONS {
+        let terminal=crate::stream_ingress::take_terminal();
+        let cleaned_terminal=terminal.is_some();drop(terminal);
+        let cancelled=crate::state().lock().ok().and_then(|mut state|state.ingress_server.as_mut().and_then(|s|s.take_cancelled_stream()));
+        let cleaned_cancelled=cancelled.is_some();drop(cancelled);
+        let work=crate::state().lock().ok().and_then(|mut state|state.ingress_server.as_mut().and_then(|s|s.take_stream(&seen)));
+        let Some(mut work)=work else{if cleaned_terminal || cleaned_cancelled {continue;}else{break;}};seen.push(work.nonce);
+        let mut response=crate::stream_ingress::run_work(*begin,&mut work);
+        let _retained=crate::state().lock().ok().is_some_and(|mut state|state.ingress_server.as_mut().is_some_and(|s|s.finish_stream(&mut work,&mut response)));
+        // Any stale work, failed push, disconnect or rejected completion drops
+        // its receiver/RAII resources here, never under the transport mutex.
+        drop(response);drop(work);
+    }
+}
+
 /// Unchanged per-quantum bounds: at most32 output steps and8 handler dispatches.
 /// Every step still checks current TLS configuration and exact write credit.
 fn progress_control_output(output_budget: &mut usize, dispatch_budget: &mut usize) {
@@ -645,6 +669,7 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
     let data_rx = crate::data_rx();
     let mut deferred_event = true;
     while !crate::is_shutdown() {
+        progress_stream_ingress();
         let published = crate::deferred_ingress::take_deferred_revision();
         if deferred_event || published {
             progress_deferred_ingress(); deferred_event = false;
@@ -670,7 +695,7 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
                 // Decode the channel message
                 match channel::decode_channel_msg(&msg) {
                     Some((msg_type, conn_id, payload)) => {
-                        if msg_type == channel::ChannelMsgType::Tick { deferred_event = true; }
+                        if msg_type == channel::ChannelMsgType::Tick { deferred_event = true; crate::stream_ingress::notify(); }
                         // Honest's host-assigned connections reach the adopter
                         // hook in the ingress range. Reject other incoming
                         // connections; the former optional peer link is removed.
@@ -765,6 +790,7 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
             }
         }
         if crate::is_shutdown() { break; }
+        progress_stream_ingress();
         // Advance queued bytes after processing actual credit, before an
         // expensive semantic callback. This uses the same remaining32 steps.
         progress_control_output(&mut output_budget, &mut dispatch_budget);
@@ -779,12 +805,15 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
     let _ = control_opportunity(hook, ControlLoopOpportunity::Shutdown);
     crate::signal_shutdown();
     let mut cancelled = Vec::new();
+    let mut cancelled_stream=Vec::new();
     if let Some(state) = crate::try_state() {
         if let Ok(mut st) = state.lock() {
-            if let Some(server) = st.ingress_server.as_mut() { cancelled = server.drain_deferred_tokens(); }
+            if let Some(server) = st.ingress_server.as_mut() { cancelled = server.drain_deferred_tokens();cancelled_stream=server.drain_stream_receivers(); }
             st.ingress_server = None;
         }
     }
+    drop(cancelled_stream);
+    for _ in 0..crate::MAX_STREAM_INGRESS_SESSIONS {drop(crate::stream_ingress::take_terminal());}
     if let Some((_, _, _, _, cancel)) = crate::HONEST_DEFERRED_INGRESS_HOOK.get() {
         for token in cancelled { cancel(token); }
         for _ in 0..crate::MAX_DEFERRED_INGRESS_REQUESTS { if let Some(token)=crate::deferred_ingress::take_terminal() { cancel(token); } else { break; } }

@@ -29,6 +29,8 @@ sgx_urts  = { git = "https://github.com/Privasys/teaclave-sgx-sdk", rev = "2330b
 tempfile = "3"
 
 [features]
+# Optional generation-bound source-stream socket-read flow control.
+stream-read-credit = []
 diagnostic-worker-storage-rpc = []
 mock = []
 

@@ -108,6 +108,15 @@ pub type HonestIngressHook = fn(
 ) -> HonestIngressResponse;
 static HONEST_INGRESS_HOOK: OnceLock<HonestIngressHook> = OnceLock::new();
 
+mod stream_ingress;
+pub use stream_ingress::{HonestStreamIngressPush,notify_honest_stream_ingress,HonestStreamIngressReceiver,HonestStreamIngressEligible,HonestStreamIngressBegin,MAX_STREAM_INGRESS_SESSIONS,MAX_STREAM_INGRESS_FRAGMENT};
+static HONEST_STREAM_INGRESS_HOOK:OnceLock<stream_ingress::Hooks>=OnceLock::new();
+/// Optional explicit input adoption; defaults retain ordinary whole-body HTTP.
+/// Registration changes transport scheduling only and creates no authority.
+pub fn register_honest_stream_ingress_hook(eligible:HonestStreamIngressEligible,begin:HonestStreamIngressBegin)->Result<(),i32> {
+    if CORE_PHASE.load()!=CorePhase::Initialising { return Err(-1); }
+    HONEST_STREAM_INGRESS_HOOK.set((eligible,begin)).map_err(|_|-1)
+}
 mod deferred_ingress;
 pub use deferred_ingress::{
     HonestDeferredIngressEligible, HonestDeferredIngressMetadata, HonestDeferredIngressHook, HonestDeferredIngressPoll, HonestDeferredIngressCancel,

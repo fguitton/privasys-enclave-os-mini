@@ -107,6 +107,7 @@ fn replacement_during_handshake_requires_a_new_connection() {
 
 #[test]
 fn replacement_rejects_buffered_requests_and_re_attestation() {
+    streamed_request_preserves_tls_and_following_request();
     let store = CertStore::new();
     register(&store, "a.test");
     let (mut client, mut session) = pair(&store, "a.test");
@@ -436,4 +437,156 @@ fn fixed_peer_configuration_boundary() {
     handshake(&mut replacement_client, &mut replacement);
     assert!(replacement.export_hctx(b"fixed-peer-test", &[]).is_ok());
     assert!(session.export_hctx(b"fixed-peer-test", &[]).is_err(), "replacement cannot resurrect old peer session");
+}
+
+// Actual Rustls + production session buffer/header/fragment methods. This
+// proves TLS delivery and extraction, not SGX quote or BFT source authority.
+fn streamed_request_preserves_tls_and_following_request() {
+    crate::stream_ingress::check_slot_ownership();
+    streamed_input_alternating_cap_refill();
+    let store=CertStore::new();register(&store,"stream.test");
+    let(mut client,mut session)=pair(&store,"stream.test");handshake(&mut client,&mut session);
+    let binding=session.channel_binder().unwrap();
+    let body=vec![0xa7;128*1024+17];
+    let head=format!("POST /honest/v1/proposal HTTP/1.1\r\nHost: stream.test\r\nContent-Type: application/honest-source-upload-batch-v2\r\nContent-Length: {}\r\n\r\n",body.len());
+    write_requests(&mut client,&mut session,head.as_bytes());
+    let(header,head_bytes,length)=session.stream_head().unwrap().unwrap();
+    assert!(header.body.is_empty());assert_eq!(length,body.len());assert!(session.validate_stream_head());
+    session.consume_stream_head(head_bytes).unwrap();
+    let context=enclave_os_common::modules::RequestContext{
+        ingress_class:enclave_os_common::modules::IngressClass::ExternalNetwork,connection_id:7,
+        server_name:Some("stream.test".into()),attested_endpoint:None,
+        local_cert_der:session.local_cert_der(),local_evidence:None,
+        channel_binder:Some(binding.clone()),peer_cert_der:None,peer_evidence:None,
+        attestation:session.attestation().into(),oidc_claims:None,
+    };
+    let mut work=crate::stream_ingress::Work{lease:crate::stream_ingress::SlotCharge::reserve().unwrap(),connection:7,nonce:1,generation:1,binding:binding.as_slice().try_into().unwrap(),context:Some(context),context_charge:None,header:Some(header),receiver:None,bytes:vec![],length,remaining:length,pending:false};
+    assert!(crate::stream_ingress::run_work(fixture_begin,&mut work).is_none());
+    for part in body.chunks(32*1024){write_requests(&mut client,&mut session,part);}
+    write_requests(&mut client,&mut session,b"GET /next HTTP/1.1\r\nHost: stream.test\r\n\r\n");
+    let segments:Vec<_>=session.stream_chunks.as_ref().unwrap().iter().map(|(b,_)|b.as_ptr()).collect();
+    let mut alternating=0;
+    let mut actual=Vec::new();
+    while actual.len()<length {
+        let part=session.stream_fragment((length-actual.len()).min(64*1024));
+        assert!(!part.is_empty() && part.len()<=64*1024);actual.extend_from_slice(&part);
+        for (bytes,_) in session.stream_chunks.as_ref().unwrap(){assert!(segments.contains(&bytes.as_ptr()),"existing backlog segment never moves on extraction");}
+        alternating+=1;
+        work.remaining-=part.len();work.bytes=part;
+        let result=crate::stream_ingress::run_work(fixture_begin,&mut work);
+        if work.remaining==0 {assert_eq!(&*result.unwrap().body,body.as_slice());}
+        else {assert!(result.is_none());}
+    }
+    assert_eq!(actual,body);assert_eq!(session.channel_binder().unwrap(),binding);
+    assert!(alternating>=3);session.finish_stream_input().unwrap();
+    assert_eq!(session.recv_http_request().unwrap().unwrap().path,"/next");
+    // Actual TLS fragment + shared production pending-accounting seam. The
+    // receiver is a data-only facade; no Main ticket/custody is manufactured.
+    session.consume_stream_head(0).unwrap();
+    for _ in 0..2{write_requests(&mut client,&mut session,&vec![0x7a;32*1024]);}
+    work.bytes=session.stream_fragment(64*1024);assert_eq!(work.bytes.len(),64*1024);
+    work.length=work.bytes.len();work.remaining=0;
+    let fragment=work.bytes.as_ptr();
+    let credit=Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let consumed=Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    work.receiver=Some(Box::new(PendingReceiver{binding:binding.clone(),credit:credit.clone(),consumed:consumed.clone()}));
+    assert!(crate::stream_ingress::run_work(fixture_begin,&mut work).is_none());assert!(work.pending);
+    let mut slot=crate::stream_ingress::Slot{lease:work.lease.clone(),nonce:work.nonce,generation:work.generation,binding:work.binding,header:None,receiver:None,remaining:64*1024,fragment:vec![],parked:false,length:64*1024,close:false,started:std::time::Instant::now()};
+    work.nonce+=1;assert!(crate::stream_ingress::retain_work(&mut slot,&mut work).is_err());work.nonce-=1;
+    crate::stream_ingress::retain_work(&mut slot,&mut work).unwrap();
+    assert!(slot.parked);assert_eq!(slot.remaining,64*1024);assert_eq!(slot.fragment.as_ptr(),fragment);assert_eq!(consumed.load(std::sync::atomic::Ordering::Acquire),0);
+    crate::stream_ingress::notify();assert!(slot.parked,"input/deadline revision cannot rearm stage-credit wait");
+    credit.store(true,std::sync::atomic::Ordering::Release);crate::stream_ingress::notify_honest_stream_ingress();
+    assert!(crate::stream_ingress::take_credit_ready());slot.credit_ready();
+    session.require_current_configuration().unwrap();assert_eq!(session.channel_binder().unwrap(),binding);
+    work.bytes=std::mem::take(&mut slot.fragment);work.receiver=slot.receiver.take().map(|r|r.value);work.remaining=0;
+    let response=crate::stream_ingress::run_work(fixture_begin,&mut work).unwrap();
+    assert!(!work.pending);assert_eq!(response.status,202);assert_eq!(consumed.load(std::sync::atomic::Ordering::Acquire),64*1024);
+    assert!(work.receiver.is_none());assert_eq!(work.bytes.as_ptr(),fragment);drop(slot);session.finish_stream_input().unwrap();
+    println!("HONEST-STREAM-PENDING exact-fragment=65536 pending-offset-unchanged=PASS actual-credit-resume=PASS consume-once-eof=PASS stale-nonce-denied=PASS");
+
+    let(mut other_client,mut other)=pair(&store,"stream.test");
+    assert!(other.channel_binder().is_none());handshake(&mut other_client,&mut other);
+    assert_ne!(other.channel_binder().unwrap(),binding,"a replacement connection cannot borrow the active stream exporter");
+    let head=b"POST /honest/v1/proposal HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n";
+    write_requests(&mut client,&mut session,head);
+    assert!(session.stream_head().unwrap().is_some());assert!(!session.validate_stream_head());
+    assert!(store.unregister("stream.test"));
+    assert!(session.stream_head().is_err());assert!(session.attestation_failed());
+}
+
+struct FixtureReceiver {bytes:Vec<u8>,binding:Vec<u8>}
+impl crate::HonestStreamIngressReceiver for FixtureReceiver {
+    fn push(&mut self,bytes:&[u8],context:&enclave_os_common::modules::RequestContext)->Result<(),()> {
+        if context.channel_binder.as_ref()!=Some(&self.binding){return Err(());}
+        self.bytes.extend_from_slice(bytes);Ok(())
+    }
+    fn finish(self:Box<Self>,context:&enclave_os_common::modules::RequestContext)->crate::HonestIngressResponse {
+        assert_eq!(context.channel_binder.as_ref(),Some(&self.binding));
+        crate::HonestIngressResponse{status:202,content_type:"application/octet-stream",body:self.bytes.into()}
+    }
+}
+fn fixture_begin(request:&enclave_os_common::protocol::HttpRequest,length:usize,context:&enclave_os_common::modules::RequestContext)->Result<Box<dyn crate::HonestStreamIngressReceiver>,crate::HonestIngressResponse> {
+    assert!(request.body.is_empty());assert_eq!(length,128*1024+17);
+    Ok(Box::new(FixtureReceiver{bytes:Vec::new(),binding:context.channel_binder.clone().unwrap()}))
+}
+
+// Exercise actual TLS plaintext draining at the original input ceiling, then
+// alternate a bounded extraction and TLS refill. Existing unread segments
+// retain their allocation and content; no large suffix is compacted.
+fn streamed_input_alternating_cap_refill() {
+    let store=CertStore::new();register(&store,"stream-cap.test");
+    let(mut client,mut session)=pair(&store,"stream-cap.test");handshake(&mut client,&mut session);
+    session.consume_stream_head(0).unwrap();
+    let frame=vec![0x5a;crate::MAX_STREAM_INGRESS_FRAGMENT];
+    for _ in 0..enclave_os_common::protocol::MAX_BODY_SIZE/frame.len() {
+        for piece in frame.chunks(32*1024){write_requests(&mut client,&mut session,piece);}
+    }
+    for _ in 0..8 {
+        let old:Vec<_>=session.stream_chunks.as_ref().unwrap().iter().skip(1).map(|(b,_)|b.as_ptr()).collect();
+        assert_eq!(session.stream_fragment(frame.len()),frame);
+        for piece in frame.chunks(32*1024){write_requests(&mut client,&mut session,piece);}
+        let queue=session.stream_chunks.as_ref().unwrap();
+        assert_eq!(queue.iter().map(|(b,o)|b.len()-o).sum::<usize>(),enclave_os_common::protocol::MAX_BODY_SIZE);
+        assert!(queue.iter().map(|(b,_)|b.capacity()).sum::<usize>()<=enclave_os_common::protocol::MAX_BODY_SIZE+frame.len());
+        assert_eq!(queue.iter().take(old.len()).map(|(b,_)|b.as_ptr()).collect::<Vec<_>>(),old,"cap/refill does not move the unread suffix");
+    }
+    // The old growable Vec can retain32MiB capacity. Reuse its already
+    // reserved parser/copy allowance without pretending capacity equals len.
+    session.stream_chunks=None;
+    session.read_buf=Vec::with_capacity((enclave_os_common::protocol::MAX_BODY_SIZE+64*1024).next_power_of_two());
+    session.read_buf.extend_from_slice(&frame);let inherited=session.read_buf.as_ptr();
+    session.consume_stream_head(0).unwrap();
+    assert_eq!(session.stream_fragment(frame.len()/2),frame[..frame.len()/2]);
+    write_requests(&mut client,&mut session,&frame[..frame.len()/2]);
+    let chunks=session.stream_chunks.as_ref().unwrap();
+    assert_eq!(chunks.front().unwrap().0.as_ptr(),inherited);
+    assert!(chunks.iter().map(|(b,_)|b.capacity()).sum::<usize>()<=RaTlsSession::STREAM_INPUT_CAPACITY);
+    assert_eq!(session.stream_fragment(frame.len()),frame);
+    // Terminal reuse: a tiny consumed prefix may leave a large allocation.
+    // Completing it must preserve that allocation, not allocate another32MiB.
+    session.read_buf=Vec::with_capacity((enclave_os_common::protocol::MAX_BODY_SIZE+64*1024).next_power_of_two());
+    session.read_buf.push(b'x');
+    for _ in 0..enclave_os_common::protocol::MAX_BODY_SIZE/frame.len()+1{session.read_buf.extend_from_slice(&frame);}
+    let original=session.read_buf.as_ptr();session.consume_stream_head(1).unwrap();
+    session.finish_stream_input().unwrap();assert_eq!(session.read_buf.as_ptr(),original);
+    assert_eq!(session.read_buf.len(),enclave_os_common::protocol::MAX_BODY_SIZE+frame.len());
+    session.read_buf.clear();session.read_buf.extend_from_slice(b"GET /tail HTTP/1.1\r\n\r\n");
+    assert_eq!(session.recv_http_request().unwrap().unwrap().path,"/tail");
+
+    println!("HONEST-STREAM-INGRESS-CAP-REFILL original-bound=16777216 fragment=65536 rounds=8");
+}
+
+struct PendingReceiver{binding:Vec<u8>,credit:Arc<std::sync::atomic::AtomicBool>,consumed:Arc<std::sync::atomic::AtomicUsize>}
+impl crate::HonestStreamIngressReceiver for PendingReceiver{
+    fn push(&mut self,_:&[u8],_:&enclave_os_common::modules::RequestContext)->Result<(),()>{unreachable!()}
+    fn push_with_backpressure(&mut self,bytes:&[u8],context:&enclave_os_common::modules::RequestContext)->Result<crate::stream_ingress::HonestStreamIngressPush,()>{
+        if context.channel_binder.as_ref()!=Some(&self.binding){return Err(());}
+        if !self.credit.load(std::sync::atomic::Ordering::Acquire){return Ok(crate::stream_ingress::HonestStreamIngressPush::Pending);}
+        assert!(bytes.iter().all(|b|*b==0x7a));self.consumed.fetch_add(bytes.len(),std::sync::atomic::Ordering::AcqRel);
+        Ok(crate::stream_ingress::HonestStreamIngressPush::Consumed)
+    }
+    fn finish(self:Box<Self>,_:&enclave_os_common::modules::RequestContext)->crate::HonestIngressResponse{
+        crate::HonestIngressResponse{status:202,content_type:"application/octet-stream",body:vec![].into()}
+    }
 }

@@ -130,6 +130,11 @@ pub enum ChannelMsgType {
     /// Enclave opts in with zero before output; host returns the cumulative
     /// bytes actually written to this socket. Untrusted flow control only.
     TcpWriteCredit = 0x0C,
+    /// Optional enclave-directed socket-read pause/rearm revision. Inert flow
+    /// control only; it cannot authorize application progress or persistence.
+    TcpReadControl = 0x0D,
+    /// Optional host-generated connection generation for read-control binding.
+    TcpReadIdentity = 0x0E,
 }
 
 /// Bounded, non-sensitive reason for an asynchronous connect failure.
@@ -170,6 +175,8 @@ impl ChannelMsgType {
             0x0A => Some(Self::PeerTcpConnected),
             0x0B => Some(Self::Tick),
             0x0C => Some(Self::TcpWriteCredit),
+            0x0D => Some(Self::TcpReadControl),
+            0x0E => Some(Self::TcpReadIdentity),
             _ => None,
         }
     }
@@ -404,6 +411,11 @@ mod tests {
 
     #[test]
     fn test_roundtrip_tcp_data() {
+        let control=encode_tcp_read_control(7,9,1,true);let(kind,id,payload)=decode_channel_msg(&control).unwrap();
+        assert_eq!((kind,id),(ChannelMsgType::TcpReadControl,7));assert_eq!(decode_tcp_read_control(payload),Some((9,1,true)));
+        assert!(decode_tcp_read_control(&[0;17]).is_none());assert!(decode_tcp_read_control(&[0;16]).is_none());
+        let mut bad=payload.to_vec();bad[16]=2;assert!(decode_tcp_read_control(&bad).is_none());
+
         let data = vec![0x16, 0x03, 0x03, 0x00, 0x05]; // fake TLS record
         let msg = encode_tcp_data(99, &data);
         let (typ, id, payload) = decode_channel_msg(&msg).unwrap();
@@ -518,4 +530,20 @@ mod tests {
         unknown_reason[8] = 0xff;
         assert!(decode_tcp_connect_failed(&unknown_reason).is_none());
     }
+}
+
+/// Optional bounded socket-read control. A newer revision replaces the prior
+/// pause state; stale messages never rearm a newer pause. No authority follows.
+pub fn encode_tcp_read_control(conn_id:u32,generation:u64,revision:u64,paused:bool)->Vec<u8>{
+    let mut payload=Vec::with_capacity(17);payload.extend_from_slice(&generation.to_be_bytes());payload.extend_from_slice(&revision.to_be_bytes());payload.push(u8::from(paused));
+    encode_channel_msg(ChannelMsgType::TcpReadControl,conn_id,&payload)
+}
+pub fn decode_tcp_read_control(payload:&[u8])->Option<(u64,u64,bool)>{
+    if payload.len()!=17 || payload[16]>1{return None;}
+    let generation=u64::from_be_bytes(payload[..8].try_into().ok()?);let revision=u64::from_be_bytes(payload[8..16].try_into().ok()?);
+    (generation!=0 && revision!=0).then_some((generation,revision,payload[16]!=0))
+}
+pub fn encode_tcp_read_identity(conn_id:u32,generation:u64)->Vec<u8>{encode_channel_msg(ChannelMsgType::TcpReadIdentity,conn_id,&generation.to_be_bytes())}
+pub fn decode_tcp_read_identity(payload:&[u8])->Option<u64>{
+    let generation=u64::from_be_bytes(payload.try_into().ok()?);(generation!=0).then_some(generation)
 }
