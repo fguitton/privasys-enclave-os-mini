@@ -592,9 +592,11 @@ impl IngressServer {
         let slot=self.stream_owner.pending.get_mut(&id)?;
         let mut charge=None;
         let context=match self.sessions.get_mut(&id) {
-            Some(SessionState::Established(s)) if slot.started.elapsed()<std::time::Duration::from_secs(60) && s.require_current_configuration().is_ok() && !s.attestation_failed() && self.stream_generations.get(&id)==Some(&slot.generation) && s.channel_binder().as_deref()==Some(slot.binding.as_slice())=>{
-                charge=s.context_allocation_bound().and_then(crate::deferred_ingress::ContextCharge::reserve);
-                if charge.is_some(){Some(fresh_context(id,self.ingress_classes.get(&id).copied().unwrap_or(enclave_os_common::modules::IngressClass::ExternalNetwork),s))}else{None}
+            Some(SessionState::Established(s))=>{
+                if slot.started.elapsed()<std::time::Duration::from_secs(60) && s.require_current_configuration().is_ok() && !s.attestation_failed() && self.stream_generations.get(&id)==Some(&slot.generation) && s.channel_binder().as_deref()==Some(slot.binding.as_slice()) {
+                    charge=s.context_allocation_bound().and_then(crate::deferred_ingress::ContextCharge::reserve);
+                    if charge.is_some(){Some(fresh_context(id,self.ingress_classes.get(&id).copied().unwrap_or(enclave_os_common::modules::IngressClass::ExternalNetwork),s))}else{None}
+                }else{None}
             }
             _=>None,
         };
@@ -610,7 +612,10 @@ impl IngressServer {
     pub(crate) fn finish_stream(&mut self,work:&mut crate::stream_ingress::Work,response:&mut Option<crate::HonestIngressResponse>)->bool {
         let id=work.connection;
         let valid=self.stream_owner.pending.get(&id).is_some_and(|slot|slot.nonce==work.nonce && slot.generation==work.generation && self.stream_generations.get(&id)==Some(&work.generation) && slot.binding==work.binding && slot.receiver.is_none())
-            && work.context.is_some() && matches!(self.sessions.get_mut(&id),Some(SessionState::Established(s)) if s.require_current_configuration().is_ok() && !s.attestation_failed() && s.channel_binder().as_deref()==Some(work.binding.as_slice()));
+            && work.context.is_some() && match self.sessions.get_mut(&id){
+                Some(SessionState::Established(s))=>s.require_current_configuration().is_ok() && !s.attestation_failed() && s.channel_binder().as_deref()==Some(work.binding.as_slice()),
+                _=>false,
+            };
         if !valid {
             if self.stream_owner.pending.get(&id).is_some_and(|slot|slot.nonce==work.nonce){self.invalidate_stream(id);self.close_deferred_transport(id);}
             return false;

@@ -774,7 +774,7 @@ mod tests {
     }
     fn header_only_stream_framing() {
         let raw=b"POST /upload HTTP/1.1\r\nContent-Length: 4\r\n\r\nab";
-        assert_eq!(parse_http_request(raw).unwrap_err(),HttpParseError::Incomplete);
+        assert!(matches!(parse_http_request(raw),Err(HttpParseError::Incomplete)));
         let large=format!("POST /stream HTTP/1.1\r\nContent-Length: {}\r\n\r\n",MAX_STREAM_BODY_SIZE);
         let(head,_,length)=parse_http_stream_request_head(large.as_bytes()).unwrap();assert_eq!(length,67_371_916);assert!(head.body.is_empty());
         assert!(matches!(parse_http_request_head(large.as_bytes()),Err(HttpParseError::BodyTooLarge)));
@@ -788,7 +788,7 @@ mod tests {
             assert!(parse_http_request(raw).is_ok(),"legacy fallback framing remains unchanged");
         }
         let oversized=b"POST /upload HTTP/1.1\r\nContent-Length: 999999999\r\n\r\n";
-        assert_eq!(parse_http_request_head(oversized).unwrap_err(),HttpParseError::BodyTooLarge);
+        assert!(matches!(parse_http_request_head(oversized),Err(HttpParseError::BodyTooLarge)));
     }
 
 }
