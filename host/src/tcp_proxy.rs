@@ -821,6 +821,14 @@ impl TcpProxy {
                                 }
                             }
                         }
+                        Some((ChannelMsgType::TcpReadIdentity,conn_id,payload))=>{
+                            // Identity travels host-to-enclave only. Validate its
+                            // exact8B/nonzero geometry, but never adopt a reverse
+                            // direction token or modify the actual socket owner.
+                            if channel::decode_tcp_read_identity(payload).is_none(){
+                                warn!("Malformed reverse read identity for conn_id={}",conn_id);
+                            }else{warn!("Unexpected read identity from enclave for conn_id={}",conn_id);}
+                        }
                         Some((ChannelMsgType::TcpReadControl,conn_id,payload))=>{
                             if let Some(conn)=self.connections.get_mut(&conn_id){
                                 if let Some((generation,revision,paused))=channel::decode_tcp_read_control(payload){
@@ -1781,6 +1789,12 @@ mod tests {
         let mut other=TcpStream::connect(fixture.proxy.listener.local_addr().unwrap()).unwrap();
         fixture.proxy.accept_connections();let second=fixture.messages(1);let(_,other_id,_)=channel::decode_channel_msg(&second[0]).unwrap();assert_ne!(id,other_id);
         let generation=fixture.proxy.connections[&id].connection_generation;assert_ne!(generation,0);
+        fixture.to_host.try_send(&channel::encode_tcp_read_identity(id,generation+1)).unwrap();
+        fixture.to_host.try_send(&channel::encode_channel_msg(ChannelMsgType::TcpReadIdentity,id,&[0;9])).unwrap();
+        fixture.proxy.drain_enclave_output();
+        assert_eq!(fixture.proxy.connections[&id].connection_generation,generation);
+        assert!(fixture.proxy.connections[&id].read_control.is_none(),"reverse valid/malformedidentity cannot mutate read ownership");
+
         fixture.to_host.try_send(&channel::encode_tcp_read_control(id,generation,1,true)).unwrap();fixture.proxy.drain_enclave_output();
         held.write_all(b"held body").unwrap();other.write_all(b"other body").unwrap();
         let messages=fixture.messages(1);let(kind,got,payload)=channel::decode_channel_msg(&messages[0]).unwrap();
