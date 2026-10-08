@@ -22,6 +22,11 @@ static DB_INSTANCE: OnceLock<Mutex<DB>> = OnceLock::new();
 fn cf_opts() -> Options {
     let mut opts = Options::default();
     opts.optimize_for_point_lookup(4); // 4 MiB block-cache per CF
+    // Values and keys are already encrypted. Compression spends CPU and
+    // scratch memory on incompressible ciphertext; existing SST files remain
+    // readable and write/WAL durability semantics are unchanged.
+    #[cfg(feature = "stream-read-credit")]
+    opts.set_compression_type(rocksdb::DBCompressionType::None);
     opts
 }
 

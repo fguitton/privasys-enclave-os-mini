@@ -34,7 +34,13 @@ use enclave_os_common::queue::{SpscConsumer, SpscProducer};
 
 use log::{debug, error, info, warn};
 
-/// Maximum bytes to read from a TCP socket in one call.
+/// Maximum bytes read per ready connection and proxy round. Streaming already
+/// has a 2 MiB pending-input cap and a 1 MiB channel-message ceiling. Coalesce
+/// socket bytes into 256 KiB channel messages to reduce enclave dispatches while
+/// keeping a bounded round for other sockets and control traffic.
+#[cfg(feature = "stream-read-credit")]
+const TCP_READ_BUF: usize = 256 * 1024;
+#[cfg(not(feature = "stream-read-credit"))]
 const TCP_READ_BUF: usize = 32_768;
 /// Per-connection cap for enclave-produced TLS ciphertext awaiting a writable
 /// socket. Exceeding it closes only that connection.
@@ -199,6 +205,8 @@ pub struct TcpProxy {
     peer_listener: Option<TcpListener>,
     /// Active connections: conn_id → state.
     connections: HashMap<u32, ConnState>,
+    #[cfg(feature = "stream-read-credit")]
+    read_cursor: Option<u32>,
     /// Outbound connects in progress: conn_id → pending state.
     pending_connects: HashMap<u32, PendingConn>,
     /// Next ingress connection ID to assign.
@@ -293,6 +301,8 @@ impl TcpProxy {
             local_control_listener,
             local_control_path,
             connections: HashMap::new(),
+            #[cfg(feature = "stream-read-credit")]
+            read_cursor: None,
             pending_connects: HashMap::new(),
             next_conn_id: 1,next_read_generation:0,
             next_peer_conn_id: CONN_ID_PEER_IN_BASE,
@@ -718,6 +728,56 @@ impl TcpProxy {
 
     /// Read from all TCP sockets and forward to enclave. Returns true if
     /// any data was read.
+    #[cfg(feature = "stream-read-credit")]
+    fn read_sockets(&mut self, buf: &mut [u8]) -> bool {
+        if buf.is_empty() { return false; }
+        let mut ids: Vec<u32> = self.connections.keys().copied().collect();
+        ids.sort_unstable();
+        let start = self.read_cursor.map_or(0, |last| ids.partition_point(|id| *id <= last));
+        // Reserve all possible close headers first. Debit each payload before
+        // reading another socket, so a full ring cannot overflow the shared
+        // backlog. Unvisited sockets retain their bytes in the kernel.
+        let close_reserve = MAX_CONNS * CHANNEL_MSG_HEADER;
+        let mut available = MAX_PENDING_TO_ENCLAVE
+            .saturating_sub(self.pending_to_enclave_bytes)
+            .saturating_sub(close_reserve);
+        let mut to_enclave = Vec::new();
+        let mut to_close = Vec::new();
+        let mut did_work = false;
+        for step in 0..ids.len() {
+            let id = ids[(start + step) % ids.len()];
+            let conn = self.connections.get_mut(&id).expect("snapshot connection");
+            if matches!(conn.origin, ConnectionOrigin::OutboundConnecting { .. }) { continue; }
+            if conn.read_control.is_some_and(|(_, paused)| paused) {
+                if conn.stream.disconnected_ready() { to_close.push(id); }
+                continue;
+            }
+            let maximum = buf.len().min(available.saturating_sub(CHANNEL_MSG_HEADER));
+            if maximum == 0 { break; }
+            self.read_cursor = Some(id);
+            match conn.stream.read(&mut buf[..maximum]) {
+                Ok(0) => { to_close.push(id); }
+                Ok(n) => {
+                    let message = channel::encode_tcp_data(id, &buf[..n]);
+                    available -= message.len();
+                    to_enclave.push(message);
+                    conn.last_activity = Instant::now();
+                    did_work = true;
+                }
+                Err(ref error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => { warn!("Read error on conn_id={}: {}", id, error); to_close.push(id); }
+            }
+        }
+        for id in to_close {
+            self.connections.remove(&id);
+            to_enclave.push(channel::encode_tcp_close(id));
+            did_work = true;
+        }
+        for message in to_enclave { self.send_to_enclave(message); }
+        did_work
+    }
+
+    #[cfg(not(feature = "stream-read-credit"))]
     fn read_sockets(&mut self, buf: &mut [u8]) -> bool {
         let mut did_work = false;
         let mut to_close = Vec::new();
@@ -1344,10 +1404,11 @@ mod tests {
     }
 
     impl QueueMemory {
-        fn new() -> Self {
+        fn new() -> Self { Self::with_capacity(4096) }
+        fn with_capacity(capacity: usize) -> Self {
             Self {
-                header: Box::new(SpscQueueHeader::new(4096)),
-                buffer: vec![0_u8; 4096].into_boxed_slice(),
+                header: Box::new(SpscQueueHeader::new(capacity as u64)),
+                buffer: vec![0_u8; capacity].into_boxed_slice(),
             }
         }
 
@@ -1370,9 +1431,10 @@ mod tests {
     }
 
     impl TransportFixture {
-        fn new() -> Self {
-            let mut host_to_enclave = QueueMemory::new();
-            let mut enclave_to_host = QueueMemory::new();
+        fn new() -> Self { Self::with_capacity(4096) }
+        fn with_capacity(capacity: usize) -> Self {
+            let mut host_to_enclave = QueueMemory::with_capacity(capacity);
+            let mut enclave_to_host = QueueMemory::with_capacity(capacity);
             Self {
                 proxy: TcpProxy::new_with_listeners(
                     0,
@@ -1667,6 +1729,54 @@ mod tests {
         }
         assert!(fixture.proxy.shutdown.load(Ordering::Acquire));
         assert!(fixture.proxy.pending_to_enclave_bytes <= MAX_PENDING_TO_ENCLAVE);
+
+        #[cfg(feature = "stream-read-credit")]
+        {
+            // Nine ready large sockets and an already full real SPSC ring
+            // reproduce the former aggregate-overflow boundary. Drain and
+            // independently check every byte, including the deferred socket.
+            let mut bulk = TransportFixture::with_capacity(2 * 1024 * 1024);
+            let address = bulk.proxy.listener.local_addr().unwrap();
+            let mut clients: Vec<_> = (0..9).map(|_| TcpStream::connect(address).unwrap()).collect();
+            bulk.proxy.accept_connections();
+            let accepted = bulk.messages(9);
+            assert!(accepted.iter().all(|m| channel::decode_channel_msg(m).unwrap().0 == ChannelMsgType::TcpNew));
+            for conn in bulk.proxy.connections.values() {
+                let stream = conn.stream.tcp().unwrap();
+                socket2::SockRef::from(stream).set_recv_buffer_size(2 * 1024 * 1024).unwrap();
+            }
+            let ids: Vec<_> = accepted.iter().map(|m| channel::decode_channel_msg(m).unwrap().1).collect();
+            for (index, client) in clients.iter_mut().enumerate() {
+                client.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                client.write_all(&vec![index as u8 + 1; 1024 * 1024]).unwrap();
+            }
+            let filler = channel::encode_tcp_data(0, &[0; 1000]);
+            while bulk.proxy.data_tx.try_send(&filler).is_ok() {}
+            let mut buffer = vec![0; TCP_READ_BUF];
+            assert!(bulk.proxy.read_sockets(&mut buffer));
+            assert!(!bulk.proxy.shutdown.load(Ordering::Acquire));
+            assert!(bulk.proxy.pending_to_enclave_bytes <= MAX_PENDING_TO_ENCLAVE);
+            let mut counts = HashMap::<u32, usize>::new();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while counts.values().sum::<usize>() < 9 * 1024 * 1024 {
+                while let Some(message) = bulk.from_host.try_recv() {
+                    let (kind, id, bytes) = channel::decode_channel_msg(&message).unwrap();
+                    if id == 0 { continue; }
+                    assert_eq!(kind, ChannelMsgType::TcpData);
+                    let index = ids.iter().position(|candidate| *candidate == id).unwrap();
+                    assert!(bytes.iter().all(|byte| *byte == index as u8 + 1));
+                    *counts.entry(id).or_default() += bytes.len();
+                }
+                bulk.proxy.flush_pending_to_enclave();
+                if bulk.proxy.pending_to_enclave.is_empty() { bulk.proxy.read_sockets(&mut buffer); }
+                assert!(!bulk.proxy.shutdown.load(Ordering::Acquire));
+                assert!(bulk.proxy.pending_to_enclave_bytes <= MAX_PENDING_TO_ENCLAVE);
+                assert!(Instant::now() < deadline, "large sockets must all progress");
+                std::thread::yield_now();
+            }
+            assert_eq!(counts.len(), 9);
+            assert!(counts.values().all(|count| *count == 1024 * 1024));
+        }
     }
 
     #[test]
