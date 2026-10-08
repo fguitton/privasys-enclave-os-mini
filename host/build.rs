@@ -39,6 +39,10 @@ fn main() {
     // -----------------------------------------------------------------------
     let edl_file = find_edl_file();
     println!("cargo:rerun-if-changed={}", edl_file.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        edl_file.with_file_name("execution_response.edl").display()
+    );
 
     // -----------------------------------------------------------------------
     //  Step 2: Locate sgx_edger8r and the teaclave EDL search paths
@@ -54,6 +58,8 @@ fn main() {
         .arg(&edl_file)
         .arg("--untrusted-dir")
         .arg(&out_dir)
+        .arg("--search-path")
+        .arg(edl_file.parent().expect("EDL file has a parent"))
         .arg("--search-path")
         .arg(format!("{}/include", sgx_sdk));
 

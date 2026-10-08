@@ -23,11 +23,13 @@ use enclave_os_common::rpc::{self, HonestRpcFrameError, HonestRpcIdentity, RpcMe
 pub type KvEntries = Vec<(Vec<u8>, Vec<u8>)>;
 
 // ---------------------------------------------------------------------------
-//  External: the single OCALL
+//  External: queue notification and bounded completion hints
 // ---------------------------------------------------------------------------
 
 extern "C" {
     fn ocall_notify() -> u32;
+    fn ocall_notify_execution_waiter() -> u32;
+    fn ocall_wait_execution_response(result: *mut i32, maximum_micros: u64) -> u32;
 }
 
 /// Notify the host that there is a pending request.
@@ -38,12 +40,24 @@ fn notify_host() {
     }
 }
 
+/// Wake an execution response waiter after a trusted fence/stop publication.
+/// This carries no epoch or authority; exact response and fence checks remain
+/// mandatory on return. No spare enclave TCS is needed for host completion.
+pub fn notify_execution_waiter() {
+    // SAFETY: no pointers or payload; pinned generated EDL notification bridge.
+    unsafe {
+        ocall_notify_execution_waiter();
+    }
+}
+
 // ---------------------------------------------------------------------------
 //  RPC client state
 // ---------------------------------------------------------------------------
 
 /// Global request ID counter (monotonically increasing).
 static NEXT_REQ_ID: AtomicU64 = AtomicU64::new(1);
+/// Maximum queue polls in one immediate execution readiness turn.
+pub const EXECUTION_READY_RECHECK_POLLS: u64 = 64;
 
 fn next_req_id() -> Option<u64> {
     NEXT_REQ_ID
@@ -79,6 +93,11 @@ pub struct PendingExecutionRpc {
     identity: HonestRpcIdentity,
 }
 
+impl PendingExecutionRpc {
+    /// Inert diagnostic join key; exposes no polling or submission authority.
+    pub const fn diagnostic_operation_id(&self)->u64 {self.identity.operation_id}
+}
+
 /// One bounded execution response returned by a single non-blocking poll.
 #[derive(Debug)]
 pub struct ExecutionRpcCompletion {
@@ -109,6 +128,7 @@ pub enum PolledExecutionRpcError {
     NotPending,
     MalformedResponse,
     UnexpectedResponse,
+    WaitUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,6 +247,20 @@ impl RpcClient {
         )
     }
 
+    /// Submit one explicitly execution-owned private storage operation. It
+    /// reserves the same worker endpoint as network I/O, so nesting is Busy.
+    pub fn try_execution_storage(
+        &self,
+        node_id: u64,
+        node_generation: u64,
+        operation: rpc::WorkerStorageOperation,
+        payload: &[u8],
+    ) -> Result<PendingExecutionRpc, PolledExecutionRpcError> {
+        let payload = rpc::encode_worker_storage_request(operation, payload)
+            .map_err(|_| PolledExecutionRpcError::InvalidRequest)?;
+        self.try_execution_request(node_id, node_generation, RpcMethod::WorkerStorage, &payload)
+    }
+
     /// Try to submit one execution-owned bounded receive.
     pub fn try_execution_net_recv(
         &self,
@@ -286,6 +320,55 @@ impl RpcClient {
             status: response.status,
             payload: response.payload.to_vec(),
         }))
+    }
+
+    /// A finite immediate readiness turn before host parking. The count is
+    /// actual queue reads; callers reserve the maximum before entering and may
+    /// refund only reads that were never attempted. Errors retain all charges.
+    pub fn recheck_execution_rpc(
+        &self,
+        pending: &PendingExecutionRpc,
+        maximum_polls: u64,
+    ) -> Result<(u64, Option<ExecutionRpcCompletion>), PolledExecutionRpcError> {
+        self.recheck_execution_rpc_with(pending, maximum_polls, core::hint::spin_loop)
+    }
+
+    pub(crate) fn recheck_execution_rpc_with(
+        &self,
+        pending: &PendingExecutionRpc,
+        maximum_polls: u64,
+        mut empty: impl FnMut(),
+    ) -> Result<(u64, Option<ExecutionRpcCompletion>), PolledExecutionRpcError> {
+        if maximum_polls==0 || maximum_polls>EXECUTION_READY_RECHECK_POLLS { return Err(PolledExecutionRpcError::InvalidRequest); }
+        for polls in 1..=maximum_polls {
+            if let Some(completion)=self.poll_execution_rpc(pending)? { return Ok((polls, Some(completion))); }
+            empty();
+        }
+        Ok((maximum_polls,None))
+    }
+
+    /// Wait only for an untrusted retained publication hint. The caller polls
+    /// the exact pending frame before and after this call and rechecks its fence.
+    /// No response bytes, completion identity or authority come from this OCALL.
+    pub fn wait_execution_rpc(
+        &self,
+        pending: &PendingExecutionRpc,
+        maximum_micros: u64,
+    ) -> Result<(), PolledExecutionRpcError> {
+        if self.in_flight_request_id.load(Ordering::Acquire) != pending.identity.operation_id {
+            return Err(PolledExecutionRpcError::NotPending);
+        }
+        if maximum_micros == 0 || maximum_micros > 1_000 {
+            return Err(PolledExecutionRpcError::InvalidRequest);
+        }
+        let mut result = -1;
+        // SAFETY: writable local result, scalar bounded interval, pinned EDL.
+        let status = unsafe { ocall_wait_execution_response(&mut result, maximum_micros) };
+        if status == 0 && matches!(result, 0 | 1) {
+            Ok(())
+        } else {
+            Err(PolledExecutionRpcError::WaitUnavailable)
+        }
     }
 
     /// Abandon one exact execution operation after its committed fence or

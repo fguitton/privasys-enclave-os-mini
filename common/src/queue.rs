@@ -161,6 +161,12 @@ impl SpscProducer {
         }
     }
 
+    /// Read-only diagnostic positions; never completion or authority evidence.
+    pub fn diagnostic_positions(&self)->(u64,u64) {
+        let header=unsafe {&*self.header};
+        (header.head.load(Ordering::Acquire),header.tail.load(Ordering::Acquire))
+    }
+
     /// Try to write a message. Returns `Ok(())` if written, `Err(())` if full.
     pub fn try_send(&self, msg: &[u8]) -> Result<(), ()> {
         let hdr = unsafe { &*self.header };
@@ -438,10 +444,14 @@ mod tests {
         let (producer, consumer) = alloc_test_queue(4096);
 
         let msg = b"Hello, enclave!";
+        assert_eq!(producer.diagnostic_positions(),(0,0));
         producer.try_send(msg).unwrap();
-
+        let end=u64::try_from(msg.len()+MSG_HEADER_SIZE).unwrap();
+        assert_eq!(producer.diagnostic_positions(),(end,0));
         let received = consumer.try_recv().unwrap();
         assert_eq!(received, msg);
+        assert_eq!(producer.diagnostic_positions(),(end,end));
+        assert!(consumer.try_recv().is_none(),"diagnostic snapshots never consume data");
     }
 
     #[test]

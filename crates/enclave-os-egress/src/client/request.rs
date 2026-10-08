@@ -23,6 +23,14 @@ pub use resource::{
     ResourceBoundHttpsRequest,
 };
 
+// One admitted plaintext turn and its bounded ciphertext scratch. Both stay
+// below the existing 1 MiB execution RPC payload ceiling (including framing).
+const TLS_PLAINTEXT_WINDOW: usize = 256 * 1024;
+const TLS_OUTPUT_WINDOW: usize = TLS_PLAINTEXT_WINDOW + 4096;
+// NetSend adds its fd field inside the unchanged framed payload limit.
+const _: () =
+    assert!(TLS_OUTPUT_WINDOW + 4 <= enclave_os_common::rpc::MAX_HONEST_RPC_PAYLOAD_BYTES);
+
 type ParsedHttpResponse = (u16, Vec<(String, String)>, Vec<u8>, Vec<u8>);
 
 /// Maximum HTTP response body size (2 MiB).
@@ -501,7 +509,9 @@ fn https_request_connected(
             )
         })?;
 
-    tls_conn.set_buffer_limit(Some(crate::attest::MAX_MESSAGE + 4096));
+    tls_conn.set_buffer_limit(Some(
+        (crate::attest::MAX_MESSAGE + 4096).max(TLS_OUTPUT_WINDOW),
+    ));
     tls_handshake(io, fd, &mut tls_conn).map_err(|error| {
         HttpsFetchError::new(
             HttpsFetchFailurePhase::TlsBeforeDispatch,
@@ -526,8 +536,8 @@ fn https_request_connected(
 
     for chunk in request
         .head
-        .chunks(16 * 1024)
-        .chain(request.body.chunks(16 * 1024))
+        .chunks(TLS_PLAINTEXT_WINDOW)
+        .chain(request.body.chunks(TLS_PLAINTEXT_WINDOW))
     {
         tls_conn.writer().write_all(chunk).map_err(|error| {
             HttpsFetchError::after_dispatch(
@@ -549,7 +559,7 @@ fn https_request_connected(
 
     let mut response_data = Vec::new();
     let mut header_complete = false;
-    let mut net_buf = vec![0u8; 16384];
+    let mut net_buf = vec![0u8; TLS_OUTPUT_WINDOW];
     let mut app_buf = vec![0u8; 16384];
     tls_conn.set_buffer_limit(None);
 
@@ -790,23 +800,32 @@ pub(super) fn flush_tls(
     fd: i32,
     tls_conn: &mut ClientConnection,
 ) -> Result<(), i32> {
-    let mut buffer = vec![0u8; 16384];
+    let mut buffer = vec![0u8; TLS_OUTPUT_WINDOW];
     loop {
-        let mut cursor = std::io::Cursor::new(&mut buffer[..]);
-        match tls_conn.write_tls(&mut cursor) {
-            Ok(0) => break,
-            Ok(written) => {
-                let data = &buffer[..written];
-                let mut offset = 0;
-                while offset < data.len() {
-                    match io.send(fd, &data[offset..]) {
-                        Ok(0) => return Err(-1),
-                        Ok(sent) => offset += sent,
-                        Err(error) => return Err(error),
-                    }
-                }
+        let mut written = 0;
+        // Accumulate complete/partial rustls records before the transport call;
+        // a write_tls implementation that writes one record per call still
+        // shares this bounded window. No plaintext or TLS state is bypassed.
+        while written < buffer.len() {
+            let mut cursor = std::io::Cursor::new(&mut buffer[written..]);
+            match tls_conn.write_tls(&mut cursor) {
+                Ok(0) => break,
+                Ok(count) => written += count,
+                Err(_) => return Err(-1),
             }
-            Err(_) => return Err(-1),
+        }
+        if written == 0 {
+            break;
+        }
+        let data = &buffer[..written];
+        let mut offset = 0;
+        while offset < data.len() {
+            match io.send(fd, &data[offset..]) {
+                Ok(0) => return Err(-1),
+                Ok(sent) if sent <= data.len() - offset => offset += sent,
+                Ok(_) => return Err(-1),
+                Err(error) => return Err(error),
+            }
         }
     }
     Ok(())

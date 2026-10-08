@@ -146,15 +146,43 @@ fn replacement_rejects_buffered_requests_and_re_attestation() {
     assert!(session.collect_tls_output().unwrap().is_empty());
 }
 
+struct BodyOwner(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for BodyOwner {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+fn owned_body(
+    bytes: Vec<u8>,
+    drops: &Arc<std::sync::atomic::AtomicUsize>,
+) -> crate::HttpResponseBody {
+    crate::HttpResponseBody::with_owner(bytes, Arc::new(BodyOwner(Arc::clone(drops))))
+}
+
 #[test]
 fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
+    fixed_peer_configuration_boundary();
+    #[cfg(feature="native-deferred-fixture")]
+    crate::actual_control_wake::check();
+    #[cfg(feature="native-deferred-fixture")]
+    crate::actual_workflow_budget::check_continuation_for_native();
+    #[cfg(feature="native-deferred-fixture")]
+    crate::deferred_ingress::check_pending_for_native();
+    #[cfg(feature="native-deferred-fixture")]
+    crate::actual_deferred_selector::check_selector_for_native();
+    let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let owner_drop_count = || drops.load(std::sync::atomic::Ordering::SeqCst);
     let store = CertStore::new();
     register(&store, "a.test");
     register(&store, "b.test");
     let (mut a_client, mut a) = pair(&store, "a.test");
     let (mut b_client, mut b) = pair(&store, "b.test");
+    assert!(!super::current_data_session(None));
+    assert!(!super::current_data_session(Some(&mut a)), "handshake has no current data binding");
     handshake(&mut a_client, &mut a);
     handshake(&mut b_client, &mut b);
+    assert!(super::current_data_session(Some(&mut a)));
+    assert!(super::current_data_session(Some(&mut b)));
     write_requests(
         &mut a_client,
         &mut a,
@@ -163,6 +191,7 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
     assert!(a.recv_http_request().unwrap().is_some());
     // A synchronous request handler unloads A before returning its response.
     assert!(store.unregister("a.test"));
+    assert!(!super::current_data_session(Some(&mut a)), "revocation keeps control work on the full path");
     assert!(a
         .send_http_response(200, b"old configuration", false)
         .is_err());
@@ -178,16 +207,59 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
     // HTTP oracle while the receiver accepts only bounded flights.
     let body: Vec<u8> = (0..5 * 1024 * 1024).map(|n| (n % 251) as u8).collect();
     let expected = enclave_os_common::protocol::format_http_response(200, &body, false);
-    b.queue_http_response(200, "application/json", &[], body, false, false)
-        .unwrap();
+    b.queue_http_response(
+        200,
+        "application/json",
+        &[],
+        owned_body(body, &drops),
+        false,
+        false,
+    )
+    .unwrap();
+    let failed_owner = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (reason, returned) = b.queue_http_response_owned(200, "application/json", &[],
+        owned_body(vec![9; 7], &failed_owner), false, false).err().unwrap();
+    assert_eq!(reason, "response already pending");
+    assert_eq!(returned.len(), 7);
+    assert_eq!(failed_owner.load(std::sync::atomic::Ordering::SeqCst), 0,
+        "failed queue returns body ownership to the outside-STATE caller");
+    drop(returned);
+    assert_eq!(failed_owner.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(b
-        .queue_http_response(200, "application/json", &[], vec![], false, false)
+        .queue_http_response(
+            200,
+            "application/json",
+            &[],
+            owned_body(vec![], &drops),
+            false,
+            false
+        )
         .is_err());
+    assert_eq!(
+        owner_drop_count(),
+        1,
+        "failed queue drops only its own body admission"
+    );
     let mut received = Vec::new();
+    let mut response_steps = 0usize;
+    let mut window = enclave_os_common::channel::TcpWriteWindow::default();
+    assert_eq!(super::response_credit(&[0; 7], Some(&mut window), Some(&b)), (false, false));
+    assert_eq!(super::response_credit(&0u64.to_le_bytes(), None, Some(&b)), (false, false), "absent/foreign window cannot classify as cheap");
+    assert!(window.send(17));
+    assert_eq!(super::response_credit(&17u64.to_le_bytes(), Some(&mut window), None), (true, false), "absent/handshaking session stays full");
+    let mut sent = 17u64;
     while b.has_pending_response() {
+        response_steps += 1;
         let (flight, close, shutdown) = b.progress_http_response().unwrap();
         assert!(flight.len() <= 64 * 1024);
         assert!(!close && !shutdown);
+        assert!(window.send(flight.len() as u64));
+        sent += flight.len() as u64;
+        let pending = b.has_pending_response();
+        assert_eq!(super::response_credit(&sent.to_le_bytes(), Some(&mut window), Some(&b)), (true, pending), "actual advancing credit is cheap only while this response drains");
+        assert_eq!(super::response_credit(&sent.to_le_bytes(), Some(&mut window), Some(&b)), (true, false), "duplicate credit never creates progress");
+        assert_eq!(super::response_credit(&(sent - 1).to_le_bytes(), Some(&mut window), Some(&b)), (false, false));
+        assert_eq!(super::response_credit(&(sent + 1).to_le_bytes(), Some(&mut window), Some(&b)), (false, false));
         let mut input = Cursor::new(flight);
         while input.position() < input.get_ref().len() as u64 {
             b_client.read_tls(&mut input).unwrap();
@@ -204,20 +276,40 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
         }
     }
     assert_eq!(received, expected);
+    assert_eq!(response_steps, expected.len().div_ceil(60 * 1024), "actual admitted TLS flights use the larger bounded plaintext quantum");
+    assert!(response_steps < expected.len().div_ceil(32 * 1024));
+    assert!(!b.has_pending_response());
+    assert!(window.send(1));
+    assert_eq!(super::response_credit(&(sent + 1).to_le_bytes(), Some(&mut window), Some(&b)), (true, false), "finished response remains full");
+    assert_eq!(
+        owner_drop_count(),
+        2,
+        "successful complete drain releases the body admission"
+    );
     b.queue_http_response(
         200,
         "application/octet-stream",
         &[],
-        vec![9; 1024 * 1024],
+        owned_body(vec![9; 1024 * 1024], &drops),
         false,
         false,
     )
     .unwrap();
     assert!(!b.progress_http_response().unwrap().0.is_empty());
     assert!(b.has_pending_response());
+    assert_eq!(
+        owner_drop_count(),
+        2,
+        "partial TLS drain retains the body admission"
+    );
     assert!(store.unregister("b.test"));
     assert!(b.progress_http_response().is_err());
     assert!(!b.has_pending_response());
+    assert_eq!(
+        owner_drop_count(),
+        3,
+        "configuration revocation drops the retained body"
+    );
     assert!(b.collect_tls_output().unwrap().is_empty());
 
     // A bounded control reply fits in its dispatch turn. A configuration
@@ -243,7 +335,105 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
     );
     register(&store, "control.test");
     assert!(control
-        .queue_http_response(200, "application/json", &[], vec![1], false, false)
+        .queue_http_response(
+            200,
+            "application/json",
+            &[],
+            owned_body(vec![1], &drops),
+            false,
+            false
+        )
         .is_err());
     assert!(control.collect_tls_output().unwrap().is_empty());
+    assert_eq!(
+        owner_drop_count(),
+        4,
+        "revoked configuration rejects and drops new admission"
+    );
+    register(&store, "teardown.test");
+    let (mut teardown_client, mut teardown) = pair(&store, "teardown.test");
+    handshake(&mut teardown_client, &mut teardown);
+    teardown
+        .queue_http_response(
+            200,
+            "application/json",
+            &[],
+            owned_body(vec![7; 1024 * 1024], &drops),
+            false,
+            false,
+        )
+        .unwrap();
+    assert_eq!(owner_drop_count(), 4);
+    drop(teardown);
+    assert_eq!(
+        owner_drop_count(),
+        5,
+        "session teardown releases an undrained body"
+    );
+}
+
+fn fixed_peer_configuration_boundary() {
+    let store = CertStore::new_honest_profile();
+    let name = enclave_os_common::modules::HONEST_PEER_SNI;
+    let (mut client, mut session) = pair(&store, name);
+    handshake(&mut client, &mut session);
+    let binder = session.export_hctx(b"fixed-peer-test", &[]).unwrap();
+    write_requests(
+        &mut client,
+        &mut session,
+        b"GET /first HTTP/1.1\r\nHost: peer.s1.invalid\r\n\r\nGET /second HTTP/1.1\r\nHost: peer.s1.invalid\r\n\r\n",
+    );
+    assert_eq!(session.recv_http_request().unwrap().unwrap().path, "/first");
+    register(&store, "workflow.test");
+    assert_eq!(session.recv_http_request().unwrap().unwrap().path, "/second");
+    assert_eq!(session.export_hctx(b"fixed-peer-test", &[]).unwrap(), binder);
+
+    let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let body: Vec<_> = (0..256 * 1024).map(|n| (n % 251) as u8).collect();
+    let expected = enclave_os_common::protocol::format_http_response(200, &body, false);
+    session.queue_http_response(200, "application/json", &[], owned_body(body, &drops), false, false).unwrap();
+    let mut actual = Vec::new();
+    let mut steps = 0;
+    while session.has_pending_response() {
+        let (bytes, close, shutdown) = session.progress_http_response().unwrap();
+        assert!(!close && !shutdown && bytes.len() <= 64 * 1024);
+        if !bytes.is_empty() {
+            let mut input = Cursor::new(bytes);
+            while input.position() < input.get_ref().len() as u64 {
+                client.read_tls(&mut input).unwrap();
+                client.process_new_packets().unwrap();
+                let mut plaintext = [0; 16 * 1024];
+                loop {
+                    match std::io::Read::read(&mut client.reader(), &mut plaintext) {
+                        Ok(0) => break,
+                        Ok(length) => actual.extend_from_slice(&plaintext[..length]),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(error) => panic!("peer response read failed: {error}"),
+                    }
+                }
+            }
+        }
+        if steps == 0 {
+            register(&store, "workflow.test");
+            assert!(store.unregister("workflow.test"));
+        }
+        steps += 1;
+        assert!(steps < 32, "bounded peer response must complete");
+    }
+    assert_eq!(actual, expected, "unrelated endpoint churn preserves exact partial peer response");
+    assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    session.queue_http_response(200, "application/json", &[], owned_body(vec![7; 256 * 1024], &drops), false, false).unwrap();
+    let (bytes, _, _) = session.progress_http_response().unwrap();
+    assert!(!bytes.is_empty() && session.has_pending_response());
+    store.invalidate(name);
+    assert!(session.progress_http_response().is_err());
+    assert!(!session.has_pending_response());
+    assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 2, "explicit peer revocation releases remaining body ownership once");
+    assert!(session.export_hctx(b"fixed-peer-test", &[]).is_err());
+    assert!(session.recv_http_request().is_err());
+    let (mut replacement_client, mut replacement) = pair(&store, name);
+    handshake(&mut replacement_client, &mut replacement);
+    assert!(replacement.export_hctx(b"fixed-peer-test", &[]).is_ok());
+    assert!(session.export_hctx(b"fixed-peer-test", &[]).is_err(), "replacement cannot resurrect old peer session");
 }

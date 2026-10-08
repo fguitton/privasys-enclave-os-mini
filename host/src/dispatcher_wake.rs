@@ -10,19 +10,50 @@
 //! acquire the same mutex. Spurious wakes only recheck the predicate.
 
 use enclave_os_common::rpc::RpcRole;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 pub struct DispatcherWake {
     pending: Mutex<[bool; 2]>,
     ready: Condvar,
+    responses: Mutex<([bool; 2], bool)>,
+    response_ready: Condvar,
+    cancellation_revision: AtomicU64,
+    #[cfg(test)]
+    execution_waits: AtomicU64,
+    #[cfg(unix)]
+    cancellation_read: std::os::unix::net::UnixDatagram,
+    #[cfg(unix)]
+    cancellation_write: std::os::unix::net::UnixDatagram,
 }
 
 impl DispatcherWake {
     pub fn new() -> Self {
+        #[cfg(unix)]
+        let (cancellation_read, cancellation_write) = {
+            let pair =
+                std::os::unix::net::UnixDatagram::pair().expect("execution cancellation channel");
+            pair.0
+                .set_nonblocking(true)
+                .expect("nonblocking cancellation reader");
+            pair.1
+                .set_nonblocking(true)
+                .expect("nonblocking cancellation writer");
+            pair
+        };
         Self {
             pending: Mutex::new([false; 2]),
             ready: Condvar::new(),
+            responses: Mutex::new(([false; 2], false)),
+            response_ready: Condvar::new(),
+            cancellation_revision: AtomicU64::new(0),
+            #[cfg(test)]
+            execution_waits: AtomicU64::new(0),
+            #[cfg(unix)]
+            cancellation_read,
+            #[cfg(unix)]
+            cancellation_write,
         }
     }
 
@@ -53,7 +84,97 @@ impl DispatcherWake {
         pending[index] = false;
     }
 
+    /// Called only after successful response-ring publication. The retained
+    /// bit closes the race between the worker's empty-ring check and its OCALL.
+    pub fn notify_response(&self, role: RpcRole) {
+        let index = usize::from(role == RpcRole::Execution);
+        let mut state = self
+            .responses
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.0[index] = true;
+        self.response_ready.notify_all();
+    }
+
+    /// A scheduling hint only. Callers must check their exact queue operation
+    /// again; an old/coalesced/spurious hint grants neither bytes nor authority.
+    /// Timeout is solely a finite fence/cancellation boundary, not pacing.
+    pub fn wait_response(&self, role: RpcRole, maximum: Duration) -> i32 {
+        let index = usize::from(role == RpcRole::Execution);
+        let state = self
+            .responses
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (mut state, _) = self
+            .response_ready
+            .wait_timeout_while(state, maximum, |state| !state.0[index] && !state.1)
+            .unwrap_or_else(|error| error.into_inner());
+        if state.1 {
+            return -1;
+        }
+        if state.0[index] {
+            state.0[index] = false;
+            0
+        } else {
+            1
+        }
+    }
+
+    pub fn notify_execution_cancel(&self) {
+        self.cancellation_revision.fetch_add(1, Ordering::AcqRel);
+        #[cfg(unix)]
+        {
+            // A saturated datagram queue is already readable. Revision checks
+            // still detect cancellation if another waiter drains the byte.
+            let _ = self.cancellation_write.send(&[1]);
+        }
+        self.notify_response(RpcRole::Execution);
+    }
+
+    #[cfg(test)]
+    pub fn record_execution_wait(&self) {
+        self.execution_waits.fetch_add(1, Ordering::Release);
+    }
+    #[cfg(test)]
+    pub fn execution_waits(&self) -> u64 {
+        self.execution_waits.load(Ordering::Acquire)
+    }
+
+    pub fn execution_revision(&self) -> u64 {
+        self.cancellation_revision.load(Ordering::Acquire)
+    }
+
+    #[cfg(unix)]
+    pub fn execution_cancel_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self.cancellation_read.as_raw_fd()
+    }
+
+    #[cfg(unix)]
+    pub fn drain_execution_cancel(&self) {
+        let mut byte = [0];
+        // One datagram per scheduling turn. Concurrent cancellation cannot
+        // keep us draining forever before revision/deadline/fence checks.
+        let _ = self.cancellation_read.recv(&mut byte);
+    }
+
+    pub fn execution_cancelled(&self) -> bool {
+        self.responses
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .1
+    }
+
     pub fn shutdown(&self, shutdown: &AtomicBool) {
+        {
+            let mut state = self
+                .responses
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.1 = true;
+            self.response_ready.notify_all();
+        }
+        self.notify_execution_cancel();
         shutdown.store(true, Ordering::Release);
         self.notify();
     }
@@ -128,6 +249,58 @@ mod tests {
             worker.join().unwrap();
             assert_eq!(premature, Err(mpsc::RecvTimeoutError::Timeout));
             completed.unwrap();
+        }
+    }
+
+    #[test]
+    fn response_publication_between_empty_check_and_wait_is_retained() {
+        let wake = Arc::new(DispatcherWake::new());
+        let shutdown = AtomicBool::new(false);
+        for _ in 0..128 {
+            wake.notify_response(RpcRole::Execution);
+            wake.notify_response(RpcRole::Execution);
+            assert_eq!(
+                wake.wait_response(RpcRole::Execution, Duration::from_secs(1)),
+                0
+            );
+            assert_eq!(wake.wait_response(RpcRole::Control, Duration::ZERO), 1);
+            assert_eq!(wake.wait_response(RpcRole::Execution, Duration::ZERO), 1);
+        }
+        wake.shutdown(&shutdown);
+        assert_eq!(
+            wake.wait_response(RpcRole::Execution, Duration::from_secs(1)),
+            -1
+        );
+    }
+
+    #[test]
+    fn response_wait_wakes_on_real_publication_and_stop_without_spurious_completion() {
+        for stopping in [false, true] {
+            let wake = Arc::new(DispatcherWake::new());
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let start = Arc::new(Barrier::new(2));
+            let (tx, rx) = mpsc::channel();
+            let worker = {
+                let (wake, start) = (wake.clone(), start.clone());
+                thread::spawn(move || {
+                    start.wait();
+                    tx.send(wake.wait_response(RpcRole::Execution, Duration::from_secs(2)))
+                        .unwrap();
+                })
+            };
+            start.wait();
+            wake.response_ready.notify_all();
+            assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
+            if stopping {
+                wake.shutdown(&shutdown);
+            } else {
+                wake.notify_response(RpcRole::Execution);
+            }
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                if stopping { -1 } else { 0 }
+            );
+            worker.join().unwrap();
         }
     }
 

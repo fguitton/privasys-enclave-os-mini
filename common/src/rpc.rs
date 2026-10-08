@@ -52,6 +52,8 @@ pub enum RpcMethod {
     KvScan = 0x0206,
     /// Control-role-only synchronous write of an opaque sealed value.
     KvPutDurable = 0x0207,
+    /// Execution-owned private scratch storage, distinct from BFT persistence.
+    WorkerStorage = 0x0208,
     // 0x0240 is retired; never reuse the former Raft persistence method ID.
 
     // -- Utility --
@@ -83,6 +85,7 @@ impl RpcMethod {
             0x0205 => Some(Self::KvMultiGet),
             0x0206 => Some(Self::KvScan),
             0x0207 => Some(Self::KvPutDurable),
+            0x0208 => Some(Self::WorkerStorage),
             0x0300 => Some(Self::GetCurrentTime),
             0x0301 => Some(Self::Log),
             0x0400 => Some(Self::QeGetTargetInfo),

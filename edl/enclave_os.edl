@@ -30,6 +30,8 @@ enclave {
     from "sgx_backtrace.edl" import *;
     from "sgx_cpuid.edl"  import *;
     from "sgx_process.edl" import *;
+    /* Append completion hints after the stable imported SDK OCALL prefix. */
+    from "execution_response.edl" import *;
 
     trusted {
         /* ================================================================
@@ -119,17 +121,18 @@ enclave {
 
     untrusted {
         /* ================================================================
-         *  Notify (the ONLY OCALL)
+         *  Request and completion hints (no response payload)
          * ================================================================
          *
          * A lightweight signal from enclave to host: "I put something in
          * the enc_to_host queue, please process it."
          *
-         * This is optional — the host can spin-poll the queue instead.
+         * Queue publication is authoritative; these hints support bounded waiting.
          * Using it lets the host sleep when idle, saving CPU.
          *
          * The OCALL carries no data; all data flows through the queue.
          */
         void ocall_notify();
+
     };
 };

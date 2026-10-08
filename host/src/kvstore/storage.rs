@@ -55,11 +55,12 @@ pub fn init(path: &str) -> Result<()> {
 
 /// Get a lock on the shared DB handle.
 fn db() -> std::sync::MutexGuard<'static, DB> {
-    DB_INSTANCE
-        .get()
-        .expect("KV store not initialised")
-        .lock()
-        .expect("KV store lock poisoned")
+    #[cfg(feature="diagnostic-worker-storage-rpc")]
+    let diagnostic=crate::storage_rpc_profile::lock_start();
+    let guard=DB_INSTANCE.get().expect("KV store not initialised").lock().expect("KV store lock poisoned");
+    #[cfg(feature="diagnostic-worker-storage-rpc")]
+    crate::storage_rpc_profile::lock_finish(diagnostic);
+    guard
 }
 
 /// Ensure a column family exists, creating it if necessary.

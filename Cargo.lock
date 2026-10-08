@@ -329,6 +329,7 @@ dependencies = [
  "enclave-os-common",
  "env_logger",
  "hex",
+ "libc",
  "log",
  "rocksdb",
  "serde",

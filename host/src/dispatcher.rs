@@ -25,9 +25,12 @@ use enclave_os_common::rpc::{self, HonestRpcIdentity, RpcMethod, RpcRole};
 use crate::dispatcher_wake::DispatcherWake;
 use crate::kvstore;
 use crate::net;
+#[path = "response_publication.rs"]
+mod response_publication;
 
 fn legacy_role_allows_method(role: RpcRole, method: RpcMethod) -> bool {
-    !matches!(method, RpcMethod::KvPutDurable) || role == RpcRole::Control
+    method != RpcMethod::WorkerStorage
+        && (!matches!(method, RpcMethod::KvPutDurable) || role == RpcRole::Control)
 }
 
 const fn role_name(role: RpcRole) -> &'static str {
@@ -49,6 +52,23 @@ fn network_error_status(error: &anyhow::Error) -> i32 {
     })
 }
 
+fn execution_network_error_status(error: &anyhow::Error) -> i32 {
+    if error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.raw_os_error() == Some(125))
+    {
+        -125
+    } else {
+        network_error_status(error)
+    }
+}
+
+fn worker_data_target(table: &[u8], key: &[u8]) -> bool {
+    const DATA: &[u8] = b"honest/retained-data/v1/";
+    table == b"honest.accepted-artifact-chunks-v1" && key.starts_with(DATA)
+        && key.len()>DATA.len()+32 && key.len()<=512
+}
+
 /// RPC dispatcher that bridges enclave requests to host services.
 pub struct RpcDispatcher {
     /// Stable physical role of this dispatcher and its queue pair.
@@ -60,6 +80,8 @@ pub struct RpcDispatcher {
     /// Shutdown flag.
     shutdown: Arc<AtomicBool>,
     wake: Arc<DispatcherWake>,
+    #[cfg(feature="diagnostic-worker-storage-rpc")]
+    storage_profile:std::sync::Mutex<crate::storage_rpc_profile::Profile>,
 }
 
 impl RpcDispatcher {
@@ -76,6 +98,8 @@ impl RpcDispatcher {
         wake: Arc<DispatcherWake>,
     ) -> Self {
         Self {
+            #[cfg(feature="diagnostic-worker-storage-rpc")]
+            storage_profile:std::sync::Mutex::new(crate::storage_rpc_profile::Profile::new()),
             role,
             request_rx,
             response_tx,
@@ -107,11 +131,22 @@ impl RpcDispatcher {
             }
         }
 
+        #[cfg(feature="diagnostic-worker-storage-rpc")]
+        if self.role==RpcRole::Execution {
+            let (_,tail)=self.response_tx.diagnostic_positions();
+            let mut profile=self.storage_profile.lock().unwrap_or_else(|x|x.into_inner());
+            profile.observe(tail,"shutdown");profile.report();
+        }
         info!("{} RPC dispatcher stopped", role_name(self.role));
     }
 
     /// Dispatch a single RPC request message.
     fn dispatch(&self, raw_msg: &[u8]) {
+        #[cfg(feature="diagnostic-worker-storage-rpc")]
+        if self.role==RpcRole::Execution {
+            let (_,tail)=self.response_tx.diagnostic_positions();
+            self.storage_profile.lock().unwrap_or_else(|x|x.into_inner()).observe(tail,"next-request");
+        }
         if rpc::has_honest_rpc_magic(raw_msg) {
             self.dispatch_honest(raw_msg);
         } else {
@@ -141,6 +176,9 @@ impl RpcDispatcher {
             identity.method,
             request.payload.len()
         );
+        #[cfg(feature="diagnostic-worker-storage-rpc")]
+        let diagnostic=(identity.role==RpcRole::Execution && self.role==RpcRole::Execution && identity.method==RpcMethod::WorkerStorage)
+            .then(||self.storage_profile.lock().unwrap_or_else(|x|x.into_inner()).start());
         let (status, payload) = if identity.role != self.role
             || !rpc::honest_role_allows_method(self.role, identity.method)
         {
@@ -152,30 +190,43 @@ impl RpcDispatcher {
             );
             (-13, Vec::new())
         } else {
-            self.dispatch_method(identity.method, request.payload)
-        };
-        self.try_send_honest_response(identity, status, &payload);
-    }
-
-    fn try_send_honest_response(&self, identity: HonestRpcIdentity, status: i32, payload: &[u8]) {
-        let response = match rpc::encode_honest_response(identity, status, payload) {
-            Ok(response) => response,
-            Err(error) => {
-                error!(
-                    "{} Honest RPC response rejected: {:?}",
-                    role_name(self.role),
-                    error
-                );
-                return;
+            if identity.method == RpcMethod::WorkerStorage {
+                self.handle_worker_storage(request.payload)
+            } else {
+                self.dispatch_method(identity.method, request.payload)
             }
         };
-        if self.response_tx.try_send(&response).is_err() {
-            error!(
-                "{} Honest RPC response queue saturated for operation {}",
-                role_name(self.role),
-                identity.operation_id
-            );
+        #[cfg(feature="diagnostic-worker-storage-rpc")]
+        let handler=diagnostic.map(|start|self.storage_profile.lock().unwrap_or_else(|x|x.into_inner()).handler_done(start));
+        #[cfg(feature="diagnostic-worker-storage-rpc")]
+        let publish=handler.map(|_|std::time::Instant::now());
+        let published=self.try_send_honest_response(identity, status, &payload);
+        #[cfg(not(feature="diagnostic-worker-storage-rpc"))]
+        let _=published;
+        #[cfg(feature="diagnostic-worker-storage-rpc")]
+        if let (Some(handler),Some(publish))=(handler,publish) {
+            let (end,tail)=self.response_tx.diagnostic_positions();
+            self.storage_profile.lock().unwrap_or_else(|x|x.into_inner()).record(crate::storage_rpc_profile::Sample{identity,kind:request.payload.first().copied().unwrap_or(255),request:raw_msg.len(),response:payload.len(),status,handler,publish,end,tail,ok:published});
         }
+    }
+
+    fn try_send_honest_response(&self, identity: HonestRpcIdentity, status: i32, payload: &[u8]) -> bool {
+        if let Err(error) = response_publication::publish(
+            self.role,
+            &self.response_tx,
+            &self.wake,
+            identity,
+            status,
+            payload,
+        ) {
+            error!(
+                "{} Honest RPC response publication failed for operation {}: {}",
+                role_name(self.role),
+                identity.operation_id,
+                error
+            );
+            false
+        } else {true}
     }
 
     fn dispatch_legacy(&self, raw_msg: &[u8]) {
@@ -235,6 +286,7 @@ impl RpcDispatcher {
             RpcMethod::KvWriteBatch => self.handle_kv_write_batch(payload),
             RpcMethod::KvMultiGet => self.handle_kv_multi_get(payload),
             RpcMethod::KvScan => self.handle_kv_scan(payload),
+            RpcMethod::WorkerStorage => (-13, Vec::new()),
 
             // ---- Utility ----
             RpcMethod::GetCurrentTime => self.handle_get_current_time(),
@@ -309,11 +361,23 @@ impl RpcDispatcher {
             Some(r) => r,
             None => return (-1, Vec::new()),
         };
-        match net::tcp_send(fd, data) {
+        let result = if self.role == RpcRole::Execution {
+            net::execution_send(fd, data, &self.wake)
+        } else {
+            net::tcp_send(fd, data)
+        };
+        match result {
             Ok(n) => (0, rpc::encode_i32(n as i32)),
             Err(e) => {
                 error!("NetSend failed: {}", e);
-                (network_error_status(&e), Vec::new())
+                (
+                    if self.role == RpcRole::Execution {
+                        execution_network_error_status(&e)
+                    } else {
+                        network_error_status(&e)
+                    },
+                    Vec::new(),
+                )
             }
         }
     }
@@ -324,12 +388,24 @@ impl RpcDispatcher {
             None => return (-1, Vec::new()),
         };
         let mut buf = vec![0u8; max_len as usize];
-        match net::tcp_recv(fd, &mut buf) {
+        let result = if self.role == RpcRole::Execution {
+            net::execution_receive(fd, &mut buf, &self.wake)
+        } else {
+            net::tcp_recv(fd, &mut buf)
+        };
+        match result {
             Ok(n) => {
                 buf.truncate(n);
                 (0, buf)
             }
-            Err(error) => (network_error_status(&error), Vec::new()),
+            Err(error) => (
+                if self.role == RpcRole::Execution {
+                    execution_network_error_status(&error)
+                } else {
+                    network_error_status(&error)
+                },
+                Vec::new(),
+            ),
         }
     }
 
@@ -344,6 +420,42 @@ impl RpcDispatcher {
     // ====================================================================
     //  KV store handlers
     // ====================================================================
+
+    fn handle_worker_storage(&self, bytes: &[u8]) -> (i32, Vec<u8>) {
+        use rpc::WorkerStorageOperation as Operation;
+        let Some((operation, payload)) = rpc::decode_worker_storage_request(bytes) else {
+            return (-22, Vec::new());
+        };
+        if operation == Operation::PutBatch {
+            let Some((table, records)) = rpc::decode_worker_storage_put_batch(payload) else { return (-22, Vec::new()); };
+            if records.iter().any(|(key,_)| !worker_data_target(table,key)) { return (-13, Vec::new()); }
+            let operations=records.iter().map(|(key,value)| (*key,Some(*value))).collect::<Vec<_>>();
+            return match kvstore::write_batch("honest.accepted-artifact-chunks-v1", &operations) {
+                Ok(()) => (0,Vec::new()), Err(_) => (-1,Vec::new()),
+            };
+        }
+        let target = match operation {
+            Operation::Get | Operation::Delete => {
+                rpc::decode_kv_get_req(payload)
+            }
+            Operation::Put => rpc::decode_kv_put_req(payload).map(|(table, key, _)| (table, key)),
+            Operation::DurablePut => {
+                rpc::decode_durable_kv_put_req(payload).map(|(table, key, _)| (table, key))
+            }
+            Operation::PutBatch => unreachable!("handled before scalar decode"),
+        };
+        let Some((table, key)) = target else {
+            return (-13, Vec::new());
+        };
+        if !worker_data_target(table,key) { return (-13,Vec::new()); }
+        match operation {
+            Operation::Get => self.handle_kv_get(payload),
+            Operation::Put => self.handle_kv_put(payload),
+            Operation::DurablePut => self.handle_kv_put_durable(payload),
+            Operation::Delete => self.handle_kv_delete(payload),
+            Operation::PutBatch => unreachable!("handled before scalar decode"),
+        }
+    }
 
     fn handle_kv_put(&self, payload: &[u8]) -> (i32, Vec<u8>) {
         let (table, key, value) = match rpc::decode_kv_put_req(payload) {
@@ -602,6 +714,11 @@ mod tests {
 
     #[test]
     fn honest_dispatcher_echoes_identity_and_denies_wrong_physical_role() {
+        check_worker_storage_namespace();
+        #[cfg(unix)]
+        check_encoded_execution_cancel();
+        #[cfg(unix)]
+        crate::net::check_execution_readiness();
         let (_unused_request_tx, request_rx) = queue();
         let (response_tx, response_rx) = queue();
         let dispatcher = RpcDispatcher::new(
@@ -654,4 +771,163 @@ mod tests {
         let response = response_rx.try_recv().expect("legacy durable write denial");
         assert_eq!(rpc::decode_response(&response).unwrap().1, -13);
     }
+    #[cfg(unix)]
+    fn check_encoded_execution_cancel() {
+        use std::net::{Ipv4Addr, TcpListener, TcpStream};
+        use std::time::{Duration, Instant};
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let _peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let fd = crate::net::listener::install_for_readiness_test(stream);
+        let (_, request_rx) = queue();
+        let (response_tx, response_rx) = queue();
+        let wake = Arc::new(crate::dispatcher_wake::DispatcherWake::new());
+        let identity = HonestRpcIdentity {
+            role: RpcRole::Execution,
+            node_id: 3,
+            node_generation: 8,
+            operation_id: 27,
+            method: RpcMethod::NetRecv,
+        };
+        let payload = rpc::encode_net_recv_req(fd, 1);
+        let request = rpc::encode_honest_request(identity, &payload).unwrap();
+        let worker = {
+            let wake = wake.clone();
+            std::thread::spawn(move || {
+                let dispatcher = RpcDispatcher::new(
+                    RpcRole::Execution,
+                    request_rx,
+                    response_tx,
+                    Arc::new(AtomicBool::new(false)),
+                    wake,
+                );
+                dispatcher.dispatch(&request);
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while wake.execution_waits() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "dispatcher never entered readiness"
+            );
+            std::thread::yield_now();
+        }
+        wake.notify_execution_cancel();
+        worker.join().unwrap();
+        let bytes = response_rx
+            .try_recv()
+            .expect("actual cancellation response frame");
+        let response = rpc::decode_honest_response_for(&bytes, identity).unwrap();
+        assert_eq!(
+            response.status, -125,
+            "execution cancellation must reach trusted fence check"
+        );
+        assert!(response.payload.is_empty());
+        assert_eq!(
+            super::network_error_status(&std::io::Error::from_raw_os_error(125).into()),
+            -1,
+            "ordinary control error mapping stays unchanged"
+        );
+        crate::net::tcp_close(fd);
+        println!("EXECUTION-SOCKET-CANCEL-FRAME: actual dispatcher exactidentity status=-125 emptybody PASS");
+    }
+    fn check_worker_storage_namespace() {
+        let (_, request_rx) = queue();
+        let (response_tx, response_rx) = queue();
+        let dispatcher = RpcDispatcher::new(
+            RpcRole::Execution,
+            request_rx,
+            response_tx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(crate::dispatcher_wake::DispatcherWake::new()),
+        );
+        let identity = HonestRpcIdentity {
+            role: RpcRole::Execution,
+            node_id: 3,
+            node_generation: 8,
+            operation_id: 51,
+            method: RpcMethod::WorkerStorage,
+        };
+        for table in [
+            b"honest.bft-runtime".as_slice(),
+            b"honest.guest-writer-scratch-v1".as_slice(),
+            b"honest.accepted-artifact-chunks-v1".as_slice(),
+        ] {
+            // The last table is valid, but its catalogue key remains control-owned.
+            let payload = rpc::encode_worker_storage_request(
+                rpc::WorkerStorageOperation::Get,
+                &rpc::encode_kv_get_req(table, b"honest/retained-scope/v1/catalog"),
+            )
+            .unwrap();
+            dispatcher.dispatch(&rpc::encode_honest_request(identity, &payload).unwrap());
+            let bytes = response_rx.try_recv().unwrap();
+            assert_eq!(
+                rpc::decode_honest_response_for(&bytes, identity)
+                    .unwrap()
+                    .status,
+                -13
+            );
+        }
+        let directory = tempfile::tempdir().unwrap();
+        crate::kvstore::init(directory.path().to_str().unwrap()).unwrap();
+        let table = b"honest.accepted-artifact-chunks-v1";
+        let key = [b"honest/retained-data/v1/".as_slice(), &[7; 32], b"/leaf"].concat();
+        let other=[b"honest/retained-data/v1/".as_slice(), &[7;32], b"/node"].concat();
+        let batch=rpc::encode_worker_storage_put_batch(table,&[(&key,b"batch leaf"),(&other,b"batch node")]).unwrap();
+        let payload=rpc::encode_worker_storage_request(rpc::WorkerStorageOperation::PutBatch,&batch).unwrap();
+        dispatcher.dispatch(&rpc::encode_honest_request(identity,&payload).unwrap());
+        let response=response_rx.try_recv().unwrap();
+        assert_eq!(rpc::decode_honest_response_for(&response,identity).unwrap().status,0);
+        assert_eq!(crate::kvstore::get("honest.accepted-artifact-chunks-v1",&other).unwrap().unwrap(),b"batch node");
+        let forbidden=rpc::encode_worker_storage_put_batch(table,&[(&key,b"replacement"),(b"honest/retained-scope/v1/catalog",b"denied")]).unwrap();
+        let payload=rpc::encode_worker_storage_request(rpc::WorkerStorageOperation::PutBatch,&forbidden).unwrap();
+        dispatcher.dispatch(&rpc::encode_honest_request(identity,&payload).unwrap());
+        let response=response_rx.try_recv().unwrap();assert_eq!(rpc::decode_honest_response_for(&response,identity).unwrap().status,-13);
+        assert_eq!(crate::kvstore::get("honest.accepted-artifact-chunks-v1",&key).unwrap().unwrap(),b"batch leaf","entire namespace group validated before mutation");
+        for cut in 0..batch.len() {assert!(rpc::decode_worker_storage_put_batch(&batch[..cut]).is_none());}
+        let mut trailing=batch.clone();trailing.push(0);assert!(rpc::decode_worker_storage_put_batch(&trailing).is_none());
+        assert!(rpc::encode_worker_storage_put_batch(table,&[(key.as_slice(),[1u8;1].as_slice());65]).is_none());
+        assert!(rpc::encode_worker_storage_put_batch(table,&[(&key,&vec![1;rpc::MAX_WORKER_STORAGE_BATCH_BYTES])]).is_none());
+
+        for (operation, payload, expected) in [
+            (
+                rpc::WorkerStorageOperation::Put,
+                rpc::encode_kv_put_req(table, &key, b"sealed bytes"),
+                Vec::new(),
+            ),
+            (
+                rpc::WorkerStorageOperation::DurablePut,
+                rpc::encode_durable_kv_put_req(table, &key, b"sealed bytes").unwrap(),
+                Vec::new(),
+            ),
+            (
+                rpc::WorkerStorageOperation::Get,
+                rpc::encode_kv_get_req(table, &key),
+                b"sealed bytes".to_vec(),
+            ),
+        ] {
+            let payload = rpc::encode_worker_storage_request(operation, &payload).unwrap();
+            dispatcher.dispatch(&rpc::encode_honest_request(identity, &payload).unwrap());
+            let bytes = response_rx.try_recv().unwrap();
+            let response = rpc::decode_honest_response_for(&bytes, identity).unwrap();
+            assert_eq!(response.status, 0);
+            assert_eq!(response.payload, expected);
+        }
+        assert!(!legacy_role_allows_method(
+            RpcRole::Execution,
+            RpcMethod::WorkerStorage
+        ));
+        assert!(!rpc::honest_role_allows_method(
+            RpcRole::Execution,
+            RpcMethod::KvPutDurable
+        ));
+        assert!(rpc::honest_role_allows_method(
+            RpcRole::Control,
+            RpcMethod::KvPutDurable
+        ));
+        println!("WORKER-STORAGE-HOST: actual framed accepted-data put/durable/get; BFT/scratch/catalogue refusals; control-only durable policy PASS");
+            #[cfg(feature="diagnostic-worker-storage-rpc")]
+        {let (_,tail)=dispatcher.response_tx.diagnostic_positions();let mut profile=dispatcher.storage_profile.lock().unwrap();profile.observe(tail,"next-request");profile.check();}
+}
 }
