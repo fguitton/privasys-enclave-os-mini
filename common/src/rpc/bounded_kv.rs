@@ -55,3 +55,75 @@ pub fn decode_kv_multi_get_resp_bounded(
     }
     (offset == bytes.len()).then_some(result)
 }
+
+/// Caller record geometry intersected with existing Mini batch/transport caps.
+/// Bounds grant neither storage authority nor durable publication.
+#[derive(Clone, Copy, Debug)]
+pub struct KvPutBatchBounds {
+    maximum_records: usize,
+    maximum_value_bytes: usize,
+    maximum_total_value_bytes: usize,
+}
+
+impl KvPutBatchBounds {
+    pub fn new(
+        maximum_records: usize,
+        maximum_value_bytes: usize,
+        maximum_total_value_bytes: usize,
+    ) -> Option<Self> {
+        if maximum_records == 0 || maximum_value_bytes == 0 || maximum_total_value_bytes == 0 {
+            return None;
+        }
+        Some(Self {
+            maximum_records: maximum_records.min(MAX_BOUNDED_KV_ITEMS),
+            maximum_value_bytes: maximum_value_bytes.min(crate::types::KV_MAX_VALUE_SIZE),
+            maximum_total_value_bytes: maximum_total_value_bytes.min(MAX_BOUNDED_KV_BYTES),
+        })
+    }
+}
+
+/// Encode borrowed puts with the exact legacy KvWriteBatch wire format.
+/// Aggregate value bytes and complete framed request bytes have separate bounds.
+pub fn encode_kv_put_batch_req_borrowed(
+    table: &[u8],
+    records: &[(&[u8], &[u8])],
+    bounds: KvPutBatchBounds,
+) -> Option<Vec<u8>> {
+    if table.is_empty() || records.is_empty() || records.len() > bounds.maximum_records {
+        return None;
+    }
+    let table_len = u16::try_from(table.len()).ok()?;
+    let count = u32::try_from(records.len()).ok()?;
+    let mut value_bytes = 0usize;
+    let mut encoded_bytes = 2usize.checked_add(table.len())?.checked_add(4)?;
+    for (key, value) in records {
+        if key.is_empty() || key.len() > crate::types::KV_MAX_KEY_SIZE
+            || value.is_empty() || value.len() > bounds.maximum_value_bytes
+        {
+            return None;
+        }
+        value_bytes = value_bytes.checked_add(value.len())?;
+        encoded_bytes = encoded_bytes.checked_add(9)?
+            .checked_add(key.len())?.checked_add(value.len())?;
+    }
+    if value_bytes > bounds.maximum_total_value_bytes
+        || encoded_bytes.checked_add(super::REQ_HEADER_SIZE)?
+            > crate::queue::MAX_MSG_SIZE as usize
+    {
+        return None;
+    }
+    // Checked full framing and caller/transport bounds precede allocation.
+    let mut output = Vec::new();
+    output.try_reserve_exact(encoded_bytes).ok()?;
+    output.extend_from_slice(&table_len.to_le_bytes());
+    output.extend_from_slice(table);
+    output.extend_from_slice(&count.to_le_bytes());
+    for (key, value) in records {
+        output.push(0); // Original put tag; record order and duplicates preserved.
+        output.extend_from_slice(&u32::try_from(key.len()).ok()?.to_le_bytes());
+        output.extend_from_slice(key);
+        output.extend_from_slice(&u32::try_from(value.len()).ok()?.to_le_bytes());
+        output.extend_from_slice(value);
+    }
+    Some(output)
+}

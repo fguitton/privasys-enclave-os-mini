@@ -104,6 +104,15 @@ pub fn kv_store_write_batch(
     rpc().kv_write_batch(table, ops)
 }
 
+/// Borrow bounded opaque puts; uses the original control RPC and staged write.
+pub fn kv_store_put_batch_borrowed(
+    table: &[u8],
+    records: &[(&[u8], &[u8])],
+    bounds: enclave_os_common::rpc::KvPutBatchBounds,
+) -> Result<(), i32> {
+    rpc().kv_put_batch_borrowed(table, records, bounds)
+}
+
 /// Fetch several keys in one host round trip. Results are in request order.
 pub fn kv_store_multi_get(table: &[u8], keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, i32> {
     rpc().kv_multi_get(table, keys)

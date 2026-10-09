@@ -585,6 +585,23 @@ impl RpcClient {
         }
     }
 
+    /// Borrow bounded put records through the original synchronous KvWriteBatch.
+    /// A successful staged write reply is not a durable publication barrier.
+    pub fn kv_put_batch_borrowed(
+        &self,
+        table: &[u8],
+        records: &[(&[u8], &[u8])],
+        bounds: rpc::KvPutBatchBounds,
+    ) -> Result<(), i32> {
+        let payload = rpc::encode_kv_put_batch_req_borrowed(table, records, bounds).ok_or(-22)?;
+        let (status, _) = self.call(RpcMethod::KvWriteBatch, &payload);
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(status)
+        }
+    }
+
     /// Fetch several keys in one round trip. Results are in request order.
     pub fn kv_multi_get(&self, table: &[u8], keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, i32> {
         let payload = rpc::encode_kv_multi_get_req(table, keys);
