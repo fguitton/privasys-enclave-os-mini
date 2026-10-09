@@ -115,6 +115,9 @@ impl ExecutionRpcCompletion {
     pub fn payload(&self) -> &[u8] {
         &self.payload
     }
+    /// Move already validated response bytes without a second payload copy.
+    #[must_use]
+    pub fn into_payload(self)->Vec<u8>{self.payload}
 }
 
 /// Fail-closed errors from the role-owned execution submit/poll interface.
