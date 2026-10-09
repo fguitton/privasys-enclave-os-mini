@@ -63,10 +63,12 @@ fn execution_network_error_status(error: &anyhow::Error) -> i32 {
     }
 }
 
-fn worker_data_target(table: &[u8], key: &[u8]) -> bool {
+fn worker_data_target(table: &[u8], key: &[u8], operation: rpc::WorkerStorageOperation) -> bool {
     const DATA: &[u8] = b"honest/retained-data/v1/";
-    table == b"honest.accepted-artifact-chunks-v1" && key.starts_with(DATA)
-        && key.len()>DATA.len()+32 && key.len()<=512
+    let table_allowed = table == b"honest.accepted-artifact-chunks-v1"
+        || (table == b"honest.retained-output-chunks-v1"
+            && matches!(operation, rpc::WorkerStorageOperation::Put | rpc::WorkerStorageOperation::PutBatch));
+    table_allowed && key.starts_with(DATA) && key.len()>DATA.len()+32 && key.len()<=512
 }
 
 /// RPC dispatcher that bridges enclave requests to host services.
@@ -428,9 +430,14 @@ impl RpcDispatcher {
         };
         if operation == Operation::PutBatch {
             let Some((table, records)) = rpc::decode_worker_storage_put_batch(payload) else { return (-22, Vec::new()); };
-            if records.iter().any(|(key,_)| !worker_data_target(table,key)) { return (-13, Vec::new()); }
+            if records.iter().any(|(key,_)| !worker_data_target(table,key,operation)) { return (-13, Vec::new()); }
             let operations=records.iter().map(|(key,value)| (*key,Some(*value))).collect::<Vec<_>>();
-            return match kvstore::write_batch("honest.accepted-artifact-chunks-v1", &operations) {
+            let table = match table {
+                b"honest.accepted-artifact-chunks-v1" => "honest.accepted-artifact-chunks-v1",
+                b"honest.retained-output-chunks-v1" => "honest.retained-output-chunks-v1",
+                _ => return (-13, Vec::new()),
+            };
+            return match kvstore::write_batch(table, &operations) {
                 Ok(()) => (0,Vec::new()), Err(_) => (-1,Vec::new()),
             };
         }
@@ -447,7 +454,7 @@ impl RpcDispatcher {
         let Some((table, key)) = target else {
             return (-13, Vec::new());
         };
-        if !worker_data_target(table,key) { return (-13,Vec::new()); }
+        if !worker_data_target(table,key,operation) { return (-13,Vec::new()); }
         match operation {
             Operation::Get => self.handle_kv_get(payload),
             Operation::Put => self.handle_kv_put(payload),
@@ -885,6 +892,41 @@ mod tests {
         dispatcher.dispatch(&rpc::encode_honest_request(identity,&payload).unwrap());
         let response=response_rx.try_recv().unwrap();assert_eq!(rpc::decode_honest_response_for(&response,identity).unwrap().status,-13);
         assert_eq!(crate::kvstore::get("honest.accepted-artifact-chunks-v1",&key).unwrap().unwrap(),b"batch leaf","entire namespace group validated before mutation");
+        // The output bridge stages ciphertext only. Actual dispatcher writes
+        // the selected dedicated table; roots/catalog/reads remain control-only.
+        let output_table=b"honest.retained-output-chunks-v1";
+        let put=rpc::encode_worker_storage_request(rpc::WorkerStorageOperation::Put,
+            &rpc::encode_kv_put_req(output_table,&key,b"output scalar")).unwrap();
+        dispatcher.dispatch(&rpc::encode_honest_request(identity,&put).unwrap());
+        let response=response_rx.try_recv().unwrap();
+        assert_eq!(rpc::decode_honest_response_for(&response,identity).unwrap().status,0);
+        let output_batch=rpc::encode_worker_storage_put_batch(output_table,
+            &[(&key,b"output leaf"),(&other,b"output node")]).unwrap();
+        let payload=rpc::encode_worker_storage_request(rpc::WorkerStorageOperation::PutBatch,&output_batch).unwrap();
+        dispatcher.dispatch(&rpc::encode_honest_request(identity,&payload).unwrap());
+        let response=response_rx.try_recv().unwrap();
+        assert_eq!(rpc::decode_honest_response_for(&response,identity).unwrap().status,0);
+        assert_eq!(crate::kvstore::get("honest.retained-output-chunks-v1",&key).unwrap().unwrap(),b"output leaf");
+        assert_eq!(crate::kvstore::get("honest.retained-output-chunks-v1",&other).unwrap().unwrap(),b"output node");
+        assert_eq!(crate::kvstore::get("honest.accepted-artifact-chunks-v1",&key).unwrap().unwrap(),b"batch leaf");
+        for (operation,payload) in [
+            (rpc::WorkerStorageOperation::Get,rpc::encode_kv_get_req(output_table,&key)),
+            (rpc::WorkerStorageOperation::Delete,rpc::encode_kv_get_req(output_table,&key)),
+            (rpc::WorkerStorageOperation::DurablePut,rpc::encode_durable_kv_put_req(output_table,&key,b"forbidden root").unwrap()),
+        ] {
+            let request=rpc::encode_worker_storage_request(operation,&payload).unwrap();
+            dispatcher.dispatch(&rpc::encode_honest_request(identity,&request).unwrap());
+            let response=response_rx.try_recv().unwrap();
+            assert_eq!(rpc::decode_honest_response_for(&response,identity).unwrap().status,-13);
+        }
+        let output_bad=rpc::encode_worker_storage_put_batch(output_table,
+            &[(&key,b"must not replace"),(b"honest/retained-scope/v1/catalog",b"denied")]).unwrap();
+        let request=rpc::encode_worker_storage_request(rpc::WorkerStorageOperation::PutBatch,&output_bad).unwrap();
+        dispatcher.dispatch(&rpc::encode_honest_request(identity,&request).unwrap());
+        let response=response_rx.try_recv().unwrap();
+        assert_eq!(rpc::decode_honest_response_for(&response,identity).unwrap().status,-13);
+        assert_eq!(crate::kvstore::get("honest.retained-output-chunks-v1",&key).unwrap().unwrap(),b"output leaf");
+        println!("OUTPUT-WORKER-STAGED-TABLE: actual dispatch Put/PutBatch isolated; output read/durable/delete/catalog denied PASS");
         for cut in 0..batch.len() {assert!(rpc::decode_worker_storage_put_batch(&batch[..cut]).is_none());}
         let mut trailing=batch.clone();trailing.push(0);assert!(rpc::decode_worker_storage_put_batch(&trailing).is_none());
         assert!(rpc::encode_worker_storage_put_batch(table,&[(key.as_slice(),[1u8;1].as_slice());65]).is_none());
