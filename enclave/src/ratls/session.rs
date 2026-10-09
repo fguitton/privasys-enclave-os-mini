@@ -129,7 +129,7 @@ struct PendingResponse {
     #[cfg(feature = "diagnostic-transfer-profile")]
     cost: Option<ResponseCost>,
     head: Vec<u8>,
-    body: crate::HttpResponseBody,
+    body: crate::HttpResponsePayload,
     offset: usize,
     close: bool,
     shutdown: bool,
@@ -414,19 +414,20 @@ impl RaTlsSession {
         status: u16,
         content_type: &str,
         extra_headers: &[(String, String)],
-        body: impl Into<crate::HttpResponseBody>,
+        body: impl Into<crate::HttpResponsePayload>,
         close: bool,
         shutdown: bool,
     ) -> Result<(), &'static str> {
-        self.queue_http_response_owned(status, content_type, extra_headers, body.into(), close, shutdown)
+        self.queue_http_response_owned(status, content_type, extra_headers, body, close, shutdown)
             .map_err(|(error, _body)| error)
     }
 
     /// Keep an unconsumed body available for its owner to drop outside STATE.
     pub(crate) fn queue_http_response_owned(
         &mut self, status: u16, content_type: &str, extra_headers: &[(String, String)],
-        body: crate::HttpResponseBody, close: bool, shutdown: bool,
-    ) -> Result<(), (&'static str, crate::HttpResponseBody)> {
+        body: impl Into<crate::HttpResponsePayload>, close: bool, shutdown: bool,
+    ) -> Result<(), (&'static str, crate::HttpResponsePayload)> {
+        let body = body.into();
         if let Err(error) = self.require_current_configuration() { return Err((error, body)); }
         if self.response.is_some() { return Err(("response already pending", body)); }
         let head = protocol::format_http_response_head(status, content_type, extra_headers, body.len(), close);
@@ -468,8 +469,12 @@ impl RaTlsSession {
             .body
             .len()
             .min(response.offset.saturating_add(remaining));
-        self.write_plaintext_chunked(&response.body[response.offset..end], &mut output)?;
-        response.offset = end;
+        while response.offset < end {
+            let part = response.body.part(response.offset, end - response.offset)
+                .filter(|part| !part.is_empty()).ok_or("invalid segmented response")?;
+            self.write_plaintext_chunked(part, &mut output)?;
+            response.offset += part.len();
+        }
         output.extend_from_slice(&self.collect_tls_output()?);
         if output.len() > 64 * 1024 {
             return Err("bounded TLS response exceeded credit");

@@ -54,7 +54,7 @@ extern crate sgx_trts;
 extern crate sgx_types;
 
 mod http_response;
-pub use http_response::HttpResponseBody;
+pub use http_response::{HttpResponseBody, HttpResponsePayload};
 
 pub mod config_merkle;
 pub mod cpuid_cache;
@@ -146,7 +146,7 @@ pub fn register_honest_deferred_ingress_hook_with_metadata(
 pub struct HonestIngressResponse {
     pub status: u16,
     pub content_type: &'static str,
-    pub body: HttpResponseBody,
+    pub body: HttpResponsePayload,
 }
 
 /// Optional adopter-owned execution worker.

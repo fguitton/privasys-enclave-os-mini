@@ -162,6 +162,7 @@ fn owned_body(
 
 #[test]
 fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
+    segmented_response_lifecycle();
     fixed_peer_configuration_boundary();
     #[cfg(feature="native-deferred-fixture")]
     crate::actual_control_wake::check();
@@ -474,7 +475,7 @@ fn streamed_request_preserves_tls_and_following_request() {
         alternating+=1;
         work.remaining-=part.len();work.bytes=part;
         let result=crate::stream_ingress::run_work(fixture_begin,&mut work);
-        if work.remaining==0 {assert_eq!(&*result.unwrap().body,body.as_slice());}
+        if work.remaining==0 {assert_eq!(result.unwrap().body.contiguous().unwrap(),body.as_slice());}
         else {assert!(result.is_none());}
     }
     assert_eq!(actual,body);assert_eq!(session.channel_binder().unwrap(),binding);
@@ -589,4 +590,59 @@ impl crate::HonestStreamIngressReceiver for PendingReceiver{
     fn finish(self:Box<Self>,_:&enclave_os_common::modules::RequestContext)->crate::HonestIngressResponse{
         crate::HonestIngressResponse{status:202,content_type:"application/octet-stream",body:vec![].into()}
     }
+}
+
+fn segmented_response_lifecycle() {
+    let store = CertStore::new();
+    register(&store, "segments.test");
+    let (mut client, mut session) = pair(&store, "segments.test");
+    handshake(&mut client, &mut session);
+    let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let bytes = Arc::new((0..5 * 1024 * 1024).map(|n| (n % 251) as u8).collect::<Vec<_>>());
+    let prefix = vec![33; 97];
+    let expected_body = [prefix.as_slice(), bytes.as_slice()].concat();
+    let expected = enclave_os_common::protocol::format_http_response(200, &expected_body, false);
+    let payload = || crate::HttpResponsePayload::shared(prefix.clone(), bytes.clone(),
+        Arc::new(BodyOwner(drops.clone()))).unwrap();
+    session.queue_http_response(200, "application/json", &[], payload(), false, false).unwrap();
+    let (reason, returned) = session.queue_http_response_owned(200, "application/json", &[],
+        payload(), false, false).err().unwrap();
+    assert_eq!(reason, "response already pending");
+    assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+    drop(returned);
+    assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let mut received = Vec::new();
+    let mut steps = 0;
+    while session.has_pending_response() {
+        let (flight, close, shutdown) = session.progress_http_response().unwrap();
+        assert!(flight.len() <= 64 * 1024);
+        assert!(!close && !shutdown);
+        steps += 1;
+        let mut input = Cursor::new(flight);
+        while input.position() < input.get_ref().len() as u64 {
+            client.read_tls(&mut input).unwrap();
+            client.process_new_packets().unwrap();
+            let mut chunk = [0;8192];
+            loop {
+                match std::io::Read::read(&mut client.reader(), &mut chunk) {
+                    Ok(0) => break,
+                    Ok(count) => received.extend_from_slice(&chunk[..count]),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("segmented TLS response: {error}"),
+                }
+            }
+        }
+    }
+    assert!(received == expected, "every original HTTP byte including segment boundary");
+    assert_eq!(steps, expected.len().div_ceil(60 * 1024));
+    assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(Arc::strong_count(&bytes), 1);
+    session.queue_http_response(200, "application/json", &[], payload(), false, false).unwrap();
+    assert!(!session.progress_http_response().unwrap().0.is_empty());
+    assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(store.unregister("segments.test"));
+    assert!(session.progress_http_response().is_err());
+    assert!(!session.has_pending_response());
+    assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(Arc::strong_count(&bytes), 1);
 }

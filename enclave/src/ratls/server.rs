@@ -1162,7 +1162,7 @@ fn fresh_context(conn_id: u32, ingress_class: enclave_os_common::modules::Ingres
 /// Result of handling an HTTP request.
 struct HttpHandleResult {
     status: u16,
-    body: crate::HttpResponseBody,
+    body: crate::HttpResponsePayload,
     shutdown: bool,
     /// Optional Content-Type override (defaults to `application/json`).
     content_type: Option<String>,
@@ -1429,12 +1429,17 @@ fn handle_http_request_with_session(
 
     let inner_result = handle_http_request(&inner, base_ctx);
 
+    // The sealed relay is a contiguous protocol, independent of the appraised
+    // peer's segmented ciphertext route. Never silently flatten a shared body.
+    let Some(inner_body) = inner_result.body.contiguous() else {
+        return HttpHandleResult::err(500, "segmented response requires direct TLS");
+    };
     // Seal response body using the SAME (method, path) AD as the request.
     let sealed = match crate::sessionrelay::seal_response(
         session_id,
         method_str,
         &http_req.path,
-        &inner_result.body,
+        inner_body,
         now,
     ) {
         Ok(v) => v,
@@ -2160,7 +2165,8 @@ fn transform_mcp_tools_response(result: HttpHandleResult) -> HttpHandleResult {
     if result.status != 200 {
         return result;
     }
-    let parsed: serde_json::Value = match serde_json::from_slice(&result.body) {
+    let Some(body) = result.body.contiguous() else { return result; };
+    let parsed: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => return result,
     };
@@ -2224,7 +2230,8 @@ fn transform_mcp_call_response(result: HttpHandleResult) -> HttpHandleResult {
     if result.status != 200 {
         return result;
     }
-    let parsed: serde_json::Value = match serde_json::from_slice(&result.body) {
+    let Some(body) = result.body.contiguous() else { return result; };
+    let parsed: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => return result,
     };
