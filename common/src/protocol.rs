@@ -28,6 +28,11 @@ pub const MAX_BODY_SIZE: usize = 16 * 1024 * 1024;
 /// Optional header-only streamed ceiling: eight canonical8MiB frames plus
 /// bounded AEAD/header/page/group overhead. Never used by the legacy parser.
 pub const MAX_STREAM_BODY_SIZE:usize=12+8*(4+92+32*1024+8*1024*1024+16);
+/// Optional peer outer authority/manifest prefix; still one canonical frame at
+/// a time. Only the explicit peer-group media header receives this ceiling.
+pub const MAX_STREAM_PEER_BODY_SIZE:usize=MAX_STREAM_BODY_SIZE+106+4096;
+const STREAM_PEER_MEDIA:&str="application/honest-source-upload-peer-group-v1";
+
 
 /// Maximum HTTP header section: 8 KiB (enforced via header count).
 pub const MAX_HEADERS: usize = 32;
@@ -373,13 +378,18 @@ pub fn peek_http_request_head(buf:&[u8])->Result<(HttpRequest,usize,usize),HttpP
 /// allocation; the adopter independently validates negotiated geometry/authority.
 pub fn parse_http_stream_request_head(buf:&[u8])->Result<(HttpRequest,usize,usize),HttpParseError>{
     if buf.windows(4).position(|w|w==b"\r\n\r\n").is_none_or(|n|n+4>16*1024){return if buf.len()>16*1024{Err(HttpParseError::TooManyHeaders)}else{Err(HttpParseError::Incomplete)};}
-    parse_http_metadata(buf,true,MAX_STREAM_BODY_SIZE)
+    parse_http_stream_metadata(buf,true)
 }
 /// Header selector peek with the optional stream ceiling; ordinary parsing
 /// still applies its original16MiB body limit if no adopter claims this request.
 pub fn peek_http_stream_request_head(buf:&[u8])->Result<(HttpRequest,usize,usize),HttpParseError>{
     if buf.windows(4).position(|w|w==b"\r\n\r\n").is_none_or(|n|n+4>16*1024){return Err(HttpParseError::Incomplete);}
-    parse_http_metadata(buf,false,MAX_STREAM_BODY_SIZE)
+    parse_http_stream_metadata(buf,false)
+}
+fn parse_http_stream_metadata(buf:&[u8],strict:bool)->Result<(HttpRequest,usize,usize),HttpParseError>{
+    let result=parse_http_metadata(buf,strict,MAX_STREAM_PEER_BODY_SIZE)?;
+    let maximum=if result.0.content_type.as_deref()==Some(STREAM_PEER_MEDIA){MAX_STREAM_PEER_BODY_SIZE}else{MAX_STREAM_BODY_SIZE};
+    if result.2>maximum{return Err(HttpParseError::BodyTooLarge);}Ok(result)
 }
 fn parse_http_metadata(buf:&[u8],strict:bool,maximum_body:usize)->Result<(HttpRequest,usize,usize),HttpParseError> {
     let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
@@ -780,6 +790,11 @@ mod tests {
         assert!(matches!(parse_http_request_head(large.as_bytes()),Err(HttpParseError::BodyTooLarge)));
         assert!(matches!(parse_http_request(large.as_bytes()),Err(HttpParseError::BodyTooLarge)));
         let excess=format!("POST /stream HTTP/1.1\r\nContent-Length: {}\r\n\r\n",MAX_STREAM_BODY_SIZE+1);assert!(matches!(parse_http_stream_request_head(excess.as_bytes()),Err(HttpParseError::BodyTooLarge)));
+        let peer=format!("POST /honest/v1/peer HTTP/1.1\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n",STREAM_PEER_MEDIA,MAX_STREAM_PEER_BODY_SIZE);
+        assert_eq!(parse_http_stream_request_head(peer.as_bytes()).unwrap().2,MAX_STREAM_PEER_BODY_SIZE);
+        assert!(matches!(parse_http_request_head(peer.as_bytes()),Err(HttpParseError::BodyTooLarge)));
+        let excess_peer=peer.replace(&MAX_STREAM_PEER_BODY_SIZE.to_string(),&(MAX_STREAM_PEER_BODY_SIZE+1).to_string());
+        assert!(matches!(parse_http_stream_request_head(excess_peer.as_bytes()),Err(HttpParseError::BodyTooLarge)));
         let(head,used,length)=parse_http_request_head(raw).unwrap();
         assert!(head.body.is_empty());assert_eq!(length,4);assert_eq!(&raw[used..],b"ab");
         for raw in [b"POST /upload HTTP/1.1\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\nabcd".as_slice(),b"POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice()] {
