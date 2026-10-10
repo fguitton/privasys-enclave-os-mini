@@ -262,9 +262,27 @@ fn spawn_execution_ecall(enclave_id: u64) -> Result<thread::JoinHandle<i32>> {
 }
 
 fn run_enclave_tests(enclave_path: &str, selection: EnclaveTestSelection) -> Result<()> {
+    // This single-use CLI exits after the suite. Mini retains the enclave in a
+    // process-lifetime OnceLock; its destroy helper does not drop that owner.
+    // Retain this bounded real channel for the same lifetime, including errors.
+    // No proxy or network worker is started for the fixture.
+    let data_channel = Box::leak(Box::new(SharedChannel::new(DEFAULT_QUEUE_CAPACITY)));
     let enclave_id = enclave::create_enclave(enclave_path)?;
-    let packed = enclave::call_ecall_enclave_tests(enclave_id, selection.code())?;
+    let ret = enclave::call_ecall_init_data_channel(
+        enclave_id,
+        data_channel.enc_to_host_header as *mut u8,
+        data_channel.enc_to_host_buf,
+        data_channel.host_to_enc_header as *mut u8,
+        data_channel.host_to_enc_buf,
+        data_channel.capacity,
+    );
+    if ret != 0 {
+        enclave::destroy_enclave(enclave_id);
+        anyhow::bail!("Failed to initialise enclave test data channel: {ret}");
+    }
+    let result = enclave::call_ecall_enclave_tests(enclave_id, selection.code());
     enclave::destroy_enclave(enclave_id);
+    let packed = result?;
 
     let code = u8::try_from(packed >> 24).expect("packed result code is one byte");
     let collected = u8::try_from((packed >> 16) & 0xff).expect("packed collection is one byte");
