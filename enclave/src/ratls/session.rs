@@ -63,6 +63,9 @@ pub struct RaTlsSession {
     read_buf: Vec<u8>,
     read_offset:usize,
     stream_chunks:Option<std::collections::VecDeque<(Vec<u8>,usize)>>,
+    // Retained after logical EOF because finish_stream_input can preserve the
+    // inherited allocation for a following request. Slot/work aliases share it.
+    stream_allocation:Option<std::sync::Arc<enclave_os_common::allocation::AllocationLeaseV1>>,
     response: Option<PendingResponse>,
     /// Exact v2 leaf served on this connection (evidence is exchanged separately).
     local_cert_der: Vec<u8>,
@@ -167,6 +170,7 @@ impl RaTlsSession {
         Self {
             tls_conn,
             read_buf: Vec::new(),read_offset:0,stream_chunks:None,
+            stream_allocation:None,
             response: None,
             local_cert_der,
             server_name,
@@ -299,10 +303,32 @@ impl RaTlsSession {
     pub(crate) fn validate_stream_head(&self)->bool {protocol::parse_http_stream_request_head(&self.read_buf[self.read_offset..]).is_ok()}
     // Reuse the old parser Vec plus full-body copy allowance. This is a
     // physical capacity bound; unread bytes keep the original separate cap.
-    pub(crate) const STREAM_INPUT_CAPACITY:usize=(protocol::MAX_BODY_SIZE+64*1024).next_power_of_two()+protocol::MAX_BODY_SIZE;
+    pub(crate) const STREAM_INPUT_CAPACITY:usize=(protocol::MAX_BODY_SIZE+crate::MAX_STREAM_INGRESS_FRAGMENT).next_power_of_two()+protocol::MAX_BODY_SIZE;
+    pub(crate) fn stream_allocation_bytes()->Option<usize>{
+        Self::STREAM_INPUT_CAPACITY.checked_add(crate::MAX_STREAM_INGRESS_FRAGMENT)
+    }
+    // Native actual TLS fixtures use an explicit bounded inert resource pool;
+    // production SGX always supplies the SDK-rooted owner below.
+    pub(crate) fn admit_stream_allocation(&mut self,pool:&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>)
+        ->Result<std::sync::Arc<enclave_os_common::allocation::AllocationLeaseV1>,&'static str>{
+        let bytes=Self::stream_allocation_bytes().ok_or("stream allocation geometry overflow")?;
+        if let Some(lease)=&self.stream_allocation{
+            if !lease.covers(pool,bytes){return Err("foreign stream allocation pool");}
+            return Ok(lease.clone());
+        }
+        let lease=std::sync::Arc::new(pool.reserve(bytes).ok_or("stream allocation admission exhausted")?);
+        self.stream_allocation=Some(lease.clone());Ok(lease)
+    }
+    #[cfg(target_env="sgx")]
+    pub(crate) fn reserve_stream_allocation(&mut self)->Result<std::sync::Arc<enclave_os_common::allocation::AllocationLeaseV1>,&'static str>{
+        let pool=crate::local_allocation_pool().ok_or("SDK heap unavailable")?;
+        self.admit_stream_allocation(&pool)
+    }
     pub(crate) fn consume_stream_head(&mut self,bytes:usize)->Result<(),&'static str> {
+        #[cfg(target_env="sgx")]
+        self.reserve_stream_allocation()?;
         let offset=self.read_offset.checked_add(bytes).ok_or("stream header overflow")?;
-        if offset>self.read_buf.len() || self.read_buf.capacity()>(protocol::MAX_BODY_SIZE+64*1024).next_power_of_two(){return Err("stream inherited input capacity exceeded bound");}
+        if offset>self.read_buf.len() || self.read_buf.capacity()>(protocol::MAX_BODY_SIZE+crate::MAX_STREAM_INGRESS_FRAGMENT).next_power_of_two(){return Err("stream inherited input capacity exceeded bound");}
         let bytes=std::mem::take(&mut self.read_buf);self.read_offset=0;
         let mut chunks=std::collections::VecDeque::new();
         if bytes.len()>offset {chunks.push_back((bytes,offset));}
@@ -520,7 +546,7 @@ impl RaTlsSession {
                 Ok(n) => {
                     if let Some(chunks)=self.stream_chunks.as_mut() {
                         let unread:usize=chunks.iter().map(|(v,o)|v.len()-o).sum();
-                        if unread.saturating_add(n)>protocol::MAX_BODY_SIZE+64*1024 {return Err("stream unread input exceeded bound");}
+                        if unread.saturating_add(n)>protocol::MAX_BODY_SIZE+crate::MAX_STREAM_INGRESS_FRAGMENT {return Err("stream unread input exceeded bound");}
                         let capacity:usize=chunks.iter().map(|(v,_)|v.capacity()).sum();
                         if chunks.back().is_none_or(|(v,_)|v.len()==v.capacity()) {
                             if capacity+crate::MAX_STREAM_INGRESS_FRAGMENT>Self::STREAM_INPUT_CAPACITY {return Err("stream input capacity exceeded bound");}
@@ -541,7 +567,7 @@ impl RaTlsSession {
                     // suffix, or to maintain the unchanged physical buffer cap.
                     // Every byte moves amortized once, never per64KiB fragment.
                     if self.read_offset>0 && (self.read_offset>=self.read_buf.len()-self.read_offset
-                        || self.read_buf.len().saturating_add(n)>protocol::MAX_BODY_SIZE+64*1024) {
+                        || self.read_buf.len().saturating_add(n)>protocol::MAX_BODY_SIZE+crate::MAX_STREAM_INGRESS_FRAGMENT) {
                         self.read_buf.drain(..self.read_offset);self.read_offset=0;
                     }
                     if self.read_buf.len().saturating_add(n) > protocol::MAX_BODY_SIZE + 64 * 1024 {

@@ -66,6 +66,31 @@ mod enclave_client_auth;
 #[allow(dead_code)]
 #[path = "../../../enclave/src/ratls/session.rs"]
 mod session;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../../enclave/src/http_response.rs"]
+mod http_response;
+#[cfg(test)]
+pub use http_response::{HttpResponseBody, HttpResponsePayload};
+#[cfg(test)]
+#[path = "../../../enclave/src/ingress_response.rs"]
+mod ingress_response;
+#[cfg(test)]
+pub use ingress_response::HonestIngressResponse;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../../enclave/src/stream_ingress.rs"]
+mod stream_ingress;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../../enclave/src/deferred_ingress.rs"]
+mod deferred_ingress;
+#[cfg(test)]
+mod ratls {
+    pub(crate) use crate::session;
+}
+#[cfg(test)]
+pub use stream_ingress::{HonestStreamIngressReceiver, MAX_STREAM_INGRESS_FRAGMENT};
 pub use enclave_os_common::attest;
 #[cfg(test)]
 pub use enclave_os_common::enclave_log_error;
@@ -82,7 +107,7 @@ pub use client::{
     verify_webpki_client_certificate_chain_at, verify_webpki_server_certificate_chain_at,
     BoundedHttpsRequest, ClientCertIdentity, EnclaveAttestationProvider, EnclaveClientCertSigner,
     ExpectedOid, HttpResponse, HttpsBodyLimitsV1, HttpsFetchError, HttpsFetchFailurePhase,
-    IncrementalTlsClient, InterruptibleBlockingNetIo, RaTlsPolicy, ReportDataBinding,
+    IncrementalTlsClient, MAX_INCREMENTAL_TLS_FRAGMENT, MAX_INCREMENTAL_TLS_OUTPUT, MAX_INCREMENTAL_REQUEST, MAX_INCREMENTAL_PLAINTEXT, InterruptibleBlockingNetIo, RaTlsPolicy, ReportDataBinding,
     ResourceBoundHttpsRequest, SgxPeerCertificateEvidence, TeeType, TlsPeerCertificateChain,
     TlsPeerCertificateEvidence, MAX_REQUEST_BODY, MAX_REQUEST_HEADERS, MAX_REQUEST_HEADER_BYTES,
     MAX_RESPONSE_BODY, MAX_RESPONSE_HEADERS, MAX_RESPONSE_HEADER_BYTES, MAX_TLS_PEER_CERTIFICATES,

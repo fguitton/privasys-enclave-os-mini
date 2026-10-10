@@ -305,14 +305,24 @@ pub fn decode_worker_storage_request(bytes: &[u8]) -> Option<(WorkerStorageOpera
 /// Private accepted-data batch: bounded ciphertext records, never a durable ACK.
 pub const MAX_WORKER_STORAGE_BATCH_BYTES: usize = 768 * 1024;
 pub const MAX_WORKER_STORAGE_BATCH_RECORDS: usize = 64;
-pub fn encode_worker_storage_put_batch(table: &[u8], records: &[(&[u8], &[u8])]) -> Option<Vec<u8>> {
-    if table.is_empty() || table.len()>256 || records.is_empty() || records.len()>MAX_WORKER_STORAGE_BATCH_RECORDS { return None; }
-    let mut length=4usize.checked_add(table.len())?;
+pub const MAX_WORKER_STORAGE_BATCH_TABLE_BYTES: usize = 256;
+pub const MAX_WORKER_STORAGE_BATCH_KEY_BYTES: usize = 512;
+pub const WORKER_STORAGE_BATCH_HEADER_BYTES: usize = 2 * core::mem::size_of::<u16>();
+pub const WORKER_STORAGE_BATCH_RECORD_HEADER_BYTES: usize = core::mem::size_of::<u16>() + core::mem::size_of::<u32>();
+/// Complete existing batch payload size; validated before allocation.
+pub fn worker_storage_put_batch_encoded_len(table: &[u8], records: &[(&[u8], &[u8])]) -> Option<usize> {
+    if table.is_empty() || table.len()>MAX_WORKER_STORAGE_BATCH_TABLE_BYTES
+        || records.is_empty() || records.len()>MAX_WORKER_STORAGE_BATCH_RECORDS { return None; }
+    let mut length=WORKER_STORAGE_BATCH_HEADER_BYTES.checked_add(table.len())?;
     for (key,value) in records {
-        if key.is_empty() || key.len()>512 || value.is_empty() { return None; }
-        length=length.checked_add(6)?.checked_add(key.len())?.checked_add(value.len())?;
+        if key.is_empty() || key.len()>MAX_WORKER_STORAGE_BATCH_KEY_BYTES || value.is_empty() { return None; }
+        u32::try_from(value.len()).ok()?;
+        length=length.checked_add(WORKER_STORAGE_BATCH_RECORD_HEADER_BYTES)?.checked_add(key.len())?.checked_add(value.len())?;
     }
-    if length>MAX_WORKER_STORAGE_BATCH_BYTES { return None; }
+    (length<=MAX_WORKER_STORAGE_BATCH_BYTES).then_some(length)
+}
+pub fn encode_worker_storage_put_batch(table: &[u8], records: &[(&[u8], &[u8])]) -> Option<Vec<u8>> {
+    let length=worker_storage_put_batch_encoded_len(table, records)?;
     let mut out=Vec::with_capacity(length);
     out.extend_from_slice(&u16::try_from(table.len()).ok()?.to_le_bytes());out.extend_from_slice(table);
     out.extend_from_slice(&u16::try_from(records.len()).ok()?.to_le_bytes());
@@ -326,15 +336,15 @@ pub type WorkerStorageBatchRecords<'a> = Vec<(&'a [u8], &'a [u8])>;
 pub fn decode_worker_storage_put_batch(bytes: &[u8]) -> Option<(&[u8], WorkerStorageBatchRecords<'_>)> {
     if bytes.len()>MAX_WORKER_STORAGE_BATCH_BYTES { return None; }
     let table_len=usize::from(u16::from_le_bytes(bytes.get(..2)?.try_into().ok()?));
-    if table_len==0 || table_len>256 { return None; }
+    if table_len==0 || table_len>MAX_WORKER_STORAGE_BATCH_TABLE_BYTES { return None; }
     let table=bytes.get(2..2+table_len)?;let mut offset=2+table_len;
     let count=usize::from(u16::from_le_bytes(bytes.get(offset..offset+2)?.try_into().ok()?));offset+=2;
     if count==0 || count>MAX_WORKER_STORAGE_BATCH_RECORDS { return None; }
     let mut records=Vec::with_capacity(count);
     for _ in 0..count {
         let key_len=usize::from(u16::from_le_bytes(bytes.get(offset..offset+2)?.try_into().ok()?));
-        let value_len=usize::try_from(u32::from_le_bytes(bytes.get(offset+2..offset+6)?.try_into().ok()?)).ok()?;offset+=6;
-        if key_len==0 || key_len>512 || value_len==0 { return None; }
+        let value_len=usize::try_from(u32::from_le_bytes(bytes.get(offset+2..offset+WORKER_STORAGE_BATCH_RECORD_HEADER_BYTES)?.try_into().ok()?)).ok()?;offset+=WORKER_STORAGE_BATCH_RECORD_HEADER_BYTES;
+        if key_len==0 || key_len>MAX_WORKER_STORAGE_BATCH_KEY_BYTES || value_len==0 { return None; }
         let key=bytes.get(offset..offset.checked_add(key_len)?)?;offset+=key_len;
         let value=bytes.get(offset..offset.checked_add(value_len)?)?;offset+=value_len;
         records.push((key,value));

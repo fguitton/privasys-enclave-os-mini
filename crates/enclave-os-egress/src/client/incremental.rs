@@ -334,10 +334,10 @@ impl IncrementalTlsClient {
     }
 }
 
-const MAX_INCREMENTAL_TLS_FRAGMENT: usize = 1024 * 1024;
-const MAX_INCREMENTAL_TLS_OUTPUT: usize = 1024 * 1024;
-const MAX_INCREMENTAL_REQUEST: usize = 512 * 1024;
-const MAX_INCREMENTAL_PLAINTEXT: usize = 2 * 1024 * 1024;
+pub const MAX_INCREMENTAL_TLS_FRAGMENT: usize = 1024 * 1024;
+pub const MAX_INCREMENTAL_TLS_OUTPUT: usize = 1024 * 1024;
+pub const MAX_INCREMENTAL_REQUEST: usize = 512 * 1024;
+pub const MAX_INCREMENTAL_PLAINTEXT: usize = 2 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {

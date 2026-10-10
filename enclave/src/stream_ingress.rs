@@ -26,17 +26,36 @@ pub type HonestStreamIngressEligible=fn(&HttpRequest,usize)->bool;
 pub type HonestStreamIngressBegin=fn(&HttpRequest,usize,&RequestContext)->Result<Box<dyn HonestStreamIngressReceiver>,HonestIngressResponse>;
 pub(crate) type Hooks=(HonestStreamIngressEligible,HonestStreamIngressBegin);
 
-pub(crate) struct SlotCharge;
+pub(crate) struct SlotCharge {
+    _allocation:Option<std::sync::Arc<enclave_os_common::allocation::AllocationLeaseV1>>,
+}
 static OWNED:std::sync::atomic::AtomicUsize=std::sync::atomic::AtomicUsize::new(0);
 impl SlotCharge {
     pub(crate) fn reserve()->Option<std::sync::Arc<Self>> {
-        OWNED.fetch_update(std::sync::atomic::Ordering::AcqRel,std::sync::atomic::Ordering::Acquire,|n|(n<MAX_STREAM_INGRESS_SESSIONS).then_some(n+1)).ok().map(|_|std::sync::Arc::new(Self))
+        OWNED.fetch_update(std::sync::atomic::Ordering::AcqRel,std::sync::atomic::Ordering::Acquire,|n|(n<MAX_STREAM_INGRESS_SESSIONS).then_some(n+1)).ok().map(|_|std::sync::Arc::new(Self{
+            _allocation:None,
+        }))
+    }
+}
+#[cfg(target_env="sgx")]
+impl SlotCharge {
+    // Count remains the existing logical marker policy. Allocation is a shared
+    // actual session/fragment owner, retained through terminal receiver teardown.
+    pub(crate) fn reserve_for_session(session:&mut crate::ratls::session::RaTlsSession)->Option<std::sync::Arc<Self>> {
+        let allocation=session.reserve_stream_allocation().ok()?;
+        Self::reserve_with_allocation(allocation)
+    }
+}
+impl SlotCharge {
+    pub(crate) fn reserve_with_allocation(allocation:std::sync::Arc<enclave_os_common::allocation::AllocationLeaseV1>)->Option<std::sync::Arc<Self>> {
+        if allocation.bytes()<crate::ratls::session::RaTlsSession::stream_allocation_bytes()?{return None;}
+        let mut slot=Self::reserve()?;
+        std::sync::Arc::get_mut(&mut slot)?._allocation=Some(allocation);Some(slot)
     }
 }
 impl Drop for SlotCharge{fn drop(&mut self){OWNED.fetch_sub(1,std::sync::atomic::Ordering::AcqRel);}}
 pub(crate) struct ChargedReceiver {pub value:Box<dyn HonestStreamIngressReceiver>,pub lease:std::sync::Arc<SlotCharge>}
 pub(crate) struct Slot {
-    pub lease:std::sync::Arc<SlotCharge>,
     pub nonce:u64,
     pub generation:u64,
     pub binding:[u8;32],
@@ -48,6 +67,8 @@ pub(crate) struct Slot {
     pub length:usize,
     pub close:bool,
     pub started:std::time::Instant,
+    // Actual fragment/context/receiver fields die before the final credit alias.
+    pub lease:std::sync::Arc<SlotCharge>,
 }
 /// The fixed session marker remains reserved during this move-only work. The
 /// actual TLS context is checked again before committing any completion.

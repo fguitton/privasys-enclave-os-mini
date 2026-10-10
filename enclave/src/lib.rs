@@ -57,7 +57,7 @@ mod http_response;
 pub use http_response::{HttpResponseBody, HttpResponsePayload};
 
 mod allocation_admission;
-pub use allocation_admission::{local_allocation_pool, reserve_local_allocation};
+pub use allocation_admission::{local_allocation_pool, reserve_local_allocation, take_local_allocation_release};
 pub mod config_merkle;
 pub mod cpuid_cache;
 pub mod crypto;
@@ -144,12 +144,8 @@ pub fn register_honest_deferred_ingress_hook_with_metadata(
     HONEST_DEFERRED_INGRESS_HOOK.set((eligible, metadata, hook, poll, cancel)).map_err(|_| -1)
 }
 
-/// Bounded response returned by the adopter-owned Honest ingress handler.
-pub struct HonestIngressResponse {
-    pub status: u16,
-    pub content_type: &'static str,
-    pub body: HttpResponsePayload,
-}
+mod ingress_response;
+pub use ingress_response::HonestIngressResponse;
 
 /// Optional adopter-owned execution worker.
 pub type ExecutionWorkerHook = fn(worker_id: u32) -> i32;

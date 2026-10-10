@@ -313,6 +313,20 @@ fn check_worker_storage_reservation() {
         &vec![0; MAX_HONEST_RPC_PAYLOAD_BYTES]
     )
     .is_err());
+    let key = vec![7; MAX_WORKER_STORAGE_BATCH_KEY_BYTES];
+    let framing = WORKER_STORAGE_BATCH_HEADER_BYTES + 1 + WORKER_STORAGE_BATCH_RECORD_HEADER_BYTES + key.len();
+    let value = vec![9; MAX_WORKER_STORAGE_BATCH_BYTES - framing + 1];
+    for length in [value.len()-2, value.len()-1] {
+        let records = [(key.as_slice(), &value[..length])];
+        let wire = encode_worker_storage_put_batch(b"t", &records).unwrap();
+        assert_eq!(worker_storage_put_batch_encoded_len(b"t", &records), Some(wire.len()));
+        assert_eq!(decode_worker_storage_put_batch(&wire).unwrap().1, records);
+        let mut trailing = wire; trailing.push(0);
+        assert!(decode_worker_storage_put_batch(&trailing).is_none());
+    }
+    assert!(encode_worker_storage_put_batch(b"t", &[(key.as_slice(),value.as_slice())]).is_none());
+    assert!(encode_worker_storage_put_batch(b"t", &[(vec![0;key.len()+1].as_slice(),b"v")]).is_none());
+    assert!(worker_storage_put_batch_encoded_len(b"t", &[]).is_none());
     println!("WORKER-STORAGE-RPC: actual framedtoken/role/size/nestedBusy/releasednetworkreservation PASS");
 }
 

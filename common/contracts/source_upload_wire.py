@@ -82,7 +82,7 @@ def load_producer_geometry(path):
             result[key] = value
         return result
     value = json.loads(raw, object_pairs_hook=unique)
-    fields = ('default_plaintext_bytes', 'largest_plaintext_bytes', 'maximum_page_bytes', 'maximum_manifest_bytes')
+    fields = ('default_plaintext_bytes', 'largest_plaintext_bytes', 'maximum_page_bytes', 'maximum_manifest_bytes', 'staged_group_frames', 'staged_open_slots')
     if (set(value) != {'schema_version', 'contract', *fields}
             or type(value['schema_version']) is not int or value['schema_version'] != 1
             or value['contract'] != 'honest-source-upload-producer-geometry-v1'):
@@ -94,6 +94,9 @@ def load_producer_geometry(path):
         if type(n) is not int or not 0 < n <= 2**31-1:
             raise ValueError('invalid producer geometry scalar')
         result[key.upper()] = n
+    if (result['STAGED_GROUP_FRAMES'] > result['STAGED_OPEN_SLOTS']
+            or result['STAGED_OPEN_SLOTS'] > 255):
+        raise ValueError('staged group exceeds signed Open field or slots')
     width = result['PEER_MANIFEST_LENGTH_END'] - result['PEER_MANIFEST_LENGTH_START']
     if result['MAXIMUM_MANIFEST_BYTES'] >= 1 << (8 * width):
         raise ValueError('producer manifest exceeds wire length field')
@@ -104,6 +107,10 @@ def load_producer_geometry(path):
         if item > 2**31-1:
             raise ValueError('producer frame overflow')
         result[profile+'_FRAME_ITEM_BYTES'] = item
+    group = result['BATCH_HEADER_BYTES'] + result['STAGED_GROUP_FRAMES'] * result['LARGEST_FRAME_ITEM_BYTES']
+    if group + result['PEER_HEADER_BYTES'] + result['MAXIMUM_MANIFEST_BYTES'] > 2**31-1:
+        raise ValueError('staged peer body overflow')
+    result['STAGED_GROUP_BODY_BYTES'] = group
     return result
 
 def frame_item_bytes(contract, plaintext):

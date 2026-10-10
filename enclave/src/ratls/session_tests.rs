@@ -453,6 +453,14 @@ fn streamed_request_preserves_tls_and_following_request() {
     write_requests(&mut client,&mut session,head.as_bytes());
     let(header,head_bytes,length)=session.stream_head().unwrap().unwrap();
     assert!(header.body.is_empty());assert_eq!(length,body.len());assert!(session.validate_stream_head());
+    let working=RaTlsSession::stream_allocation_bytes().unwrap();
+    let physical=enclave_os_common::allocation::AllocationPoolV1::new(working).unwrap();
+    let insufficient=enclave_os_common::allocation::AllocationPoolV1::new(working-1).unwrap();
+    assert!(session.admit_stream_allocation(&insufficient).is_err());
+    assert_eq!(insufficient.used(),0);
+    let allocation=session.admit_stream_allocation(&physical).unwrap();
+    assert_eq!(physical.used(),working);assert!(physical.reserve(1).is_none());
+    assert!(session.admit_stream_allocation(&insufficient).is_err());
     session.consume_stream_head(head_bytes).unwrap();
     let context=enclave_os_common::modules::RequestContext{
         ingress_class:enclave_os_common::modules::IngressClass::ExternalNetwork,connection_id:7,
@@ -461,7 +469,7 @@ fn streamed_request_preserves_tls_and_following_request() {
         channel_binder:Some(binding.clone()),peer_cert_der:None,peer_evidence:None,
         attestation:session.attestation().into(),oidc_claims:None,
     };
-    let mut work=crate::stream_ingress::Work{lease:crate::stream_ingress::SlotCharge::reserve().unwrap(),connection:7,nonce:1,generation:1,binding:binding.as_slice().try_into().unwrap(),context:Some(context),context_charge:None,header:Some(header),receiver:None,bytes:vec![],length,remaining:length,pending:false};
+    let mut work=crate::stream_ingress::Work{lease:crate::stream_ingress::SlotCharge::reserve_with_allocation(allocation.clone()).unwrap(),connection:7,nonce:1,generation:1,binding:binding.as_slice().try_into().unwrap(),context:Some(context),context_charge:None,header:Some(header),receiver:None,bytes:vec![],length,remaining:length,pending:false};
     assert!(crate::stream_ingress::run_work(fixture_begin,&mut work).is_none());
     for part in body.chunks(32*1024){write_requests(&mut client,&mut session,part);}
     write_requests(&mut client,&mut session,b"GET /next HTTP/1.1\r\nHost: stream.test\r\n\r\n");
@@ -514,6 +522,10 @@ fn streamed_request_preserves_tls_and_following_request() {
     assert!(session.stream_head().unwrap().is_some());assert!(!session.validate_stream_head());
     assert!(store.unregister("stream.test"));
     assert!(session.stream_head().is_err());assert!(session.attestation_failed());
+    drop(session);drop(allocation);
+    assert_eq!(physical.used(),working,"outside-STATE fragment/work owns allocation after session teardown");
+    drop(work);assert_eq!(physical.used(),0);
+
 }
 
 struct FixtureReceiver {bytes:Vec<u8>,binding:Vec<u8>}

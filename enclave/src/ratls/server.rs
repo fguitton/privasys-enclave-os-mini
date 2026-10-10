@@ -735,7 +735,11 @@ impl IngressServer {
                         if !session.validate_stream_head() || session.attestation_failed() || self.stream_owner.pending.len()+self.stream_owner.cancelled.len()+crate::stream_ingress::terminal_count()>=crate::MAX_STREAM_INGRESS_SESSIONS {self.send_close(conn_id);return false;}
                         let Some(binding)=session.channel_binder().as_deref().and_then(|b|<[u8;32]>::try_from(b).ok()) else {self.send_close(conn_id);return false;};
                         let Some(nonce)=self.next_stream.checked_add(1) else {self.send_close(conn_id);return false;};self.next_stream=nonce;
-                        let Some(lease)=crate::stream_ingress::SlotCharge::reserve() else{self.send_close(conn_id);return false;};
+                        #[cfg(target_env="sgx")]
+                        let lease=crate::stream_ingress::SlotCharge::reserve_for_session(session);
+                        #[cfg(not(target_env="sgx"))]
+                        let lease=crate::stream_ingress::SlotCharge::reserve();
+                        let Some(lease)=lease else{self.send_close(conn_id);return false;};
                         let close=header.connection_close;
                         if session.consume_stream_head(head).is_err(){self.send_close(conn_id);return false;}
                         self.stream_owner.pending.insert(conn_id,crate::stream_ingress::Slot{lease,nonce,generation:self.stream_generations[&conn_id],binding,header:Some(header),receiver:None,remaining:length,fragment:Vec::new(),parked:false,length,close,started:std::time::Instant::now()});
