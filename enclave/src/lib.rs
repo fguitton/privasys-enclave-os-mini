@@ -56,6 +56,8 @@ extern crate sgx_types;
 mod http_response;
 pub use http_response::{HttpResponseBody, HttpResponsePayload};
 
+mod allocation_admission;
+pub use allocation_admission::{local_allocation_pool, reserve_local_allocation};
 pub mod config_merkle;
 pub mod cpuid_cache;
 pub mod crypto;

@@ -506,6 +506,7 @@ mod tests {
 
     #[test]
     fn test_single_message() {
+        crate::allocation::check_allocation_owner();
         let (producer, consumer) = alloc_test_queue(4096);
 
         let msg = b"Hello, enclave!";
