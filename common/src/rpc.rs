@@ -106,6 +106,32 @@ pub const REQ_HEADER_SIZE: usize = 14;
 /// Response header size in bytes: req_id(8) + status(4) + payload_len(4) = 16.
 pub const RESP_HEADER_SIZE: usize = 16;
 
+/// Validate complete RPC framing before allocation or endpoint reservation.
+pub fn framed_payload_len_valid(payload: usize, header: usize, message_maximum: usize) -> bool {
+    payload <= u32::MAX as usize
+        && payload.checked_add(header).is_some_and(|bytes| {
+            bytes <= message_maximum.min(crate::queue::MAX_MSG_SIZE as usize)
+        })
+}
+
+pub fn encode_request_bounded(
+    req_id: u64, method: RpcMethod, payload: &[u8], message_maximum: usize,
+) -> Option<Vec<u8>> {
+    if !framed_payload_len_valid(payload.len(), REQ_HEADER_SIZE, message_maximum) {
+        return None;
+    }
+    Some(encode_request(req_id, method, payload))
+}
+
+pub fn encode_response_bounded(
+    req_id: u64, status: i32, payload: &[u8], message_maximum: usize,
+) -> Option<Vec<u8>> {
+    if !framed_payload_len_valid(payload.len(), RESP_HEADER_SIZE, message_maximum) {
+        return None;
+    }
+    Some(encode_response(req_id, status, payload))
+}
+
 /// Encode an RPC request into a byte buffer.
 ///
 /// Format: `[u64 req_id LE] [u16 method LE] [u32 payload_len LE] [payload]`
@@ -733,6 +759,15 @@ mod tests {
         assert_eq!(req_id, 42);
         assert_eq!(method, RpcMethod::NetTcpListen);
         assert_eq!(decoded_payload, payload);
+        let maximum = crate::queue::max_message_bytes(crate::queue::DEFAULT_QUEUE_CAPACITY);
+        let exact = vec![19; maximum - REQ_HEADER_SIZE];
+        assert_eq!(
+            encode_request_bounded(42, RpcMethod::NetTcpListen, &exact, maximum).unwrap(),
+            encode_request(42, RpcMethod::NetTcpListen, &exact),
+        );
+        assert!(encode_request_bounded(42, RpcMethod::NetTcpListen,
+            &vec![23; exact.len() + 1], maximum).is_none());
+        assert!(!framed_payload_len_valid(usize::MAX, REQ_HEADER_SIZE, maximum));
     }
 
     #[test]
@@ -743,6 +778,17 @@ mod tests {
         assert_eq!(req_id, 42);
         assert_eq!(status, 0);
         assert_eq!(decoded_payload, payload);
+        let maximum = crate::queue::max_message_bytes(crate::queue::DEFAULT_QUEUE_CAPACITY);
+        assert_eq!(encode_response_bounded(42, 0, payload, maximum).unwrap(), encoded);
+        for bytes in [maximum - RESP_HEADER_SIZE - 1, maximum - RESP_HEADER_SIZE] {
+            let body = vec![31; bytes];
+            let response = encode_response_bounded(42, 0, &body, maximum).unwrap();
+            assert_eq!(response, encode_response(42, 0, &body));
+            assert_eq!(decode_response(&response), Some((42, 0, body.as_slice())));
+        }
+        assert!(encode_response_bounded(42, 0,
+            &vec![29; maximum - RESP_HEADER_SIZE + 1], maximum).is_none());
+        assert!(!framed_payload_len_valid(usize::MAX, RESP_HEADER_SIZE, maximum));
     }
 
     #[test]
@@ -1392,7 +1438,8 @@ mod tests {
         // Invalid IDs
         assert_eq!(RpcMethod::from_u16(0x0000), None);
         assert_eq!(RpcMethod::from_u16(0x0106), None);
-        assert_eq!(RpcMethod::from_u16(0x0208), None);
+        assert_eq!(RpcMethod::from_u16(0x0208), Some(RpcMethod::WorkerStorage));
+        assert_eq!(RpcMethod::from_u16(0x0209), None);
         assert_eq!(RpcMethod::from_u16(0xFFFF), None);
     }
 }

@@ -258,15 +258,21 @@ impl RpcDispatcher {
                 method
             );
             let response = rpc::encode_response(req_id, -13, &[]);
-            self.response_tx.send(&response);
+            if self.response_tx.send_bounded(&response).is_err() {
+                error!("legacy rejection response exceeds actual queue capacity");
+            }
             return;
         }
 
         let (status, response_payload) = self.dispatch_method(method, payload);
 
         // Send response back to legacy Mini callers.
-        let resp = rpc::encode_response(req_id, status, &response_payload);
-        self.response_tx.send(&resp);
+        let resp = rpc::encode_response_bounded(
+            req_id, status, &response_payload, self.response_tx.max_message_bytes(),
+        ).unwrap_or_else(|| rpc::encode_response(req_id, -90, &[]));
+        if self.response_tx.send_bounded(&resp).is_err() {
+            error!("legacy response exceeds actual queue capacity");
+        }
     }
 
     fn dispatch_method(&self, method: RpcMethod, payload: &[u8]) -> (i32, Vec<u8>) {

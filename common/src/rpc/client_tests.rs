@@ -61,6 +61,7 @@ fn receive(queue: &SpscConsumer) -> Vec<u8> {
 }
 
 pub(super) fn check_synchronous_ownership() {
+    check_actual_capacity_refusal();
     check_synchronous_pair(false);
     check_synchronous_pair(true);
     check_polled_owner();
@@ -69,6 +70,29 @@ pub(super) fn check_synchronous_ownership() {
     check_rejected_wait();
     check_worker_storage_reservation();
     check_ready_recheck();
+}
+
+fn check_actual_capacity_refusal() {
+    let (tx, host_rx) = queue();
+    let maximum = tx.max_message_bytes();
+    let (host_tx, rx) = queue();
+    let rpc = client::RpcClient::new(tx, rx);
+    let too_large = vec![41; maximum];
+    assert_eq!(rpc.kv_put(b"t", b"k", &too_large), Err(-22));
+    assert!(host_rx.try_recv().is_none());
+    assert!(matches!(
+        rpc.try_execution_net_send(3, 8, 7, &too_large),
+        Err(client::PolledExecutionRpcError::InvalidRequest),
+    ));
+    assert!(host_rx.try_recv().is_none());
+    let host = std::thread::spawn(move || {
+        let raw = receive(&host_rx);
+        let (id, method, _) = decode_request(&raw).unwrap();
+        assert_eq!(method, RpcMethod::KvPut);
+        host_tx.send_bounded(&encode_response(id, 0, &[])).unwrap();
+    });
+    rpc.kv_put(b"t", b"k", b"real bounded value").unwrap();
+    host.join().unwrap();
 }
 
 fn check_synchronous_pair(durable_first: bool) {

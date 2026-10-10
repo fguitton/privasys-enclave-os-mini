@@ -1593,6 +1593,7 @@ mod tests {
         let mut sockets = Vec::new();
         let mut ingress_ids = Vec::new();
         let mut peer_ids = Vec::new();
+        let mut read_identities = HashMap::new();
         for _ in 0..3 {
             sockets
                 .push(TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, ingress_port)).unwrap());
@@ -1602,7 +1603,16 @@ mod tests {
             while collected < 2 {
                 fixture.proxy.accept_connections();
                 while let Some(message) = fixture.from_host.try_recv() {
-                    let (kind, id, _) = channel::decode_channel_msg(&message).unwrap();
+                    let (kind, id, payload) = channel::decode_channel_msg(&message).unwrap();
+                    if kind == ChannelMsgType::TcpReadIdentity {
+                        assert!(cfg!(feature = "stream-read-credit"));
+                        let generation = channel::decode_tcp_read_identity(payload).unwrap();
+                        assert_ne!(generation, 0);
+                        assert_eq!(generation, fixture.proxy.connections[&id].connection_generation);
+                        assert!(ingress_ids.contains(&id) || peer_ids.contains(&id));
+                        assert!(read_identities.insert(id, generation).is_none());
+                        continue;
+                    }
                     assert_eq!(kind, ChannelMsgType::TcpNew);
                     if id < CONN_ID_PEER_IN_BASE {
                         assert_ne!(id, 0);
@@ -1630,6 +1640,7 @@ mod tests {
             ]
         );
         assert_eq!(fixture.proxy.connections.len(), sockets.len());
+        assert_eq!(read_identities.len(), if cfg!(feature = "stream-read-credit") { sockets.len() } else { 0 });
     }
 
     #[test]

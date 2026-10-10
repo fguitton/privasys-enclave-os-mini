@@ -193,6 +193,11 @@ impl RpcClient {
         if !rpc::honest_role_allows_method(RpcRole::Execution, method) {
             return Err(PolledExecutionRpcError::MethodDenied);
         }
+        if !rpc::framed_payload_len_valid(
+            payload.len(), rpc::HONEST_REQ_HEADER_SIZE, self.request_tx.max_message_bytes(),
+        ) {
+            return Err(PolledExecutionRpcError::InvalidRequest);
+        }
         let operation_id = self.try_reserve_request().map_err(|error| match error {
             RequestReserveError::Busy => PolledExecutionRpcError::Busy,
             RequestReserveError::OperationIdExhausted => {
@@ -403,6 +408,11 @@ impl RpcClient {
     ///
     /// Returns `(status, payload)` from the host's response.
     fn call(&self, method: RpcMethod, payload: &[u8]) -> (i32, Vec<u8>) {
+        if !rpc::framed_payload_len_valid(
+            payload.len(), rpc::REQ_HEADER_SIZE, self.request_tx.max_message_bytes(),
+        ) {
+            return (-22, Vec::new());
+        }
         let Ok(_exchange) = self.synchronous_exchange.lock() else {
             return (-1, Vec::new());
         };
@@ -413,10 +423,17 @@ impl RpcClient {
             Err(RequestReserveError::Busy) => return (-16, Vec::new()),
             Err(RequestReserveError::OperationIdExhausted) => return (-75, Vec::new()),
         };
-        let msg = rpc::encode_request(req_id, method, payload);
+        let Some(msg) = rpc::encode_request_bounded(
+            req_id, method, payload, self.request_tx.max_message_bytes(),
+        ) else {
+            self.release_request(req_id);
+            return (-22, Vec::new());
+        };
 
-        // Send
-        self.request_tx.send(&msg);
+        if self.request_tx.send_bounded(&msg).is_err() {
+            self.release_request(req_id);
+            return (-22, Vec::new());
+        }
 
         // Wake the host dispatcher
         notify_host();
@@ -525,6 +542,11 @@ impl RpcClient {
     /// Active consensus scheduling should use a separate polled adapter.
     pub fn kv_put_durable(&self, table: &[u8], key: &[u8], value: &[u8]) -> Result<(), i32> {
         let payload = rpc::encode_durable_kv_put_req(table, key, value).ok_or(-22)?;
+        if !rpc::framed_payload_len_valid(
+            payload.len(), rpc::REQ_HEADER_SIZE, self.request_tx.max_message_bytes(),
+        ) {
+            return Err(-22);
+        }
         let _exchange = self.synchronous_exchange.lock().map_err(|_| -1)?;
         let request_id = self.try_reserve_request().map_err(|error| match error {
             RequestReserveError::Busy => -16,

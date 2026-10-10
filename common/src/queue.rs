@@ -59,8 +59,33 @@ const CACHE_LINE: usize = 64;
 /// Message header size (4 bytes for length prefix).
 pub const MSG_HEADER_SIZE: usize = 4;
 
-/// Maximum single message size.
-pub const MAX_MSG_SIZE: u32 = 4 * 1024 * 1024; // 4 MiB
+/// Shared channel allocation bounds, owned by the queue primitive.
+pub const MIN_SHARED_QUEUE_CAPACITY: u64 = 4096;
+pub const MAX_SHARED_QUEUE_CAPACITY: u64 = 16 * 1024 * 1024;
+/// Existing maximum complete ring frame, including its length prefix.
+pub const MAX_RING_FRAME_BYTES: u64 = 4 * 1024 * 1024;
+/// Maximum message payload; complete framing is checked against actual capacity.
+pub const MAX_MSG_SIZE: u32 = (MAX_RING_FRAME_BYTES - MSG_HEADER_SIZE as u64) as u32;
+const _: () = assert!(
+    DEFAULT_QUEUE_CAPACITY.is_power_of_two()
+        && DEFAULT_QUEUE_CAPACITY >= MIN_SHARED_QUEUE_CAPACITY
+        && DEFAULT_QUEUE_CAPACITY <= MAX_SHARED_QUEUE_CAPACITY
+        && MAX_RING_FRAME_BYTES <= MAX_SHARED_QUEUE_CAPACITY
+        && MAX_RING_FRAME_BYTES > MSG_HEADER_SIZE as u64
+        && MAX_RING_FRAME_BYTES <= u32::MAX as u64
+);
+
+pub const fn shared_queue_capacity_valid(capacity: u64) -> bool {
+    capacity.is_power_of_two()
+        && capacity >= MIN_SHARED_QUEUE_CAPACITY
+        && capacity <= MAX_SHARED_QUEUE_CAPACITY
+}
+
+/// Complete frames must fit both the primitive ceiling and the actual ring.
+pub const fn max_message_bytes(capacity: u64) -> usize {
+    let frame = if capacity < MAX_RING_FRAME_BYTES { capacity } else { MAX_RING_FRAME_BYTES };
+    frame.saturating_sub(MSG_HEADER_SIZE as u64) as usize
+}
 
 /// The shared queue header, laid out for cache-line alignment.
 ///
@@ -90,7 +115,8 @@ impl SpscQueueHeader {
     /// Create a new zeroed header with the given capacity.
     pub fn new(capacity: u64) -> Self {
         assert!(capacity.is_power_of_two(), "capacity must be power of 2");
-        assert!(capacity >= 4096, "capacity must be >= 4096");
+        assert!(capacity >= MIN_SHARED_QUEUE_CAPACITY, "capacity must be >= 4096");
+        assert!(shared_queue_capacity_valid(capacity), "invalid shared queue capacity");
         Self {
             head: AtomicU64::new(0),
             _pad_head: [0; CACHE_LINE - 8],
@@ -136,9 +162,9 @@ impl SpscQueueHeader {
 pub struct SpscProducer {
     header: *const SpscQueueHeader,
     buf_ptr: *mut u8,
-    /// Trusted-at-construction snapshot. Enclave users validate the header and
-    /// backing range before calling `from_raw`; later host mutation cannot
-    /// redirect indexing beyond that validated range.
+    /// Trusted capacity supplied by the caller that validated the backing range.
+    /// Enclave callers use `from_raw_with_capacity` to avoid rereading a
+    /// mutable untrusted header after validation.
     capacity: u64,
 }
 
@@ -154,6 +180,19 @@ impl SpscProducer {
     /// - Only one producer may exist for a given queue
     pub unsafe fn from_raw(header: *const SpscQueueHeader, buf_ptr: *mut u8) -> Self {
         let capacity = core::ptr::read_volatile(core::ptr::addr_of!((*header).capacity));
+        Self::from_raw_with_capacity(header, buf_ptr, capacity)
+    }
+
+    /// Construct with an already validated capacity; never reread host geometry.
+    ///
+    /// # Safety
+    /// The header must be valid and aligned, the buffer must cover `capacity`
+    /// bytes for the handle lifetime, and only one endpoint of this role may
+    /// exist. The caller validates the scalar and backing range together.
+    pub unsafe fn from_raw_with_capacity(
+        header: *const SpscQueueHeader, buf_ptr: *mut u8, capacity: u64,
+    ) -> Self {
+        assert!(shared_queue_capacity_valid(capacity), "invalid shared queue capacity");
         Self {
             header,
             buf_ptr,
@@ -167,14 +206,22 @@ impl SpscProducer {
         (header.head.load(Ordering::Acquire),header.tail.load(Ordering::Acquire))
     }
 
-    /// Try to write a message. Returns `Ok(())` if written, `Err(())` if full.
-    pub fn try_send(&self, msg: &[u8]) -> Result<(), ()> {
-        let hdr = unsafe { &*self.header };
-        let total = MSG_HEADER_SIZE as u64 + msg.len() as u64;
+    /// Maximum payload for this endpoint's trusted capacity snapshot.
+    pub const fn max_message_bytes(&self) -> usize {
+        max_message_bytes(self.capacity)
+    }
 
-        if total > MAX_MSG_SIZE as u64 {
+    pub fn message_len_valid(&self, bytes: usize) -> bool {
+        bytes <= self.max_message_bytes()
+    }
+
+    /// Try to write a message. Oversize and transient queue pressure both refuse.
+    pub fn try_send(&self, msg: &[u8]) -> Result<(), ()> {
+        if !self.message_len_valid(msg.len()) {
             return Err(());
         }
+        let hdr = unsafe { &*self.header };
+        let total = MSG_HEADER_SIZE as u64 + msg.len() as u64;
 
         // Check available space
         let head = hdr.head.load(Ordering::Relaxed);
@@ -201,17 +248,22 @@ impl SpscProducer {
         Ok(())
     }
 
-    /// Blocking send: spins until space is available, then writes.
-    pub fn send(&self, msg: &[u8]) {
+    /// Blocking send with permanent size refusal before waiting for space.
+    pub fn send_bounded(&self, msg: &[u8]) -> Result<(), ()> {
+        if !self.message_len_valid(msg.len()) {
+            return Err(());
+        }
         loop {
             match self.try_send(msg) {
-                Ok(()) => return,
-                Err(()) => {
-                    // Spin with a hint (reduces power on x86)
-                    core::hint::spin_loop();
-                }
+                Ok(()) => return Ok(()),
+                Err(()) => core::hint::spin_loop(),
             }
         }
+    }
+
+    /// Legacy convenience API; invalid geometry fails instead of spinning forever.
+    pub fn send(&self, msg: &[u8]) {
+        self.send_bounded(msg).expect("message exceeds actual queue capacity");
     }
 
     /// Write bytes into the ring buffer at the given offset, handling wrap-around.
@@ -307,6 +359,19 @@ impl SpscConsumer {
     /// Same requirements as `SpscProducer::from_raw`.
     pub unsafe fn from_raw(header: *const SpscQueueHeader, buf_ptr: *const u8) -> Self {
         let capacity = core::ptr::read_volatile(core::ptr::addr_of!((*header).capacity));
+        Self::from_raw_with_capacity(header, buf_ptr, capacity)
+    }
+
+    /// Construct with an already validated capacity; never reread host geometry.
+    ///
+    /// # Safety
+    /// The header must be valid and aligned, the buffer must cover `capacity`
+    /// bytes for the handle lifetime, and only one endpoint of this role may
+    /// exist. The caller validates the scalar and backing range together.
+    pub unsafe fn from_raw_with_capacity(
+        header: *const SpscQueueHeader, buf_ptr: *const u8, capacity: u64,
+    ) -> Self {
+        assert!(shared_queue_capacity_valid(capacity), "invalid shared queue capacity");
         Self {
             header,
             buf_ptr,
@@ -334,7 +399,7 @@ impl SpscConsumer {
         self.read_bytes(tail, &mut len_bytes);
         let msg_len = u32::from_le_bytes(len_bytes) as u64;
 
-        if msg_len > MAX_MSG_SIZE as u64 {
+        if msg_len > max_message_bytes(self.capacity) as u64 {
             // Corrupted message – skip and advance tail past the header
             hdr.tail
                 .store(tail + MSG_HEADER_SIZE as u64, Ordering::Release);
@@ -478,6 +543,19 @@ mod tests {
         }
         producer.try_send(b"bounded").unwrap();
         assert_eq!(consumer.try_recv().unwrap(), b"bounded");
+        // The validated scalar remains authoritative even when the untrusted
+        // header changes before handle construction, as at the ECALL boundary.
+        drop(producer);
+        drop(consumer);
+        let (producer, consumer) = unsafe {
+            (SpscProducer::from_raw_with_capacity(header, buf_ptr, 4096),
+             SpscConsumer::from_raw_with_capacity(header, buf_ptr, 4096))
+        };
+        assert_eq!(producer.max_message_bytes(), 4096 - MSG_HEADER_SIZE);
+        let exact = vec![37; producer.max_message_bytes()];
+        producer.send_bounded(&exact).unwrap();
+        assert_eq!(consumer.try_recv().unwrap(), exact);
+        assert!(producer.send_bounded(&vec![0; producer.max_message_bytes()+1]).is_err());
     }
 
     #[test]
@@ -600,20 +678,29 @@ mod tests {
     #[test]
     fn test_message_too_large_rejected() {
         let (producer, _consumer) = alloc_test_queue(4096);
-        // MAX_MSG_SIZE is 4 MiB; a message larger than that is rejected
+        // A message beyond the primitive payload ceiling is rejected
         let huge = vec![0u8; MAX_MSG_SIZE as usize + 1];
         assert!(producer.try_send(&huge).is_err());
     }
 
     #[test]
     fn test_message_larger_than_capacity_rejected() {
-        let (producer, _consumer) = alloc_test_queue(4096);
-        // 4096 - 4 header = 4092 max useful, but framing overhead means
-        // a 4092-byte payload needs 4096 bytes which fills the entire buffer.
-        // Actually we need space = capacity, and 4092+4 = 4096 = capacity,
-        // so it should just barely fit.
-        let fits = vec![0u8; 4092];
-        producer.try_send(&fits).unwrap();
+        let (producer, consumer) = alloc_test_queue(4096);
+        let fits = vec![19u8; producer.max_message_bytes()];
+        producer.send_bounded(&fits).unwrap();
+        assert_eq!(consumer.try_recv().unwrap(), fits);
+        let too_large = vec![23u8; producer.max_message_bytes() + 1];
+        let positions = producer.diagnostic_positions();
+        assert!(producer.send_bounded(&too_large).is_err());
+        assert_eq!(producer.diagnostic_positions(), positions);
+        assert!(consumer.try_recv().is_none());
+        let (producer, consumer) = alloc_test_queue(DEFAULT_QUEUE_CAPACITY);
+        let original_gap = vec![29u8; DEFAULT_QUEUE_CAPACITY as usize];
+        assert!(original_gap.len() <= MAX_MSG_SIZE as usize);
+        assert!(producer.send_bounded(&original_gap).is_err());
+        let exact = vec![31u8; producer.max_message_bytes()];
+        producer.send_bounded(&exact).unwrap();
+        assert_eq!(consumer.try_recv().unwrap(), exact);
     }
 
     #[test]

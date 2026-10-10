@@ -26,6 +26,11 @@ pub(super) fn publish(
     status: i32,
     payload: &[u8],
 ) -> Result<(), PublishError> {
+    if !rpc::framed_payload_len_valid(
+        payload.len(), rpc::HONEST_RESP_HEADER_SIZE, queue.max_message_bytes(),
+    ) {
+        return Err(PublishError::Encoding(HonestRpcFrameError::PayloadBound));
+    }
     let response =
         rpc::encode_honest_response(identity, status, payload).map_err(PublishError::Encoding)?;
     queue
@@ -123,10 +128,17 @@ mod tests {
         let wake = DispatcherWake::new();
         assert!(matches!(
             publish(RpcRole::Execution, &tx, &wake, identity(), 0, &[0; 4096]),
-            Err(PublishError::QueueFull)
+            Err(PublishError::Encoding(HonestRpcFrameError::PayloadBound))
         ));
         assert!(rx.try_recv().is_none());
         assert_eq!(wake.wait_response(RpcRole::Execution, Duration::ZERO), 1);
+        tx.try_send(&vec![17; tx.max_message_bytes()]).unwrap();
+        assert!(matches!(
+            publish(RpcRole::Execution, &tx, &wake, identity(), 0, b"bounded"),
+            Err(PublishError::QueueFull)
+        ));
+        assert_eq!(wake.wait_response(RpcRole::Execution, Duration::ZERO), 1);
+        rx.try_recv().unwrap();
         let oversized = vec![0; rpc::MAX_HONEST_RPC_PAYLOAD_BYTES + 1];
         assert!(matches!(
             publish(RpcRole::Execution, &tx, &wake, identity(), 0, &oversized),

@@ -55,7 +55,6 @@ use enclave_os_common::types::AEAD_KEY_SIZE;
 //  Channel initialisation
 // ==========================================================================
 
-const MAX_SHARED_QUEUE_CAPACITY: u64 = 16 * 1024 * 1024;
 const MAX_CONFIG_BYTES: usize = 4 * 1024 * 1024;
 const QUEUE_BUFFER_ALIGNMENT: usize = 64;
 
@@ -92,7 +91,7 @@ fn validate_channel_description(
     host_to_enc_buf: *mut u8,
     capacity: u64,
 ) -> Result<(), i32> {
-    if !capacity.is_power_of_two() || capacity < 4096 || capacity > MAX_SHARED_QUEUE_CAPACITY {
+    if !enclave_os_common::queue::shared_queue_capacity_valid(capacity) {
         return Err(-1);
     }
     let capacity = usize::try_from(capacity).map_err(|_| -1)?;
@@ -154,15 +153,17 @@ fn initialise_rpc_channel(
     // The enclave is the **producer** for enc_to_host and the **consumer**
     // for host_to_enc.
     let request_tx = unsafe {
-        SpscProducer::from_raw(
+        SpscProducer::from_raw_with_capacity(
             enc_to_host_header as *const SpscQueueHeader,
             enc_to_host_buf,
+            capacity,
         )
     };
     let response_rx = unsafe {
-        SpscConsumer::from_raw(
+        SpscConsumer::from_raw_with_capacity(
             host_to_enc_header as *const SpscQueueHeader,
             host_to_enc_buf as *const u8,
+            capacity,
         )
     };
 
@@ -242,15 +243,17 @@ pub extern "C" fn ecall_init_data_channel(
     // The enclave is the **producer** for enc_to_host (TLS output to proxy)
     // and the **consumer** for host_to_enc (raw TCP data from proxy).
     let data_tx = unsafe {
-        SpscProducer::from_raw(
+        SpscProducer::from_raw_with_capacity(
             enc_to_host_header as *const SpscQueueHeader,
             enc_to_host_buf,
+            capacity,
         )
     };
     let data_rx = unsafe {
-        SpscConsumer::from_raw(
+        SpscConsumer::from_raw_with_capacity(
             host_to_enc_header as *const SpscQueueHeader,
             host_to_enc_buf as *const u8,
+            capacity,
         )
     };
 

@@ -107,8 +107,11 @@ pub fn encode_kv_put_batch_req_borrowed(
             .checked_add(key.len())?.checked_add(value.len())?;
     }
     if value_bytes > bounds.maximum_total_value_bytes
-        || encoded_bytes.checked_add(super::REQ_HEADER_SIZE)?
-            > crate::queue::MAX_MSG_SIZE as usize
+        || !super::framed_payload_len_valid(
+            encoded_bytes,
+            super::REQ_HEADER_SIZE,
+            crate::queue::max_message_bytes(crate::queue::DEFAULT_QUEUE_CAPACITY),
+        )
     {
         return None;
     }
