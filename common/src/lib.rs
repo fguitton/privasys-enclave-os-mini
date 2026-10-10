@@ -23,6 +23,10 @@ pub mod modules;
 pub mod ocall;
 pub mod oids;
 pub mod protocol;
+/// Versioned byte geometry only; never source or caller authority.
+pub mod source_upload_wire_v1 {
+    include!(concat!(env!("OUT_DIR"), "/source_upload_wire_v1.rs"));
+}
 pub mod queue;
 pub mod quote;
 

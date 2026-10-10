@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "contract": "honest-source-upload-wire-geometry-v1",
+  "frame_fields": [
+    [
+      "magic",
+      8
+    ],
+    [
+      "ticket",
+      32
+    ],
+    [
+      "session",
+      32
+    ],
+    [
+      "ordinal",
+      4
+    ],
+    [
+      "offset",
+      8
+    ],
+    [
+      "page_length",
+      4
+    ],
+    [
+      "data_length",
+      4
+    ]
+  ],
+  "batch_fields": [
+    [
+      "magic",
+      8
+    ],
+    [
+      "count",
+      4
+    ]
+  ],
+  "peer_fields": [
+    [
+      "magic",
+      8
+    ],
+    [
+      "expected",
+      32
+    ],
+    [
+      "ticket",
+      32
+    ],
+    [
+      "session",
+      32
+    ],
+    [
+      "manifest_length",
+      2
+    ]
+  ],
+  "single_peer_fields": [
+    [
+      "magic",
+      8
+    ],
+    [
+      "expected",
+      32
+    ],
+    [
+      "manifest_length",
+      2
+    ]
+  ],
+  "push_fields": [
+    [
+      "magic",
+      8
+    ],
+    [
+      "expected",
+      32
+    ],
+    [
+      "manifest_length",
+      2
+    ],
+    [
+      "count",
+      1
+    ]
+  ],
+  "source_aead_tag_bytes": 16,
+  "batch_item_prefix_bytes": 4
+}

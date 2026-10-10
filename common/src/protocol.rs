@@ -27,10 +27,11 @@ use serde::{Deserialize, Serialize};
 pub const MAX_BODY_SIZE: usize = 16 * 1024 * 1024;
 /// Optional header-only streamed ceiling: eight canonical8MiB frames plus
 /// bounded AEAD/header/page/group overhead. Never used by the legacy parser.
-pub const MAX_STREAM_BODY_SIZE:usize=12+8*(4+92+32*1024+8*1024*1024+16);
+// Opaque HTTP policy ceiling; source codecs and signed admission are independent.
+pub const MAX_STREAM_BODY_SIZE:usize=67_371_916;
 /// Optional peer outer authority/manifest prefix; still one canonical frame at
 /// a time. Only the explicit peer-group media header receives this ceiling.
-pub const MAX_STREAM_PEER_BODY_SIZE:usize=MAX_STREAM_BODY_SIZE+106+4096;
+pub const MAX_STREAM_PEER_BODY_SIZE:usize=67_376_118;
 const STREAM_PEER_MEDIA:&str="application/honest-source-upload-peer-group-v1";
 
 
