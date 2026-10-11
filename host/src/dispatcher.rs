@@ -701,8 +701,9 @@ mod tests {
         self, honest_role_allows_method, HonestRpcIdentity, RpcMethod, RpcRole,
     };
 
-    fn queue() -> (SpscProducer, SpscConsumer) {
-        let capacity = 8_192_u64;
+    fn queue() -> (SpscProducer, SpscConsumer) { queue_with_capacity(8_192_u64) }
+
+    fn queue_with_capacity(capacity:u64) -> (SpscProducer, SpscConsumer) {
         let header = Box::into_raw(Box::new(SpscQueueHeader::new(capacity)));
         let buffer = vec![0_u8; capacity as usize];
         let buffer = Box::into_raw(buffer.into_boxed_slice()).cast::<u8>();
@@ -910,6 +911,38 @@ mod tests {
         let response=response_rx.try_recv().unwrap();
         assert_eq!(rpc::decode_honest_response_for(&response,identity).unwrap().status,0);
         assert_eq!(crate::kvstore::get("honest.accepted-artifact-chunks-v1",&other).unwrap().unwrap(),b"batch node");
+        {
+        // The original 8 KiB negative queues remain unchanged. This positive
+        // full group uses a power-of-two queue sized from the lower batch cap.
+        let full_capacity=u64::try_from(rpc::MAX_WORKER_STORAGE_BATCH_BYTES.next_power_of_two()).unwrap();
+        let (_,request_rx)=queue_with_capacity(full_capacity);
+        let (response_tx,response_rx)=queue_with_capacity(full_capacity);
+        let dispatcher=RpcDispatcher::new(RpcRole::Execution,request_rx,response_tx,
+            Arc::new(AtomicBool::new(false)),Arc::new(crate::dispatcher_wake::DispatcherWake::new()));
+        // Actual supported record-count boundary with representative 8 KiB
+        // opaque values through the existing DB and framed response queues.
+        let full_keys=(0..rpc::MAX_WORKER_STORAGE_BATCH_RECORDS).map(|index|
+            [b"honest/retained-data/v1/".as_slice(),&[7;32],b"/geometry-",&(index as u64).to_be_bytes()].concat()
+        ).collect::<Vec<_>>();
+        let full_values=(0..full_keys.len()).map(|index|vec![u8::try_from(index).unwrap();8192]).collect::<Vec<_>>();
+        let full_records=full_keys.iter().zip(&full_values).map(|(key,value)|(key.as_slice(),value.as_slice())).collect::<Vec<_>>();
+        let batch=rpc::encode_worker_storage_put_batch(table,&full_records).unwrap();
+        let payload=rpc::encode_worker_storage_request(rpc::WorkerStorageOperation::PutBatch,&batch).unwrap();
+        dispatcher.dispatch(&rpc::encode_honest_request(identity,&payload).unwrap());
+        let response=response_rx.try_recv().unwrap();
+        assert_eq!(rpc::decode_honest_response_for(&response,identity).unwrap().status,0);
+        let full_requests=full_keys.iter().map(|key|(key.as_slice(),8192)).collect::<Vec<_>>();
+        let get=rpc::encode_worker_get_batch([7;32],table,&full_requests,dispatcher.request_rx.max_message_bytes(),dispatcher.response_tx.max_message_bytes()).unwrap();
+        let payload=rpc::encode_worker_storage_request(rpc::WorkerStorageOperation::GetBatch,&get).unwrap();
+        dispatcher.dispatch(&rpc::encode_honest_request(identity,&payload).unwrap());
+        let response=response_rx.try_recv().unwrap();
+        let reply=rpc::decode_honest_response_for(&response,identity).unwrap();
+        assert_eq!(reply.status,0);
+        let maxima=vec![8192;full_keys.len()];
+        let returned=rpc::decode_worker_get_batch_response(reply.payload,&maxima).unwrap();
+        assert_eq!(returned.len(),full_values.len());
+        for(actual,expected)in returned.iter().zip(&full_values){assert_eq!(*actual,expected.as_slice());}
+        }
         // Actual existing dispatcher/DB/SPSC path, with reversed/duplicate
         // requests, exact envelope correlation and strict whole-result errors.
         let capacity=dispatcher.response_tx.max_message_bytes();

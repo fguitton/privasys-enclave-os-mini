@@ -328,6 +328,13 @@ fn check_worker_storage_reservation() {
     assert!(encode_worker_storage_put_batch(b"t", &[(key.as_slice(),value.as_slice())]).is_none());
     assert!(encode_worker_storage_put_batch(b"t", &[(vec![0;key.len()+1].as_slice(),b"v")]).is_none());
     assert!(worker_storage_put_batch_encoded_len(b"t", &[]).is_none());
+    for count in [MAX_WORKER_STORAGE_BATCH_RECORDS-1,MAX_WORKER_STORAGE_BATCH_RECORDS]{
+        let records=vec![(b"k".as_slice(),b"v".as_slice());count];
+        let wire=encode_worker_storage_put_batch(b"t",&records).unwrap();
+        assert_eq!(decode_worker_storage_put_batch(&wire).unwrap().1,records);
+    }
+    let excessive=vec![(b"k".as_slice(),b"v".as_slice());MAX_WORKER_STORAGE_BATCH_RECORDS+1];
+    assert!(encode_worker_storage_put_batch(b"t",&excessive).is_none());
     println!("WORKER-STORAGE-RPC: actual framedtoken/role/size/nestedBusy/releasednetworkreservation PASS");
 }
 
