@@ -15,14 +15,31 @@ pub fn worker_get_batch_response_demand(maxima:&[usize])->Option<usize>{
     for maximum in maxima {if *maximum==0 {return None;}u32::try_from(*maximum).ok()?;length=length.checked_add(WORKER_GET_BATCH_VALUE_HEADER_BYTES)?.checked_add(*maximum)?;}
     Some(length)
 }
+fn request_header(table_bytes:usize)->Option<usize>{SCOPE_BYTES.checked_add(2*core::mem::size_of::<u16>())?.checked_add(table_bytes)}
+fn request_record(key_bytes:usize)->Option<usize>{key_bytes.checked_add(core::mem::size_of::<u16>()+core::mem::size_of::<u32>())}
+/// Size-only homogeneous window derived from this codec and actual installed
+/// request/response capacities. No scope, permission, allocation or IO.
+pub fn worker_get_batch_geometry(table:&[u8],key:usize,value:usize,request_maximum:usize,response_maximum:usize)->Option<(usize,usize)>{
+    if table.is_empty()||table.len()>MAX_WORKER_STORAGE_BATCH_TABLE_BYTES||key==0||key>MAX_WORKER_STORAGE_BATCH_KEY_BYTES||value==0{return None;}
+    u32::try_from(value).ok()?;
+    let header=request_header(table.len())?;
+    let record=request_record(key)?;
+    let request_payload=request_maximum.checked_sub(HONEST_REQ_HEADER_SIZE)?.min(MAX_HONEST_RPC_PAYLOAD_BYTES).checked_sub(1)?;
+    let response_payload=response_maximum.checked_sub(HONEST_RESP_HEADER_SIZE)?.min(MAX_HONEST_RPC_PAYLOAD_BYTES);
+    let count=MAX_WORKER_STORAGE_BATCH_RECORDS
+        .min(request_payload.checked_sub(header)?/record)
+        .min(response_payload.checked_sub(WORKER_GET_BATCH_RESPONSE_HEADER_BYTES)?/value.checked_add(WORKER_GET_BATCH_VALUE_HEADER_BYTES)?);
+    if count==0{return None;}
+    Some((count,header.checked_add(count.checked_mul(record)?)?))
+}
 pub fn worker_get_batch_encoded_len(scope:[u8;32],table:&[u8],requests:&[(&[u8],usize)],request_maximum:usize,response_maximum:usize)->Option<usize>{
     if scope==[0;32]||table.is_empty()||table.len()>MAX_WORKER_STORAGE_BATCH_TABLE_BYTES||requests.is_empty()||requests.len()>MAX_WORKER_STORAGE_BATCH_RECORDS{return None;}
-    let mut length=SCOPE_BYTES.checked_add(2*core::mem::size_of::<u16>())?.checked_add(table.len())?;
+    let mut length=request_header(table.len())?;
     let mut reply=WORKER_GET_BATCH_RESPONSE_HEADER_BYTES;
     for(key,maximum)in requests{
         if key.is_empty()||key.len()>MAX_WORKER_STORAGE_BATCH_KEY_BYTES||*maximum==0{return None;}
         u32::try_from(*maximum).ok()?;
-        length=length.checked_add(core::mem::size_of::<u16>()+core::mem::size_of::<u32>())?.checked_add(key.len())?;
+        length=length.checked_add(request_record(key.len())?)?;
         reply=reply.checked_add(WORKER_GET_BATCH_VALUE_HEADER_BYTES)?.checked_add(*maximum)?;
     }
     // Storage opcode consumes one Honest REQUEST payload byte; response has no opcode.

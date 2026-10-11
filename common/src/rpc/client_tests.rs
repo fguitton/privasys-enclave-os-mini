@@ -369,6 +369,20 @@ fn check_get_batch_codec(){
     assert_eq!(worker_get_batch_response_demand(&[maximum;8]),Some(1_057_090));
     assert!(worker_get_batch_encoded_len(scope,b"t",&[(key,maximum);8],capacity,capacity).is_none());
     let group=[(key,maximum);7];let wire=encode_worker_get_batch(scope,b"t",&group,capacity,capacity).unwrap();
+    let(count,length)=worker_get_batch_geometry(b"t",key.len(),maximum,capacity,capacity).unwrap();
+    assert_eq!(count,group.len());assert_eq!(length,wire.len(),"size-only owner must match actual codec bytes");
+    for count in [MAX_WORKER_STORAGE_BATCH_RECORDS-1,MAX_WORKER_STORAGE_BATCH_RECORDS]{
+        let records=vec![(key,5);count];
+        let encoded=encode_worker_get_batch(scope,b"t",&records,capacity,capacity).unwrap();
+        assert_eq!(decode_worker_get_batch(&encoded,capacity,capacity).unwrap().2,records);
+    }
+    let excessive=vec![(key,5);MAX_WORKER_STORAGE_BATCH_RECORDS+1];
+    assert!(encode_worker_get_batch(scope,b"t",&excessive,capacity,capacity).is_none());
+    assert!(worker_get_batch_geometry(b"",key.len(),5,capacity,capacity).is_none());
+    assert!(worker_get_batch_geometry(b"t",0,5,capacity,capacity).is_none());
+    assert!(worker_get_batch_geometry(b"t",usize::MAX,5,capacity,capacity).is_none());
+    assert!(worker_get_batch_geometry(b"t",key.len(),usize::MAX,capacity,capacity).is_none());
+    assert!(worker_get_batch_geometry(b"t",key.len(),5,0,capacity).is_none());
     let(decoded_scope,table,requests)=decode_worker_get_batch(&wire,capacity,capacity).unwrap();
     assert_eq!(decoded_scope,scope);assert_eq!(table,b"t");assert_eq!(requests,group);
     for cut in 0..wire.len(){assert!(decode_worker_get_batch(&wire[..cut],capacity,capacity).is_none());}
@@ -383,6 +397,12 @@ fn check_get_batch_codec(){
     let request_length=worker_get_batch_encoded_len(scope,b"t",&[(key,5)],capacity,capacity).unwrap();
     let request_frame=request_length+1+HONEST_REQ_HEADER_SIZE;
     let reply_frame=2+4+5+HONEST_RESP_HEADER_SIZE;
+    assert_eq!(worker_get_batch_geometry(b"t",key.len(),5,request_frame,reply_frame),Some((1,request_length)));
+    assert_eq!(worker_get_batch_geometry(b"t",key.len(),5,request_frame+1,reply_frame),Some((1,request_length)));
+    assert_eq!(worker_get_batch_geometry(b"t",key.len(),5,request_frame,reply_frame+1),Some((1,request_length)));
+    assert_eq!(worker_get_batch_geometry(b"t",key.len(),5,request_frame+1,reply_frame+1),Some((1,request_length)));
+    assert!(worker_get_batch_geometry(b"t",key.len(),5,request_frame-1,reply_frame).is_none());
+    assert!(worker_get_batch_geometry(b"t",key.len(),5,request_frame,reply_frame-1).is_none());
     assert!(worker_get_batch_encoded_len(scope,b"t",&[(key,5)],request_frame,reply_frame).is_some());
     assert!(worker_get_batch_encoded_len(scope,b"t",&[(key,5)],request_frame-1,reply_frame).is_none());
     assert!(worker_get_batch_encoded_len(scope,b"t",&[(key,5)],request_frame,reply_frame-1).is_none());
