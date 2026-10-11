@@ -57,8 +57,10 @@ pub fn unseal_with_mrenclave(sealed_blob: &[u8]) -> Result<(Vec<u8>, Vec<u8>), &
 
     let unsealed = sealed.unseal().map_err(|_| "sgx_unseal_data failed")?;
 
-    let plaintext = unsealed.to_plaintext().to_vec();
+    // Copy the authenticated AAD before consuming its SDK owner. Transfer the
+    // already decrypted plaintext allocation instead of cloning it again.
     let aad = unsealed.to_aad().to_vec();
+    let plaintext = unsealed.into_plaintext().into_vec();
 
     Ok((plaintext, aad))
 }
