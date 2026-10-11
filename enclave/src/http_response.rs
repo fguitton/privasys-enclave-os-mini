@@ -57,22 +57,39 @@ pub enum HttpResponsePayload {
 }
 impl HttpResponsePayload {
     pub fn shared(
-        prefix: Vec<u8>, bytes: Arc<dyn AsRef<[u8]> + Send + Sync>,
+        prefix: Vec<u8>,
+        bytes: Arc<dyn AsRef<[u8]> + Send + Sync>,
         owner: Arc<dyn Any + Send + Sync>,
     ) -> Result<Self, &'static str> {
-        let length = prefix.len().checked_add(bytes.as_ref().as_ref().len())
+        let length = prefix
+            .len()
+            .checked_add(bytes.as_ref().as_ref().len())
             .ok_or("response length overflow")?;
-        Ok(Self::Shared { prefix, bytes, owner, length })
+        Ok(Self::Shared {
+            prefix,
+            bytes,
+            owner,
+            length,
+        })
     }
     pub fn len(&self) -> usize {
-        match self { Self::Contiguous(body) => body.len(), Self::Shared { length, .. } => *length }
+        match self {
+            Self::Contiguous(body) => body.len(),
+            Self::Shared { length, .. } => *length,
+        }
     }
-    pub fn is_empty(&self) -> bool { self.len() == 0 }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     /// Return one bounded contiguous part, never combine the two allocations.
     pub fn part(&self, offset: usize, limit: usize) -> Option<&[u8]> {
-        if offset > self.len() { return None; }
+        if offset > self.len() {
+            return None;
+        }
         match self {
-            Self::Contiguous(body) => body.get(offset..offset.saturating_add(limit).min(body.len())),
+            Self::Contiguous(body) => {
+                body.get(offset..offset.saturating_add(limit).min(body.len()))
+            }
             Self::Shared { prefix, bytes, .. } => {
                 if offset < prefix.len() {
                     prefix.get(offset..offset.saturating_add(limit).min(prefix.len()))
@@ -86,18 +103,27 @@ impl HttpResponsePayload {
     }
     /// Only receive-side/legacy contiguous bodies can be borrowed as one slice.
     pub fn contiguous(&self) -> Option<&[u8]> {
-        match self { Self::Contiguous(body) => Some(body), Self::Shared { .. } => None }
+        match self {
+            Self::Contiguous(body) => Some(body),
+            Self::Shared { .. } => None,
+        }
     }
 }
 impl From<Vec<u8>> for HttpResponsePayload {
-    fn from(bytes: Vec<u8>) -> Self { Self::Contiguous(bytes.into()) }
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::Contiguous(bytes.into())
+    }
 }
 impl From<HttpResponseBody> for HttpResponsePayload {
-    fn from(body: HttpResponseBody) -> Self { Self::Contiguous(body) }
+    fn from(body: HttpResponseBody) -> Self {
+        Self::Contiguous(body)
+    }
 }
 impl fmt::Debug for HttpResponsePayload {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("HttpResponsePayload").field("bytes", &self.len())
-            .field("shared", &matches!(self, Self::Shared { .. })).finish()
+        f.debug_struct("HttpResponsePayload")
+            .field("bytes", &self.len())
+            .field("shared", &matches!(self, Self::Shared { .. }))
+            .finish()
     }
 }

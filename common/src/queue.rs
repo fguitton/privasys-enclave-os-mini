@@ -83,7 +83,11 @@ pub const fn shared_queue_capacity_valid(capacity: u64) -> bool {
 
 /// Complete frames must fit both the primitive ceiling and the actual ring.
 pub const fn max_message_bytes(capacity: u64) -> usize {
-    let frame = if capacity < MAX_RING_FRAME_BYTES { capacity } else { MAX_RING_FRAME_BYTES };
+    let frame = if capacity < MAX_RING_FRAME_BYTES {
+        capacity
+    } else {
+        MAX_RING_FRAME_BYTES
+    };
     frame.saturating_sub(MSG_HEADER_SIZE as u64) as usize
 }
 
@@ -115,8 +119,14 @@ impl SpscQueueHeader {
     /// Create a new zeroed header with the given capacity.
     pub fn new(capacity: u64) -> Self {
         assert!(capacity.is_power_of_two(), "capacity must be power of 2");
-        assert!(capacity >= MIN_SHARED_QUEUE_CAPACITY, "capacity must be >= 4096");
-        assert!(shared_queue_capacity_valid(capacity), "invalid shared queue capacity");
+        assert!(
+            capacity >= MIN_SHARED_QUEUE_CAPACITY,
+            "capacity must be >= 4096"
+        );
+        assert!(
+            shared_queue_capacity_valid(capacity),
+            "invalid shared queue capacity"
+        );
         Self {
             head: AtomicU64::new(0),
             _pad_head: [0; CACHE_LINE - 8],
@@ -190,9 +200,14 @@ impl SpscProducer {
     /// bytes for the handle lifetime, and only one endpoint of this role may
     /// exist. The caller validates the scalar and backing range together.
     pub unsafe fn from_raw_with_capacity(
-        header: *const SpscQueueHeader, buf_ptr: *mut u8, capacity: u64,
+        header: *const SpscQueueHeader,
+        buf_ptr: *mut u8,
+        capacity: u64,
     ) -> Self {
-        assert!(shared_queue_capacity_valid(capacity), "invalid shared queue capacity");
+        assert!(
+            shared_queue_capacity_valid(capacity),
+            "invalid shared queue capacity"
+        );
         Self {
             header,
             buf_ptr,
@@ -201,9 +216,12 @@ impl SpscProducer {
     }
 
     /// Read-only diagnostic positions; never completion or authority evidence.
-    pub fn diagnostic_positions(&self)->(u64,u64) {
-        let header=unsafe {&*self.header};
-        (header.head.load(Ordering::Acquire),header.tail.load(Ordering::Acquire))
+    pub fn diagnostic_positions(&self) -> (u64, u64) {
+        let header = unsafe { &*self.header };
+        (
+            header.head.load(Ordering::Acquire),
+            header.tail.load(Ordering::Acquire),
+        )
     }
 
     /// Maximum payload for this endpoint's trusted capacity snapshot.
@@ -263,7 +281,8 @@ impl SpscProducer {
 
     /// Legacy convenience API; invalid geometry fails instead of spinning forever.
     pub fn send(&self, msg: &[u8]) {
-        self.send_bounded(msg).expect("message exceeds actual queue capacity");
+        self.send_bounded(msg)
+            .expect("message exceeds actual queue capacity");
     }
 
     /// Write bytes into the ring buffer at the given offset, handling wrap-around.
@@ -369,9 +388,14 @@ impl SpscConsumer {
     /// bytes for the handle lifetime, and only one endpoint of this role may
     /// exist. The caller validates the scalar and backing range together.
     pub unsafe fn from_raw_with_capacity(
-        header: *const SpscQueueHeader, buf_ptr: *const u8, capacity: u64,
+        header: *const SpscQueueHeader,
+        buf_ptr: *const u8,
+        capacity: u64,
     ) -> Self {
-        assert!(shared_queue_capacity_valid(capacity), "invalid shared queue capacity");
+        assert!(
+            shared_queue_capacity_valid(capacity),
+            "invalid shared queue capacity"
+        );
         Self {
             header,
             buf_ptr,
@@ -510,14 +534,17 @@ mod tests {
         let (producer, consumer) = alloc_test_queue(4096);
 
         let msg = b"Hello, enclave!";
-        assert_eq!(producer.diagnostic_positions(),(0,0));
+        assert_eq!(producer.diagnostic_positions(), (0, 0));
         producer.try_send(msg).unwrap();
-        let end=u64::try_from(msg.len()+MSG_HEADER_SIZE).unwrap();
-        assert_eq!(producer.diagnostic_positions(),(end,0));
+        let end = u64::try_from(msg.len() + MSG_HEADER_SIZE).unwrap();
+        assert_eq!(producer.diagnostic_positions(), (end, 0));
         let received = consumer.try_recv().unwrap();
         assert_eq!(received, msg);
-        assert_eq!(producer.diagnostic_positions(),(end,end));
-        assert!(consumer.try_recv().is_none(),"diagnostic snapshots never consume data");
+        assert_eq!(producer.diagnostic_positions(), (end, end));
+        assert!(
+            consumer.try_recv().is_none(),
+            "diagnostic snapshots never consume data"
+        );
     }
 
     #[test]
@@ -549,14 +576,18 @@ mod tests {
         drop(producer);
         drop(consumer);
         let (producer, consumer) = unsafe {
-            (SpscProducer::from_raw_with_capacity(header, buf_ptr, 4096),
-             SpscConsumer::from_raw_with_capacity(header, buf_ptr, 4096))
+            (
+                SpscProducer::from_raw_with_capacity(header, buf_ptr, 4096),
+                SpscConsumer::from_raw_with_capacity(header, buf_ptr, 4096),
+            )
         };
         assert_eq!(producer.max_message_bytes(), 4096 - MSG_HEADER_SIZE);
         let exact = vec![37; producer.max_message_bytes()];
         producer.send_bounded(&exact).unwrap();
         assert_eq!(consumer.try_recv().unwrap(), exact);
-        assert!(producer.send_bounded(&vec![0; producer.max_message_bytes()+1]).is_err());
+        assert!(producer
+            .send_bounded(&vec![0; producer.max_message_bytes() + 1])
+            .is_err());
     }
 
     #[test]

@@ -39,7 +39,9 @@ unsafe impl Send for SharedChannel {}
 impl SharedChannel {
     /// Allocate a new bidirectional channel in host memory.
     pub fn new(capacity: u64) -> Self {
-        assert!(enclave_os_common::queue::shared_queue_capacity_valid(capacity));
+        assert!(enclave_os_common::queue::shared_queue_capacity_valid(
+            capacity
+        ));
         let hdr_layout = Layout::new::<SpscQueueHeader>();
         let buf_layout = Layout::from_size_align(capacity as usize, 64).unwrap();
 

@@ -57,7 +57,9 @@ mod http_response;
 pub use http_response::{HttpResponseBody, HttpResponsePayload};
 
 mod allocation_admission;
-pub use allocation_admission::{local_allocation_pool, reserve_local_allocation, take_local_allocation_release};
+pub use allocation_admission::{
+    local_allocation_pool, reserve_local_allocation, take_local_allocation_release,
+};
 pub mod config_merkle;
 pub mod cpuid_cache;
 pub mod crypto;
@@ -111,37 +113,70 @@ pub type HonestIngressHook = fn(
 static HONEST_INGRESS_HOOK: OnceLock<HonestIngressHook> = OnceLock::new();
 
 mod stream_ingress;
-pub use stream_ingress::{HonestStreamIngressPush,notify_honest_stream_ingress,HonestStreamIngressReceiver,HonestStreamIngressEligible,HonestStreamIngressBegin,MAX_STREAM_INGRESS_SESSIONS,MAX_STREAM_INGRESS_FRAGMENT};
-static HONEST_STREAM_INGRESS_HOOK:OnceLock<stream_ingress::Hooks>=OnceLock::new();
+pub use stream_ingress::{
+    notify_honest_stream_ingress, HonestStreamIngressBegin, HonestStreamIngressEligible,
+    HonestStreamIngressPush, HonestStreamIngressReceiver, MAX_STREAM_INGRESS_FRAGMENT,
+    MAX_STREAM_INGRESS_SESSIONS,
+};
+static HONEST_STREAM_INGRESS_HOOK: OnceLock<stream_ingress::Hooks> = OnceLock::new();
 /// Optional explicit input adoption; defaults retain ordinary whole-body HTTP.
 /// Registration changes transport scheduling only and creates no authority.
-pub fn register_honest_stream_ingress_hook(eligible:HonestStreamIngressEligible,begin:HonestStreamIngressBegin)->Result<(),i32> {
-    if CORE_PHASE.load()!=CorePhase::Initialising { return Err(-1); }
-    HONEST_STREAM_INGRESS_HOOK.set((eligible,begin)).map_err(|_|-1)
+pub fn register_honest_stream_ingress_hook(
+    eligible: HonestStreamIngressEligible,
+    begin: HonestStreamIngressBegin,
+) -> Result<(), i32> {
+    if CORE_PHASE.load() != CorePhase::Initialising {
+        return Err(-1);
+    }
+    HONEST_STREAM_INGRESS_HOOK
+        .set((eligible, begin))
+        .map_err(|_| -1)
 }
 mod deferred_ingress;
 pub use deferred_ingress::{
-    HonestDeferredIngressEligible, HonestDeferredIngressMetadata, HonestDeferredIngressHook, HonestDeferredIngressPoll, HonestDeferredIngressCancel,
-    HonestIngressStart, HonestPendingIngress, notify_deferred_ingress,
-    MAX_DEFERRED_INGRESS_REQUEST_BYTES, MAX_DEFERRED_INGRESS_REQUESTS,
+    notify_deferred_ingress, HonestDeferredIngressCancel, HonestDeferredIngressEligible,
+    HonestDeferredIngressHook, HonestDeferredIngressMetadata, HonestDeferredIngressPoll,
+    HonestIngressStart, HonestPendingIngress, MAX_DEFERRED_INGRESS_REQUESTS,
+    MAX_DEFERRED_INGRESS_REQUEST_BYTES,
 };
-static HONEST_DEFERRED_INGRESS_HOOK: OnceLock<(HonestDeferredIngressEligible, HonestDeferredIngressMetadata, HonestDeferredIngressHook, HonestDeferredIngressPoll, HonestDeferredIngressCancel)> = OnceLock::new();
+static HONEST_DEFERRED_INGRESS_HOOK: OnceLock<(
+    HonestDeferredIngressEligible,
+    HonestDeferredIngressMetadata,
+    HonestDeferredIngressHook,
+    HonestDeferredIngressPoll,
+    HonestDeferredIngressCancel,
+)> = OnceLock::new();
 
 /// Install the optional data-request continuation during initialisation.
 pub fn register_honest_deferred_ingress_hook(
-    eligible: HonestDeferredIngressEligible, hook: HonestDeferredIngressHook,
-    poll: HonestDeferredIngressPoll, cancel: HonestDeferredIngressCancel,
+    eligible: HonestDeferredIngressEligible,
+    hook: HonestDeferredIngressHook,
+    poll: HonestDeferredIngressPoll,
+    cancel: HonestDeferredIngressCancel,
 ) -> Result<(), i32> {
-    register_honest_deferred_ingress_hook_with_metadata(eligible, deferred_ingress::legacy_metadata, hook, poll, cancel)
+    register_honest_deferred_ingress_hook_with_metadata(
+        eligible,
+        deferred_ingress::legacy_metadata,
+        hook,
+        poll,
+        cancel,
+    )
 }
 
 /// Register an adopter that retains compact, bounded operation metadata.
 pub fn register_honest_deferred_ingress_hook_with_metadata(
-    eligible: HonestDeferredIngressEligible, metadata: HonestDeferredIngressMetadata,
-    hook: HonestDeferredIngressHook, poll: HonestDeferredIngressPoll, cancel: HonestDeferredIngressCancel,
+    eligible: HonestDeferredIngressEligible,
+    metadata: HonestDeferredIngressMetadata,
+    hook: HonestDeferredIngressHook,
+    poll: HonestDeferredIngressPoll,
+    cancel: HonestDeferredIngressCancel,
 ) -> Result<(), i32> {
-    if CORE_PHASE.load() != CorePhase::Initialising { return Err(-1); }
-    HONEST_DEFERRED_INGRESS_HOOK.set((eligible, metadata, hook, poll, cancel)).map_err(|_| -1)
+    if CORE_PHASE.load() != CorePhase::Initialising {
+        return Err(-1);
+    }
+    HONEST_DEFERRED_INGRESS_HOOK
+        .set((eligible, metadata, hook, poll, cancel))
+        .map_err(|_| -1)
 }
 
 mod ingress_response;

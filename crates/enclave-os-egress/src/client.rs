@@ -47,7 +47,10 @@ mod incremental;
 mod renewal;
 mod request;
 
-pub use incremental::{IncrementalTlsClient, MAX_INCREMENTAL_TLS_FRAGMENT, MAX_INCREMENTAL_TLS_OUTPUT, MAX_INCREMENTAL_REQUEST, MAX_INCREMENTAL_PLAINTEXT};
+pub use incremental::{
+    IncrementalTlsClient, MAX_INCREMENTAL_PLAINTEXT, MAX_INCREMENTAL_REQUEST,
+    MAX_INCREMENTAL_TLS_FRAGMENT, MAX_INCREMENTAL_TLS_OUTPUT,
+};
 pub use renewal::{AttestationRenewalBudget, AttestationRenewalPolicy};
 pub use request::{
     https_fetch, https_fetch_authorized_interruptible_detailed, https_fetch_interruptible,

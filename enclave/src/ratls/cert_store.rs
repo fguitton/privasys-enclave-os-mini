@@ -233,10 +233,15 @@ impl CertStore {
         let inner = self.inner.read().map_err(|_| "CertStore poisoned")?;
         match hostname.and_then(|name| inner.apps.get(name).map(|app| (name, app))) {
             Some((name, app)) => Ok((Some(Self::app_data(name, app)), app.configuration.clone())),
-            None => Ok((None, inner.fixed_peer.as_ref()
-                .filter(|_| hostname == Some(enclave_os_common::modules::HONEST_PEER_SNI))
-                .unwrap_or(&inner.platform)
-                .clone())),
+            None => Ok((
+                None,
+                inner
+                    .fixed_peer
+                    .as_ref()
+                    .filter(|_| hostname == Some(enclave_os_common::modules::HONEST_PEER_SNI))
+                    .unwrap_or(&inner.platform)
+                    .clone(),
+            )),
         }
     }
 
@@ -392,11 +397,17 @@ mod tests {
         let generic = CertStore::new();
         let (_, generic_peer) = generic.snapshot(Some(peer_name)).unwrap();
         generic.register(identity("workflow.test"));
-        assert!(!generic_peer.is_current(), "generic Mini retains broad revocation");
+        assert!(
+            !generic_peer.is_current(),
+            "generic Mini retains broad revocation"
+        );
 
         let honest = CertStore::new_honest_profile();
         let (peer_data, peer) = honest.snapshot(Some(peer_name)).unwrap();
-        assert!(peer_data.is_none(), "peer still selects the platform certificate");
+        assert!(
+            peer_data.is_none(),
+            "peer still selects the platform certificate"
+        );
         let (_, unknown) = honest.snapshot(Some("later.test")).unwrap();
         honest.register(identity("workflow.test"));
         let (_, workflow) = honest.snapshot(Some("workflow.test")).unwrap();
@@ -407,7 +418,10 @@ mod tests {
         assert!(peer.is_current());
         assert!(honest.unregister("workflow.test"));
         honest.invalidate("absent-workflow.test");
-        assert!(peer.is_current(), "unrelated endpoint mutations do not revoke peer security");
+        assert!(
+            peer.is_current(),
+            "unrelated endpoint mutations do not revoke peer security"
+        );
         honest.invalidate(peer_name);
         assert!(!peer.is_current());
         let (_, replacement_peer) = honest.snapshot(Some(peer_name)).unwrap();
@@ -415,18 +429,30 @@ mod tests {
         honest.register(identity(peer_name));
         assert!(!replacement_peer.is_current());
         let (registered_data, registered_peer) = honest.snapshot(Some(peer_name)).unwrap();
-        assert!(registered_data.is_some(), "reserved conflict retains original selection");
+        assert!(
+            registered_data.is_some(),
+            "reserved conflict retains original selection"
+        );
         assert!(honest.unregister(peer_name));
         assert!(!registered_peer.is_current());
         let (_, broad_peer) = honest.snapshot(Some(peer_name)).unwrap();
         honest.register(identity("later.test"));
-        assert!(!broad_peer.is_current(), "reserved conflict cannot silently reenable fixed scoping");
-        assert!(!peer.is_current(), "identical reloading cannot resurrect an old lease");
+        assert!(
+            !broad_peer.is_current(),
+            "reserved conflict cannot silently reenable fixed scoping"
+        );
+        assert!(
+            !peer.is_current(),
+            "identical reloading cannot resurrect an old lease"
+        );
 
         let honest = CertStore::new_honest_profile();
         let (_, peer) = honest.snapshot(Some(peer_name)).unwrap();
         assert!(!honest.unregister(peer_name));
-        assert!(!peer.is_current(), "explicit reserved removal retires even an unregistered peer lease");
+        assert!(
+            !peer.is_current(),
+            "explicit reserved removal retires even an unregistered peer lease"
+        );
     }
 
     #[test]

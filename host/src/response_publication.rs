@@ -27,7 +27,9 @@ pub(super) fn publish(
     payload: &[u8],
 ) -> Result<(), PublishError> {
     if !rpc::framed_payload_len_valid(
-        payload.len(), rpc::HONEST_RESP_HEADER_SIZE, queue.max_message_bytes(),
+        payload.len(),
+        rpc::HONEST_RESP_HEADER_SIZE,
+        queue.max_message_bytes(),
     ) {
         return Err(PublishError::Encoding(HonestRpcFrameError::PayloadBound));
     }

@@ -109,13 +109,16 @@ pub const RESP_HEADER_SIZE: usize = 16;
 /// Validate complete RPC framing before allocation or endpoint reservation.
 pub fn framed_payload_len_valid(payload: usize, header: usize, message_maximum: usize) -> bool {
     payload <= u32::MAX as usize
-        && payload.checked_add(header).is_some_and(|bytes| {
-            bytes <= message_maximum.min(crate::queue::MAX_MSG_SIZE as usize)
-        })
+        && payload
+            .checked_add(header)
+            .is_some_and(|bytes| bytes <= message_maximum.min(crate::queue::MAX_MSG_SIZE as usize))
 }
 
 pub fn encode_request_bounded(
-    req_id: u64, method: RpcMethod, payload: &[u8], message_maximum: usize,
+    req_id: u64,
+    method: RpcMethod,
+    payload: &[u8],
+    message_maximum: usize,
 ) -> Option<Vec<u8>> {
     if !framed_payload_len_valid(payload.len(), REQ_HEADER_SIZE, message_maximum) {
         return None;
@@ -124,7 +127,10 @@ pub fn encode_request_bounded(
 }
 
 pub fn encode_response_bounded(
-    req_id: u64, status: i32, payload: &[u8], message_maximum: usize,
+    req_id: u64,
+    status: i32,
+    payload: &[u8],
+    message_maximum: usize,
 ) -> Option<Vec<u8>> {
     if !framed_payload_len_valid(payload.len(), RESP_HEADER_SIZE, message_maximum) {
         return None;
@@ -765,9 +771,18 @@ mod tests {
             encode_request_bounded(42, RpcMethod::NetTcpListen, &exact, maximum).unwrap(),
             encode_request(42, RpcMethod::NetTcpListen, &exact),
         );
-        assert!(encode_request_bounded(42, RpcMethod::NetTcpListen,
-            &vec![23; exact.len() + 1], maximum).is_none());
-        assert!(!framed_payload_len_valid(usize::MAX, REQ_HEADER_SIZE, maximum));
+        assert!(encode_request_bounded(
+            42,
+            RpcMethod::NetTcpListen,
+            &vec![23; exact.len() + 1],
+            maximum
+        )
+        .is_none());
+        assert!(!framed_payload_len_valid(
+            usize::MAX,
+            REQ_HEADER_SIZE,
+            maximum
+        ));
     }
 
     #[test]
@@ -779,16 +794,25 @@ mod tests {
         assert_eq!(status, 0);
         assert_eq!(decoded_payload, payload);
         let maximum = crate::queue::max_message_bytes(crate::queue::DEFAULT_QUEUE_CAPACITY);
-        assert_eq!(encode_response_bounded(42, 0, payload, maximum).unwrap(), encoded);
+        assert_eq!(
+            encode_response_bounded(42, 0, payload, maximum).unwrap(),
+            encoded
+        );
         for bytes in [maximum - RESP_HEADER_SIZE - 1, maximum - RESP_HEADER_SIZE] {
             let body = vec![31; bytes];
             let response = encode_response_bounded(42, 0, &body, maximum).unwrap();
             assert_eq!(response, encode_response(42, 0, &body));
             assert_eq!(decode_response(&response), Some((42, 0, body.as_slice())));
         }
-        assert!(encode_response_bounded(42, 0,
-            &vec![29; maximum - RESP_HEADER_SIZE + 1], maximum).is_none());
-        assert!(!framed_payload_len_valid(usize::MAX, RESP_HEADER_SIZE, maximum));
+        assert!(
+            encode_response_bounded(42, 0, &vec![29; maximum - RESP_HEADER_SIZE + 1], maximum)
+                .is_none()
+        );
+        assert!(!framed_payload_len_valid(
+            usize::MAX,
+            RESP_HEADER_SIZE,
+            maximum
+        ));
     }
 
     #[test]
@@ -1118,15 +1142,23 @@ mod tests {
         assert_eq!(decoded, ops);
 
         // Legacy encoder and unchanged host decoder are independent wire oracles.
-        let bounds = KvPutBatchBounds::new(MAX_BOUNDED_KV_ITEMS,
-            crate::types::KV_MAX_VALUE_SIZE, MAX_BOUNDED_KV_BYTES).unwrap();
+        let bounds = KvPutBatchBounds::new(
+            MAX_BOUNDED_KV_ITEMS,
+            crate::types::KV_MAX_VALUE_SIZE,
+            MAX_BOUNDED_KV_BYTES,
+        )
+        .unwrap();
         assert!(KvPutBatchBounds::new(0, 1, 1).is_none());
         assert!(KvPutBatchBounds::new(1, 0, 1).is_none());
         assert!(KvPutBatchBounds::new(1, 1, 0).is_none());
         let same_as_legacy = |table: &[u8], records: &[(&[u8], &[u8])]| {
-            let owned = records.iter().map(|(key, value)| KvBatchOp::Put {
-                key: key.to_vec(), value: value.to_vec(),
-            }).collect::<Vec<_>>();
+            let owned = records
+                .iter()
+                .map(|(key, value)| KvBatchOp::Put {
+                    key: key.to_vec(),
+                    value: value.to_vec(),
+                })
+                .collect::<Vec<_>>();
             let legacy = encode_kv_write_batch_req(table, &owned);
             let borrowed = encode_kv_put_batch_req_borrowed(table, records, bounds).unwrap();
             assert_eq!(borrowed, legacy);
@@ -1143,39 +1175,102 @@ mod tests {
         let table_limit = vec![b't'; u16::MAX as usize];
         let key_limit = vec![b'k'; crate::types::KV_MAX_KEY_SIZE];
         same_as_legacy(&table_limit, &[(key_limit.as_slice(), b"value")]);
-        same_as_legacy(b"t", &[(b"k".as_slice(), b"v".as_slice()); MAX_BOUNDED_KV_ITEMS]);
+        same_as_legacy(
+            b"t",
+            &[(b"k".as_slice(), b"v".as_slice()); MAX_BOUNDED_KV_ITEMS],
+        );
         let individual = vec![1u8; crate::types::KV_MAX_VALUE_SIZE];
         let remaining = vec![2u8; MAX_BOUNDED_KV_BYTES - individual.len()];
-        same_as_legacy(b"t", &[(b"a", individual.as_slice()), (b"b", remaining.as_slice())]);
-        assert!(encode_kv_put_batch_req_borrowed(b"t", &[(b"a", individual.as_slice()),
-            (b"b", remaining.as_slice()), (b"c", b"x")], bounds).is_none());
+        same_as_legacy(
+            b"t",
+            &[(b"a", individual.as_slice()), (b"b", remaining.as_slice())],
+        );
+        assert!(encode_kv_put_batch_req_borrowed(
+            b"t",
+            &[
+                (b"a", individual.as_slice()),
+                (b"b", remaining.as_slice()),
+                (b"c", b"x")
+            ],
+            bounds
+        )
+        .is_none());
         let too_large = vec![3u8; crate::types::KV_MAX_VALUE_SIZE + 1];
-        assert!(encode_kv_put_batch_req_borrowed(b"t", &[(b"k", too_large.as_slice())], bounds).is_none());
-        assert!(encode_kv_put_batch_req_borrowed(b"t", &[(b"k".as_slice(), b"v".as_slice());
-            MAX_BOUNDED_KV_ITEMS + 1], bounds).is_none());
+        assert!(
+            encode_kv_put_batch_req_borrowed(b"t", &[(b"k", too_large.as_slice())], bounds)
+                .is_none()
+        );
+        assert!(encode_kv_put_batch_req_borrowed(
+            b"t",
+            &[(b"k".as_slice(), b"v".as_slice()); MAX_BOUNDED_KV_ITEMS + 1],
+            bounds
+        )
+        .is_none());
         assert!(encode_kv_put_batch_req_borrowed(b"", ordered, bounds).is_none());
-        assert!(encode_kv_put_batch_req_borrowed(&vec![b't'; u16::MAX as usize + 1], ordered, bounds).is_none());
-        assert!(encode_kv_put_batch_req_borrowed(b"t", &[(vec![b'k'; crate::types::KV_MAX_KEY_SIZE + 1].as_slice(), b"v")], bounds).is_none());
+        assert!(encode_kv_put_batch_req_borrowed(
+            &vec![b't'; u16::MAX as usize + 1],
+            ordered,
+            bounds
+        )
+        .is_none());
+        assert!(encode_kv_put_batch_req_borrowed(
+            b"t",
+            &[(
+                vec![b'k'; crate::types::KV_MAX_KEY_SIZE + 1].as_slice(),
+                b"v"
+            )],
+            bounds
+        )
+        .is_none());
         assert!(encode_kv_put_batch_req_borrowed(b"t", &[(b"", b"v")], bounds).is_none());
         assert!(encode_kv_put_batch_req_borrowed(b"t", &[(b"k", b"")], bounds).is_none());
         assert!(encode_kv_put_batch_req_borrowed(b"t", &[], bounds).is_none());
         let tighter = KvPutBatchBounds::new(2, 5, 8).unwrap();
         assert!(encode_kv_put_batch_req_borrowed(b"t", ordered, tighter).is_none());
         assert!(encode_kv_put_batch_req_borrowed(b"t", &[(b"k", b"123456")], tighter).is_none());
-        assert!(encode_kv_put_batch_req_borrowed(b"t", &[(b"a", b"12345"), (b"b", b"1234")], tighter).is_none());
-        let accepted = &[(b"a".as_slice(), b"12345".as_slice()), (b"b".as_slice(), b"123".as_slice())];
-        assert_eq!(encode_kv_put_batch_req_borrowed(b"t", accepted, tighter).unwrap(),
-            same_as_legacy(b"t", accepted));
+        assert!(encode_kv_put_batch_req_borrowed(
+            b"t",
+            &[(b"a", b"12345"), (b"b", b"1234")],
+            tighter
+        )
+        .is_none());
+        let accepted = &[
+            (b"a".as_slice(), b"12345".as_slice()),
+            (b"b".as_slice(), b"123".as_slice()),
+        ];
+        assert_eq!(
+            encode_kv_put_batch_req_borrowed(b"t", accepted, tighter).unwrap(),
+            same_as_legacy(b"t", accepted)
+        );
         let intersected = KvPutBatchBounds::new(usize::MAX, usize::MAX, usize::MAX).unwrap();
-        assert!(encode_kv_put_batch_req_borrowed(b"t", &[(b"k", too_large.as_slice())], intersected).is_none());
-        assert!(encode_kv_put_batch_req_borrowed(b"t", &[(b"k".as_slice(), b"v".as_slice());
-            MAX_BOUNDED_KV_ITEMS + 1], intersected).is_none());
-        assert!(encode_kv_put_batch_req_borrowed(b"t", &[(b"a", individual.as_slice()),
-            (b"b", remaining.as_slice()), (b"c", b"x")], intersected).is_none());
+        assert!(encode_kv_put_batch_req_borrowed(
+            b"t",
+            &[(b"k", too_large.as_slice())],
+            intersected
+        )
+        .is_none());
+        assert!(encode_kv_put_batch_req_borrowed(
+            b"t",
+            &[(b"k".as_slice(), b"v".as_slice()); MAX_BOUNDED_KV_ITEMS + 1],
+            intersected
+        )
+        .is_none());
+        assert!(encode_kv_put_batch_req_borrowed(
+            b"t",
+            &[
+                (b"a", individual.as_slice()),
+                (b"b", remaining.as_slice()),
+                (b"c", b"x")
+            ],
+            intersected
+        )
+        .is_none());
         // The original mixed/delete and empty-value API remains compatible above;
         // empty legacy batches keep their original wire representation as well.
-        assert_eq!(decode_kv_write_batch_req(&encode_kv_write_batch_req(b"t", &[])),
-            Some((b"t".as_slice(), Vec::new())));
+        assert_eq!(
+            decode_kv_write_batch_req(&encode_kv_write_batch_req(b"t", &[])),
+            Some((b"t".as_slice(), Vec::new()))
+        );
     }
 
     #[test]

@@ -113,9 +113,14 @@ pub fn tcp_connect(host: &str, port: u16) -> Result<i32> {
 /// Own the same OS socket before a readiness wait. The shared table guard is
 /// released here; close/replacement cannot switch this operation to another fd.
 pub(super) fn owned_stream(fd: i32) -> Result<TcpStream> {
-    SOCKET_TABLE.lock().unwrap().streams.get(&fd)
+    SOCKET_TABLE
+        .lock()
+        .unwrap()
+        .streams
+        .get(&fd)
         .ok_or_else(|| anyhow::anyhow!("Invalid stream fd {}", fd))?
-        .try_clone().map_err(Into::into)
+        .try_clone()
+        .map_err(Into::into)
 }
 
 /// Send data on a connected socket.
