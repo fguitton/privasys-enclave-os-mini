@@ -434,6 +434,23 @@ impl RpcDispatcher {
         let Some((operation, payload)) = rpc::decode_worker_storage_request(bytes) else {
             return (-22, Vec::new());
         };
+        if operation == Operation::GetBatch {
+            let Some((scope,table,records))=rpc::decode_worker_get_batch(payload,
+                self.request_rx.max_message_bytes(),self.response_tx.max_message_bytes()) else{return(-22,Vec::new());};
+            const DATA:&[u8]=b"honest/retained-data/v1/";
+            if table!=b"honest.accepted-artifact-chunks-v1" || records.iter().any(|(key,_)|
+                !worker_data_target(table,key,operation)||key.get(DATA.len()..DATA.len()+scope.len())!=Some(scope.as_slice())){return(-13,Vec::new());}
+            // Scope is inert address correlation. The trusted caller still
+            // requires its actual fresh Core observer/fence and per-page AEAD.
+            let keys=records.iter().map(|(key,_)|*key).collect::<Vec<_>>();
+            let values=match kvstore::multi_get("honest.accepted-artifact-chunks-v1",&keys){Ok(values)=>values,Err(_)=>return(-1,Vec::new())};
+            if values.iter().any(Option::is_none){return(1,Vec::new());}
+            let borrowed=values.iter().filter_map(|value|value.as_deref()).collect::<Vec<_>>();
+            let maxima=records.iter().map(|(_,maximum)|*maximum).collect::<Vec<_>>();
+            return match rpc::encode_worker_get_batch_response(&borrowed,&maxima,self.response_tx.max_message_bytes()){
+                Some(bytes)=>(0,bytes),None=>(-90,Vec::new()),
+            };
+        }
         if operation == Operation::PutBatch {
             let Some((table, records)) = rpc::decode_worker_storage_put_batch(payload) else { return (-22, Vec::new()); };
             if records.iter().any(|(key,_)| !worker_data_target(table,key,operation)) { return (-13, Vec::new()); }
@@ -455,7 +472,7 @@ impl RpcDispatcher {
             Operation::DurablePut => {
                 rpc::decode_durable_kv_put_req(payload).map(|(table, key, _)| (table, key))
             }
-            Operation::PutBatch => unreachable!("handled before scalar decode"),
+            Operation::PutBatch | Operation::GetBatch => unreachable!("handled before scalar decode"),
         };
         let Some((table, key)) = target else {
             return (-13, Vec::new());
@@ -466,7 +483,7 @@ impl RpcDispatcher {
             Operation::Put => self.handle_kv_put(payload),
             Operation::DurablePut => self.handle_kv_put_durable(payload),
             Operation::Delete => self.handle_kv_delete(payload),
-            Operation::PutBatch => unreachable!("handled before scalar decode"),
+            Operation::PutBatch | Operation::GetBatch => unreachable!("handled before scalar decode"),
         }
     }
 
@@ -884,7 +901,7 @@ mod tests {
         }
         let directory = tempfile::tempdir().unwrap();
         crate::kvstore::init(directory.path().to_str().unwrap()).unwrap();
-        let table = b"honest.accepted-artifact-chunks-v1";
+        let table: &[u8] = b"honest.accepted-artifact-chunks-v1";
         let key = [b"honest/retained-data/v1/".as_slice(), &[7; 32], b"/leaf"].concat();
         let other=[b"honest/retained-data/v1/".as_slice(), &[7;32], b"/node"].concat();
         let batch=rpc::encode_worker_storage_put_batch(table,&[(&key,b"batch leaf"),(&other,b"batch node")]).unwrap();
@@ -893,6 +910,32 @@ mod tests {
         let response=response_rx.try_recv().unwrap();
         assert_eq!(rpc::decode_honest_response_for(&response,identity).unwrap().status,0);
         assert_eq!(crate::kvstore::get("honest.accepted-artifact-chunks-v1",&other).unwrap().unwrap(),b"batch node");
+        // Actual existing dispatcher/DB/SPSC path, with reversed/duplicate
+        // requests, exact envelope correlation and strict whole-result errors.
+        let capacity=dispatcher.response_tx.max_message_bytes();
+        let get=rpc::encode_worker_get_batch([7;32],table,&[(&other,32),(&key,32),(&other,32)],dispatcher.request_rx.max_message_bytes(),capacity).unwrap();
+        let payload=rpc::encode_worker_storage_request(rpc::WorkerStorageOperation::GetBatch,&get).unwrap();
+        dispatcher.dispatch(&rpc::encode_honest_request(identity,&payload).unwrap());
+        let bytes=response_rx.try_recv().unwrap();let reply=rpc::decode_honest_response_for(&bytes,identity).unwrap();
+        assert_eq!(reply.status,0);
+        assert_eq!(rpc::decode_worker_get_batch_response(reply.payload,&[32,32,32]).unwrap(),[b"batch node".as_slice(),b"batch leaf".as_slice(),b"batch node".as_slice()]);
+        let missing=[b"honest/retained-data/v1/".as_slice(),&[7;32],b"/missing-get-batch"].concat();
+        let foreign=[b"honest/retained-data/v1/".as_slice(),&[8;32],b"/node"].concat();
+        for(table,requests,expected)in [
+            (table,vec![(key.as_slice(),32),(missing.as_slice(),32)],1),
+            (table,vec![(key.as_slice(),1)],-90),
+            (table,vec![(key.as_slice(),32),(foreign.as_slice(),32)],-13),
+            (table,vec![(b"honest/retained-scope/v1/catalog".as_slice(),32)],-13),
+            (b"honest.retained-output-chunks-v1".as_slice(),vec![(key.as_slice(),32)],-13),
+        ]{
+            let get=rpc::encode_worker_get_batch([7;32],table,&requests,dispatcher.request_rx.max_message_bytes(),capacity).unwrap();
+            let payload=rpc::encode_worker_storage_request(rpc::WorkerStorageOperation::GetBatch,&get).unwrap();
+            dispatcher.dispatch(&rpc::encode_honest_request(identity,&payload).unwrap());
+            let bytes=response_rx.try_recv().unwrap();let reply=rpc::decode_honest_response_for(&bytes,identity).unwrap();
+            assert_eq!(reply.status,expected);assert!(reply.payload.is_empty(),"missing/forbidden/oversized member cannot become successful subset");
+        }
+        assert_eq!(crate::kvstore::get("honest.accepted-artifact-chunks-v1",&key).unwrap().unwrap(),b"batch leaf","read group does not mutate original data");
+
         let forbidden=rpc::encode_worker_storage_put_batch(table,&[(&key,b"replacement"),(b"honest/retained-scope/v1/catalog",b"denied")]).unwrap();
         let payload=rpc::encode_worker_storage_request(rpc::WorkerStorageOperation::PutBatch,&forbidden).unwrap();
         dispatcher.dispatch(&rpc::encode_honest_request(identity,&payload).unwrap());

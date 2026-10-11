@@ -162,6 +162,9 @@ impl RpcClient {
         }
     }
 
+    /// Immutable endpoint sizes; metadata grants no IO or owner authority.
+    pub fn queue_geometry(&self)->(usize,usize){(self.request_tx.max_message_bytes(),self.response_rx.max_message_bytes())}
+
     fn try_reserve_request(&self) -> Result<u64, RequestReserveError> {
         let request_id = next_req_id().ok_or(RequestReserveError::OperationIdExhausted)?;
         self.in_flight_request_id

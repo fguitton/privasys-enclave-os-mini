@@ -270,6 +270,7 @@ pub enum WorkerStorageOperation {
     DurablePut = 2,
     Delete = 3,
     PutBatch = 4,
+    GetBatch = 5,
 }
 
 pub fn encode_worker_storage_request(
@@ -297,6 +298,7 @@ pub fn decode_worker_storage_request(bytes: &[u8]) -> Option<(WorkerStorageOpera
         2 => WorkerStorageOperation::DurablePut,
         3 => WorkerStorageOperation::Delete,
         4 => WorkerStorageOperation::PutBatch,
+        5 => WorkerStorageOperation::GetBatch,
         _ => return None,
     };
     Some((operation, payload))
@@ -351,3 +353,6 @@ pub fn decode_worker_storage_put_batch(bytes: &[u8]) -> Option<(&[u8], WorkerSto
     }
     (offset==bytes.len()).then_some((table,records))
 }
+
+mod get_batch;
+pub use get_batch::*;

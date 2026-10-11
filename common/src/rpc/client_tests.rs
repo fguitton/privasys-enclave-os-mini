@@ -270,6 +270,7 @@ fn check_rejected_wait() {
 }
 
 fn check_worker_storage_reservation() {
+    check_get_batch_codec();
     assert!(!honest_role_allows_method(
         RpcRole::Control,
         RpcMethod::WorkerStorage
@@ -352,4 +353,30 @@ fn check_ready_recheck() {
     assert_eq!(rpc.recheck_execution_rpc(&pending,64).unwrap().1.unwrap().payload(),b"event completed");
     assert!(matches!(rpc.recheck_execution_rpc(&pending,64),Err(client::PolledExecutionRpcError::NotPending)));
     println!("EXECUTION-READY-RECHECK: actual exact queue fastcompletion skipsOCALL, finiteempty64 thenretainedwait, eventcompletion PASS");
+}
+
+fn check_get_batch_codec(){
+    let capacity=crate::queue::max_message_bytes(crate::queue::DEFAULT_QUEUE_CAPACITY);
+    let scope=[7;32];let key=b"key".as_slice();
+    let maximum=128*1024+36+1024; // Independent existing canonical-node v2 vector.
+    assert_eq!(worker_get_batch_response_demand(&[maximum;8]),Some(1_057_090));
+    assert!(worker_get_batch_encoded_len(scope,b"t",&[(key,maximum);8],capacity,capacity).is_none());
+    let group=[(key,maximum);7];let wire=encode_worker_get_batch(scope,b"t",&group,capacity,capacity).unwrap();
+    let(decoded_scope,table,requests)=decode_worker_get_batch(&wire,capacity,capacity).unwrap();
+    assert_eq!(decoded_scope,scope);assert_eq!(table,b"t");assert_eq!(requests,group);
+    for cut in 0..wire.len(){assert!(decode_worker_get_batch(&wire[..cut],capacity,capacity).is_none());}
+    let mut trailing=wire.clone();trailing.push(0);assert!(decode_worker_get_batch(&trailing,capacity,capacity).is_none());
+    assert!(encode_worker_get_batch([0;32],b"t",&group,capacity,capacity).is_none());
+    assert!(worker_get_batch_encoded_len(scope,b"t",&[(key,0)],capacity,capacity).is_none());
+    let value=[9;5];let reply=encode_worker_get_batch_response(&[&value,&value],&[5,5],capacity).unwrap();
+    assert_eq!(decode_worker_get_batch_response(&reply,&[5,5]).unwrap(),[value.as_slice(),value.as_slice()]);
+    for cut in 0..reply.len(){assert!(decode_worker_get_batch_response(&reply[..cut],&[5,5]).is_none());}
+    assert!(decode_worker_get_batch_response(&reply,&[4,5]).is_none());
+    let mut tail=reply;tail.push(0);assert!(decode_worker_get_batch_response(&tail,&[5,5]).is_none());
+    let request_length=worker_get_batch_encoded_len(scope,b"t",&[(key,5)],capacity,capacity).unwrap();
+    let request_frame=request_length+1+HONEST_REQ_HEADER_SIZE;
+    let reply_frame=2+4+5+HONEST_RESP_HEADER_SIZE;
+    assert!(worker_get_batch_encoded_len(scope,b"t",&[(key,5)],request_frame,reply_frame).is_some());
+    assert!(worker_get_batch_encoded_len(scope,b"t",&[(key,5)],request_frame-1,reply_frame).is_none());
+    assert!(worker_get_batch_encoded_len(scope,b"t",&[(key,5)],request_frame,reply_frame-1).is_none());
 }
