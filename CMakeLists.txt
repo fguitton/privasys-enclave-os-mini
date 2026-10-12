@@ -109,6 +109,7 @@ if(NOT TEACLAVE_CANDIDATE_COUNT EQUAL 1)
         "found ${TEACLAVE_CANDIDATE_COUNT}")
 endif()
 list(GET TEACLAVE_CANDIDATES 0 TEACLAVE_CHECKOUT)
+set(TEACLAVE_IDENTITY_CHECKOUT "${TEACLAVE_CHECKOUT}")
 
 function(require_sdk230_teaclave SOURCE_ROOT)
     set(_FILES
@@ -179,12 +180,12 @@ message(STATUS "Teaclave SDK: ${TEACLAVE_CHECKOUT}")
 set(TEACLAVE_EDL_DIR  "${TEACLAVE_CHECKOUT}/sgx_edl/edl")
 set(TEACLAVE_INC_DIR  "${TEACLAVE_CHECKOUT}/common/inc")
 set(TEACLAVE_TLIBC    "${TEACLAVE_CHECKOUT}/common/inc/tlibc")
-if(SGX_MODE STREQUAL "SIM")
-    set(SGX_SYSROOT_DIR "${CMAKE_BINARY_DIR}/sgx-sysroot")
-    set(SYSROOT_BUILD_DIR "${CMAKE_BINARY_DIR}/teaclave-sysroot-build")
-else()
-    set(SGX_SYSROOT_DIR "${CMAKE_SOURCE_DIR}/sysroot")
-    set(SYSROOT_BUILD_DIR "${TEACLAVE_CHECKOUT}/build_sysroot")
+# Both hardware and simulation own every generated sysroot path in this build.
+# The source checkout and the SDK's old build_sysroot/target are never outputs.
+set(SGX_SYSROOT_DIR "${CMAKE_BINARY_DIR}/sgx-sysroot")
+set(SYSROOT_BUILD_DIR "${CMAKE_BINARY_DIR}/teaclave-sysroot-build")
+if(BUILD_ENCLAVE)
+    include(cmake/TeaclaveSysrootInputs.cmake)
 endif()
 get_filename_component(TEACLAVE_REMAP_SOURCE_ROOT
     "${TEACLAVE_CHECKOUT}" ABSOLUTE)
@@ -203,12 +204,14 @@ string(CONCAT SGX_SYSROOT_REPRODUCIBLE_RUSTFLAGS
 # Step 1: Build SGX sysroot (via the fork's CMake sgx_sysroot target)
 # =============================================================================
 if(BUILD_ENCLAVE)
-    # ExternalProject-like: configure + build the fork's sysroot target
+    # Use the existing source-locked recipe; its Cargo output and install copy
+    # both consume SGX_STD_TARGET_DIR. Input changes choose a fresh owned target.
     set(SYSROOT_STAMP "${CMAKE_BINARY_DIR}/sysroot.stamp")
     add_custom_command(
-        OUTPUT "${SYSROOT_STAMP}"
+        OUTPUT "${SYSROOT_STAMP}" "${SGX_SYSROOT_DIR}/build-inputs-v1.txt"
         COMMENT "Building SGX sysroot via Teaclave fork CMake..."
         COMMAND ${CMAKE_COMMAND} -E env
+            "PATH=${SGX_SYSROOT_CARGO_BIN_DIR}:$ENV{PATH}"
             "SGX_MODE=${SGX_MODE}"
             "SGX_SDK_PATH=${SGX_SDK_PATH}"
             "SGX_CRYPTO_BACKEND=${SGX_CRYPTO_BACKEND}"
@@ -225,10 +228,13 @@ if(BUILD_ENCLAVE)
             -DBUILD_SYSROOT=ON
             -DBUILD_URTS=OFF
             -DSGX_SYSROOT_OUTPUT=${SGX_SYSROOT_DIR}
+            -DSGX_STD_TARGET_DIR=${SGX_STD_TARGET_DIR}
             -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
             -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
             -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+        COMMAND ${CMAKE_COMMAND} -E rm -f "${SYSROOT_BUILD_DIR}/sgx_sysroot.stamp"
         COMMAND ${CMAKE_COMMAND} -E env
+            "PATH=${SGX_SYSROOT_CARGO_BIN_DIR}:$ENV{PATH}"
             "SGX_MODE=${SGX_MODE}"
             "SGX_SDK_PATH=${SGX_SDK_PATH}"
             "SGX_CRYPTO_BACKEND=${SGX_CRYPTO_BACKEND}"
@@ -242,10 +248,14 @@ if(BUILD_ENCLAVE)
             ${CMAKE_COMMAND}
             --build "${SYSROOT_BUILD_DIR}"
             --target sgx_sysroot
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${SGX_SYSROOT_INPUTS_FILE}" "${SGX_SYSROOT_DIR}/build-inputs-v1.txt"
         COMMAND ${CMAKE_COMMAND} -E touch "${SYSROOT_STAMP}"
+        DEPENDS "${SGX_SYSROOT_INPUTS_FILE}" ${SGX_SYSROOT_INPUT_FILES}
         VERBATIM
     )
-    add_custom_target(sgx_sysroot DEPENDS "${SYSROOT_STAMP}")
+    add_custom_target(sgx_sysroot
+        DEPENDS "${SYSROOT_STAMP}" "${SGX_SYSROOT_DIR}/build-inputs-v1.txt")
 endif()
 
 # =============================================================================
