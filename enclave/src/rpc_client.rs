@@ -95,7 +95,9 @@ pub struct PendingExecutionRpc {
 
 impl PendingExecutionRpc {
     /// Inert diagnostic join key; exposes no polling or submission authority.
-    pub const fn diagnostic_operation_id(&self)->u64 {self.identity.operation_id}
+    pub const fn diagnostic_operation_id(&self) -> u64 {
+        self.identity.operation_id
+    }
 }
 
 /// One bounded execution response returned by a single non-blocking poll.
@@ -117,7 +119,9 @@ impl ExecutionRpcCompletion {
     }
     /// Move already validated response bytes without a second payload copy.
     #[must_use]
-    pub fn into_payload(self)->Vec<u8>{self.payload}
+    pub fn into_payload(self) -> Vec<u8> {
+        self.payload
+    }
 }
 
 /// Fail-closed errors from the role-owned execution submit/poll interface.
@@ -197,7 +201,9 @@ impl RpcClient {
             return Err(PolledExecutionRpcError::MethodDenied);
         }
         if !rpc::framed_payload_len_valid(
-            payload.len(), rpc::HONEST_REQ_HEADER_SIZE, self.request_tx.max_message_bytes(),
+            payload.len(),
+            rpc::HONEST_REQ_HEADER_SIZE,
+            self.request_tx.max_message_bytes(),
         ) {
             return Err(PolledExecutionRpcError::InvalidRequest);
         }
@@ -350,12 +356,16 @@ impl RpcClient {
         maximum_polls: u64,
         mut empty: impl FnMut(),
     ) -> Result<(u64, Option<ExecutionRpcCompletion>), PolledExecutionRpcError> {
-        if maximum_polls==0 || maximum_polls>EXECUTION_READY_RECHECK_POLLS { return Err(PolledExecutionRpcError::InvalidRequest); }
+        if maximum_polls == 0 || maximum_polls > EXECUTION_READY_RECHECK_POLLS {
+            return Err(PolledExecutionRpcError::InvalidRequest);
+        }
         for polls in 1..=maximum_polls {
-            if let Some(completion)=self.poll_execution_rpc(pending)? { return Ok((polls, Some(completion))); }
+            if let Some(completion) = self.poll_execution_rpc(pending)? {
+                return Ok((polls, Some(completion)));
+            }
             empty();
         }
-        Ok((maximum_polls,None))
+        Ok((maximum_polls, None))
     }
 
     /// Wait only for an untrusted retained publication hint. The caller polls
@@ -412,7 +422,9 @@ impl RpcClient {
     /// Returns `(status, payload)` from the host's response.
     fn call(&self, method: RpcMethod, payload: &[u8]) -> (i32, Vec<u8>) {
         if !rpc::framed_payload_len_valid(
-            payload.len(), rpc::REQ_HEADER_SIZE, self.request_tx.max_message_bytes(),
+            payload.len(),
+            rpc::REQ_HEADER_SIZE,
+            self.request_tx.max_message_bytes(),
         ) {
             return (-22, Vec::new());
         }
@@ -427,7 +439,10 @@ impl RpcClient {
             Err(RequestReserveError::OperationIdExhausted) => return (-75, Vec::new()),
         };
         let Some(msg) = rpc::encode_request_bounded(
-            req_id, method, payload, self.request_tx.max_message_bytes(),
+            req_id,
+            method,
+            payload,
+            self.request_tx.max_message_bytes(),
         ) else {
             self.release_request(req_id);
             return (-22, Vec::new());
@@ -546,7 +561,9 @@ impl RpcClient {
     pub fn kv_put_durable(&self, table: &[u8], key: &[u8], value: &[u8]) -> Result<(), i32> {
         let payload = rpc::encode_durable_kv_put_req(table, key, value).ok_or(-22)?;
         if !rpc::framed_payload_len_valid(
-            payload.len(), rpc::REQ_HEADER_SIZE, self.request_tx.max_message_bytes(),
+            payload.len(),
+            rpc::REQ_HEADER_SIZE,
+            self.request_tx.max_message_bytes(),
         ) {
             return Err(-22);
         }

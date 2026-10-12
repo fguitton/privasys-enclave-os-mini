@@ -411,10 +411,15 @@ mod tests {
 
     #[test]
     fn test_roundtrip_tcp_data() {
-        let control=encode_tcp_read_control(7,9,1,true);let(kind,id,payload)=decode_channel_msg(&control).unwrap();
-        assert_eq!((kind,id),(ChannelMsgType::TcpReadControl,7));assert_eq!(decode_tcp_read_control(payload),Some((9,1,true)));
-        assert!(decode_tcp_read_control(&[0;17]).is_none());assert!(decode_tcp_read_control(&[0;16]).is_none());
-        let mut bad=payload.to_vec();bad[16]=2;assert!(decode_tcp_read_control(&bad).is_none());
+        let control = encode_tcp_read_control(7, 9, 1, true);
+        let (kind, id, payload) = decode_channel_msg(&control).unwrap();
+        assert_eq!((kind, id), (ChannelMsgType::TcpReadControl, 7));
+        assert_eq!(decode_tcp_read_control(payload), Some((9, 1, true)));
+        assert!(decode_tcp_read_control(&[0; 17]).is_none());
+        assert!(decode_tcp_read_control(&[0; 16]).is_none());
+        let mut bad = payload.to_vec();
+        bad[16] = 2;
+        assert!(decode_tcp_read_control(&bad).is_none());
 
         let data = vec![0x16, 0x03, 0x03, 0x00, 0x05]; // fake TLS record
         let msg = encode_tcp_data(99, &data);
@@ -534,16 +539,34 @@ mod tests {
 
 /// Optional bounded socket-read control. A newer revision replaces the prior
 /// pause state; stale messages never rearm a newer pause. No authority follows.
-pub fn encode_tcp_read_control(conn_id:u32,generation:u64,revision:u64,paused:bool)->Vec<u8>{
-    let mut payload=Vec::with_capacity(17);payload.extend_from_slice(&generation.to_be_bytes());payload.extend_from_slice(&revision.to_be_bytes());payload.push(u8::from(paused));
-    encode_channel_msg(ChannelMsgType::TcpReadControl,conn_id,&payload)
+pub fn encode_tcp_read_control(
+    conn_id: u32,
+    generation: u64,
+    revision: u64,
+    paused: bool,
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(17);
+    payload.extend_from_slice(&generation.to_be_bytes());
+    payload.extend_from_slice(&revision.to_be_bytes());
+    payload.push(u8::from(paused));
+    encode_channel_msg(ChannelMsgType::TcpReadControl, conn_id, &payload)
 }
-pub fn decode_tcp_read_control(payload:&[u8])->Option<(u64,u64,bool)>{
-    if payload.len()!=17 || payload[16]>1{return None;}
-    let generation=u64::from_be_bytes(payload[..8].try_into().ok()?);let revision=u64::from_be_bytes(payload[8..16].try_into().ok()?);
-    (generation!=0 && revision!=0).then_some((generation,revision,payload[16]!=0))
+pub fn decode_tcp_read_control(payload: &[u8]) -> Option<(u64, u64, bool)> {
+    if payload.len() != 17 || payload[16] > 1 {
+        return None;
+    }
+    let generation = u64::from_be_bytes(payload[..8].try_into().ok()?);
+    let revision = u64::from_be_bytes(payload[8..16].try_into().ok()?);
+    (generation != 0 && revision != 0).then_some((generation, revision, payload[16] != 0))
 }
-pub fn encode_tcp_read_identity(conn_id:u32,generation:u64)->Vec<u8>{encode_channel_msg(ChannelMsgType::TcpReadIdentity,conn_id,&generation.to_be_bytes())}
-pub fn decode_tcp_read_identity(payload:&[u8])->Option<u64>{
-    let generation=u64::from_be_bytes(payload.try_into().ok()?);(generation!=0).then_some(generation)
+pub fn encode_tcp_read_identity(conn_id: u32, generation: u64) -> Vec<u8> {
+    encode_channel_msg(
+        ChannelMsgType::TcpReadIdentity,
+        conn_id,
+        &generation.to_be_bytes(),
+    )
+}
+pub fn decode_tcp_read_identity(payload: &[u8]) -> Option<u64> {
+    let generation = u64::from_be_bytes(payload.try_into().ok()?);
+    (generation != 0).then_some(generation)
 }

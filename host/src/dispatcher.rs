@@ -16,8 +16,8 @@
 //! Queue publication and shutdown notify both independent dispatchers.
 
 use log::{debug, error, info, trace, warn};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use enclave_os_common::queue::{SpscConsumer, SpscProducer};
 use enclave_os_common::rpc::{self, HonestRpcIdentity, RpcMethod, RpcRole};
@@ -67,8 +67,11 @@ fn worker_data_target(table: &[u8], key: &[u8], operation: rpc::WorkerStorageOpe
     const DATA: &[u8] = b"honest/retained-data/v1/";
     let table_allowed = table == b"honest.accepted-artifact-chunks-v1"
         || (table == b"honest.retained-output-chunks-v1"
-            && matches!(operation, rpc::WorkerStorageOperation::Put | rpc::WorkerStorageOperation::PutBatch));
-    table_allowed && key.starts_with(DATA) && key.len()>DATA.len()+32 && key.len()<=512
+            && matches!(
+                operation,
+                rpc::WorkerStorageOperation::Put | rpc::WorkerStorageOperation::PutBatch
+            ));
+    table_allowed && key.starts_with(DATA) && key.len() > DATA.len() + 32 && key.len() <= 512
 }
 
 /// RPC dispatcher that bridges enclave requests to host services.
@@ -82,8 +85,8 @@ pub struct RpcDispatcher {
     /// Shutdown flag.
     shutdown: Arc<AtomicBool>,
     wake: Arc<DispatcherWake>,
-    #[cfg(feature="diagnostic-worker-storage-rpc")]
-    storage_profile:std::sync::Mutex<crate::storage_rpc_profile::Profile>,
+    #[cfg(feature = "diagnostic-worker-storage-rpc")]
+    storage_profile: std::sync::Mutex<crate::storage_rpc_profile::Profile>,
 }
 
 impl RpcDispatcher {
@@ -100,8 +103,8 @@ impl RpcDispatcher {
         wake: Arc<DispatcherWake>,
     ) -> Self {
         Self {
-            #[cfg(feature="diagnostic-worker-storage-rpc")]
-            storage_profile:std::sync::Mutex::new(crate::storage_rpc_profile::Profile::new()),
+            #[cfg(feature = "diagnostic-worker-storage-rpc")]
+            storage_profile: std::sync::Mutex::new(crate::storage_rpc_profile::Profile::new()),
             role,
             request_rx,
             response_tx,
@@ -133,21 +136,28 @@ impl RpcDispatcher {
             }
         }
 
-        #[cfg(feature="diagnostic-worker-storage-rpc")]
-        if self.role==RpcRole::Execution {
-            let (_,tail)=self.response_tx.diagnostic_positions();
-            let mut profile=self.storage_profile.lock().unwrap_or_else(|x|x.into_inner());
-            profile.observe(tail,"shutdown");profile.report();
+        #[cfg(feature = "diagnostic-worker-storage-rpc")]
+        if self.role == RpcRole::Execution {
+            let (_, tail) = self.response_tx.diagnostic_positions();
+            let mut profile = self
+                .storage_profile
+                .lock()
+                .unwrap_or_else(|x| x.into_inner());
+            profile.observe(tail, "shutdown");
+            profile.report();
         }
         info!("{} RPC dispatcher stopped", role_name(self.role));
     }
 
     /// Dispatch a single RPC request message.
     fn dispatch(&self, raw_msg: &[u8]) {
-        #[cfg(feature="diagnostic-worker-storage-rpc")]
-        if self.role==RpcRole::Execution {
-            let (_,tail)=self.response_tx.diagnostic_positions();
-            self.storage_profile.lock().unwrap_or_else(|x|x.into_inner()).observe(tail,"next-request");
+        #[cfg(feature = "diagnostic-worker-storage-rpc")]
+        if self.role == RpcRole::Execution {
+            let (_, tail) = self.response_tx.diagnostic_positions();
+            self.storage_profile
+                .lock()
+                .unwrap_or_else(|x| x.into_inner())
+                .observe(tail, "next-request");
         }
         if rpc::has_honest_rpc_magic(raw_msg) {
             self.dispatch_honest(raw_msg);
@@ -178,9 +188,16 @@ impl RpcDispatcher {
             identity.method,
             request.payload.len()
         );
-        #[cfg(feature="diagnostic-worker-storage-rpc")]
-        let diagnostic=(identity.role==RpcRole::Execution && self.role==RpcRole::Execution && identity.method==RpcMethod::WorkerStorage)
-            .then(||self.storage_profile.lock().unwrap_or_else(|x|x.into_inner()).start());
+        #[cfg(feature = "diagnostic-worker-storage-rpc")]
+        let diagnostic = (identity.role == RpcRole::Execution
+            && self.role == RpcRole::Execution
+            && identity.method == RpcMethod::WorkerStorage)
+            .then(|| {
+                self.storage_profile
+                    .lock()
+                    .unwrap_or_else(|x| x.into_inner())
+                    .start()
+            });
         let (status, payload) = if identity.role != self.role
             || !rpc::honest_role_allows_method(self.role, identity.method)
         {
@@ -198,21 +215,45 @@ impl RpcDispatcher {
                 self.dispatch_method(identity.method, request.payload)
             }
         };
-        #[cfg(feature="diagnostic-worker-storage-rpc")]
-        let handler=diagnostic.map(|start|self.storage_profile.lock().unwrap_or_else(|x|x.into_inner()).handler_done(start));
-        #[cfg(feature="diagnostic-worker-storage-rpc")]
-        let publish=handler.map(|_|std::time::Instant::now());
-        let published=self.try_send_honest_response(identity, status, &payload);
-        #[cfg(not(feature="diagnostic-worker-storage-rpc"))]
-        let _=published;
-        #[cfg(feature="diagnostic-worker-storage-rpc")]
-        if let (Some(handler),Some(publish))=(handler,publish) {
-            let (end,tail)=self.response_tx.diagnostic_positions();
-            self.storage_profile.lock().unwrap_or_else(|x|x.into_inner()).record(crate::storage_rpc_profile::Sample{identity,kind:request.payload.first().copied().unwrap_or(255),request:raw_msg.len(),response:payload.len(),status,handler,publish,end,tail,ok:published});
+        #[cfg(feature = "diagnostic-worker-storage-rpc")]
+        let handler = diagnostic.map(|start| {
+            self.storage_profile
+                .lock()
+                .unwrap_or_else(|x| x.into_inner())
+                .handler_done(start)
+        });
+        #[cfg(feature = "diagnostic-worker-storage-rpc")]
+        let publish = handler.map(|_| std::time::Instant::now());
+        let published = self.try_send_honest_response(identity, status, &payload);
+        #[cfg(not(feature = "diagnostic-worker-storage-rpc"))]
+        let _ = published;
+        #[cfg(feature = "diagnostic-worker-storage-rpc")]
+        if let (Some(handler), Some(publish)) = (handler, publish) {
+            let (end, tail) = self.response_tx.diagnostic_positions();
+            self.storage_profile
+                .lock()
+                .unwrap_or_else(|x| x.into_inner())
+                .record(crate::storage_rpc_profile::Sample {
+                    identity,
+                    kind: request.payload.first().copied().unwrap_or(255),
+                    request: raw_msg.len(),
+                    response: payload.len(),
+                    status,
+                    handler,
+                    publish,
+                    end,
+                    tail,
+                    ok: published,
+                });
         }
     }
 
-    fn try_send_honest_response(&self, identity: HonestRpcIdentity, status: i32, payload: &[u8]) -> bool {
+    fn try_send_honest_response(
+        &self,
+        identity: HonestRpcIdentity,
+        status: i32,
+        payload: &[u8],
+    ) -> bool {
         if let Err(error) = response_publication::publish(
             self.role,
             &self.response_tx,
@@ -228,7 +269,9 @@ impl RpcDispatcher {
                 error
             );
             false
-        } else {true}
+        } else {
+            true
+        }
     }
 
     fn dispatch_legacy(&self, raw_msg: &[u8]) {
@@ -268,8 +311,12 @@ impl RpcDispatcher {
 
         // Send response back to legacy Mini callers.
         let resp = rpc::encode_response_bounded(
-            req_id, status, &response_payload, self.response_tx.max_message_bytes(),
-        ).unwrap_or_else(|| rpc::encode_response(req_id, -90, &[]));
+            req_id,
+            status,
+            &response_payload,
+            self.response_tx.max_message_bytes(),
+        )
+        .unwrap_or_else(|| rpc::encode_response(req_id, -90, &[]));
         if self.response_tx.send_bounded(&resp).is_err() {
             error!("legacy response exceeds actual queue capacity");
         }
@@ -435,55 +482,97 @@ impl RpcDispatcher {
             return (-22, Vec::new());
         };
         if operation == Operation::GetBatch {
-            let Some((scope,table,records))=rpc::decode_worker_get_batch(payload,
-                self.request_rx.max_message_bytes(),self.response_tx.max_message_bytes()) else{return(-22,Vec::new());};
-            const DATA:&[u8]=b"honest/retained-data/v1/";
-            if table!=b"honest.accepted-artifact-chunks-v1" || records.iter().any(|(key,_)|
-                !worker_data_target(table,key,operation)||key.get(DATA.len()..DATA.len()+scope.len())!=Some(scope.as_slice())){return(-13,Vec::new());}
+            let Some((scope, table, records)) = rpc::decode_worker_get_batch(
+                payload,
+                self.request_rx.max_message_bytes(),
+                self.response_tx.max_message_bytes(),
+            ) else {
+                return (-22, Vec::new());
+            };
+            const DATA: &[u8] = b"honest/retained-data/v1/";
+            if table != b"honest.accepted-artifact-chunks-v1"
+                || records.iter().any(|(key, _)| {
+                    !worker_data_target(table, key, operation)
+                        || key.get(DATA.len()..DATA.len() + scope.len()) != Some(scope.as_slice())
+                })
+            {
+                return (-13, Vec::new());
+            }
             // Scope is inert address correlation. The trusted caller still
             // requires its actual fresh Core observer/fence and per-page AEAD.
-            let keys=records.iter().map(|(key,_)|*key).collect::<Vec<_>>();
-            let values=match kvstore::multi_get("honest.accepted-artifact-chunks-v1",&keys){Ok(values)=>values,Err(_)=>return(-1,Vec::new())};
-            if values.iter().any(Option::is_none){return(1,Vec::new());}
-            let borrowed=values.iter().filter_map(|value|value.as_deref()).collect::<Vec<_>>();
-            let maxima=records.iter().map(|(_,maximum)|*maximum).collect::<Vec<_>>();
-            return match rpc::encode_worker_get_batch_response(&borrowed,&maxima,self.response_tx.max_message_bytes()){
-                Some(bytes)=>(0,bytes),None=>(-90,Vec::new()),
+            let keys = records.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+            let values = match kvstore::multi_get("honest.accepted-artifact-chunks-v1", &keys) {
+                Ok(values) => values,
+                Err(_) => return (-1, Vec::new()),
+            };
+            if values.iter().any(Option::is_none) {
+                return (1, Vec::new());
+            }
+            let borrowed = values
+                .iter()
+                .filter_map(|value| value.as_deref())
+                .collect::<Vec<_>>();
+            let maxima = records
+                .iter()
+                .map(|(_, maximum)| *maximum)
+                .collect::<Vec<_>>();
+            return match rpc::encode_worker_get_batch_response(
+                &borrowed,
+                &maxima,
+                self.response_tx.max_message_bytes(),
+            ) {
+                Some(bytes) => (0, bytes),
+                None => (-90, Vec::new()),
             };
         }
         if operation == Operation::PutBatch {
-            let Some((table, records)) = rpc::decode_worker_storage_put_batch(payload) else { return (-22, Vec::new()); };
-            if records.iter().any(|(key,_)| !worker_data_target(table,key,operation)) { return (-13, Vec::new()); }
-            let operations=records.iter().map(|(key,value)| (*key,Some(*value))).collect::<Vec<_>>();
+            let Some((table, records)) = rpc::decode_worker_storage_put_batch(payload) else {
+                return (-22, Vec::new());
+            };
+            if records
+                .iter()
+                .any(|(key, _)| !worker_data_target(table, key, operation))
+            {
+                return (-13, Vec::new());
+            }
+            let operations = records
+                .iter()
+                .map(|(key, value)| (*key, Some(*value)))
+                .collect::<Vec<_>>();
             let table = match table {
                 b"honest.accepted-artifact-chunks-v1" => "honest.accepted-artifact-chunks-v1",
                 b"honest.retained-output-chunks-v1" => "honest.retained-output-chunks-v1",
                 _ => return (-13, Vec::new()),
             };
             return match kvstore::write_batch(table, &operations) {
-                Ok(()) => (0,Vec::new()), Err(_) => (-1,Vec::new()),
+                Ok(()) => (0, Vec::new()),
+                Err(_) => (-1, Vec::new()),
             };
         }
         let target = match operation {
-            Operation::Get | Operation::Delete => {
-                rpc::decode_kv_get_req(payload)
-            }
+            Operation::Get | Operation::Delete => rpc::decode_kv_get_req(payload),
             Operation::Put => rpc::decode_kv_put_req(payload).map(|(table, key, _)| (table, key)),
             Operation::DurablePut => {
                 rpc::decode_durable_kv_put_req(payload).map(|(table, key, _)| (table, key))
             }
-            Operation::PutBatch | Operation::GetBatch => unreachable!("handled before scalar decode"),
+            Operation::PutBatch | Operation::GetBatch => {
+                unreachable!("handled before scalar decode")
+            }
         };
         let Some((table, key)) = target else {
             return (-13, Vec::new());
         };
-        if !worker_data_target(table,key,operation) { return (-13,Vec::new()); }
+        if !worker_data_target(table, key, operation) {
+            return (-13, Vec::new());
+        }
         match operation {
             Operation::Get => self.handle_kv_get(payload),
             Operation::Put => self.handle_kv_put(payload),
             Operation::DurablePut => self.handle_kv_put_durable(payload),
             Operation::Delete => self.handle_kv_delete(payload),
-            Operation::PutBatch | Operation::GetBatch => unreachable!("handled before scalar decode"),
+            Operation::PutBatch | Operation::GetBatch => {
+                unreachable!("handled before scalar decode")
+            }
         }
     }
 
@@ -692,18 +781,20 @@ impl RpcDispatcher {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
-    use super::{legacy_role_allows_method, RpcDispatcher};
+    use super::{RpcDispatcher, legacy_role_allows_method};
     use enclave_os_common::queue::{SpscConsumer, SpscProducer, SpscQueueHeader};
     use enclave_os_common::rpc::{
-        self, honest_role_allows_method, HonestRpcIdentity, RpcMethod, RpcRole,
+        self, HonestRpcIdentity, RpcMethod, RpcRole, honest_role_allows_method,
     };
 
-    fn queue() -> (SpscProducer, SpscConsumer) { queue_with_capacity(8_192_u64) }
+    fn queue() -> (SpscProducer, SpscConsumer) {
+        queue_with_capacity(8_192_u64)
+    }
 
-    fn queue_with_capacity(capacity:u64) -> (SpscProducer, SpscConsumer) {
+    fn queue_with_capacity(capacity: u64) -> (SpscProducer, SpscConsumer) {
         let header = Box::into_raw(Box::new(SpscQueueHeader::new(capacity)));
         let buffer = vec![0_u8; capacity as usize];
         let buffer = Box::into_raw(buffer.into_boxed_slice()).cast::<u8>();
@@ -861,7 +952,9 @@ mod tests {
             "ordinary control error mapping stays unchanged"
         );
         crate::net::tcp_close(fd);
-        println!("EXECUTION-SOCKET-CANCEL-FRAME: actual dispatcher exactidentity status=-125 emptybody PASS");
+        println!(
+            "EXECUTION-SOCKET-CANCEL-FRAME: actual dispatcher exactidentity status=-125 emptybody PASS"
+        );
     }
     fn check_worker_storage_namespace() {
         let (_, request_rx) = queue();
@@ -904,115 +997,336 @@ mod tests {
         crate::kvstore::init(directory.path().to_str().unwrap()).unwrap();
         let table: &[u8] = b"honest.accepted-artifact-chunks-v1";
         let key = [b"honest/retained-data/v1/".as_slice(), &[7; 32], b"/leaf"].concat();
-        let other=[b"honest/retained-data/v1/".as_slice(), &[7;32], b"/node"].concat();
-        let batch=rpc::encode_worker_storage_put_batch(table,&[(&key,b"batch leaf"),(&other,b"batch node")]).unwrap();
-        let payload=rpc::encode_worker_storage_request(rpc::WorkerStorageOperation::PutBatch,&batch).unwrap();
-        dispatcher.dispatch(&rpc::encode_honest_request(identity,&payload).unwrap());
-        let response=response_rx.try_recv().unwrap();
-        assert_eq!(rpc::decode_honest_response_for(&response,identity).unwrap().status,0);
-        assert_eq!(crate::kvstore::get("honest.accepted-artifact-chunks-v1",&other).unwrap().unwrap(),b"batch node");
+        let other = [b"honest/retained-data/v1/".as_slice(), &[7; 32], b"/node"].concat();
+        let batch = rpc::encode_worker_storage_put_batch(
+            table,
+            &[(&key, b"batch leaf"), (&other, b"batch node")],
+        )
+        .unwrap();
+        let payload =
+            rpc::encode_worker_storage_request(rpc::WorkerStorageOperation::PutBatch, &batch)
+                .unwrap();
+        dispatcher.dispatch(&rpc::encode_honest_request(identity, &payload).unwrap());
+        let response = response_rx.try_recv().unwrap();
+        assert_eq!(
+            rpc::decode_honest_response_for(&response, identity)
+                .unwrap()
+                .status,
+            0
+        );
+        assert_eq!(
+            crate::kvstore::get("honest.accepted-artifact-chunks-v1", &other)
+                .unwrap()
+                .unwrap(),
+            b"batch node"
+        );
         {
-        // The original 8 KiB negative queues remain unchanged. This positive
-        // full group uses a power-of-two queue sized from the lower batch cap.
-        let full_capacity=u64::try_from(rpc::MAX_WORKER_STORAGE_BATCH_BYTES.next_power_of_two()).unwrap();
-        let (_,request_rx)=queue_with_capacity(full_capacity);
-        let (response_tx,response_rx)=queue_with_capacity(full_capacity);
-        let dispatcher=RpcDispatcher::new(RpcRole::Execution,request_rx,response_tx,
-            Arc::new(AtomicBool::new(false)),Arc::new(crate::dispatcher_wake::DispatcherWake::new()));
-        // Actual supported record-count boundary with representative 8 KiB
-        // opaque values through the existing DB and framed response queues.
-        let full_keys=(0..rpc::MAX_WORKER_STORAGE_BATCH_RECORDS).map(|index|
-            [b"honest/retained-data/v1/".as_slice(),&[7;32],b"/geometry-",&(index as u64).to_be_bytes()].concat()
-        ).collect::<Vec<_>>();
-        let full_values=(0..full_keys.len()).map(|index|vec![u8::try_from(index).unwrap();8192]).collect::<Vec<_>>();
-        let full_records=full_keys.iter().zip(&full_values).map(|(key,value)|(key.as_slice(),value.as_slice())).collect::<Vec<_>>();
-        let batch=rpc::encode_worker_storage_put_batch(table,&full_records).unwrap();
-        let payload=rpc::encode_worker_storage_request(rpc::WorkerStorageOperation::PutBatch,&batch).unwrap();
-        dispatcher.dispatch(&rpc::encode_honest_request(identity,&payload).unwrap());
-        let response=response_rx.try_recv().unwrap();
-        assert_eq!(rpc::decode_honest_response_for(&response,identity).unwrap().status,0);
-        let full_requests=full_keys.iter().map(|key|(key.as_slice(),8192)).collect::<Vec<_>>();
-        let get=rpc::encode_worker_get_batch([7;32],table,&full_requests,dispatcher.request_rx.max_message_bytes(),dispatcher.response_tx.max_message_bytes()).unwrap();
-        let payload=rpc::encode_worker_storage_request(rpc::WorkerStorageOperation::GetBatch,&get).unwrap();
-        dispatcher.dispatch(&rpc::encode_honest_request(identity,&payload).unwrap());
-        let response=response_rx.try_recv().unwrap();
-        let reply=rpc::decode_honest_response_for(&response,identity).unwrap();
-        assert_eq!(reply.status,0);
-        let maxima=vec![8192;full_keys.len()];
-        let returned=rpc::decode_worker_get_batch_response(reply.payload,&maxima).unwrap();
-        assert_eq!(returned.len(),full_values.len());
-        for(actual,expected)in returned.iter().zip(&full_values){assert_eq!(*actual,expected.as_slice());}
+            // The original 8 KiB negative queues remain unchanged. This positive
+            // full group uses a power-of-two queue sized from the lower batch cap.
+            let full_capacity =
+                u64::try_from(rpc::MAX_WORKER_STORAGE_BATCH_BYTES.next_power_of_two()).unwrap();
+            let (_, request_rx) = queue_with_capacity(full_capacity);
+            let (response_tx, response_rx) = queue_with_capacity(full_capacity);
+            let dispatcher = RpcDispatcher::new(
+                RpcRole::Execution,
+                request_rx,
+                response_tx,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(crate::dispatcher_wake::DispatcherWake::new()),
+            );
+            // Actual supported record-count boundary with representative 8 KiB
+            // opaque values through the existing DB and framed response queues.
+            let full_keys = (0..rpc::MAX_WORKER_STORAGE_BATCH_RECORDS)
+                .map(|index| {
+                    [
+                        b"honest/retained-data/v1/".as_slice(),
+                        &[7; 32],
+                        b"/geometry-",
+                        &(index as u64).to_be_bytes(),
+                    ]
+                    .concat()
+                })
+                .collect::<Vec<_>>();
+            let full_values = (0..full_keys.len())
+                .map(|index| vec![u8::try_from(index).unwrap(); 8192])
+                .collect::<Vec<_>>();
+            let full_records = full_keys
+                .iter()
+                .zip(&full_values)
+                .map(|(key, value)| (key.as_slice(), value.as_slice()))
+                .collect::<Vec<_>>();
+            let batch = rpc::encode_worker_storage_put_batch(table, &full_records).unwrap();
+            let payload =
+                rpc::encode_worker_storage_request(rpc::WorkerStorageOperation::PutBatch, &batch)
+                    .unwrap();
+            dispatcher.dispatch(&rpc::encode_honest_request(identity, &payload).unwrap());
+            let response = response_rx.try_recv().unwrap();
+            assert_eq!(
+                rpc::decode_honest_response_for(&response, identity)
+                    .unwrap()
+                    .status,
+                0
+            );
+            let full_requests = full_keys
+                .iter()
+                .map(|key| (key.as_slice(), 8192))
+                .collect::<Vec<_>>();
+            let get = rpc::encode_worker_get_batch(
+                [7; 32],
+                table,
+                &full_requests,
+                dispatcher.request_rx.max_message_bytes(),
+                dispatcher.response_tx.max_message_bytes(),
+            )
+            .unwrap();
+            let payload =
+                rpc::encode_worker_storage_request(rpc::WorkerStorageOperation::GetBatch, &get)
+                    .unwrap();
+            dispatcher.dispatch(&rpc::encode_honest_request(identity, &payload).unwrap());
+            let response = response_rx.try_recv().unwrap();
+            let reply = rpc::decode_honest_response_for(&response, identity).unwrap();
+            assert_eq!(reply.status, 0);
+            let maxima = vec![8192; full_keys.len()];
+            let returned = rpc::decode_worker_get_batch_response(reply.payload, &maxima).unwrap();
+            assert_eq!(returned.len(), full_values.len());
+            for (actual, expected) in returned.iter().zip(&full_values) {
+                assert_eq!(*actual, expected.as_slice());
+            }
         }
         // Actual existing dispatcher/DB/SPSC path, with reversed/duplicate
         // requests, exact envelope correlation and strict whole-result errors.
-        let capacity=dispatcher.response_tx.max_message_bytes();
-        let get=rpc::encode_worker_get_batch([7;32],table,&[(&other,32),(&key,32),(&other,32)],dispatcher.request_rx.max_message_bytes(),capacity).unwrap();
-        let payload=rpc::encode_worker_storage_request(rpc::WorkerStorageOperation::GetBatch,&get).unwrap();
-        dispatcher.dispatch(&rpc::encode_honest_request(identity,&payload).unwrap());
-        let bytes=response_rx.try_recv().unwrap();let reply=rpc::decode_honest_response_for(&bytes,identity).unwrap();
-        assert_eq!(reply.status,0);
-        assert_eq!(rpc::decode_worker_get_batch_response(reply.payload,&[32,32,32]).unwrap(),[b"batch node".as_slice(),b"batch leaf".as_slice(),b"batch node".as_slice()]);
-        let missing=[b"honest/retained-data/v1/".as_slice(),&[7;32],b"/missing-get-batch"].concat();
-        let foreign=[b"honest/retained-data/v1/".as_slice(),&[8;32],b"/node"].concat();
-        for(table,requests,expected)in [
-            (table,vec![(key.as_slice(),32),(missing.as_slice(),32)],1),
-            (table,vec![(key.as_slice(),1)],-90),
-            (table,vec![(key.as_slice(),32),(foreign.as_slice(),32)],-13),
-            (table,vec![(b"honest/retained-scope/v1/catalog".as_slice(),32)],-13),
-            (b"honest.retained-output-chunks-v1".as_slice(),vec![(key.as_slice(),32)],-13),
-        ]{
-            let get=rpc::encode_worker_get_batch([7;32],table,&requests,dispatcher.request_rx.max_message_bytes(),capacity).unwrap();
-            let payload=rpc::encode_worker_storage_request(rpc::WorkerStorageOperation::GetBatch,&get).unwrap();
-            dispatcher.dispatch(&rpc::encode_honest_request(identity,&payload).unwrap());
-            let bytes=response_rx.try_recv().unwrap();let reply=rpc::decode_honest_response_for(&bytes,identity).unwrap();
-            assert_eq!(reply.status,expected);assert!(reply.payload.is_empty(),"missing/forbidden/oversized member cannot become successful subset");
+        let capacity = dispatcher.response_tx.max_message_bytes();
+        let get = rpc::encode_worker_get_batch(
+            [7; 32],
+            table,
+            &[(&other, 32), (&key, 32), (&other, 32)],
+            dispatcher.request_rx.max_message_bytes(),
+            capacity,
+        )
+        .unwrap();
+        let payload =
+            rpc::encode_worker_storage_request(rpc::WorkerStorageOperation::GetBatch, &get)
+                .unwrap();
+        dispatcher.dispatch(&rpc::encode_honest_request(identity, &payload).unwrap());
+        let bytes = response_rx.try_recv().unwrap();
+        let reply = rpc::decode_honest_response_for(&bytes, identity).unwrap();
+        assert_eq!(reply.status, 0);
+        assert_eq!(
+            rpc::decode_worker_get_batch_response(reply.payload, &[32, 32, 32]).unwrap(),
+            [
+                b"batch node".as_slice(),
+                b"batch leaf".as_slice(),
+                b"batch node".as_slice()
+            ]
+        );
+        let missing = [
+            b"honest/retained-data/v1/".as_slice(),
+            &[7; 32],
+            b"/missing-get-batch",
+        ]
+        .concat();
+        let foreign = [b"honest/retained-data/v1/".as_slice(), &[8; 32], b"/node"].concat();
+        for (table, requests, expected) in [
+            (
+                table,
+                vec![(key.as_slice(), 32), (missing.as_slice(), 32)],
+                1,
+            ),
+            (table, vec![(key.as_slice(), 1)], -90),
+            (
+                table,
+                vec![(key.as_slice(), 32), (foreign.as_slice(), 32)],
+                -13,
+            ),
+            (
+                table,
+                vec![(b"honest/retained-scope/v1/catalog".as_slice(), 32)],
+                -13,
+            ),
+            (
+                b"honest.retained-output-chunks-v1".as_slice(),
+                vec![(key.as_slice(), 32)],
+                -13,
+            ),
+        ] {
+            let get = rpc::encode_worker_get_batch(
+                [7; 32],
+                table,
+                &requests,
+                dispatcher.request_rx.max_message_bytes(),
+                capacity,
+            )
+            .unwrap();
+            let payload =
+                rpc::encode_worker_storage_request(rpc::WorkerStorageOperation::GetBatch, &get)
+                    .unwrap();
+            dispatcher.dispatch(&rpc::encode_honest_request(identity, &payload).unwrap());
+            let bytes = response_rx.try_recv().unwrap();
+            let reply = rpc::decode_honest_response_for(&bytes, identity).unwrap();
+            assert_eq!(reply.status, expected);
+            assert!(
+                reply.payload.is_empty(),
+                "missing/forbidden/oversized member cannot become successful subset"
+            );
         }
-        assert_eq!(crate::kvstore::get("honest.accepted-artifact-chunks-v1",&key).unwrap().unwrap(),b"batch leaf","read group does not mutate original data");
+        assert_eq!(
+            crate::kvstore::get("honest.accepted-artifact-chunks-v1", &key)
+                .unwrap()
+                .unwrap(),
+            b"batch leaf",
+            "read group does not mutate original data"
+        );
 
-        let forbidden=rpc::encode_worker_storage_put_batch(table,&[(&key,b"replacement"),(b"honest/retained-scope/v1/catalog",b"denied")]).unwrap();
-        let payload=rpc::encode_worker_storage_request(rpc::WorkerStorageOperation::PutBatch,&forbidden).unwrap();
-        dispatcher.dispatch(&rpc::encode_honest_request(identity,&payload).unwrap());
-        let response=response_rx.try_recv().unwrap();assert_eq!(rpc::decode_honest_response_for(&response,identity).unwrap().status,-13);
-        assert_eq!(crate::kvstore::get("honest.accepted-artifact-chunks-v1",&key).unwrap().unwrap(),b"batch leaf","entire namespace group validated before mutation");
+        let forbidden = rpc::encode_worker_storage_put_batch(
+            table,
+            &[
+                (&key, b"replacement"),
+                (b"honest/retained-scope/v1/catalog", b"denied"),
+            ],
+        )
+        .unwrap();
+        let payload =
+            rpc::encode_worker_storage_request(rpc::WorkerStorageOperation::PutBatch, &forbidden)
+                .unwrap();
+        dispatcher.dispatch(&rpc::encode_honest_request(identity, &payload).unwrap());
+        let response = response_rx.try_recv().unwrap();
+        assert_eq!(
+            rpc::decode_honest_response_for(&response, identity)
+                .unwrap()
+                .status,
+            -13
+        );
+        assert_eq!(
+            crate::kvstore::get("honest.accepted-artifact-chunks-v1", &key)
+                .unwrap()
+                .unwrap(),
+            b"batch leaf",
+            "entire namespace group validated before mutation"
+        );
         // The output bridge stages ciphertext only. Actual dispatcher writes
         // the selected dedicated table; roots/catalog/reads remain control-only.
-        let output_table=b"honest.retained-output-chunks-v1";
-        let put=rpc::encode_worker_storage_request(rpc::WorkerStorageOperation::Put,
-            &rpc::encode_kv_put_req(output_table,&key,b"output scalar")).unwrap();
-        dispatcher.dispatch(&rpc::encode_honest_request(identity,&put).unwrap());
-        let response=response_rx.try_recv().unwrap();
-        assert_eq!(rpc::decode_honest_response_for(&response,identity).unwrap().status,0);
-        let output_batch=rpc::encode_worker_storage_put_batch(output_table,
-            &[(&key,b"output leaf"),(&other,b"output node")]).unwrap();
-        let payload=rpc::encode_worker_storage_request(rpc::WorkerStorageOperation::PutBatch,&output_batch).unwrap();
-        dispatcher.dispatch(&rpc::encode_honest_request(identity,&payload).unwrap());
-        let response=response_rx.try_recv().unwrap();
-        assert_eq!(rpc::decode_honest_response_for(&response,identity).unwrap().status,0);
-        assert_eq!(crate::kvstore::get("honest.retained-output-chunks-v1",&key).unwrap().unwrap(),b"output leaf");
-        assert_eq!(crate::kvstore::get("honest.retained-output-chunks-v1",&other).unwrap().unwrap(),b"output node");
-        assert_eq!(crate::kvstore::get("honest.accepted-artifact-chunks-v1",&key).unwrap().unwrap(),b"batch leaf");
-        for (operation,payload) in [
-            (rpc::WorkerStorageOperation::Get,rpc::encode_kv_get_req(output_table,&key)),
-            (rpc::WorkerStorageOperation::Delete,rpc::encode_kv_get_req(output_table,&key)),
-            (rpc::WorkerStorageOperation::DurablePut,rpc::encode_durable_kv_put_req(output_table,&key,b"forbidden root").unwrap()),
+        let output_table = b"honest.retained-output-chunks-v1";
+        let put = rpc::encode_worker_storage_request(
+            rpc::WorkerStorageOperation::Put,
+            &rpc::encode_kv_put_req(output_table, &key, b"output scalar"),
+        )
+        .unwrap();
+        dispatcher.dispatch(&rpc::encode_honest_request(identity, &put).unwrap());
+        let response = response_rx.try_recv().unwrap();
+        assert_eq!(
+            rpc::decode_honest_response_for(&response, identity)
+                .unwrap()
+                .status,
+            0
+        );
+        let output_batch = rpc::encode_worker_storage_put_batch(
+            output_table,
+            &[(&key, b"output leaf"), (&other, b"output node")],
+        )
+        .unwrap();
+        let payload = rpc::encode_worker_storage_request(
+            rpc::WorkerStorageOperation::PutBatch,
+            &output_batch,
+        )
+        .unwrap();
+        dispatcher.dispatch(&rpc::encode_honest_request(identity, &payload).unwrap());
+        let response = response_rx.try_recv().unwrap();
+        assert_eq!(
+            rpc::decode_honest_response_for(&response, identity)
+                .unwrap()
+                .status,
+            0
+        );
+        assert_eq!(
+            crate::kvstore::get("honest.retained-output-chunks-v1", &key)
+                .unwrap()
+                .unwrap(),
+            b"output leaf"
+        );
+        assert_eq!(
+            crate::kvstore::get("honest.retained-output-chunks-v1", &other)
+                .unwrap()
+                .unwrap(),
+            b"output node"
+        );
+        assert_eq!(
+            crate::kvstore::get("honest.accepted-artifact-chunks-v1", &key)
+                .unwrap()
+                .unwrap(),
+            b"batch leaf"
+        );
+        for (operation, payload) in [
+            (
+                rpc::WorkerStorageOperation::Get,
+                rpc::encode_kv_get_req(output_table, &key),
+            ),
+            (
+                rpc::WorkerStorageOperation::Delete,
+                rpc::encode_kv_get_req(output_table, &key),
+            ),
+            (
+                rpc::WorkerStorageOperation::DurablePut,
+                rpc::encode_durable_kv_put_req(output_table, &key, b"forbidden root").unwrap(),
+            ),
         ] {
-            let request=rpc::encode_worker_storage_request(operation,&payload).unwrap();
-            dispatcher.dispatch(&rpc::encode_honest_request(identity,&request).unwrap());
-            let response=response_rx.try_recv().unwrap();
-            assert_eq!(rpc::decode_honest_response_for(&response,identity).unwrap().status,-13);
+            let request = rpc::encode_worker_storage_request(operation, &payload).unwrap();
+            dispatcher.dispatch(&rpc::encode_honest_request(identity, &request).unwrap());
+            let response = response_rx.try_recv().unwrap();
+            assert_eq!(
+                rpc::decode_honest_response_for(&response, identity)
+                    .unwrap()
+                    .status,
+                -13
+            );
         }
-        let output_bad=rpc::encode_worker_storage_put_batch(output_table,
-            &[(&key,b"must not replace"),(b"honest/retained-scope/v1/catalog",b"denied")]).unwrap();
-        let request=rpc::encode_worker_storage_request(rpc::WorkerStorageOperation::PutBatch,&output_bad).unwrap();
-        dispatcher.dispatch(&rpc::encode_honest_request(identity,&request).unwrap());
-        let response=response_rx.try_recv().unwrap();
-        assert_eq!(rpc::decode_honest_response_for(&response,identity).unwrap().status,-13);
-        assert_eq!(crate::kvstore::get("honest.retained-output-chunks-v1",&key).unwrap().unwrap(),b"output leaf");
-        println!("OUTPUT-WORKER-STAGED-TABLE: actual dispatch Put/PutBatch isolated; output read/durable/delete/catalog denied PASS");
-        for cut in 0..batch.len() {assert!(rpc::decode_worker_storage_put_batch(&batch[..cut]).is_none());}
-        let mut trailing=batch.clone();trailing.push(0);assert!(rpc::decode_worker_storage_put_batch(&trailing).is_none());
-        assert!(rpc::encode_worker_storage_put_batch(table,&[(key.as_slice(),[1u8;1].as_slice());65]).is_none());
-        assert!(rpc::encode_worker_storage_put_batch(table,&[(&key,&vec![1;rpc::MAX_WORKER_STORAGE_BATCH_BYTES])]).is_none());
+        let output_bad = rpc::encode_worker_storage_put_batch(
+            output_table,
+            &[
+                (&key, b"must not replace"),
+                (b"honest/retained-scope/v1/catalog", b"denied"),
+            ],
+        )
+        .unwrap();
+        let request =
+            rpc::encode_worker_storage_request(rpc::WorkerStorageOperation::PutBatch, &output_bad)
+                .unwrap();
+        dispatcher.dispatch(&rpc::encode_honest_request(identity, &request).unwrap());
+        let response = response_rx.try_recv().unwrap();
+        assert_eq!(
+            rpc::decode_honest_response_for(&response, identity)
+                .unwrap()
+                .status,
+            -13
+        );
+        assert_eq!(
+            crate::kvstore::get("honest.retained-output-chunks-v1", &key)
+                .unwrap()
+                .unwrap(),
+            b"output leaf"
+        );
+        println!(
+            "OUTPUT-WORKER-STAGED-TABLE: actual dispatch Put/PutBatch isolated; output read/durable/delete/catalog denied PASS"
+        );
+        for cut in 0..batch.len() {
+            assert!(rpc::decode_worker_storage_put_batch(&batch[..cut]).is_none());
+        }
+        let mut trailing = batch.clone();
+        trailing.push(0);
+        assert!(rpc::decode_worker_storage_put_batch(&trailing).is_none());
+        assert!(
+            rpc::encode_worker_storage_put_batch(
+                table,
+                &[(key.as_slice(), [1u8; 1].as_slice()); 65]
+            )
+            .is_none()
+        );
+        assert!(
+            rpc::encode_worker_storage_put_batch(
+                table,
+                &[(&key, &vec![1; rpc::MAX_WORKER_STORAGE_BATCH_BYTES])]
+            )
+            .is_none()
+        );
 
         for (operation, payload, expected) in [
             (
@@ -1050,8 +1364,15 @@ mod tests {
             RpcRole::Control,
             RpcMethod::KvPutDurable
         ));
-        println!("WORKER-STORAGE-HOST: actual framed accepted-data put/durable/get; BFT/scratch/catalogue refusals; control-only durable policy PASS");
-            #[cfg(feature="diagnostic-worker-storage-rpc")]
-        {let (_,tail)=dispatcher.response_tx.diagnostic_positions();let mut profile=dispatcher.storage_profile.lock().unwrap();profile.observe(tail,"next-request");profile.check();}
-}
+        println!(
+            "WORKER-STORAGE-HOST: actual framed accepted-data put/durable/get; BFT/scratch/catalogue refusals; control-only durable policy PASS"
+        );
+        #[cfg(feature = "diagnostic-worker-storage-rpc")]
+        {
+            let (_, tail) = dispatcher.response_tx.diagnostic_positions();
+            let mut profile = dispatcher.storage_profile.lock().unwrap();
+            profile.observe(tail, "next-request");
+            profile.check();
+        }
+    }
 }

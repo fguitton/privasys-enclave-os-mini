@@ -105,12 +105,12 @@ pub struct IngressServer {
     /// Enclave-visible route class for each multiplexed TLS connection.
     /// This remains routing metadata and never substitutes for authorization.
     ingress_classes: BTreeMap<u32, enclave_os_common::modules::IngressClass>,
-    stream_owner:crate::stream_ingress::CancellationOwner,
-    next_stream:u64,
-    stream_cursor:u32,
-    read_revision:u64,
-    stream_generations:BTreeMap<u32,u64>,
-    paused_stream_reads:BTreeSet<u32>,
+    stream_owner: crate::stream_ingress::CancellationOwner,
+    next_stream: u64,
+    stream_cursor: u32,
+    read_revision: u64,
+    stream_generations: BTreeMap<u32, u64>,
+    paused_stream_reads: BTreeSet<u32>,
     /// Intermediary CA for certificate generation.
     ca: Arc<CaContext>,
     /// Producer for `data_enc_to_host` — sends TLS bytes to the TCP proxy.
@@ -164,7 +164,12 @@ impl IngressServer {
             pending_dispatch: BTreeSet::new(),
             deferred_owner: crate::deferred_ingress::CancellationOwner::default(),
             next_deferred: 0,
-            stream_owner:crate::stream_ingress::CancellationOwner::default(),next_stream:0,stream_cursor:0,read_revision:0,stream_generations:BTreeMap::new(),paused_stream_reads:BTreeSet::new(),
+            stream_owner: crate::stream_ingress::CancellationOwner::default(),
+            next_stream: 0,
+            stream_cursor: 0,
+            read_revision: 0,
+            stream_generations: BTreeMap::new(),
+            paused_stream_reads: BTreeSet::new(),
             deferred_cursor: 0,
             ingress_classes: BTreeMap::new(),
             ca,
@@ -184,7 +189,9 @@ impl IngressServer {
     /// operation authority or renewing any authenticated request.
     pub(crate) fn current_data_session(&mut self, connection: u32) -> bool {
         match self.sessions.get_mut(&connection) {
-            Some(SessionState::Established(session)) => super::session::current_data_session(Some(session)),
+            Some(SessionState::Established(session)) => {
+                super::session::current_data_session(Some(session))
+            }
             _ => false,
         }
     }
@@ -193,12 +200,18 @@ impl IngressServer {
     ///
     /// Called from the enclave event loop for each message received on
     /// the `data_host_to_enc` queue.
-    pub fn handle_message(&mut self, msg_type: ChannelMsgType, conn_id: u32, payload: &[u8]) -> bool {
+    pub fn handle_message(
+        &mut self,
+        msg_type: ChannelMsgType,
+        conn_id: u32,
+        payload: &[u8],
+    ) -> bool {
         let mut advancing_response_credit = false;
         match msg_type {
             ChannelMsgType::TcpNew | ChannelMsgType::LocalControlNew => {
                 self.invalidate_deferred(conn_id);
-                self.paused_stream_reads.remove(&conn_id);self.stream_generations.remove(&conn_id);
+                self.paused_stream_reads.remove(&conn_id);
+                self.stream_generations.remove(&conn_id);
                 self.pending_dispatch.remove(&conn_id);
                 let peer_addr = core::str::from_utf8(payload)
                     .unwrap_or("<invalid>")
@@ -229,13 +242,16 @@ impl IngressServer {
                     _ => None,
                 };
                 let (valid, advancing) = super::session::response_credit(
-                    payload, self.write_windows.borrow_mut().get_mut(&conn_id), established,
+                    payload,
+                    self.write_windows.borrow_mut().get_mut(&conn_id),
+                    established,
                 );
                 advancing_response_credit = advancing;
                 if !valid {
                     self.sessions.remove(&conn_id);
-                        self.invalidate_deferred(conn_id);
-                self.paused_stream_reads.remove(&conn_id);self.stream_generations.remove(&conn_id);
+                    self.invalidate_deferred(conn_id);
+                    self.paused_stream_reads.remove(&conn_id);
+                    self.stream_generations.remove(&conn_id);
                     self.pending_dispatch.remove(&conn_id);
                     self.ingress_classes.remove(&conn_id);
                     self.write_windows.borrow_mut().remove(&conn_id);
@@ -244,12 +260,17 @@ impl IngressServer {
             }
             ChannelMsgType::TcpData => {
                 self.handle_tcp_data(conn_id, payload);
-                if self.stream_owner.pending.contains_key(&conn_id) && matches!(self.sessions.get(&conn_id),Some(SessionState::Established(s)) if s.stream_input_bytes()>=8*1024*1024){self.stream_read_control(conn_id,true);}
+                if self.stream_owner.pending.contains_key(&conn_id)
+                    && matches!(self.sessions.get(&conn_id),Some(SessionState::Established(s)) if s.stream_input_bytes()>=8*1024*1024)
+                {
+                    self.stream_read_control(conn_id, true);
+                }
             }
 
             ChannelMsgType::TcpClose => {
                 self.invalidate_deferred(conn_id);
-                self.paused_stream_reads.remove(&conn_id);self.stream_generations.remove(&conn_id);
+                self.paused_stream_reads.remove(&conn_id);
+                self.stream_generations.remove(&conn_id);
                 self.pending_dispatch.remove(&conn_id);
                 self.ingress_classes.remove(&conn_id);
                 self.write_windows.borrow_mut().remove(&conn_id);
@@ -266,12 +287,23 @@ impl IngressServer {
                 }
             }
 
-            ChannelMsgType::TcpReadIdentity=>{
-                if self.sessions.contains_key(&conn_id){
-                    if let Some(generation)=channel::decode_tcp_read_identity(payload){
-                        if self.stream_generations.get(&conn_id).is_some_and(|old|*old!=generation){self.invalidate_deferred(conn_id);self.close_deferred_transport(conn_id);}
-                        else{self.stream_generations.insert(conn_id,generation);}
-                    }else{self.invalidate_deferred(conn_id);self.close_deferred_transport(conn_id);}
+            ChannelMsgType::TcpReadIdentity => {
+                if self.sessions.contains_key(&conn_id) {
+                    if let Some(generation) = channel::decode_tcp_read_identity(payload) {
+                        if self
+                            .stream_generations
+                            .get(&conn_id)
+                            .is_some_and(|old| *old != generation)
+                        {
+                            self.invalidate_deferred(conn_id);
+                            self.close_deferred_transport(conn_id);
+                        } else {
+                            self.stream_generations.insert(conn_id, generation);
+                        }
+                    } else {
+                        self.invalidate_deferred(conn_id);
+                        self.close_deferred_transport(conn_id);
+                    }
                 }
             }
             ChannelMsgType::DataReady | ChannelMsgType::TcpReadControl => {
@@ -514,7 +546,8 @@ impl IngressServer {
         }
         if !self.sessions.contains_key(&conn_id) {
             self.invalidate_deferred(conn_id);
-            self.paused_stream_reads.remove(&conn_id);self.stream_generations.remove(&conn_id);
+            self.paused_stream_reads.remove(&conn_id);
+            self.stream_generations.remove(&conn_id);
             self.pending_dispatch.remove(&conn_id);
             self.write_windows.borrow_mut().remove(&conn_id);
             self.ingress_classes.remove(&conn_id);
@@ -537,15 +570,21 @@ impl IngressServer {
     }
 
     /// Process all complete HTTP/1.1 requests from a session.
-    fn invalidate_stream(&mut self,id:u32) {
-        if let Some(slot)=self.stream_owner.pending.remove(&id) {
-            if let Some(receiver)=slot.receiver {self.stream_owner.cancelled.push_back(receiver);}
+    fn invalidate_stream(&mut self, id: u32) {
+        if let Some(slot) = self.stream_owner.pending.remove(&id) {
+            if let Some(receiver) = slot.receiver {
+                self.stream_owner.cancelled.push_back(receiver);
+            }
             crate::stream_ingress::notify();
         }
     }
     fn invalidate_deferred(&mut self, id: u32) {
         self.invalidate_stream(id);
-        crate::deferred_ingress::invalidate_pending(&mut self.deferred_owner.pending, &mut self.deferred_owner.cancelled, id);
+        crate::deferred_ingress::invalidate_pending(
+            &mut self.deferred_owner.pending,
+            &mut self.deferred_owner.cancelled,
+            id,
+        );
         crate::notify_deferred_ingress();
     }
     pub(crate) fn take_cancelled_deferred(&mut self) -> Option<crate::HonestPendingIngress> {
@@ -554,19 +593,34 @@ impl IngressServer {
 
     // Actual header/stage consumption controls socket reads only. The original
     // independent plaintext/ciphertext bounds remain enforced if a host lies.
-    fn stream_read_control(&mut self,id:u32,paused:bool)->bool {
-        if self.paused_stream_reads.contains(&id)==paused{return true;}
-        let Some(revision)=self.read_revision.checked_add(1) else{self.close_deferred_transport(id);return false;};
-        self.read_revision=revision;
-        if paused{self.paused_stream_reads.insert(id);}else{self.paused_stream_reads.remove(&id);}
-        let Some(generation)=self.stream_generations.get(&id).copied()else{self.close_deferred_transport(id);return false;};
-        self.queue_to_proxy(channel::encode_tcp_read_control(id,generation,revision,paused));
+    fn stream_read_control(&mut self, id: u32, paused: bool) -> bool {
+        if self.paused_stream_reads.contains(&id) == paused {
+            return true;
+        }
+        let Some(revision) = self.read_revision.checked_add(1) else {
+            self.close_deferred_transport(id);
+            return false;
+        };
+        self.read_revision = revision;
+        if paused {
+            self.paused_stream_reads.insert(id);
+        } else {
+            self.paused_stream_reads.remove(&id);
+        }
+        let Some(generation) = self.stream_generations.get(&id).copied() else {
+            self.close_deferred_transport(id);
+            return false;
+        };
+        self.queue_to_proxy(channel::encode_tcp_read_control(
+            id, generation, revision, paused,
+        ));
         !self.output_failed.get()
     }
 
     fn close_deferred_transport(&mut self, id: u32) {
         // The extracted token is cancelled after releasing STATE.
-        self.paused_stream_reads.remove(&id);self.stream_generations.remove(&id);
+        self.paused_stream_reads.remove(&id);
+        self.stream_generations.remove(&id);
         self.sessions.remove(&id);
         self.pending_dispatch.remove(&id);
         self.ingress_classes.remove(&id);
@@ -578,73 +632,199 @@ impl IngressServer {
         self.deferred_owner.take_tokens()
     }
 
-    pub(crate) fn take_cancelled_stream(&mut self)->Option<crate::stream_ingress::ChargedReceiver> {self.stream_owner.cancelled.pop_front()}
-    pub(crate) fn stream_credit_ready(&mut self){
-        for slot in self.stream_owner.pending.values_mut(){slot.credit_ready();}
+    pub(crate) fn take_cancelled_stream(
+        &mut self,
+    ) -> Option<crate::stream_ingress::ChargedReceiver> {
+        self.stream_owner.cancelled.pop_front()
     }
-    pub(crate) fn take_stream(&mut self,seen:&[u64])->Option<crate::stream_ingress::Work> {
-        let eligible=|id:&u32,slot:&crate::stream_ingress::Slot| !seen.contains(&slot.nonce) && (
-            slot.header.is_some() || slot.started.elapsed()>=std::time::Duration::from_secs(60)
-            || !matches!(self.sessions.get(id),Some(SessionState::Established(s)) if !s.attestation_failed() && s.channel_binder().as_deref()==Some(slot.binding.as_slice()))
-            || (!slot.parked && slot.receiver.is_some() && (!slot.fragment.is_empty() || matches!(self.sessions.get(id),Some(SessionState::Established(s)) if s.stream_has_input()))));
-        let id=self.stream_owner.pending.range((std::ops::Bound::Excluded(self.stream_cursor),std::ops::Bound::Unbounded)).find(|(id,slot)|eligible(id,slot)).or_else(||self.stream_owner.pending.iter().find(|(id,slot)|eligible(id,slot))).map(|(id,_)|*id)?;
-        self.stream_cursor=id;
-        let slot=self.stream_owner.pending.get_mut(&id)?;
-        let mut charge=None;
-        let context=match self.sessions.get_mut(&id) {
-            Some(SessionState::Established(s))=>{
-                if slot.started.elapsed()<std::time::Duration::from_secs(60) && s.require_current_configuration().is_ok() && !s.attestation_failed() && self.stream_generations.get(&id)==Some(&slot.generation) && s.channel_binder().as_deref()==Some(slot.binding.as_slice()) {
-                    charge=s.context_allocation_bound().and_then(crate::deferred_ingress::ContextCharge::reserve);
-                    if charge.is_some(){Some(fresh_context(id,self.ingress_classes.get(&id).copied().unwrap_or(enclave_os_common::modules::IngressClass::ExternalNetwork),s))}else{None}
-                }else{None}
-            }
-            _=>None,
+    pub(crate) fn stream_credit_ready(&mut self) {
+        for slot in self.stream_owner.pending.values_mut() {
+            slot.credit_ready();
+        }
+    }
+    pub(crate) fn take_stream(&mut self, seen: &[u64]) -> Option<crate::stream_ingress::Work> {
+        let eligible = |id: &u32, slot: &crate::stream_ingress::Slot| {
+            !seen.contains(&slot.nonce)
+                && (slot.header.is_some()
+                    || slot.started.elapsed() >= std::time::Duration::from_secs(60)
+                    || !matches!(self.sessions.get(id),Some(SessionState::Established(s)) if !s.attestation_failed() && s.channel_binder().as_deref()==Some(slot.binding.as_slice()))
+                    || (!slot.parked
+                        && slot.receiver.is_some()
+                        && (!slot.fragment.is_empty()
+                            || matches!(self.sessions.get(id),Some(SessionState::Established(s)) if s.stream_has_input()))))
         };
-        let header=slot.header.take();
-        let bytes=if context.is_some() && header.is_none() {
-            if !slot.fragment.is_empty(){std::mem::take(&mut slot.fragment)}else{
-                match self.sessions.get_mut(&id) {Some(SessionState::Established(s))=>s.stream_fragment(slot.remaining.min(crate::MAX_STREAM_INGRESS_FRAGMENT)),_=>Vec::new()}
+        let id = self
+            .stream_owner
+            .pending
+            .range((
+                std::ops::Bound::Excluded(self.stream_cursor),
+                std::ops::Bound::Unbounded,
+            ))
+            .find(|(id, slot)| eligible(id, slot))
+            .or_else(|| {
+                self.stream_owner
+                    .pending
+                    .iter()
+                    .find(|(id, slot)| eligible(id, slot))
+            })
+            .map(|(id, _)| *id)?;
+        self.stream_cursor = id;
+        let slot = self.stream_owner.pending.get_mut(&id)?;
+        let mut charge = None;
+        let context = match self.sessions.get_mut(&id) {
+            Some(SessionState::Established(s)) => {
+                if slot.started.elapsed() < std::time::Duration::from_secs(60)
+                    && s.require_current_configuration().is_ok()
+                    && !s.attestation_failed()
+                    && self.stream_generations.get(&id) == Some(&slot.generation)
+                    && s.channel_binder().as_deref() == Some(slot.binding.as_slice())
+                {
+                    charge = s
+                        .context_allocation_bound()
+                        .and_then(crate::deferred_ingress::ContextCharge::reserve);
+                    if charge.is_some() {
+                        Some(fresh_context(
+                            id,
+                            self.ingress_classes.get(&id).copied().unwrap_or(
+                                enclave_os_common::modules::IngressClass::ExternalNetwork,
+                            ),
+                            s,
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
             }
-        }else{Vec::new()};
-        let remaining=slot.remaining.checked_sub(bytes.len())?;
-        Some(crate::stream_ingress::Work{lease:slot.lease.clone(),connection:id,nonce:slot.nonce,generation:slot.generation,binding:slot.binding,context,context_charge:charge,header,receiver:slot.receiver.take().map(|r|r.value),bytes,length:slot.length,remaining,pending:false})
+            _ => None,
+        };
+        let header = slot.header.take();
+        let bytes = if context.is_some() && header.is_none() {
+            if !slot.fragment.is_empty() {
+                std::mem::take(&mut slot.fragment)
+            } else {
+                match self.sessions.get_mut(&id) {
+                    Some(SessionState::Established(s)) => {
+                        s.stream_fragment(slot.remaining.min(crate::MAX_STREAM_INGRESS_FRAGMENT))
+                    }
+                    _ => Vec::new(),
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let remaining = slot.remaining.checked_sub(bytes.len())?;
+        Some(crate::stream_ingress::Work {
+            lease: slot.lease.clone(),
+            connection: id,
+            nonce: slot.nonce,
+            generation: slot.generation,
+            binding: slot.binding,
+            context,
+            context_charge: charge,
+            header,
+            receiver: slot.receiver.take().map(|r| r.value),
+            bytes,
+            length: slot.length,
+            remaining,
+            pending: false,
+        })
     }
-    pub(crate) fn finish_stream(&mut self,work:&mut crate::stream_ingress::Work,response:&mut Option<crate::HonestIngressResponse>)->bool {
-        let id=work.connection;
-        let valid=self.stream_owner.pending.get(&id).is_some_and(|slot|slot.nonce==work.nonce && slot.generation==work.generation && self.stream_generations.get(&id)==Some(&work.generation) && slot.binding==work.binding && slot.receiver.is_none())
-            && work.context.is_some() && match self.sessions.get_mut(&id){
-                Some(SessionState::Established(s))=>s.require_current_configuration().is_ok() && !s.attestation_failed() && s.channel_binder().as_deref()==Some(work.binding.as_slice()),
-                _=>false,
+    pub(crate) fn finish_stream(
+        &mut self,
+        work: &mut crate::stream_ingress::Work,
+        response: &mut Option<crate::HonestIngressResponse>,
+    ) -> bool {
+        let id = work.connection;
+        let valid = self.stream_owner.pending.get(&id).is_some_and(|slot| {
+            slot.nonce == work.nonce
+                && slot.generation == work.generation
+                && self.stream_generations.get(&id) == Some(&work.generation)
+                && slot.binding == work.binding
+                && slot.receiver.is_none()
+        }) && work.context.is_some()
+            && match self.sessions.get_mut(&id) {
+                Some(SessionState::Established(s)) => {
+                    s.require_current_configuration().is_ok()
+                        && !s.attestation_failed()
+                        && s.channel_binder().as_deref() == Some(work.binding.as_slice())
+                }
+                _ => false,
             };
         if !valid {
-            if self.stream_owner.pending.get(&id).is_some_and(|slot|slot.nonce==work.nonce){self.invalidate_stream(id);self.close_deferred_transport(id);}
+            if self
+                .stream_owner
+                .pending
+                .get(&id)
+                .is_some_and(|slot| slot.nonce == work.nonce)
+            {
+                self.invalidate_stream(id);
+                self.close_deferred_transport(id);
+            }
             return false;
         }
         if response.is_none() {
-            let slot=self.stream_owner.pending.get_mut(&id).unwrap();
-            if crate::stream_ingress::retain_work(slot,work).is_err(){self.invalidate_stream(id);self.close_deferred_transport(id);return false;}
-            let backlog=match self.sessions.get(&id){Some(SessionState::Established(s))=>s.stream_input_bytes(),_=>0};
-            if work.pending || backlog>=8*1024*1024{self.stream_read_control(id,true);}
-            else if backlog<=4*1024*1024{self.stream_read_control(id,false);}
-            if !work.pending && matches!(self.sessions.get(&id),Some(SessionState::Established(s)) if s.stream_has_input()){crate::stream_ingress::notify();}
+            let slot = self.stream_owner.pending.get_mut(&id).unwrap();
+            if crate::stream_ingress::retain_work(slot, work).is_err() {
+                self.invalidate_stream(id);
+                self.close_deferred_transport(id);
+                return false;
+            }
+            let backlog = match self.sessions.get(&id) {
+                Some(SessionState::Established(s)) => s.stream_input_bytes(),
+                _ => 0,
+            };
+            if work.pending || backlog >= 8 * 1024 * 1024 {
+                self.stream_read_control(id, true);
+            } else if backlog <= 4 * 1024 * 1024 {
+                self.stream_read_control(id, false);
+            }
+            if !work.pending
+                && matches!(self.sessions.get(&id),Some(SessionState::Established(s)) if s.stream_has_input())
+            {
+                crate::stream_ingress::notify();
+            }
             return true;
         }
-        let slot=self.stream_owner.pending.remove(&id).unwrap();
-        let Some(SessionState::Established(mut session))=self.sessions.remove(&id) else{return false;};
-        let ready=response.take().unwrap();
-        if session.finish_stream_input().is_err(){self.close_deferred_transport(id);return false;}
-        let failed=ready.status>=400;
-        if !failed && !self.stream_read_control(id,false){return false;}
-        if self.queue_deferred_ready(id,&mut session,ready,slot.close||failed){self.sessions.insert(id,SessionState::Established(session));}
-        else{self.paused_stream_reads.remove(&id);self.pending_dispatch.remove(&id);self.write_windows.borrow_mut().remove(&id);self.ingress_classes.remove(&id);}
+        let slot = self.stream_owner.pending.remove(&id).unwrap();
+        let Some(SessionState::Established(mut session)) = self.sessions.remove(&id) else {
+            return false;
+        };
+        let ready = response.take().unwrap();
+        if session.finish_stream_input().is_err() {
+            self.close_deferred_transport(id);
+            return false;
+        }
+        let failed = ready.status >= 400;
+        if !failed && !self.stream_read_control(id, false) {
+            return false;
+        }
+        if self.queue_deferred_ready(id, &mut session, ready, slot.close || failed) {
+            self.sessions.insert(id, SessionState::Established(session));
+        } else {
+            self.paused_stream_reads.remove(&id);
+            self.pending_dispatch.remove(&id);
+            self.write_windows.borrow_mut().remove(&id);
+            self.ingress_classes.remove(&id);
+        }
         false
     }
-    pub(crate) fn drain_stream_receivers(&mut self)->Vec<crate::stream_ingress::ChargedReceiver> {self.stream_owner.take_receivers()}
+    pub(crate) fn drain_stream_receivers(&mut self) -> Vec<crate::stream_ingress::ChargedReceiver> {
+        self.stream_owner.take_receivers()
+    }
 
     /// Extract one fixed slot after an event. The marker stays reserved while
     /// the adopter progresses outside STATE, including disconnect races.
-    pub(crate) fn take_deferred(&mut self, seen: &[u64]) -> Option<crate::deferred_ingress::DeferredWork> {
-        let id = crate::deferred_ingress::select_pending(&self.deferred_owner.pending, self.deferred_cursor, seen)?;
+    pub(crate) fn take_deferred(
+        &mut self,
+        seen: &[u64],
+    ) -> Option<crate::deferred_ingress::DeferredWork> {
+        let id = crate::deferred_ingress::select_pending(
+            &self.deferred_owner.pending,
+            self.deferred_cursor,
+            seen,
+        )?;
         self.deferred_cursor = id;
         let slot = self.deferred_owner.pending.get_mut(&id)?;
         let token = slot.token.take()?;
@@ -653,40 +833,85 @@ impl IngressServer {
         let mut context_charge = None;
         let context = match self.sessions.get_mut(&id) {
             Some(SessionState::Established(session)) if !expired => {
-                if session.require_current_configuration().is_err() || session.attestation_failed()
-                    || session.channel_binder().as_deref() != Some(binding.as_slice()) {
+                if session.require_current_configuration().is_err()
+                    || session.attestation_failed()
+                    || session.channel_binder().as_deref() != Some(binding.as_slice())
+                {
                     None
                 } else {
-                    context_charge = session.context_allocation_bound().and_then(crate::deferred_ingress::ContextCharge::reserve);
-                    if context_charge.is_none() { return Some(crate::deferred_ingress::DeferredWork { connection:id, nonce, binding, token, context:None, context_charge:None }); }
-                    Some(fresh_context(id, self.ingress_classes.get(&id).copied()
-                        .unwrap_or(enclave_os_common::modules::IngressClass::ExternalNetwork), session))
+                    context_charge = session
+                        .context_allocation_bound()
+                        .and_then(crate::deferred_ingress::ContextCharge::reserve);
+                    if context_charge.is_none() {
+                        return Some(crate::deferred_ingress::DeferredWork {
+                            connection: id,
+                            nonce,
+                            binding,
+                            token,
+                            context: None,
+                            context_charge: None,
+                        });
+                    }
+                    Some(fresh_context(
+                        id,
+                        self.ingress_classes
+                            .get(&id)
+                            .copied()
+                            .unwrap_or(enclave_os_common::modules::IngressClass::ExternalNetwork),
+                        session,
+                    ))
                 }
             }
             _ => None,
         };
-        Some(crate::deferred_ingress::DeferredWork { connection: id, nonce, binding, token, context, context_charge })
+        Some(crate::deferred_ingress::DeferredWork {
+            connection: id,
+            nonce,
+            binding,
+            token,
+            context,
+            context_charge,
+        })
     }
 
     /// Ready bytes are queued only after the exact retained marker and current
     /// session/configuration join. False means cancel the adopter token outside
     /// STATE; any unqueued body also drops outside STATE.
-    pub(crate) fn finish_deferred(&mut self, work: &crate::deferred_ingress::DeferredWork,
-        response: &mut Option<crate::HonestIngressResponse>) -> bool {
+    pub(crate) fn finish_deferred(
+        &mut self,
+        work: &crate::deferred_ingress::DeferredWork,
+        response: &mut Option<crate::HonestIngressResponse>,
+    ) -> bool {
         let id = work.connection;
-        let valid_marker = self.deferred_owner.pending.get(&id).is_some_and(|slot| slot.matches_inflight(work.nonce, work.binding));
+        let valid_marker = self
+            .deferred_owner
+            .pending
+            .get(&id)
+            .is_some_and(|slot| slot.matches_inflight(work.nonce, work.binding));
         if !valid_marker {
-            if self.deferred_owner.pending.get(&id).is_some_and(|slot| slot.nonce == work.nonce) { self.deferred_owner.pending.remove(&id); self.close_deferred_transport(id); }
+            if self
+                .deferred_owner
+                .pending
+                .get(&id)
+                .is_some_and(|slot| slot.nonce == work.nonce)
+            {
+                self.deferred_owner.pending.remove(&id);
+                self.close_deferred_transport(id);
+            }
             return false;
         }
-        let valid_session = work.context.is_some() && match self.sessions.get_mut(&id) {
-            Some(SessionState::Established(session)) => session.require_current_configuration().is_ok()
-                && !session.attestation_failed()
-                && session.channel_binder().as_deref() == Some(work.binding.as_slice()),
-            _ => false,
-        };
+        let valid_session = work.context.is_some()
+            && match self.sessions.get_mut(&id) {
+                Some(SessionState::Established(session)) => {
+                    session.require_current_configuration().is_ok()
+                        && !session.attestation_failed()
+                        && session.channel_binder().as_deref() == Some(work.binding.as_slice())
+                }
+                _ => false,
+            };
         if !valid_session {
-            self.deferred_owner.pending.remove(&id); self.close_deferred_transport(id);
+            self.deferred_owner.pending.remove(&id);
+            self.close_deferred_transport(id);
             return false;
         }
         if response.is_none() {
@@ -694,59 +919,152 @@ impl IngressServer {
             return true;
         }
         let slot = self.deferred_owner.pending.remove(&id).unwrap();
-        let Some(SessionState::Established(mut session)) = self.sessions.remove(&id) else { return false; };
+        let Some(SessionState::Established(mut session)) = self.sessions.remove(&id) else {
+            return false;
+        };
         let ready = response.take().unwrap();
-        let keep = match session.queue_http_response_owned(ready.status, ready.content_type,
-            &[], ready.body, slot.close, false) {
-            Ok(()) => { self.pending_dispatch.insert(id); true }
+        let keep = match session.queue_http_response_owned(
+            ready.status,
+            ready.content_type,
+            &[],
+            ready.body,
+            slot.close,
+            false,
+        ) {
+            Ok(()) => {
+                self.pending_dispatch.insert(id);
+                true
+            }
             Err((_, body)) => {
-                *response = Some(crate::HonestIngressResponse { status:ready.status, content_type:ready.content_type, body });
-                self.send_close(id); false
+                *response = Some(crate::HonestIngressResponse {
+                    status: ready.status,
+                    content_type: ready.content_type,
+                    body,
+                });
+                self.send_close(id);
+                false
             }
         };
-        if keep { self.sessions.insert(id, SessionState::Established(session)); }
-        else { self.pending_dispatch.remove(&id); self.write_windows.borrow_mut().remove(&id); self.ingress_classes.remove(&id); }
+        if keep {
+            self.sessions.insert(id, SessionState::Established(session));
+        } else {
+            self.pending_dispatch.remove(&id);
+            self.write_windows.borrow_mut().remove(&id);
+            self.ingress_classes.remove(&id);
+        }
         false
     }
 
-    fn queue_deferred_ready(&mut self, conn_id: u32, session: &mut RaTlsSession,
-        response: crate::HonestIngressResponse, close: bool) -> bool {
-        if session.queue_http_response(response.status, response.content_type, &[],
-            response.body, close, false).is_err() {
-            self.send_close(conn_id); return false;
+    fn queue_deferred_ready(
+        &mut self,
+        conn_id: u32,
+        session: &mut RaTlsSession,
+        response: crate::HonestIngressResponse,
+        close: bool,
+    ) -> bool {
+        if session
+            .queue_http_response(
+                response.status,
+                response.content_type,
+                &[],
+                response.body,
+                close,
+                false,
+            )
+            .is_err()
+        {
+            self.send_close(conn_id);
+            return false;
         }
         self.pending_dispatch.insert(conn_id);
-        let credit = self.write_windows.borrow().get(&conn_id)
+        let credit = self
+            .write_windows
+            .borrow()
+            .get(&conn_id)
             .is_some_and(|window| window.available() >= 64 * 1024);
         !credit || self.flush_response(conn_id, session)
     }
 
     fn dispatch_requests(&mut self, conn_id: u32, session: &mut RaTlsSession) -> bool {
-        if self.stream_owner.pending.contains_key(&conn_id) {crate::stream_ingress::notify();return true;}
-        if self.deferred_owner.pending.contains_key(&conn_id) { return true; }
+        if self.stream_owner.pending.contains_key(&conn_id) {
+            crate::stream_ingress::notify();
+            return true;
+        }
+        if self.deferred_owner.pending.contains_key(&conn_id) {
+            return true;
+        }
         self.pending_dispatch.remove(&conn_id);
         if session.has_pending_response() {
             return true;
         }
         if crate::honest_ingress_profile_selected() {
-            if let Some((eligible,_))=crate::HONEST_STREAM_INGRESS_HOOK.get() {
+            if let Some((eligible, _)) = crate::HONEST_STREAM_INGRESS_HOOK.get() {
                 match session.stream_head() {
-                    Ok(Some((header,head,length))) if eligible(&header,length) && self.stream_generations.contains_key(&conn_id)=>{
-                        if !session.validate_stream_head() || session.attestation_failed() || self.stream_owner.pending.len()+self.stream_owner.cancelled.len()+crate::stream_ingress::terminal_count()>=crate::MAX_STREAM_INGRESS_SESSIONS {self.send_close(conn_id);return false;}
-                        let Some(binding)=session.channel_binder().as_deref().and_then(|b|<[u8;32]>::try_from(b).ok()) else {self.send_close(conn_id);return false;};
-                        let Some(nonce)=self.next_stream.checked_add(1) else {self.send_close(conn_id);return false;};self.next_stream=nonce;
-                        #[cfg(target_env="sgx")]
-                        let lease=crate::stream_ingress::SlotCharge::reserve_for_session(session);
-                        #[cfg(not(target_env="sgx"))]
-                        let lease=crate::stream_ingress::SlotCharge::reserve();
-                        let Some(lease)=lease else{self.send_close(conn_id);return false;};
-                        let close=header.connection_close;
-                        if session.consume_stream_head(head).is_err(){self.send_close(conn_id);return false;}
-                        self.stream_owner.pending.insert(conn_id,crate::stream_ingress::Slot{lease,nonce,generation:self.stream_generations[&conn_id],binding,header:Some(header),receiver:None,remaining:length,fragment:Vec::new(),parked:false,length,close,started:std::time::Instant::now()});
-                        if !self.stream_read_control(conn_id,true){self.invalidate_stream(conn_id);return false;}
-                        crate::stream_ingress::notify();return true;
+                    Ok(Some((header, head, length)))
+                        if eligible(&header, length)
+                            && self.stream_generations.contains_key(&conn_id) =>
+                    {
+                        if !session.validate_stream_head()
+                            || session.attestation_failed()
+                            || self.stream_owner.pending.len()
+                                + self.stream_owner.cancelled.len()
+                                + crate::stream_ingress::terminal_count()
+                                >= crate::MAX_STREAM_INGRESS_SESSIONS
+                        {
+                            self.send_close(conn_id);
+                            return false;
+                        }
+                        let Some(binding) = session
+                            .channel_binder()
+                            .as_deref()
+                            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                        else {
+                            self.send_close(conn_id);
+                            return false;
+                        };
+                        let Some(nonce) = self.next_stream.checked_add(1) else {
+                            self.send_close(conn_id);
+                            return false;
+                        };
+                        self.next_stream = nonce;
+                        #[cfg(target_env = "sgx")]
+                        let lease = crate::stream_ingress::SlotCharge::reserve_for_session(session);
+                        #[cfg(not(target_env = "sgx"))]
+                        let lease = crate::stream_ingress::SlotCharge::reserve();
+                        let Some(lease) = lease else {
+                            self.send_close(conn_id);
+                            return false;
+                        };
+                        let close = header.connection_close;
+                        if session.consume_stream_head(head).is_err() {
+                            self.send_close(conn_id);
+                            return false;
+                        }
+                        self.stream_owner.pending.insert(
+                            conn_id,
+                            crate::stream_ingress::Slot {
+                                lease,
+                                nonce,
+                                generation: self.stream_generations[&conn_id],
+                                binding,
+                                header: Some(header),
+                                receiver: None,
+                                remaining: length,
+                                fragment: Vec::new(),
+                                parked: false,
+                                length,
+                                close,
+                                started: std::time::Instant::now(),
+                            },
+                        );
+                        if !self.stream_read_control(conn_id, true) {
+                            self.invalidate_stream(conn_id);
+                            return false;
+                        }
+                        crate::stream_ingress::notify();
+                        return true;
                     }
-                    _=>{}
+                    _ => {}
                 }
             }
         }
@@ -766,29 +1084,29 @@ impl IngressServer {
                 // session (its exporter, its peer certificate) is at hand.
                 // Every other request sees the peer evidence accepted so
                 // far on this connection and the connection's tag.
-                let result = if http_req.path == enclave_os_common::attest::ATTEST_PATH {
-                    let result = self.handle_attest(session, &http_req);
-                    if result.status >= 400 {
+                let result =
+                    if http_req.path == enclave_os_common::attest::ATTEST_PATH {
+                        let result = self.handle_attest(session, &http_req);
+                        if result.status >= 400 {
+                            session.fail_attestation();
+                            close = true;
+                        }
+                        result
+                    } else if (session.server_name()
+                        == Some(enclave_os_common::modules::HONEST_PEER_SNI)
+                        || session
+                            .peer_cert_der()
+                            .is_some_and(|der| leaf_claims_enclave_identity(&der)))
+                        && session.peer_evidence().is_none()
+                    {
                         session.fail_attestation();
                         close = true;
-                    }
-                    result
-                } else if (session.server_name()
-                    == Some(enclave_os_common::modules::HONEST_PEER_SNI)
-                    || session
-                        .peer_cert_der()
-                        .is_some_and(|der| leaf_claims_enclave_identity(&der)))
-                    && session.peer_evidence().is_none()
-                {
-                    session.fail_attestation();
-                    close = true;
-                    HttpHandleResult::err(
-                        403,
-                        "mutual evidence required before application traffic",
-                    )
-                } else {
-                    let base_ctx =
-                        enclave_os_common::modules::RequestContext {
+                        HttpHandleResult::err(
+                            403,
+                            "mutual evidence required before application traffic",
+                        )
+                    } else {
+                        let base_ctx = enclave_os_common::modules::RequestContext {
                             ingress_class: self.ingress_classes.get(&conn_id).copied().unwrap_or(
                                 enclave_os_common::modules::IngressClass::ExternalNetwork,
                             ),
@@ -803,45 +1121,85 @@ impl IngressServer {
                             attestation: session.attestation().to_string(),
                             oidc_claims: None,
                         };
-                    if crate::honest_ingress_profile_selected()
-                        && matches!(enclave_os_common::modules::classify_honest_ingress(
+                        if crate::honest_ingress_profile_selected()
+                            && matches!(enclave_os_common::modules::classify_honest_ingress(
                             &http_req.method, &http_req.path, &base_ctx),
                             enclave_os_common::modules::HonestIngressRoute::Peer
                             | enclave_os_common::modules::HonestIngressRoute::Proposal
                             | enclave_os_common::modules::HonestIngressRoute::LocalControl
                             | enclave_os_common::modules::HonestIngressRoute::Bootstrap
                             | enclave_os_common::modules::HonestIngressRoute::ComponentStaging)
-
-                    {
-                        if let Some((_, _, start, _, _)) = crate::HONEST_DEFERRED_INGRESS_HOOK.get().filter(|(eligible, metadata, _, _, _)| eligible(&http_req, &base_ctx) && crate::deferred_ingress::metadata_fits(metadata(&http_req, &base_ctx))) {
-                            if !crate::deferred_ingress::pending_capacity(self.deferred_owner.pending.len(), self.deferred_owner.cancelled.len() + crate::deferred_ingress::terminal_count()) {
-                                return self.queue_deferred_ready(conn_id, session, crate::HonestIngressResponse {
-                                    status: 429, content_type: "application/octet-stream", body: Vec::new().into(),
-                                }, close);
-                            }
-                            let Some(binding) = base_ctx.channel_binder.as_deref()
-                                .and_then(|value| <[u8; 32]>::try_from(value).ok()) else { return false; };
-                            let Some(nonce) = self.next_deferred.checked_add(1) else { return false; };
-                            self.next_deferred = nonce;
-                            // Reserve before the adopter may allocate its bounded request.
-                            self.deferred_owner.pending.insert(conn_id, crate::deferred_ingress::PendingSession {
-                                nonce, binding, token: None, close, started: std::time::Instant::now(),
-                            });
-                            match start(&http_req, &base_ctx) {
-                                Some(crate::HonestIngressStart::Pending(token)) => {
-                                    self.deferred_owner.pending.get_mut(&conn_id).unwrap().token = Some(token);
-                                    return true;
+                        {
+                            if let Some((_, _, start, _, _)) = crate::HONEST_DEFERRED_INGRESS_HOOK
+                                .get()
+                                .filter(|(eligible, metadata, _, _, _)| {
+                                    eligible(&http_req, &base_ctx)
+                                        && crate::deferred_ingress::metadata_fits(metadata(
+                                            &http_req, &base_ctx,
+                                        ))
+                                })
+                            {
+                                if !crate::deferred_ingress::pending_capacity(
+                                    self.deferred_owner.pending.len(),
+                                    self.deferred_owner.cancelled.len()
+                                        + crate::deferred_ingress::terminal_count(),
+                                ) {
+                                    return self.queue_deferred_ready(
+                                        conn_id,
+                                        session,
+                                        crate::HonestIngressResponse {
+                                            status: 429,
+                                            content_type: "application/octet-stream",
+                                            body: Vec::new().into(),
+                                        },
+                                        close,
+                                    );
                                 }
-                                Some(crate::HonestIngressStart::Ready(response)) => {
-                                    self.deferred_owner.pending.remove(&conn_id);
-                                    return self.queue_deferred_ready(conn_id, session, response, close);
+                                let Some(binding) = base_ctx
+                                    .channel_binder
+                                    .as_deref()
+                                    .and_then(|value| <[u8; 32]>::try_from(value).ok())
+                                else {
+                                    return false;
+                                };
+                                let Some(nonce) = self.next_deferred.checked_add(1) else {
+                                    return false;
+                                };
+                                self.next_deferred = nonce;
+                                // Reserve before the adopter may allocate its bounded request.
+                                self.deferred_owner.pending.insert(
+                                    conn_id,
+                                    crate::deferred_ingress::PendingSession {
+                                        nonce,
+                                        binding,
+                                        token: None,
+                                        close,
+                                        started: std::time::Instant::now(),
+                                    },
+                                );
+                                match start(&http_req, &base_ctx) {
+                                    Some(crate::HonestIngressStart::Pending(token)) => {
+                                        self.deferred_owner
+                                            .pending
+                                            .get_mut(&conn_id)
+                                            .unwrap()
+                                            .token = Some(token);
+                                        return true;
+                                    }
+                                    Some(crate::HonestIngressStart::Ready(response)) => {
+                                        self.deferred_owner.pending.remove(&conn_id);
+                                        return self.queue_deferred_ready(
+                                            conn_id, session, response, close,
+                                        );
+                                    }
+                                    None => {
+                                        self.deferred_owner.pending.remove(&conn_id);
+                                    }
                                 }
-                                None => { self.deferred_owner.pending.remove(&conn_id); }
                             }
                         }
-                    }
-                    handle_http_request_with_session(&http_req, &base_ctx)
-                };
+                        handle_http_request_with_session(&http_req, &base_ctx)
+                    };
 
                 // Move the body into a bounded producer; do not construct
                 // either a second HTTP body or a whole-response TLS buffer.
@@ -1147,15 +1505,23 @@ fn build_tls_config(
     })
 }
 
-fn fresh_context(conn_id: u32, ingress_class: enclave_os_common::modules::IngressClass,
-    session: &RaTlsSession) -> enclave_os_common::modules::RequestContext {
+fn fresh_context(
+    conn_id: u32,
+    ingress_class: enclave_os_common::modules::IngressClass,
+    session: &RaTlsSession,
+) -> enclave_os_common::modules::RequestContext {
     enclave_os_common::modules::RequestContext {
-        ingress_class, connection_id: conn_id,
+        ingress_class,
+        connection_id: conn_id,
         server_name: session.server_name().map(str::to_owned),
-        attested_endpoint: session.attested_endpoint(), local_cert_der: session.local_cert_der(),
-        local_evidence: session.local_evidence().cloned(), channel_binder: session.channel_binder(),
-        peer_cert_der: session.peer_cert_der(), peer_evidence: session.peer_evidence().cloned(),
-        attestation: session.attestation().to_string(), oidc_claims: None,
+        attested_endpoint: session.attested_endpoint(),
+        local_cert_der: session.local_cert_der(),
+        local_evidence: session.local_evidence().cloned(),
+        channel_binder: session.channel_binder(),
+        peer_cert_der: session.peer_cert_der(),
+        peer_evidence: session.peer_evidence().cloned(),
+        attestation: session.attestation().to_string(),
+        oidc_claims: None,
     }
 }
 
@@ -2169,7 +2535,9 @@ fn transform_mcp_tools_response(result: HttpHandleResult) -> HttpHandleResult {
     if result.status != 200 {
         return result;
     }
-    let Some(body) = result.body.contiguous() else { return result; };
+    let Some(body) = result.body.contiguous() else {
+        return result;
+    };
     let parsed: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => return result,
@@ -2213,7 +2581,9 @@ fn transform_mcp_tools_response(result: HttpHandleResult) -> HttpHandleResult {
                 .unwrap_or("error");
             HttpHandleResult {
                 status: 400,
-                body: serde_json::to_vec(&serde_json::json!({"error": msg})).unwrap_or_default().into(),
+                body: serde_json::to_vec(&serde_json::json!({"error": msg}))
+                    .unwrap_or_default()
+                    .into(),
                 shutdown: false,
                 content_type: None,
                 extra_headers: Vec::new(),
@@ -2234,7 +2604,9 @@ fn transform_mcp_call_response(result: HttpHandleResult) -> HttpHandleResult {
     if result.status != 200 {
         return result;
     }
-    let Some(body) = result.body.contiguous() else { return result; };
+    let Some(body) = result.body.contiguous() else {
+        return result;
+    };
     let parsed: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => return result,
@@ -2268,7 +2640,9 @@ fn transform_mcp_call_response(result: HttpHandleResult) -> HttpHandleResult {
                 .unwrap_or("error");
             HttpHandleResult {
                 status: 400,
-                body: serde_json::to_vec(&serde_json::json!({"error": msg})).unwrap_or_default().into(),
+                body: serde_json::to_vec(&serde_json::json!({"error": msg}))
+                    .unwrap_or_default()
+                    .into(),
                 shutdown: false,
                 content_type: None,
                 extra_headers: Vec::new(),

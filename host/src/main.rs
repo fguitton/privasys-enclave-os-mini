@@ -14,8 +14,6 @@ mod c3_endpoints;
 #[cfg(all(target_os = "linux", not(sgx_mode_sim), not(feature = "mock")))]
 mod dcap;
 mod dispatcher;
-#[cfg(feature="diagnostic-worker-storage-rpc")]
-mod storage_rpc_profile;
 mod dispatcher_wake;
 mod enclave;
 mod kvstore;
@@ -23,6 +21,8 @@ mod net;
 #[cfg(target_os = "linux")]
 mod ocall_alignment;
 mod ocall_impl;
+#[cfg(feature = "diagnostic-worker-storage-rpc")]
+mod storage_rpc_profile;
 mod tcp_proxy;
 
 use anyhow::Result;

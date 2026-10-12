@@ -293,7 +293,10 @@ fn check_worker_storage_reservation() {
     let message = receive(&host_rx);
     let request = decode_honest_request(&message).unwrap();
     assert_eq!(request.identity.method, RpcMethod::WorkerStorage);
-    assert_eq!(pending.diagnostic_operation_id(),request.identity.operation_id);
+    assert_eq!(
+        pending.diagnostic_operation_id(),
+        request.identity.operation_id
+    );
     assert_eq!(
         decode_worker_storage_request(request.payload),
         Some((WorkerStorageOperation::Get, payload.as_slice()))
@@ -315,18 +318,28 @@ fn check_worker_storage_reservation() {
     )
     .is_err());
     let key = vec![7; MAX_WORKER_STORAGE_BATCH_KEY_BYTES];
-    let framing = WORKER_STORAGE_BATCH_HEADER_BYTES + 1 + WORKER_STORAGE_BATCH_RECORD_HEADER_BYTES + key.len();
+    let framing = WORKER_STORAGE_BATCH_HEADER_BYTES
+        + 1
+        + WORKER_STORAGE_BATCH_RECORD_HEADER_BYTES
+        + key.len();
     let value = vec![9; MAX_WORKER_STORAGE_BATCH_BYTES - framing + 1];
-    for length in [value.len()-2, value.len()-1] {
+    for length in [value.len() - 2, value.len() - 1] {
         let records = [(key.as_slice(), &value[..length])];
         let wire = encode_worker_storage_put_batch(b"t", &records).unwrap();
-        assert_eq!(worker_storage_put_batch_encoded_len(b"t", &records), Some(wire.len()));
+        assert_eq!(
+            worker_storage_put_batch_encoded_len(b"t", &records),
+            Some(wire.len())
+        );
         assert_eq!(decode_worker_storage_put_batch(&wire).unwrap().1, records);
-        let mut trailing = wire; trailing.push(0);
+        let mut trailing = wire;
+        trailing.push(0);
         assert!(decode_worker_storage_put_batch(&trailing).is_none());
     }
-    assert!(encode_worker_storage_put_batch(b"t", &[(key.as_slice(),value.as_slice())]).is_none());
-    assert!(encode_worker_storage_put_batch(b"t", &[(vec![0;key.len()+1].as_slice(),b"v")]).is_none());
+    assert!(encode_worker_storage_put_batch(b"t", &[(key.as_slice(), value.as_slice())]).is_none());
+    assert!(
+        encode_worker_storage_put_batch(b"t", &[(vec![0; key.len() + 1].as_slice(), b"v")])
+            .is_none()
+    );
     assert!(worker_storage_put_batch_encoded_len(b"t", &[]).is_none());
     for count in [MAX_WORKER_STORAGE_BATCH_RECORDS-1,MAX_WORKER_STORAGE_BATCH_RECORDS]{
         let records=vec![(b"k".as_slice(),b"v".as_slice());count];
@@ -339,26 +352,61 @@ fn check_worker_storage_reservation() {
 }
 
 fn check_ready_recheck() {
-    WAIT_CALLS.with(|value|value.set(0));
-    let (tx,host_rx)=queue();let (host_tx,rx)=queue();let rpc=client::RpcClient::new(tx,rx);
-    let pending=rpc.try_execution_storage(3,8,WorkerStorageOperation::Get,b"bounded").unwrap();
-    let message=receive(&host_rx);let identity=decode_honest_request(&message).unwrap().identity;
-    let mut empty=0;
-    let ready=rpc.recheck_execution_rpc_with(&pending,64,||{
-        empty+=1;
-        if empty==3 {host_tx.send(&encode_honest_response(identity,0,b"ready sealed value").unwrap());}
-    }).unwrap();
-    assert_eq!(ready.0,4,"only four actual polls consumed");
-    let ready=ready.1.unwrap();
-    assert_eq!(ready.payload(),b"ready sealed value");assert_eq!(empty,3);
-    assert_eq!(WAIT_CALLS.with(std::cell::Cell::get),0,"fast ready frame never parks or calls wait OCALL");
-    let pending=rpc.try_execution_net_close(3,8,7).unwrap();let message=receive(&host_rx);let identity=decode_honest_request(&message).unwrap().identity;
-    let mut empty=0;assert!(rpc.recheck_execution_rpc_with(&pending,64,||empty+=1).unwrap().1.is_none());
-    assert_eq!(empty,usize::try_from(client::EXECUTION_READY_RECHECK_POLLS).unwrap());
-    rpc.wait_execution_rpc(&pending,1000).unwrap();assert_eq!(WAIT_CALLS.with(std::cell::Cell::get),1);
-    host_tx.send(&encode_honest_response(identity,0,b"event completed").unwrap());
-    assert_eq!(rpc.recheck_execution_rpc(&pending,64).unwrap().1.unwrap().payload(),b"event completed");
-    assert!(matches!(rpc.recheck_execution_rpc(&pending,64),Err(client::PolledExecutionRpcError::NotPending)));
+    WAIT_CALLS.with(|value| value.set(0));
+    let (tx, host_rx) = queue();
+    let (host_tx, rx) = queue();
+    let rpc = client::RpcClient::new(tx, rx);
+    let pending = rpc
+        .try_execution_storage(3, 8, WorkerStorageOperation::Get, b"bounded")
+        .unwrap();
+    let message = receive(&host_rx);
+    let identity = decode_honest_request(&message).unwrap().identity;
+    let mut empty = 0;
+    let ready = rpc
+        .recheck_execution_rpc_with(&pending, 64, || {
+            empty += 1;
+            if empty == 3 {
+                host_tx.send(&encode_honest_response(identity, 0, b"ready sealed value").unwrap());
+            }
+        })
+        .unwrap();
+    assert_eq!(ready.0, 4, "only four actual polls consumed");
+    let ready = ready.1.unwrap();
+    assert_eq!(ready.payload(), b"ready sealed value");
+    assert_eq!(empty, 3);
+    assert_eq!(
+        WAIT_CALLS.with(std::cell::Cell::get),
+        0,
+        "fast ready frame never parks or calls wait OCALL"
+    );
+    let pending = rpc.try_execution_net_close(3, 8, 7).unwrap();
+    let message = receive(&host_rx);
+    let identity = decode_honest_request(&message).unwrap().identity;
+    let mut empty = 0;
+    assert!(rpc
+        .recheck_execution_rpc_with(&pending, 64, || empty += 1)
+        .unwrap()
+        .1
+        .is_none());
+    assert_eq!(
+        empty,
+        usize::try_from(client::EXECUTION_READY_RECHECK_POLLS).unwrap()
+    );
+    rpc.wait_execution_rpc(&pending, 1000).unwrap();
+    assert_eq!(WAIT_CALLS.with(std::cell::Cell::get), 1);
+    host_tx.send(&encode_honest_response(identity, 0, b"event completed").unwrap());
+    assert_eq!(
+        rpc.recheck_execution_rpc(&pending, 64)
+            .unwrap()
+            .1
+            .unwrap()
+            .payload(),
+        b"event completed"
+    );
+    assert!(matches!(
+        rpc.recheck_execution_rpc(&pending, 64),
+        Err(client::PolledExecutionRpcError::NotPending)
+    ));
     println!("EXECUTION-READY-RECHECK: actual exact queue fastcompletion skipsOCALL, finiteempty64 thenretainedwait, eventcompletion PASS");
 }
 

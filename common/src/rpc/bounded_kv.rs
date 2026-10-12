@@ -97,14 +97,18 @@ pub fn encode_kv_put_batch_req_borrowed(
     let mut value_bytes = 0usize;
     let mut encoded_bytes = 2usize.checked_add(table.len())?.checked_add(4)?;
     for (key, value) in records {
-        if key.is_empty() || key.len() > crate::types::KV_MAX_KEY_SIZE
-            || value.is_empty() || value.len() > bounds.maximum_value_bytes
+        if key.is_empty()
+            || key.len() > crate::types::KV_MAX_KEY_SIZE
+            || value.is_empty()
+            || value.len() > bounds.maximum_value_bytes
         {
             return None;
         }
         value_bytes = value_bytes.checked_add(value.len())?;
-        encoded_bytes = encoded_bytes.checked_add(9)?
-            .checked_add(key.len())?.checked_add(value.len())?;
+        encoded_bytes = encoded_bytes
+            .checked_add(9)?
+            .checked_add(key.len())?
+            .checked_add(value.len())?;
     }
     if value_bytes > bounds.maximum_total_value_bytes
         || !super::framed_payload_len_valid(
