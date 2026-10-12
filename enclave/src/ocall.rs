@@ -3,9 +3,10 @@
 
 //! OCall wrappers – safe Rust interfaces to host services.
 //!
-//! All host calls now go through the shared-memory SPSC queue via
-//! `RpcClient`. The only actual OCALL is `ocall_notify()` (used
-//! internally by `RpcClient` to wake the host dispatcher).
+//! Most host calls go through the shared-memory SPSC queue via `RpcClient`.
+//! `ocall_notify()` wakes the host dispatcher, while the monotonic-clock
+//! sampler deliberately uses the SDK time OCALL directly so it cannot contend
+//! for the single control-RPC slot.
 //!
 //! The public API is kept identical so that `ratls/`, `https/`, and
 //! `kvstore/` code does not need any changes.
@@ -14,6 +15,72 @@ use std::string::String;
 use std::vec::Vec;
 
 use crate::rpc_client::RpcClient;
+use crate::untrusted_time::{checked_monotonic_millis, MonotonicTimespecError};
+use sgx_types::error::SgxStatus;
+use sgx_types::types::timespec;
+
+const CLOCK_MONOTONIC: i32 = 1;
+
+extern "C" {
+    /// Trusted bridge generated from the imported `sgx_time.edl` interface.
+    fn u_clock_gettime_ocall(
+        result: *mut i32,
+        error: *mut i32,
+        clk_id: i32,
+        tp: *mut timespec,
+    ) -> SgxStatus;
+}
+
+/// Why an untrusted monotonic-clock sample could not be accepted.
+///
+/// The host remains free to lie about an otherwise well-formed value. Callers
+/// must therefore use this clock only as a liveness delay, never as security
+/// authority, and must reject backwards samples relative to their own last
+/// accepted observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UntrustedMonotonicClockError {
+    /// The enclave-to-host transition itself failed.
+    OcallTransport(SgxStatus),
+    /// The host `clock_gettime` call failed with this errno.
+    Host(i32),
+    /// A host supplied a negative `tv_sec`.
+    NegativeSeconds,
+    /// A host supplied `tv_nsec` outside the POSIX range.
+    InvalidNanoseconds,
+    /// The valid-looking fields do not fit in the public millisecond type.
+    MillisecondOverflow,
+}
+
+/// Sample the host's untrusted `CLOCK_MONOTONIC` value in milliseconds.
+///
+/// Unlike `std::time::Instant` in the pinned SGX sysroot, this boundary never
+/// unwraps an OCALL failure and never constructs an SDK time value before
+/// validating both fields. Malformed host output is reported without panicking.
+/// The conversion intentionally rounds down sub-millisecond precision.
+pub fn untrusted_monotonic_millis() -> Result<u64, UntrustedMonotonicClockError> {
+    let mut result = -1;
+    let mut error = 0;
+    let mut sample = timespec::default();
+    let status =
+        unsafe { u_clock_gettime_ocall(&mut result, &mut error, CLOCK_MONOTONIC, &mut sample) };
+
+    if !status.is_success() {
+        return Err(UntrustedMonotonicClockError::OcallTransport(status));
+    }
+    if result != 0 {
+        return Err(UntrustedMonotonicClockError::Host(error));
+    }
+
+    checked_monotonic_millis(sample.tv_sec, sample.tv_nsec).map_err(|error| match error {
+        MonotonicTimespecError::NegativeSeconds => UntrustedMonotonicClockError::NegativeSeconds,
+        MonotonicTimespecError::InvalidNanoseconds => {
+            UntrustedMonotonicClockError::InvalidNanoseconds
+        }
+        MonotonicTimespecError::MillisecondOverflow => {
+            UntrustedMonotonicClockError::MillisecondOverflow
+        }
+    })
+}
 
 // ---------------------------------------------------------------------------
 //  Global RPC client accessor
