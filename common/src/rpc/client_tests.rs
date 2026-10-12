@@ -419,6 +419,25 @@ fn check_get_batch_codec(){
     let group=[(key,maximum);7];let wire=encode_worker_get_batch(scope,b"t",&group,capacity,capacity).unwrap();
     let(count,length)=worker_get_batch_geometry(b"t",key.len(),maximum,capacity,capacity).unwrap();
     assert_eq!(count,group.len());assert_eq!(length,wire.len(),"size-only owner must match actual codec bytes");
+    assert_eq!(worker_get_batch_request_demand(b"t".len(),group.iter().map(|(key,_)|key.len())),Some(wire.len()));
+    // Real maximum table/key/count encoding and heterogeneous keys exercise
+    // the shared size owner, not a second handwritten length formula.
+    let max_table=vec![b't';MAX_WORKER_STORAGE_BATCH_TABLE_BYTES];
+    let max_key=vec![b'k';MAX_WORKER_STORAGE_BATCH_KEY_BYTES];
+    let max_records=vec![(max_key.as_slice(),1);MAX_WORKER_STORAGE_BATCH_RECORDS];
+    let max_encoded=encode_worker_get_batch(scope,&max_table,&max_records,capacity,capacity).unwrap();
+    assert_eq!(worker_get_batch_request_demand(max_table.len(),max_records.iter().map(|(key,_)|key.len())),Some(max_encoded.len()));
+    assert_eq!(decode_worker_get_batch(&max_encoded,capacity,capacity).unwrap().2,max_records);
+    let mixed=[(key,1),(max_key.as_slice(),1)];
+    let mixed_encoded=encode_worker_get_batch(scope,b"t",&mixed,capacity,capacity).unwrap();
+    assert_eq!(worker_get_batch_request_demand(1,mixed.iter().map(|(key,_)|key.len())),Some(mixed_encoded.len()));
+    assert!(worker_get_batch_request_demand(0,[key.len()]).is_none());
+    assert!(worker_get_batch_request_demand(usize::MAX,[key.len()]).is_none());
+    assert!(worker_get_batch_request_demand(1,core::iter::empty()).is_none());
+    assert!(worker_get_batch_request_demand(1,[0]).is_none());
+    assert!(worker_get_batch_request_demand(1,[usize::MAX]).is_none());
+    assert!(worker_get_batch_request_demand(1,core::iter::repeat(key.len()).take(MAX_WORKER_STORAGE_BATCH_RECORDS+1)).is_none());
+
     for count in [MAX_WORKER_STORAGE_BATCH_RECORDS-1,MAX_WORKER_STORAGE_BATCH_RECORDS]{
         let records=vec![(key,5);count];
         let encoded=encode_worker_get_batch(scope,b"t",&records,capacity,capacity).unwrap();
