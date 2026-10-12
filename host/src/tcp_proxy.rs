@@ -255,19 +255,19 @@ impl TcpProxy {
     /// Create a new TCP proxy bound to the given ingress port.
     pub fn new(
         port: u16,
-        _backlog: i32,
+        backlog: i32,
         data_tx: SpscProducer,
         data_rx: SpscConsumer,
         shutdown: Arc<AtomicBool>,
     ) -> io::Result<Self> {
-        Self::new_with_local_control(port, _backlog, None, data_tx, data_rx, shutdown)
+        Self::new_with_local_control(port, backlog, None, data_tx, data_rx, shutdown)
     }
 
     /// Create the shared ciphertext multiplexer with an optional Unix local
     /// control listener. Both listener classes terminate TLS in the enclave.
     pub fn new_with_local_control(
         port: u16,
-        _backlog: i32,
+        backlog: i32,
         local_control_path: Option<PathBuf>,
         data_tx: SpscProducer,
         data_rx: SpscConsumer,
@@ -275,7 +275,7 @@ impl TcpProxy {
     ) -> io::Result<Self> {
         Self::new_with_listeners(
             port,
-            _backlog,
+            backlog,
             local_control_path,
             None,
             data_tx,
@@ -287,22 +287,28 @@ impl TcpProxy {
     /// Configure the independent ingress, local-control and optional peer listeners.
     pub fn new_with_listeners(
         port: u16,
-        _backlog: i32,
+        backlog: i32,
         local_control_path: Option<PathBuf>,
         peer_port: Option<u16>,
         data_tx: SpscProducer,
         data_rx: SpscConsumer,
         shutdown: Arc<AtomicBool>,
     ) -> io::Result<Self> {
-        let addr = format!("0.0.0.0:{}", port);
-        let listener = TcpListener::bind(&addr)?;
+        let addr: SocketAddr = format!("0.0.0.0:{}", port)
+            .parse()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let listener = crate::net::listener::bind_tcp_listener(addr, backlog)
+            .map_err(|error| io::Error::other(error.to_string()))?;
         listener.set_nonblocking(true)?;
         info!("TCP proxy listening on {}", addr);
 
         let peer_listener = match peer_port {
             Some(p) => {
-                let peer_addr = format!("0.0.0.0:{}", p);
-                let l = TcpListener::bind(&peer_addr)?;
+                let peer_addr: SocketAddr = format!("0.0.0.0:{}", p)
+                    .parse()
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+                let l = crate::net::listener::bind_tcp_listener(peer_addr, backlog)
+                    .map_err(|error| io::Error::other(error.to_string()))?;
                 l.set_nonblocking(true)?;
                 info!("TCP proxy peer listener on {}", peer_addr);
                 Some(l)
@@ -1797,7 +1803,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_credit_backlog_preserves_order_and_closes_on_overflow() {
+    fn queue_creditbacklog_preserves_order_and_closes_on_overflow() {
         let mut fixture = TransportFixture::new();
         let expected: Vec<_> = (0..12)
             .map(|sequence| channel::encode_tcp_data(7, &vec![sequence; 1000]))
