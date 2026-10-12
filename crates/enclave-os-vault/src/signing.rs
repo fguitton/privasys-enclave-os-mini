@@ -182,10 +182,3 @@ pub(crate) fn verify_approval_token(
     }
     Ok(())
 }
-
-/// Best-effort decode of an approval token without verification, for
-/// returning useful errors before the full check.
-#[allow(dead_code)]
-pub(crate) fn peek_claims(token: &ApprovalToken) -> Result<ApprovalClaims, String> {
-    decode_payload_unverified::<ApprovalClaims>(token.jwt.as_bytes())
-}
