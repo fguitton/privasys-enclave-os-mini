@@ -404,7 +404,9 @@ impl SpscConsumer {
     }
 
     /// Immutable actual receive geometry; no read or reservation authority.
-    pub const fn max_message_bytes(&self)->usize{max_message_bytes(self.capacity)}
+    pub const fn max_message_bytes(&self) -> usize {
+        max_message_bytes(self.capacity)
+    }
 
     /// Try to read a message. Returns `Some(Vec<u8>)` or `None` if empty.
     pub fn try_recv(&self) -> Option<Vec<u8>> {

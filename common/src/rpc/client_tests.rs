@@ -341,13 +341,16 @@ fn check_worker_storage_reservation() {
             .is_none()
     );
     assert!(worker_storage_put_batch_encoded_len(b"t", &[]).is_none());
-    for count in [MAX_WORKER_STORAGE_BATCH_RECORDS-1,MAX_WORKER_STORAGE_BATCH_RECORDS]{
-        let records=vec![(b"k".as_slice(),b"v".as_slice());count];
-        let wire=encode_worker_storage_put_batch(b"t",&records).unwrap();
-        assert_eq!(decode_worker_storage_put_batch(&wire).unwrap().1,records);
+    for count in [
+        MAX_WORKER_STORAGE_BATCH_RECORDS - 1,
+        MAX_WORKER_STORAGE_BATCH_RECORDS,
+    ] {
+        let records = vec![(b"k".as_slice(), b"v".as_slice()); count];
+        let wire = encode_worker_storage_put_batch(b"t", &records).unwrap();
+        assert_eq!(decode_worker_storage_put_batch(&wire).unwrap().1, records);
     }
-    let excessive=vec![(b"k".as_slice(),b"v".as_slice());MAX_WORKER_STORAGE_BATCH_RECORDS+1];
-    assert!(encode_worker_storage_put_batch(b"t",&excessive).is_none());
+    let excessive = vec![(b"k".as_slice(), b"v".as_slice()); MAX_WORKER_STORAGE_BATCH_RECORDS + 1];
+    assert!(encode_worker_storage_put_batch(b"t", &excessive).is_none());
     println!("WORKER-STORAGE-RPC: actual framedtoken/role/size/nestedBusy/releasednetworkreservation PASS");
 }
 
@@ -410,67 +413,152 @@ fn check_ready_recheck() {
     println!("EXECUTION-READY-RECHECK: actual exact queue fastcompletion skipsOCALL, finiteempty64 thenretainedwait, eventcompletion PASS");
 }
 
-fn check_get_batch_codec(){
-    let capacity=crate::queue::max_message_bytes(crate::queue::DEFAULT_QUEUE_CAPACITY);
-    let scope=[7;32];let key=b"key".as_slice();
-    let maximum=128*1024+36+1024; // Independent existing canonical-node v2 vector.
-    assert_eq!(worker_get_batch_response_demand(&[maximum;8]),Some(1_057_090));
-    assert!(worker_get_batch_encoded_len(scope,b"t",&[(key,maximum);8],capacity,capacity).is_none());
-    let group=[(key,maximum);7];let wire=encode_worker_get_batch(scope,b"t",&group,capacity,capacity).unwrap();
-    let(count,length)=worker_get_batch_geometry(b"t",key.len(),maximum,capacity,capacity).unwrap();
-    assert_eq!(count,group.len());assert_eq!(length,wire.len(),"size-only owner must match actual codec bytes");
-    assert_eq!(worker_get_batch_request_demand(b"t".len(),group.iter().map(|(key,_)|key.len())),Some(wire.len()));
+fn check_get_batch_codec() {
+    let capacity = crate::queue::max_message_bytes(crate::queue::DEFAULT_QUEUE_CAPACITY);
+    let scope = [7; 32];
+    let key = b"key".as_slice();
+    let maximum = 128 * 1024 + 36 + 1024; // Independent existing canonical-node v2 vector.
+    assert_eq!(
+        worker_get_batch_response_demand(&[maximum; 8]),
+        Some(1_057_090)
+    );
+    assert!(
+        worker_get_batch_encoded_len(scope, b"t", &[(key, maximum); 8], capacity, capacity)
+            .is_none()
+    );
+    let group = [(key, maximum); 7];
+    let wire = encode_worker_get_batch(scope, b"t", &group, capacity, capacity).unwrap();
+    let (count, length) =
+        worker_get_batch_geometry(b"t", key.len(), maximum, capacity, capacity).unwrap();
+    assert_eq!(count, group.len());
+    assert_eq!(
+        length,
+        wire.len(),
+        "size-only owner must match actual codec bytes"
+    );
+    assert_eq!(
+        worker_get_batch_request_demand(b"t".len(), group.iter().map(|(key, _)| key.len())),
+        Some(wire.len())
+    );
     // Real maximum table/key/count encoding and heterogeneous keys exercise
     // the shared size owner, not a second handwritten length formula.
-    let max_table=vec![b't';MAX_WORKER_STORAGE_BATCH_TABLE_BYTES];
-    let max_key=vec![b'k';MAX_WORKER_STORAGE_BATCH_KEY_BYTES];
-    let max_records=vec![(max_key.as_slice(),1);MAX_WORKER_STORAGE_BATCH_RECORDS];
-    let max_encoded=encode_worker_get_batch(scope,&max_table,&max_records,capacity,capacity).unwrap();
-    assert_eq!(worker_get_batch_request_demand(max_table.len(),max_records.iter().map(|(key,_)|key.len())),Some(max_encoded.len()));
-    assert_eq!(decode_worker_get_batch(&max_encoded,capacity,capacity).unwrap().2,max_records);
-    let mixed=[(key,1),(max_key.as_slice(),1)];
-    let mixed_encoded=encode_worker_get_batch(scope,b"t",&mixed,capacity,capacity).unwrap();
-    assert_eq!(worker_get_batch_request_demand(1,mixed.iter().map(|(key,_)|key.len())),Some(mixed_encoded.len()));
-    assert!(worker_get_batch_request_demand(0,[key.len()]).is_none());
-    assert!(worker_get_batch_request_demand(usize::MAX,[key.len()]).is_none());
-    assert!(worker_get_batch_request_demand(1,core::iter::empty()).is_none());
-    assert!(worker_get_batch_request_demand(1,[0]).is_none());
-    assert!(worker_get_batch_request_demand(1,[usize::MAX]).is_none());
-    assert!(worker_get_batch_request_demand(1,core::iter::repeat(key.len()).take(MAX_WORKER_STORAGE_BATCH_RECORDS+1)).is_none());
+    let max_table = vec![b't'; MAX_WORKER_STORAGE_BATCH_TABLE_BYTES];
+    let max_key = vec![b'k'; MAX_WORKER_STORAGE_BATCH_KEY_BYTES];
+    let max_records = vec![(max_key.as_slice(), 1); MAX_WORKER_STORAGE_BATCH_RECORDS];
+    let max_encoded =
+        encode_worker_get_batch(scope, &max_table, &max_records, capacity, capacity).unwrap();
+    assert_eq!(
+        worker_get_batch_request_demand(
+            max_table.len(),
+            max_records.iter().map(|(key, _)| key.len())
+        ),
+        Some(max_encoded.len())
+    );
+    assert_eq!(
+        decode_worker_get_batch(&max_encoded, capacity, capacity)
+            .unwrap()
+            .2,
+        max_records
+    );
+    let mixed = [(key, 1), (max_key.as_slice(), 1)];
+    let mixed_encoded = encode_worker_get_batch(scope, b"t", &mixed, capacity, capacity).unwrap();
+    assert_eq!(
+        worker_get_batch_request_demand(1, mixed.iter().map(|(key, _)| key.len())),
+        Some(mixed_encoded.len())
+    );
+    assert!(worker_get_batch_request_demand(0, [key.len()]).is_none());
+    assert!(worker_get_batch_request_demand(usize::MAX, [key.len()]).is_none());
+    assert!(worker_get_batch_request_demand(1, core::iter::empty()).is_none());
+    assert!(worker_get_batch_request_demand(1, [0]).is_none());
+    assert!(worker_get_batch_request_demand(1, [usize::MAX]).is_none());
+    assert!(worker_get_batch_request_demand(
+        1,
+        core::iter::repeat(key.len()).take(MAX_WORKER_STORAGE_BATCH_RECORDS + 1)
+    )
+    .is_none());
 
-    for count in [MAX_WORKER_STORAGE_BATCH_RECORDS-1,MAX_WORKER_STORAGE_BATCH_RECORDS]{
-        let records=vec![(key,5);count];
-        let encoded=encode_worker_get_batch(scope,b"t",&records,capacity,capacity).unwrap();
-        assert_eq!(decode_worker_get_batch(&encoded,capacity,capacity).unwrap().2,records);
+    for count in [
+        MAX_WORKER_STORAGE_BATCH_RECORDS - 1,
+        MAX_WORKER_STORAGE_BATCH_RECORDS,
+    ] {
+        let records = vec![(key, 5); count];
+        let encoded = encode_worker_get_batch(scope, b"t", &records, capacity, capacity).unwrap();
+        assert_eq!(
+            decode_worker_get_batch(&encoded, capacity, capacity)
+                .unwrap()
+                .2,
+            records
+        );
     }
-    let excessive=vec![(key,5);MAX_WORKER_STORAGE_BATCH_RECORDS+1];
-    assert!(encode_worker_get_batch(scope,b"t",&excessive,capacity,capacity).is_none());
-    assert!(worker_get_batch_geometry(b"",key.len(),5,capacity,capacity).is_none());
-    assert!(worker_get_batch_geometry(b"t",0,5,capacity,capacity).is_none());
-    assert!(worker_get_batch_geometry(b"t",usize::MAX,5,capacity,capacity).is_none());
-    assert!(worker_get_batch_geometry(b"t",key.len(),usize::MAX,capacity,capacity).is_none());
-    assert!(worker_get_batch_geometry(b"t",key.len(),5,0,capacity).is_none());
-    let(decoded_scope,table,requests)=decode_worker_get_batch(&wire,capacity,capacity).unwrap();
-    assert_eq!(decoded_scope,scope);assert_eq!(table,b"t");assert_eq!(requests,group);
-    for cut in 0..wire.len(){assert!(decode_worker_get_batch(&wire[..cut],capacity,capacity).is_none());}
-    let mut trailing=wire.clone();trailing.push(0);assert!(decode_worker_get_batch(&trailing,capacity,capacity).is_none());
-    assert!(encode_worker_get_batch([0;32],b"t",&group,capacity,capacity).is_none());
-    assert!(worker_get_batch_encoded_len(scope,b"t",&[(key,0)],capacity,capacity).is_none());
-    let value=[9;5];let reply=encode_worker_get_batch_response(&[&value,&value],&[5,5],capacity).unwrap();
-    assert_eq!(decode_worker_get_batch_response(&reply,&[5,5]).unwrap(),[value.as_slice(),value.as_slice()]);
-    for cut in 0..reply.len(){assert!(decode_worker_get_batch_response(&reply[..cut],&[5,5]).is_none());}
-    assert!(decode_worker_get_batch_response(&reply,&[4,5]).is_none());
-    let mut tail=reply;tail.push(0);assert!(decode_worker_get_batch_response(&tail,&[5,5]).is_none());
-    let request_length=worker_get_batch_encoded_len(scope,b"t",&[(key,5)],capacity,capacity).unwrap();
-    let request_frame=request_length+1+HONEST_REQ_HEADER_SIZE;
-    let reply_frame=2+4+5+HONEST_RESP_HEADER_SIZE;
-    assert_eq!(worker_get_batch_geometry(b"t",key.len(),5,request_frame,reply_frame),Some((1,request_length)));
-    assert_eq!(worker_get_batch_geometry(b"t",key.len(),5,request_frame+1,reply_frame),Some((1,request_length)));
-    assert_eq!(worker_get_batch_geometry(b"t",key.len(),5,request_frame,reply_frame+1),Some((1,request_length)));
-    assert_eq!(worker_get_batch_geometry(b"t",key.len(),5,request_frame+1,reply_frame+1),Some((1,request_length)));
-    assert!(worker_get_batch_geometry(b"t",key.len(),5,request_frame-1,reply_frame).is_none());
-    assert!(worker_get_batch_geometry(b"t",key.len(),5,request_frame,reply_frame-1).is_none());
-    assert!(worker_get_batch_encoded_len(scope,b"t",&[(key,5)],request_frame,reply_frame).is_some());
-    assert!(worker_get_batch_encoded_len(scope,b"t",&[(key,5)],request_frame-1,reply_frame).is_none());
-    assert!(worker_get_batch_encoded_len(scope,b"t",&[(key,5)],request_frame,reply_frame-1).is_none());
+    let excessive = vec![(key, 5); MAX_WORKER_STORAGE_BATCH_RECORDS + 1];
+    assert!(encode_worker_get_batch(scope, b"t", &excessive, capacity, capacity).is_none());
+    assert!(worker_get_batch_geometry(b"", key.len(), 5, capacity, capacity).is_none());
+    assert!(worker_get_batch_geometry(b"t", 0, 5, capacity, capacity).is_none());
+    assert!(worker_get_batch_geometry(b"t", usize::MAX, 5, capacity, capacity).is_none());
+    assert!(worker_get_batch_geometry(b"t", key.len(), usize::MAX, capacity, capacity).is_none());
+    assert!(worker_get_batch_geometry(b"t", key.len(), 5, 0, capacity).is_none());
+    let (decoded_scope, table, requests) =
+        decode_worker_get_batch(&wire, capacity, capacity).unwrap();
+    assert_eq!(decoded_scope, scope);
+    assert_eq!(table, b"t");
+    assert_eq!(requests, group);
+    for cut in 0..wire.len() {
+        assert!(decode_worker_get_batch(&wire[..cut], capacity, capacity).is_none());
+    }
+    let mut trailing = wire.clone();
+    trailing.push(0);
+    assert!(decode_worker_get_batch(&trailing, capacity, capacity).is_none());
+    assert!(encode_worker_get_batch([0; 32], b"t", &group, capacity, capacity).is_none());
+    assert!(worker_get_batch_encoded_len(scope, b"t", &[(key, 0)], capacity, capacity).is_none());
+    let value = [9; 5];
+    let reply = encode_worker_get_batch_response(&[&value, &value], &[5, 5], capacity).unwrap();
+    assert_eq!(
+        decode_worker_get_batch_response(&reply, &[5, 5]).unwrap(),
+        [value.as_slice(), value.as_slice()]
+    );
+    for cut in 0..reply.len() {
+        assert!(decode_worker_get_batch_response(&reply[..cut], &[5, 5]).is_none());
+    }
+    assert!(decode_worker_get_batch_response(&reply, &[4, 5]).is_none());
+    let mut tail = reply;
+    tail.push(0);
+    assert!(decode_worker_get_batch_response(&tail, &[5, 5]).is_none());
+    let request_length =
+        worker_get_batch_encoded_len(scope, b"t", &[(key, 5)], capacity, capacity).unwrap();
+    let request_frame = request_length + 1 + HONEST_REQ_HEADER_SIZE;
+    let reply_frame = 2 + 4 + 5 + HONEST_RESP_HEADER_SIZE;
+    assert_eq!(
+        worker_get_batch_geometry(b"t", key.len(), 5, request_frame, reply_frame),
+        Some((1, request_length))
+    );
+    assert_eq!(
+        worker_get_batch_geometry(b"t", key.len(), 5, request_frame + 1, reply_frame),
+        Some((1, request_length))
+    );
+    assert_eq!(
+        worker_get_batch_geometry(b"t", key.len(), 5, request_frame, reply_frame + 1),
+        Some((1, request_length))
+    );
+    assert_eq!(
+        worker_get_batch_geometry(b"t", key.len(), 5, request_frame + 1, reply_frame + 1),
+        Some((1, request_length))
+    );
+    assert!(
+        worker_get_batch_geometry(b"t", key.len(), 5, request_frame - 1, reply_frame).is_none()
+    );
+    assert!(
+        worker_get_batch_geometry(b"t", key.len(), 5, request_frame, reply_frame - 1).is_none()
+    );
+    assert!(
+        worker_get_batch_encoded_len(scope, b"t", &[(key, 5)], request_frame, reply_frame)
+            .is_some()
+    );
+    assert!(
+        worker_get_batch_encoded_len(scope, b"t", &[(key, 5)], request_frame - 1, reply_frame)
+            .is_none()
+    );
+    assert!(
+        worker_get_batch_encoded_len(scope, b"t", &[(key, 5)], request_frame, reply_frame - 1)
+            .is_none()
+    );
 }
