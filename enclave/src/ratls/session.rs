@@ -136,10 +136,13 @@ struct ResponseCost {
     steps: u64,
     tls_bytes: usize,
 }
+const MAX_RESPONSE_HEADER_BYTES: usize = 32 * 1024;
 struct PendingResponse {
     #[cfg(feature = "diagnostic-transfer-profile")]
     cost: Option<ResponseCost>,
     head: Vec<u8>,
+    // Header backing is destroyed before this move-only physical credit.
+    _header_allocation: Option<enclave_os_common::allocation::AllocationLeaseV1>,
     body: crate::HttpResponsePayload,
     offset: usize,
     close: bool,
@@ -531,21 +534,70 @@ impl RaTlsSession {
         shutdown: bool,
     ) -> Result<(), (&'static str, crate::HttpResponsePayload)> {
         let body = body.into();
+        #[cfg(target_env = "sgx")]
+        let pool = match crate::local_allocation_pool() {
+            Some(pool) => Some(pool),
+            None => return Err(("SDK heap unavailable", body)),
+        };
+        #[cfg(not(target_env = "sgx"))]
+        let pool = None;
+        self.queue_http_response_admitted(
+            status,
+            content_type,
+            extra_headers,
+            body,
+            (close, shutdown),
+            pool.as_ref(),
+        )
+    }
+    // Native owning fixtures supply a real pool here. Production always supplies
+    // the existing SDK pool through queue_http_response_owned above.
+    fn queue_http_response_admitted(
+        &mut self,
+        status: u16,
+        content_type: &str,
+        extra_headers: &[(String, String)],
+        body: crate::HttpResponsePayload,
+        completion: (bool, bool),
+        pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
+    ) -> Result<(), (&'static str, crate::HttpResponsePayload)> {
+        let (close, shutdown) = completion;
         if let Err(error) = self.require_current_configuration() {
             return Err((error, body));
         }
         if self.response.is_some() {
             return Err(("response already pending", body));
         }
-        let head = protocol::format_http_response_head(
+        let Some(head_bytes) = protocol::response_head_encoded_len(
             status,
             content_type,
             extra_headers,
             body.len(),
             close,
-        );
-        if head.len() > 32 * 1024 {
+        )
+        .filter(|n| *n <= MAX_RESPONSE_HEADER_BYTES) else {
             return Err(("response headers too large", body));
+        };
+        let allocation = match pool {
+            Some(pool) => match pool.reserve_unpublished(head_bytes) {
+                Some(credit) => Some(credit),
+                None => return Err(("response header admission exhausted", body)),
+            },
+            None => None,
+        };
+        let head = match protocol::format_http_response_head_bounded(
+            status,
+            content_type,
+            extra_headers,
+            body.len(),
+            close,
+            head_bytes,
+        ) {
+            Ok(head) => head,
+            Err(error) => return Err((error, body)),
+        };
+        if let Some(credit) = &allocation {
+            credit.activate_release_notification();
         }
         self.response = Some(PendingResponse {
             #[cfg(feature = "diagnostic-transfer-profile")]
@@ -557,6 +609,7 @@ impl RaTlsSession {
                 tls_bytes: 0,
             }),
             head,
+            _header_allocation: allocation,
             body,
             offset: 0,
             close,

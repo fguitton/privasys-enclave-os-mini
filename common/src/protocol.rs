@@ -602,6 +602,27 @@ pub fn format_http_response_head(
     content_length: usize,
     close: bool,
 ) -> Vec<u8> {
+    let mut header = String::new();
+    write_response_head(
+        &mut header,
+        status,
+        content_type,
+        extra_headers,
+        content_length,
+        close,
+    )
+    .expect("String formatting is infallible");
+    header.into_bytes()
+}
+
+fn write_response_head(
+    out: &mut impl core::fmt::Write,
+    status: u16,
+    content_type: &str,
+    extra_headers: &[(String, String)],
+    content_length: usize,
+    close: bool,
+) -> core::fmt::Result {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -615,25 +636,101 @@ pub fn format_http_response_head(
         _ => "Unknown",
     };
 
-    let conn_header = if close { "Connection: close\r\n" } else { "" };
-
-    let mut extras = String::new();
+    write!(
+        out,
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n",
+        status, reason, content_type, content_length
+    )?;
     for (name, value) in extra_headers {
         if name.contains(['\r', '\n']) || value.contains(['\r', '\n']) {
             continue;
         }
-        extras.push_str(name);
-        extras.push_str(": ");
-        extras.push_str(value);
-        extras.push_str("\r\n");
+        write!(out, "{}: {}\r\n", name, value)?;
     }
-
-    let header = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}{}\r\n",
-        status, reason, content_type, content_length, extras, conn_header,
-    );
-
-    header.into_bytes()
+    if close {
+        out.write_str("Connection: close\r\n")?;
+    }
+    out.write_str("\r\n")
+}
+struct ResponseHeadWriter {
+    bytes: Option<Vec<u8>>,
+    length: usize,
+    maximum: usize,
+}
+impl core::fmt::Write for ResponseHeadWriter {
+    fn write_str(&mut self, value: &str) -> core::fmt::Result {
+        let next = self
+            .length
+            .checked_add(value.len())
+            .filter(|n| *n <= self.maximum)
+            .ok_or(core::fmt::Error)?;
+        if let Some(bytes) = &mut self.bytes {
+            bytes.extend_from_slice(value.as_bytes());
+        }
+        self.length = next;
+        Ok(())
+    }
+}
+/// Measure the actual response writer without allocating or copying header strings.
+pub fn response_head_encoded_len(
+    status: u16,
+    content_type: &str,
+    extra_headers: &[(String, String)],
+    content_length: usize,
+    close: bool,
+) -> Option<usize> {
+    let mut out = ResponseHeadWriter {
+        bytes: None,
+        length: 0,
+        maximum: usize::MAX,
+    };
+    write_response_head(
+        &mut out,
+        status,
+        content_type,
+        extra_headers,
+        content_length,
+        close,
+    )
+    .ok()?;
+    Some(out.length)
+}
+/// Encode within backing already admitted by the actual response owner.
+/// Refuses before allocation if the complete head exceeds the supplied ceiling.
+pub fn format_http_response_head_bounded(
+    status: u16,
+    content_type: &str,
+    extra_headers: &[(String, String)],
+    content_length: usize,
+    close: bool,
+    maximum: usize,
+) -> Result<Vec<u8>, &'static str> {
+    let length =
+        response_head_encoded_len(status, content_type, extra_headers, content_length, close)
+            .filter(|n| *n <= maximum)
+            .ok_or("response header bound")?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length)
+        .map_err(|_| "response header allocation")?;
+    if bytes.capacity() != length {
+        return Err("response header capacity");
+    }
+    let mut out = ResponseHeadWriter {
+        bytes: Some(bytes),
+        length: 0,
+        maximum: length,
+    };
+    write_response_head(
+        &mut out,
+        status,
+        content_type,
+        extra_headers,
+        content_length,
+        close,
+    )
+    .map_err(|_| "response header changed")?;
+    Ok(out.bytes.expect("bounded response writer"))
 }
 
 // ---------------------------------------------------------------------------
@@ -778,6 +875,65 @@ mod tests {
 
     #[test]
     fn test_format_http_response_200() {
+        for status in [0, 200, 404, u16::MAX] {
+            for length in [0, 9, 10, 99, 100, usize::MAX] {
+                for close in [false, true] {
+                    let extras = [
+                        ("X-One".to_string(), "value".to_string()),
+                        ("Bad\r\nName".to_string(), "skip".to_string()),
+                    ];
+                    let original = format_http_response_head(
+                        status,
+                        "application/json",
+                        &extras,
+                        length,
+                        close,
+                    );
+                    let measured = response_head_encoded_len(
+                        status,
+                        "application/json",
+                        &extras,
+                        length,
+                        close,
+                    )
+                    .unwrap();
+                    assert_eq!(measured, original.len());
+                    let bounded = format_http_response_head_bounded(
+                        status,
+                        "application/json",
+                        &extras,
+                        length,
+                        close,
+                        measured,
+                    )
+                    .unwrap();
+                    assert_eq!(bounded, original);
+                    assert_eq!(bounded.capacity(), measured);
+                    assert!(format_http_response_head_bounded(
+                        status,
+                        "application/json",
+                        &extras,
+                        length,
+                        close,
+                        measured - 1
+                    )
+                    .is_err());
+                    assert_eq!(
+                        format_http_response_head_bounded(
+                            status,
+                            "application/json",
+                            &extras,
+                            length,
+                            close,
+                            measured + 1
+                        )
+                        .unwrap(),
+                        original
+                    );
+                    assert!(!core::str::from_utf8(&original).unwrap().contains("skip"));
+                }
+            }
+        }
         let body = b"{\"status\":\"ok\"}";
         let resp = format_http_response(200, body, false);
         let resp_str = core::str::from_utf8(&resp).unwrap();

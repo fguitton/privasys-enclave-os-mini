@@ -251,6 +251,88 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
     );
     handshake(&mut a_client, &mut a);
     handshake(&mut b_client, &mut b);
+    // Same original queue owner, with a real finite header pool before formatting.
+    let (mut header_client, mut header_session) = pair(&store, "b.test");
+    handshake(&mut header_client, &mut header_session);
+    let required = enclave_os_common::protocol::response_head_encoded_len(
+        200,
+        "application/json",
+        &[],
+        0,
+        false,
+    )
+    .unwrap();
+    let short = enclave_os_common::allocation::AllocationPoolV1::new(required - 1).unwrap();
+    assert!(header_session
+        .queue_http_response_admitted(
+            200,
+            "application/json",
+            &[],
+            Vec::new().into(),
+            (false, false),
+            Some(&short)
+        )
+        .is_err());
+    assert_eq!(short.used(), 0);
+    assert!(!header_session.has_pending_response());
+    for capacity in [required, required + 1] {
+        let pool = enclave_os_common::allocation::AllocationPoolV1::new(capacity).unwrap();
+        header_session
+            .queue_http_response_admitted(
+                200,
+                "application/json",
+                &[],
+                Vec::new().into(),
+                (false, false),
+                Some(&pool),
+            )
+            .unwrap();
+        assert_eq!(pool.used(), required);
+        assert_eq!(
+            header_session.response.as_ref().unwrap().head.capacity(),
+            required
+        );
+        assert!(header_session
+            .queue_http_response_admitted(
+                200,
+                "application/json",
+                &[],
+                Vec::new().into(),
+                (false, false),
+                Some(&pool)
+            )
+            .is_err());
+        let (output, _, _) = header_session.progress_http_response().unwrap();
+        assert!(!output.is_empty());
+        assert_eq!(pool.used(), 0);
+        assert!(!header_session.has_pending_response());
+    }
+    let pool = enclave_os_common::allocation::AllocationPoolV1::new(required).unwrap();
+    let oversized = "x".repeat(super::MAX_RESPONSE_HEADER_BYTES + 1);
+    assert!(header_session
+        .queue_http_response_admitted(
+            200,
+            &oversized,
+            &[],
+            Vec::new().into(),
+            (false, false),
+            Some(&pool)
+        )
+        .is_err());
+    assert_eq!(pool.used(), 0);
+    header_session
+        .queue_http_response_admitted(
+            200,
+            "application/json",
+            &[],
+            Vec::new().into(),
+            (false, false),
+            Some(&pool),
+        )
+        .unwrap();
+    drop(header_session);
+    assert_eq!(pool.used(), 0);
+
     assert!(super::current_data_session(Some(&mut a)));
     assert!(super::current_data_session(Some(&mut b)));
     write_requests(
