@@ -67,6 +67,11 @@ impl<K: Ord, V> OrderedMap<K, V> {
         value: V,
         pool: Option<&Arc<AllocationPoolV1>>,
     ) -> Result<Option<V>, (K, V)> {
+        // Vec<ZST> reports usize::MAX capacity without calling grow.
+        // Refuse this unsupported private-map representation before that path.
+        if core::mem::size_of::<(K, V)>() == 0 {
+            return Err((key, value));
+        }
         let position = match self.position(&key) {
             Ok(i) => return Ok(Some(core::mem::replace(&mut self.entries[i].1, value))),
             Err(i) => i,
@@ -87,6 +92,11 @@ impl<K: Ord, V> OrderedMap<K, V> {
         let backing = core::alloc::Layout::array::<(K, V)>(capacity)
             .map_err(|_| ())?
             .size();
+        // This private transport map stores real nonzero metadata tuples;
+        // zero-sized generic storage is unsupported, never charged as one byte.
+        if backing == 0 {
+            return Err(());
+        }
         let allocation = pool
             .map(|pool| pool.reserve_unpublished(backing).ok_or(()))
             .transpose()?;
@@ -202,6 +212,51 @@ pub(super) fn check() {
     assert_eq!(
         map.into_iter().collect::<Vec<_>>(),
         reference.into_iter().collect::<Vec<_>>()
+    );
+    #[derive(Eq, Debug)]
+    struct Key {
+        order: u32,
+        identity: u32,
+    }
+    impl PartialEq for Key {
+        fn eq(&self, other: &Self) -> bool {
+            self.order == other.order
+        }
+    }
+    impl PartialOrd for Key {
+        fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for Key {
+        fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+            self.order.cmp(&other.order)
+        }
+    }
+    let mut actual = OrderedMap::default();
+    let mut original = BTreeMap::new();
+    for identity in [1, 2] {
+        assert_eq!(
+            actual
+                .try_insert(Key { order: 1, identity }, identity)
+                .unwrap(),
+            original.insert(Key { order: 1, identity }, identity)
+        );
+    }
+    assert_eq!(
+        actual.iter().next().unwrap().0.identity,
+        original.keys().next().unwrap().identity
+    );
+    assert_eq!(
+        actual.iter().next().unwrap().0.identity,
+        1,
+        "original equivalent key retained"
+    );
+    let mut zero = OrderedMap::<(), ()>::default();
+    assert_eq!(
+        zero.try_insert((), ()),
+        Err(((), ())),
+        "zero-sized tuples explicitly unsupported"
     );
     eprintln!("SESSION-MAP-PAID: original ordered-map oracle, real backing peak/refusal/empty/iterator refund PASS");
 }

@@ -84,7 +84,7 @@ pub enum IngressShutdownReasonV1 {
 pub struct IngressServer {
     /// Per-connection state, keyed by conn_id from the TCP proxy.
     sessions: super::session::ordered_map::OrderedMap<u32, SessionState>,
-    write_windows: RefCell<BTreeMap<u32, channel::TcpWriteWindow>>,
+    write_windows: RefCell<super::session::ordered_map::OrderedMap<u32, channel::TcpWriteWindow>>,
     output_cursor: u32,
     /// One deferred parse turn after a response completes, including a small
     /// response completed synchronously during dispatch.
@@ -95,7 +95,8 @@ pub struct IngressServer {
     deferred_cursor: u32,
     /// Enclave-visible route class for each multiplexed TLS connection.
     /// This remains routing metadata and never substitutes for authorization.
-    ingress_classes: BTreeMap<u32, enclave_os_common::modules::IngressClass>,
+    ingress_classes:
+        super::session::ordered_map::OrderedMap<u32, enclave_os_common::modules::IngressClass>,
     stream_owner: crate::stream_ingress::CancellationOwner,
     next_stream: u64,
     stream_cursor: u32,
@@ -149,7 +150,7 @@ impl IngressServer {
     pub fn new(ca: Arc<CaContext>, data_tx: &'static SpscProducer) -> Self {
         Self {
             sessions: super::session::ordered_map::OrderedMap::default(),
-            write_windows: RefCell::new(BTreeMap::new()),
+            write_windows: RefCell::new(super::session::ordered_map::OrderedMap::default()),
             output_cursor: 0,
             pending_dispatch: BTreeSet::new(),
             deferred_owner: crate::deferred_ingress::CancellationOwner::default(),
@@ -161,7 +162,7 @@ impl IngressServer {
             stream_generations: BTreeMap::new(),
             paused_stream_reads: BTreeSet::new(),
             deferred_cursor: 0,
-            ingress_classes: BTreeMap::new(),
+            ingress_classes: super::session::ordered_map::OrderedMap::default(),
             ca,
             data_tx,
             shutdown: false,
@@ -231,10 +232,23 @@ impl IngressServer {
                     conn_id,
                     pending.peer_addr()
                 );
-                self.ingress_classes.insert(conn_id, ingress_class);
-                self.write_windows
-                    .borrow_mut()
-                    .insert(conn_id, channel::TcpWriteWindow::default());
+                let retained_class = self
+                    .ingress_classes
+                    .try_insert(conn_id, ingress_class)
+                    .is_ok();
+                let retained_window = retained_class
+                    && self
+                        .write_windows
+                        .borrow_mut()
+                        .try_insert(conn_id, channel::TcpWriteWindow::default())
+                        .is_ok();
+                // End the RefCell borrow before rollback touches this table.
+                if !retained_window {
+                    drop(pending);
+                    self.invalidate_deferred(conn_id);
+                    self.close_deferred_transport(conn_id);
+                    return false;
+                }
                 self.queue_to_proxy(channel::TCP_WRITE_CREDIT_PAYLOAD_BYTES, || {
                     channel::encode_tcp_write_credit(conn_id, 0)
                 });

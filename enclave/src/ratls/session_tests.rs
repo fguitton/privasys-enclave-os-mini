@@ -123,6 +123,7 @@ fn replacement_rejects_buffered_requests_and_re_attestation() {
     checked_pending_client_hello();
     super::ordered_map::check();
     checked_session_table_refusal();
+    checked_connection_metadata_tables();
     let store = CertStore::new();
     register(&store, "a.test");
     let (mut client, mut session) = pair(&store, "a.test");
@@ -1447,4 +1448,38 @@ fn checked_session_table_refusal() {
     drop(table);
     assert_eq!(pool.used(), 0);
     eprintln!("SESSION-MAP-TLS: real rejected session leaves original live authority intact and paid slot reusable PASS");
+}
+
+fn checked_connection_metadata_tables() {
+    use enclave_os_common::{
+        allocation::AllocationPoolV1, channel::TcpWriteWindow, modules::IngressClass,
+    };
+    let class_bytes = core::alloc::Layout::array::<(u32, IngressClass)>(1)
+        .unwrap()
+        .size();
+    let window_bytes = core::alloc::Layout::array::<(u32, TcpWriteWindow)>(1)
+        .unwrap()
+        .size();
+    let pool = AllocationPoolV1::new(class_bytes + window_bytes).unwrap();
+    let mut classes = super::ordered_map::OrderedMap::default();
+    let mut windows = super::ordered_map::OrderedMap::default();
+    assert!(classes
+        .insert_for_fixture(1, IngressClass::ExternalNetwork, &pool)
+        .is_ok());
+    assert!(windows
+        .insert_for_fixture(1, TcpWriteWindow::default(), &pool)
+        .is_ok());
+    let before = windows.get(&1).unwrap().available();
+    assert!(classes
+        .insert_for_fixture(2, IngressClass::LocalControl, &pool)
+        .is_err());
+    assert_eq!(classes.get(&1), Some(&IngressClass::ExternalNetwork));
+    assert_eq!(windows.get(&1).unwrap().available(), before);
+    assert!(!classes.contains_key(&2));
+    assert!(!windows.contains_key(&2));
+    drop(classes);
+    assert_eq!(pool.used(), window_bytes);
+    drop(windows);
+    assert_eq!(pool.used(), 0);
+    eprintln!("CONNECTION-METADATA-PAID: actual class/window layout refusal preserves original retained entry PASS");
 }
