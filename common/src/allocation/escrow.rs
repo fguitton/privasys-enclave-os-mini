@@ -2,7 +2,7 @@
 //! The caller moves its original physical credit here. This is not a global
 //! allocator and grants no caller, source, signing or publication authority.
 use super::{
-    AllocationLeaseV1, AllocationPoolV1, SharedAllocationCreditV1, SharedAllocationReservationV1,
+    AllocationLeaseV1, AllocationPoolV1,
     SharedAllocationV1,
 };
 use alloc::sync::Arc;
@@ -143,43 +143,6 @@ unsafe impl Allocator for LoanAllocator {
 struct RawSharedTicket {
     payload: usize,
     credit: usize,
-}
-impl<T, C: SharedAllocationCreditV1> SharedAllocationReservationV1<T, C> {
-    fn try_finish_unpublished(
-        self,
-        value: T,
-    ) -> Result<SharedAllocationV1<T, C>, core::alloc::AllocError> {
-        let mut credit = match Arc::<C>::try_new_uninit() {
-            Ok(value) => value,
-            Err(error) => {
-                drop(value);
-                drop(self.allocation);
-                return Err(error);
-            }
-        };
-        let payload = match Arc::try_new(value) {
-            Ok(value) => value,
-            Err(error) => {
-                drop(credit);
-                drop(self.allocation);
-                return Err(error);
-            }
-        };
-        // SAFETY: this new uninitialized Arc is unique; no alias or callback
-        // sees it before initialization. Admission remains held until both
-        // backing allocations exist; every failure frees backing before refund.
-        unsafe {
-            Arc::get_mut(&mut credit)
-                .unwrap()
-                .as_mut_ptr()
-                .write(self.allocation);
-        }
-        let credit = unsafe { credit.assume_init() };
-        Ok(SharedAllocationV1 {
-            payload: Some(payload),
-            credit: Some(credit),
-        })
-    }
 }
 impl<T, C> SharedAllocationV1<T, C> {
     /// Transfer one additional exact paired strong ownership to a private

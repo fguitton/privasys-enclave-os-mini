@@ -148,6 +148,40 @@ impl<T> SharedAllocationV1<T> {
         Self::from_admission(pool.reserve_unpublished(Self::required_bytes(retained_child_bytes)?)?, retained_child_bytes)
     }
 }
+/// Failure leaves the original shared value and all its aliases untouched.
+#[cfg(feature = "fallible-allocation-v1")]
+#[derive(Debug)]
+pub enum SharedMutationErrorV1<E> { DifferentPool, Admission, Allocation, Clone(E) }
+#[cfg(feature = "fallible-allocation-v1")]
+impl<T> SharedAllocationV1<T> {
+    /// Reuse a unique payload or independently admit a complete shared copy.
+    /// The callback must pay for its own children; this owner pays both Arcs.
+    /// Release notification preserves the original publication disposition.
+    /// # Errors
+    /// Refuses a foreign pool, admission, clone failure or actual Arc refusal.
+    pub fn try_make_unique_with<E>(
+        &mut self, pool: &Arc<AllocationPoolV1>, retained_child_bytes: usize,
+        clone: impl FnOnce(&T) -> Result<T,E>,
+    ) -> Result<&mut T,SharedMutationErrorV1<E>> {
+        let credit = self.credit.as_ref().ok_or(SharedMutationErrorV1::Allocation)?;
+        if !credit.covers(pool, credit.bytes()) { return Err(SharedMutationErrorV1::DifferentPool); }
+        let notify = credit.notify.load(Ordering::Acquire);
+        if self.payload.as_ref().is_some_and(|value| Arc::strong_count(value) == 1) {
+            let required = Self::required_bytes(retained_child_bytes).ok_or(SharedMutationErrorV1::Admission)?;
+            if credit.bytes() < required { return Err(SharedMutationErrorV1::Admission); }
+            return self.get_mut().ok_or(SharedMutationErrorV1::Allocation);
+        }
+        let reservation = Self::reserve(pool, retained_child_bytes).ok_or(SharedMutationErrorV1::Admission)?;
+        let value = match clone(self) {
+            Ok(value) => value,
+            Err(error) => { drop(reservation); return Err(SharedMutationErrorV1::Clone(error)); }
+        };
+        let replacement = reservation.try_finish_unpublished(value).map_err(|_| SharedMutationErrorV1::Allocation)?;
+        if notify { replacement.activate_release_notification(); }
+        *self = replacement;
+        self.get_mut().ok_or(SharedMutationErrorV1::Allocation)
+    }
+}
 impl<T, C> SharedAllocationV1<T, C> {
     /// Complete requested payload/credit Arc layouts plus caller-owned children.
     pub fn required_bytes(retained_child_bytes: usize) -> Option<usize> {
@@ -179,6 +213,43 @@ impl<T, C: SharedAllocationCreditV1> SharedAllocationReservationV1<T,C> {
         let value = self.finish_unpublished(value);
         value.activate_release_notification();
         value
+    }
+    /// Fallibly allocate both admitted Arc containers, then publish the credit.
+    /// The caller must separately own every child allocation of `value`.
+    /// # Errors
+    /// Returns allocator refusal after destroying the value and rolling back credit.
+    #[cfg(feature = "fallible-allocation-v1")]
+    pub fn try_finish(self, value: T) -> Result<SharedAllocationV1<T,C>, core::alloc::AllocError> {
+        let value = self.try_finish_unpublished(value)?;
+        value.activate_release_notification();
+        Ok(value)
+    }
+    /// Fallible silent construction; no raw Arc or Weak can escape.
+    /// Allocate the credit container unarmed, so allocation failure never drops
+    /// the lease before the caller's payload or a retained container is freed.
+    /// # Errors
+    /// Refuses either real allocator request and refunds the original admission.
+    #[cfg(feature = "fallible-allocation-v1")]
+    pub fn try_finish_unpublished(self, value: T) -> Result<SharedAllocationV1<T,C>, core::alloc::AllocError> {
+        let mut credit = match Arc::<C>::try_new_uninit() {
+            Ok(credit) => credit,
+            Err(error) => { drop(value); drop(self); return Err(error); }
+        };
+        let payload = match Arc::try_new(value) {
+            Ok(payload) => payload,
+            Err(error) => {
+                // The failed Arc request already destroyed `value`. Release
+                // uninitialized container backing before the still-owned lease.
+                drop(Arc::into_inner(credit));
+                drop(self);
+                return Err(error);
+            }
+        };
+        Arc::get_mut(&mut credit).expect("fresh unaliased credit").write(self.allocation);
+        // SAFETY: this locally unique Arc was just fully initialized. Neither
+        // raw/Weak aliases nor uninitialized credit ever leave this function.
+        let credit = unsafe { credit.assume_init() };
+        Ok(SharedAllocationV1 { payload: Some(payload), credit: Some(credit) })
     }
     /// Keep rollback silent until the actual owning route publishes this value.
     pub fn finish_unpublished(self, value: T) -> SharedAllocationV1<T,C> {
