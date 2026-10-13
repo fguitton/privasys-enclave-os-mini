@@ -17,7 +17,10 @@ pub fn take_local_allocation_release() -> bool {
 /// This does not fabricate memory for the semantic Wasm1TiB profile.
 pub fn local_allocation_pool() -> Option<Arc<AllocationPoolV1>> {
     POOL.get_or_init(|| {
-        AllocationPoolV1::new_with_release(crate::enclave_heap_bytes(), Some(released))
+        #[cfg(all(feature = "fallible-allocation-v1", target_vendor = "teaclave"))]
+        { AllocationPoolV1::try_new_with_release(crate::enclave_heap_bytes(), Some(released)) }
+        #[cfg(not(all(feature = "fallible-allocation-v1", target_vendor = "teaclave")))]
+        { AllocationPoolV1::new_with_release(crate::enclave_heap_bytes(), Some(released)) }
     })
     .clone()
 }

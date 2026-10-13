@@ -28,6 +28,20 @@ impl AllocationPoolV1 {
             released,
         }))
     }
+    /// Fallible measured startup root, before any child pool or loan exists.
+    /// The acquired ArcInner<Self> request is admitted by reducing the supplied
+    /// physical capacity BEFORE Arc allocates. Runtime retains this root for the
+    /// process lifetime; this does not bound allocator-private heap overhead.
+    /// Existing default/native constructor semantics remain unchanged.
+    /// # Errors
+    /// Returns None for unavailable metadata geometry, no remaining capacity,
+    /// or actual Arc allocation refusal. No pool or partial credit escapes.
+    #[cfg(feature = "fallible-allocation-v1")]
+    pub fn try_new_with_release(capacity: usize, released: Option<fn()>) -> Option<Arc<Self>> {
+        let root_bytes = shared_allocation_bytes::<Self>()?;
+        let available = capacity.checked_sub(root_bytes).filter(|bytes| *bytes != 0)?;
+        Arc::try_new(Self { capacity: available, used: AtomicUsize::new(0), released }).ok()
+    }
     pub fn capacity(&self) -> usize {
         self.capacity
     }
@@ -240,7 +254,7 @@ impl<T, C: SharedAllocationCreditV1> SharedAllocationReservationV1<T,C> {
             Err(error) => {
                 // The failed Arc request already destroyed `value`. Release
                 // uninitialized container backing before the still-owned lease.
-                drop(Arc::into_inner(credit));
+                let _ = Arc::into_inner(credit);
                 drop(self);
                 return Err(error);
             }
