@@ -2997,15 +2997,17 @@ impl IngressServer {
                     return HttpHandleResult::err(404, "unknown leaf");
                 };
                 // Only the leaf actually served on this connection may be attested.
-                let served_leaf = session.local_cert_der().unwrap_or_default();
+                let served_leaf = session.local_cert_der_ref();
                 let served_hash = {
                     use x509_parser::prelude::*;
-                    match X509Certificate::from_der(&served_leaf) {
+                    match X509Certificate::from_der(served_leaf) {
                         Ok((_, cert)) => {
-                            let spki = enclave_os_common::quote::build_p256_spki_der(
+                            match enclave_os_common::quote::p256_spki_sha256(
                                 cert.public_key().subject_public_key.as_ref(),
-                            );
-                            ring::digest::digest(&ring::digest::SHA256, &spki)
+                            ) {
+                                Some(hash) => hash,
+                                None => return HttpHandleResult::err(500, "session leaf unavailable"),
+                            }
                         }
                         Err(_) => return HttpHandleResult::err(500, "session leaf unavailable"),
                     }

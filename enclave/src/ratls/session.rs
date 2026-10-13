@@ -1014,6 +1014,12 @@ impl RaTlsSession {
         self.attestation
     }
 
+    /// Borrow the immutable served leaf for identity comparisons. This is data,
+    /// not a currentness grant; dispatch/exporter checks retain their authority.
+    pub(crate) fn local_cert_der_ref(&self) -> &[u8] {
+        &self.local_cert_der
+    }
+
     /// Exact DER leaf served by this session.
     pub fn local_cert_der(&self) -> Option<Vec<u8>> {
         Some(self.local_cert_der.clone())

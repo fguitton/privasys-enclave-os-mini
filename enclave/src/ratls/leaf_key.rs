@@ -91,6 +91,17 @@ impl RetainedLeafKey {
 
 #[cfg(test)]
 pub(super) fn check() {
+    // Original report-data transcript oracle: SHA512(SHA256(key)||binding).
+    // Fixed known answer is independent of the streaming encoder implementation.
+    let expected_report = [0x7e, 0x66, 0xd7, 0x0c, 0x18, 0xea, 0x30, 0x30, 0x99, 0xd8, 0x8c, 0x89, 0xfb, 0x1e, 0x9d, 0x5f, 0xce, 0xdb, 0xd5, 0xfa, 0xe4, 0x85, 0x7e, 0x14, 0x2f, 0xd2, 0x3e, 0xe8, 0xf6, 0xca, 0x37, 0x36, 0x8e, 0xca, 0x39, 0x35, 0x3d, 0x18, 0x7a, 0x01, 0xb5, 0xe5, 0x5a, 0x70, 0x6b, 0x5b, 0x41, 0xf0, 0x2c, 0x15, 0x85, 0xe7, 0x14, 0xef, 0x08, 0x54, 0x89, 0xfe, 0xd1, 0xd8, 0xb9, 0xba, 0xfb, 0xb6];
+    assert_eq!(enclave_os_common::quote::compute_report_data_hash(b"pubkey", b"binding").as_ref(), expected_report);
+    for binding in [b"".as_slice(), b"binding".as_slice(), b"other-binding".as_slice()] {
+        let key_hash = digest::digest(&digest::SHA256, b"pubkey");
+        let mut original_preimage = key_hash.as_ref().to_vec();
+        original_preimage.extend_from_slice(binding);
+        assert_eq!(enclave_os_common::quote::compute_report_data_hash(b"pubkey", binding).as_ref(),
+            digest::digest(&digest::SHA512, &original_preimage).as_ref());
+    }
     let rng = SystemRandom::new();
     let document = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
     let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, document.as_ref(), &rng).unwrap();
@@ -108,6 +119,10 @@ pub(super) fn check() {
     let mut bounded_spki = vec![0; spki_len];
     assert!(enclave_os_common::quote::write_p256_spki_der(point, &mut bounded_spki).is_some());
     assert_eq!(bounded_spki, expected_spki);
+    assert_eq!(
+        enclave_os_common::quote::p256_spki_sha256(point).unwrap().as_ref(),
+        digest::digest(&digest::SHA256, &expected_spki).as_ref(),
+    );
     let required = SharedAllocationV1::<LeafKey>::required_bytes(document.as_ref().len().checked_add(spki_len).unwrap()).unwrap();
     let short = AllocationPoolV1::new(required - 1).unwrap();
     assert!(RetainedLeafKey::from_generated(&short, 17, &document, &pair).is_none());

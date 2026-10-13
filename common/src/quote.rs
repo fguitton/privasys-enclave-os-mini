@@ -381,6 +381,19 @@ fn spki_parts(point_len: usize) -> Option<([u8; 2], [u8; 3], usize)> {
 pub fn p256_spki_der_len(point_len: usize) -> Option<usize> {
     spki_parts(point_len).map(|(_, _, length)| length)
 }
+/// SHA-256 of the exact SPKI encoder bytes without a temporary output buffer.
+#[cfg(feature = "crypto")]
+#[must_use]
+pub fn p256_spki_sha256(ec_point: &[u8]) -> Option<ring::digest::Digest> {
+    let (sequence, bits, _) = spki_parts(ec_point.len())?;
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+    digest.update(&sequence);
+    digest.update(P256_ALGO_ID);
+    digest.update(&bits);
+    digest.update(ec_point);
+    Some(digest.finish())
+}
+
 /// Encode into an exactly preadmitted destination without any allocation.
 /// Returns `None` before writing if length arithmetic or destination size refuses.
 #[must_use]
@@ -421,10 +434,10 @@ pub fn write_p256_spki_der(ec_point: &[u8], output: &mut [u8]) -> Option<()> {
 #[cfg(feature = "crypto")]
 pub fn compute_report_data_hash(pubkey_bytes: &[u8], binding: &[u8]) -> ring::digest::Digest {
     let pk_hash = ring::digest::digest(&ring::digest::SHA256, pubkey_bytes);
-    let mut preimage = Vec::with_capacity(32 + binding.len());
-    preimage.extend_from_slice(pk_hash.as_ref());
-    preimage.extend_from_slice(binding);
-    ring::digest::digest(&ring::digest::SHA512, &preimage)
+    let mut context = ring::digest::Context::new(&ring::digest::SHA512);
+    context.update(pk_hash.as_ref());
+    context.update(binding);
+    context.finish()
 }
 
 #[cfg(test)]

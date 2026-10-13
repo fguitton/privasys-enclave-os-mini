@@ -131,6 +131,15 @@ fn replacement_rejects_buffered_requests_and_re_attestation() {
     register(&store, "a.test");
     let (mut client, mut session) = pair(&store, "a.test");
     handshake(&mut client, &mut session);
+    assert_eq!(session.local_cert_der_ref(), session.local_cert_der().unwrap());
+    {
+        use x509_parser::prelude::*;
+        let (_, served) = X509Certificate::from_der(session.local_cert_der_ref()).unwrap();
+        let point = served.public_key().subject_public_key.as_ref();
+        let encoded = enclave_os_common::quote::build_p256_spki_der(point);
+        assert_eq!(enclave_os_common::quote::p256_spki_sha256(point).unwrap().as_ref(),
+            ring::digest::digest(&ring::digest::SHA256, &encoded).as_ref());
+    }
     write_requests(
         &mut client,
         &mut session,

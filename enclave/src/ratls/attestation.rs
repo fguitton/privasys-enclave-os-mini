@@ -16,7 +16,6 @@
 //!                hctx = TLS-Exporter("EXPORTER-privasys-ratls-attest-v2", context, 32)
 //! ```
 
-use ring::digest;
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 use std::string::String;
@@ -111,11 +110,7 @@ pub struct CertGenerationResult {
 /// `SHA-512( SHA-256(SPKI_DER) || binding )`, with `spki_der` the full DER
 /// `SubjectPublicKeyInfo` (91 bytes for P-256).
 pub fn compute_report_data(spki_der: &[u8], binding: &[u8]) -> [u8; 64] {
-    let pubkey_hash = digest::digest(&digest::SHA256, spki_der);
-    let mut preimage = Vec::with_capacity(32 + binding.len());
-    preimage.extend_from_slice(pubkey_hash.as_ref());
-    preimage.extend_from_slice(binding);
-    let rd = digest::digest(&digest::SHA512, &preimage);
+    let rd = enclave_os_common::quote::compute_report_data_hash(spki_der, binding);
     let mut out = [0u8; 64];
     out.copy_from_slice(rd.as_ref());
     out
