@@ -84,7 +84,7 @@ impl SlotCharge {
             })
     }
 }
-#[cfg(target_env = "sgx")]
+#[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
 impl SlotCharge {
     // Count remains the existing logical marker policy. Allocation is a shared
     // actual session/fragment owner, retained through terminal receiver teardown.
@@ -272,7 +272,7 @@ impl CancellationOwner {
         self.cancelled = cancelled;
         true
     }
-    #[cfg(target_env = "sgx")]
+    #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
     pub(crate) fn prepare(&mut self) -> bool {
         crate::local_allocation_pool().is_some_and(|pool| self.prepare_from(&pool))
     }

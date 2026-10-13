@@ -1039,9 +1039,9 @@ impl IngressServer {
                             return false;
                         };
                         self.next_stream = nonce;
-                        #[cfg(target_env = "sgx")]
+                        #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
                         let lease = crate::stream_ingress::SlotCharge::reserve_for_session(session);
-                        #[cfg(not(target_env = "sgx"))]
+                        #[cfg(not(any(target_env = "sgx", target_vendor = "teaclave")))]
                         let lease = crate::stream_ingress::SlotCharge::reserve();
                         let Some(lease) = lease else {
                             self.send_close(conn_id);
@@ -1426,14 +1426,14 @@ impl IngressServer {
     }
 
     fn queue_to_proxy(&self, payload: usize, encode: impl FnOnce() -> Vec<u8>) {
-        #[cfg(target_env = "sgx")]
+        #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
         let Some(pool) = crate::local_allocation_pool() else {
             self.output_failed.set(true);
             return;
         };
-        #[cfg(target_env = "sgx")]
+        #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
         let pool = Some(pool);
-        #[cfg(not(target_env = "sgx"))]
+        #[cfg(not(any(target_env = "sgx", target_vendor = "teaclave")))]
         let pool = None;
         let Ok(message) = ChannelMessage::encode(pool.as_ref(), payload, encode) else {
             self.output_failed.set(true);

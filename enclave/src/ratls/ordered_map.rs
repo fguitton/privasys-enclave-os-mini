@@ -38,12 +38,12 @@ impl<K: Ord, V> OrderedMap<K, V> {
         let capacity = self.len().checked_add(1).ok_or(())?;
         self.prepare_from(pool, capacity)
     }
-    #[cfg(target_env = "sgx")]
+    #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
     pub(crate) fn reserve_new_entry(&mut self) -> Result<(), ()> {
         let pool = crate::local_allocation_pool().ok_or(())?;
         self.reserve_new_from(&pool)
     }
-    #[cfg(target_env = "sgx")]
+    #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
     pub(crate) fn reserve_entry<Q: Ord + ?Sized>(&mut self, key: &Q) -> Result<(), ()>
     where
         K: Borrow<Q>,
@@ -98,7 +98,7 @@ impl<K: Ord, V> OrderedMap<K, V> {
         assert!(inner.contains_key(&key) || inner.len() < inner.capacity());
         inner
             .try_insert(key, value)
-            .unwrap_or_else(|_| panic!("pre-admitted nonzero tuple backing"))
+            .unwrap_or_else(|_| std::panic!("pre-admitted nonzero tuple backing"))
     }
     pub(crate) fn get<Q: Ord + ?Sized>(&self, key: &Q) -> Option<&V>
     where
@@ -130,7 +130,7 @@ impl<K: Ord, V> OrderedMap<K, V> {
     pub(crate) fn after<'a>(&'a self, key: &'a K) -> impl Iterator<Item = (&'a K, &'a V)> {
         self.inner.iter().flat_map(move |map| map.after(key))
     }
-    #[cfg(target_env = "sgx")]
+    #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
     pub(crate) fn try_insert(&mut self, key: K, value: V) -> Result<Option<V>, (K, V)> {
         let Some(pool) = crate::local_allocation_pool() else {
             return Err((key, value));

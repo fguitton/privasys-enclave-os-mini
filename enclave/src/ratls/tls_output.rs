@@ -36,13 +36,13 @@ impl TlsOutput {
         }
     }
     fn pool() -> Result<Option<Arc<AllocationPoolV1>>, &'static str> {
-        #[cfg(target_env = "sgx")]
+        #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
         {
             crate::local_allocation_pool()
                 .map(Some)
                 .ok_or("SDK heap unavailable")
         }
-        #[cfg(not(target_env = "sgx"))]
+        #[cfg(not(any(target_env = "sgx", target_vendor = "teaclave")))]
         {
             Ok(None)
         }

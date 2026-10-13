@@ -57,10 +57,10 @@ pub use tls_output::TlsOutput;
 pub(crate) mod channel_output;
 #[path = "http_request.rs"]
 mod http_request;
-#[cfg(any(test, target_env = "sgx"))]
+#[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
 #[path = "leaf_key.rs"]
 pub(crate) mod leaf_key;
-#[cfg(any(test, target_env = "sgx"))]
+#[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
 #[path = "retained_name.rs"]
 pub(crate) mod retained_name;
 #[path = "ordered_map.rs"]
@@ -358,9 +358,9 @@ impl RaTlsSession {
         // Drain any available decrypted plaintext into read_buf
         self.drain_plaintext()?;
 
-        #[cfg(target_env = "sgx")]
+        #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
         let pool = Some(crate::local_allocation_pool().ok_or("SDK heap unavailable")?);
-        #[cfg(not(target_env = "sgx"))]
+        #[cfg(not(any(target_env = "sgx", target_vendor = "teaclave")))]
         let pool = None;
         match PaidHttpRequest::parse(&self.read_buf[self.read_offset..], pool.as_ref())? {
             Some((request, consumed)) => {
@@ -375,20 +375,20 @@ impl RaTlsSession {
         &mut self,
     ) -> Result<Option<(PaidHttpRequest, usize, usize)>, &'static str> {
         self.require_current_configuration()?;
-        #[cfg(target_env = "sgx")]
+        #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
         let pool = Some(crate::local_allocation_pool().ok_or("SDK heap unavailable")?);
-        #[cfg(not(target_env = "sgx"))]
+        #[cfg(not(any(target_env = "sgx", target_vendor = "teaclave")))]
         let pool = None;
         PaidHttpRequest::parse_head(&self.read_buf[self.read_offset..], pool.as_ref(), false)
     }
     pub(crate) fn validate_stream_head(&self) -> bool {
-        #[cfg(target_env = "sgx")]
+        #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
         let Some(pool) = crate::local_allocation_pool() else {
             return false;
         };
-        #[cfg(target_env = "sgx")]
+        #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
         let pool = Some(pool);
-        #[cfg(not(target_env = "sgx"))]
+        #[cfg(not(any(target_env = "sgx", target_vendor = "teaclave")))]
         let pool = None;
         matches!(
             PaidHttpRequest::parse_head(&self.read_buf[self.read_offset..], pool.as_ref(), true),
@@ -439,13 +439,13 @@ impl RaTlsSession {
         self.stream_allocation = Some(lease.clone());
         Ok(lease)
     }
-    #[cfg(target_env = "sgx")]
+    #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
     pub(crate) fn reserve_stream_allocation(&mut self) -> Result<StreamAllocation, &'static str> {
         let pool = crate::local_allocation_pool().ok_or("SDK heap unavailable")?;
         self.admit_stream_allocation(&pool)
     }
     pub(crate) fn consume_stream_head(&mut self, bytes: usize) -> Result<(), &'static str> {
-        #[cfg(target_env = "sgx")]
+        #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
         self.reserve_stream_allocation()?;
         let offset = self
             .read_offset
@@ -639,12 +639,12 @@ impl RaTlsSession {
         shutdown: bool,
     ) -> Result<(), (&'static str, crate::HttpResponsePayload)> {
         let body = body.into();
-        #[cfg(target_env = "sgx")]
+        #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
         let pool = match crate::local_allocation_pool() {
             Some(pool) => Some(pool),
             None => return Err(("SDK heap unavailable", body)),
         };
-        #[cfg(not(target_env = "sgx"))]
+        #[cfg(not(any(target_env = "sgx", target_vendor = "teaclave")))]
         let pool = None;
         self.queue_http_response_admitted(
             status,
@@ -772,9 +772,9 @@ impl RaTlsSession {
                     control.0.saturating_sub(cost.control_at_open.0),
                     control.1.saturating_sub(cost.control_at_open.1), self.tls_conn.negotiated_cipher_suite().map(|suite| suite.suite())
                 );
-                #[cfg(target_env = "sgx")]
+                #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
                 enclave_os_common::enclave_log_info!("{}", message);
-                #[cfg(not(target_env = "sgx"))]
+                #[cfg(not(any(target_env = "sgx", target_vendor = "teaclave")))]
                 eprintln!("{}", message);
             }
             Ok((output, response.close, response.shutdown))
@@ -858,9 +858,9 @@ impl RaTlsSession {
     fn drain_plaintext(&mut self) -> Result<(), &'static str> {
         // Fixed reader scratch uses the existing thread stack, not a hidden Vec.
         let mut buf = [0u8; Self::PLAINTEXT_READ_CHUNK_BYTES];
-        #[cfg(target_env = "sgx")]
+        #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
         let pool = Some(crate::local_allocation_pool().ok_or("SDK heap unavailable")?);
-        #[cfg(not(target_env = "sgx"))]
+        #[cfg(not(any(target_env = "sgx", target_vendor = "teaclave")))]
         let pool = None;
         loop {
             let mut reader = self.tls_conn.reader();
@@ -1102,9 +1102,9 @@ impl RaTlsSession {
         connection_id: u32,
         ingress_class: enclave_os_common::modules::IngressClass,
     ) -> Result<PaidRequestContext, &'static str> {
-        #[cfg(target_env = "sgx")]
+        #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
         let pool = Some(crate::local_allocation_pool().ok_or("SDK heap unavailable")?);
-        #[cfg(not(target_env = "sgx"))]
+        #[cfg(not(any(target_env = "sgx", target_vendor = "teaclave")))]
         let pool = None;
         self.request_context_with_pool(connection_id, ingress_class, pool.as_ref())
     }

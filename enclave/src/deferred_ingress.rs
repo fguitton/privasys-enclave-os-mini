@@ -80,9 +80,9 @@ pub(crate) struct ContextCharge {
 }
 impl ContextCharge {
     pub(crate) fn reserve(bytes: usize) -> Option<Self> {
-        #[cfg(target_env = "sgx")]
+        #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
         let pool = Some(crate::local_allocation_pool()?);
-        #[cfg(not(target_env = "sgx"))]
+        #[cfg(not(any(target_env = "sgx", target_vendor = "teaclave")))]
         let pool = None;
         Self::reserve_from(bytes, pool.as_ref())
     }
@@ -424,7 +424,7 @@ impl CancellationOwner {
         self.cancelled = cancelled;
         true
     }
-    #[cfg(target_env = "sgx")]
+    #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
     pub(crate) fn prepare(&mut self) -> bool {
         crate::local_allocation_pool().is_some_and(|pool| self.prepare_from(&pool))
     }
