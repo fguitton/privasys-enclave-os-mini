@@ -57,6 +57,10 @@ pub use tls_output::TlsOutput;
 pub(crate) mod channel_output;
 #[path = "http_request.rs"]
 mod http_request;
+#[path = "ordered_map.rs"]
+pub(crate) mod ordered_map;
+#[path = "pending_client.rs"]
+pub(crate) mod pending_client;
 pub use http_request::PaidHttpRequest;
 
 #[cfg(test)]

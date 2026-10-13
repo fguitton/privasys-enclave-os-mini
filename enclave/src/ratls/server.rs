@@ -53,27 +53,17 @@ use rustls::ServerConfig;
 ///   `Pending` → `Handshaking` → `Established`
 enum SessionState {
     /// TCP connection accepted; ClientHello not yet complete.
-    Pending {
-        peer_addr: String,
-        /// Raw TLS bytes received so far. A ClientHello can arrive split
-        /// across several TcpData chunks (more likely now that the RA-TLS
-        /// challenge extension enlarges it); accumulate until the record
-        /// is complete before handing it to the rustls Acceptor.
-        buffered: Vec<u8>,
-    },
+    Pending(PendingClientHello),
     /// TLS handshake is in progress.
     Handshaking(RaTlsSession),
     /// TLS handshake complete, processing application data.
     Established(RaTlsSession),
 }
 
-/// Upper bound on buffered ClientHello bytes while waiting for a
-/// fragmented hello to complete. A TLS record maxes at 16 KiB; a real
-/// ClientHello (even with the RA-TLS challenge extension) is ~1-2 KiB.
-const MAX_PENDING_CLIENTHELLO: usize = 16 * 1024;
 use super::session::channel_output::{
     Message as ChannelMessage, Queue as ChannelQueue, MAX_PENDING_ENCLAVE_OUTPUT,
 };
+use super::session::pending_client::{PendingClientHello, MAX_PENDING_CLIENTHELLO};
 
 /// Closed reason why the ingress server requested a global enclave stop.
 ///
@@ -93,7 +83,7 @@ pub enum IngressShutdownReasonV1 {
 /// RA-TLS ingress server driven by data channel messages.
 pub struct IngressServer {
     /// Per-connection state, keyed by conn_id from the TCP proxy.
-    sessions: BTreeMap<u32, SessionState>,
+    sessions: super::session::ordered_map::OrderedMap<u32, SessionState>,
     write_windows: RefCell<BTreeMap<u32, channel::TcpWriteWindow>>,
     output_cursor: u32,
     /// One deferred parse turn after a response completes, including a small
@@ -158,7 +148,7 @@ impl IngressServer {
     /// the wire.
     pub fn new(ca: Arc<CaContext>, data_tx: &'static SpscProducer) -> Self {
         Self {
-            sessions: BTreeMap::new(),
+            sessions: super::session::ordered_map::OrderedMap::default(),
             write_windows: RefCell::new(BTreeMap::new()),
             output_cursor: 0,
             pending_dispatch: BTreeSet::new(),
@@ -181,6 +171,17 @@ impl IngressServer {
             leaf_keys: BTreeMap::new(),
             leaf_by_spki: BTreeMap::new(),
             det_quotes: BTreeMap::new(),
+        }
+    }
+
+    /// Refuse only the unpaid connection; preserve existing session authority
+    /// and the original exact global shutdown reasons.
+    fn retain_session(&mut self, connection: u32, state: SessionState) {
+        if let Err((connection, state)) = self.sessions.try_insert(connection, state) {
+            // Drop TLS/Pending children and their credit before logical reuse.
+            drop(state);
+            self.invalidate_deferred(connection);
+            self.close_deferred_transport(connection);
         }
     }
 
@@ -212,15 +213,24 @@ impl IngressServer {
                 self.paused_stream_reads.remove(&conn_id);
                 self.stream_generations.remove(&conn_id);
                 self.pending_dispatch.remove(&conn_id);
-                let peer_addr = core::str::from_utf8(payload)
-                    .unwrap_or("<invalid>")
-                    .to_string();
+                let pending = match PendingClientHello::new(payload) {
+                    Ok(pending) => pending,
+                    Err(_) => {
+                        self.sessions.remove(&conn_id);
+                        self.send_close(conn_id);
+                        return false;
+                    }
+                };
                 let ingress_class = if msg_type == ChannelMsgType::LocalControlNew {
                     enclave_os_common::modules::IngressClass::LocalControl
                 } else {
                     enclave_os_common::modules::IngressClass::ExternalNetwork
                 };
-                enclave_log_info!("New connection conn_id={} from {}", conn_id, peer_addr);
+                enclave_log_info!(
+                    "New connection conn_id={} from {}",
+                    conn_id,
+                    pending.peer_addr()
+                );
                 self.ingress_classes.insert(conn_id, ingress_class);
                 self.write_windows
                     .borrow_mut()
@@ -228,13 +238,7 @@ impl IngressServer {
                 self.queue_to_proxy(channel::TCP_WRITE_CREDIT_PAYLOAD_BYTES, || {
                     channel::encode_tcp_write_credit(conn_id, 0)
                 });
-                self.sessions.insert(
-                    conn_id,
-                    SessionState::Pending {
-                        peer_addr,
-                        buffered: Vec::new(),
-                    },
-                );
+                self.retain_session(conn_id, SessionState::Pending(pending));
             }
 
             ChannelMsgType::TcpWriteCredit => {
@@ -362,10 +366,7 @@ impl IngressServer {
         };
         let next = self
             .sessions
-            .range((
-                std::ops::Bound::Excluded(self.output_cursor),
-                std::ops::Bound::Unbounded,
-            ))
+            .after(&self.output_cursor)
             .find(|(id, state)| eligible(id, state))
             .or_else(|| self.sessions.iter().find(|(id, state)| eligible(id, state)))
             .map(|(id, _)| *id);
@@ -385,8 +386,7 @@ impl IngressServer {
             self.dispatch_requests(conn_id, &mut session)
         };
         if keep {
-            self.sessions
-                .insert(conn_id, SessionState::Established(session));
+            self.retain_session(conn_id, SessionState::Established(session));
         } else {
             self.invalidate_deferred(conn_id);
             self.pending_dispatch.remove(&conn_id);
@@ -448,23 +448,21 @@ impl IngressServer {
         };
 
         match state {
-            SessionState::Pending {
-                peer_addr,
-                mut buffered,
-            } => {
+            SessionState::Pending(mut pending) => {
                 // Accumulate TLS bytes until the ClientHello record is
                 // complete — it can arrive split across several TcpData
                 // chunks. Re-feeding the whole buffer to a fresh Acceptor
                 // each round is idempotent.
-                buffered.extend_from_slice(data);
-                match self.create_session(conn_id, &peer_addr, &buffered) {
+                if pending.append(data).is_err() {
+                    self.send_close(conn_id);
+                    return;
+                }
+                match self.create_session(conn_id, pending.peer_addr(), pending.buffered()) {
                     Ok(Some(session)) => {
                         if session.is_handshaking() {
-                            self.sessions
-                                .insert(conn_id, SessionState::Handshaking(session));
+                            self.retain_session(conn_id, SessionState::Handshaking(session));
                         } else {
-                            self.sessions
-                                .insert(conn_id, SessionState::Established(session));
+                            self.retain_session(conn_id, SessionState::Established(session));
                         }
                     }
                     Ok(None) => {
@@ -472,7 +470,7 @@ impl IngressServer {
                         // for the next TcpData. Cap the buffer so a
                         // malformed/never-completing hello can't grow
                         // unbounded.
-                        if buffered.len() > MAX_PENDING_CLIENTHELLO {
+                        if pending.buffered().len() > MAX_PENDING_CLIENTHELLO {
                             enclave_log_error!(
                                 "ClientHello exceeded {} bytes for conn_id={}, dropping",
                                 MAX_PENDING_CLIENTHELLO,
@@ -480,13 +478,7 @@ impl IngressServer {
                             );
                             self.send_close(conn_id);
                         } else {
-                            self.sessions.insert(
-                                conn_id,
-                                SessionState::Pending {
-                                    peer_addr,
-                                    buffered,
-                                },
-                            );
+                            self.retain_session(conn_id, SessionState::Pending(pending));
                         }
                     }
                     Err(e) => {
@@ -504,8 +496,7 @@ impl IngressServer {
                 match self.process_session_data(conn_id, &mut session, data) {
                     Ok(()) => {
                         if session.is_handshaking() {
-                            self.sessions
-                                .insert(conn_id, SessionState::Handshaking(session));
+                            self.retain_session(conn_id, SessionState::Handshaking(session));
                         } else {
                             enclave_log_info!("TLS handshake complete for conn_id={}", conn_id);
                             // The client may have sent application data
@@ -513,8 +504,7 @@ impl IngressServer {
                             // flight as the handshake Finished message.
                             // Dispatch any buffered requests now.
                             if self.dispatch_requests(conn_id, &mut session) {
-                                self.sessions
-                                    .insert(conn_id, SessionState::Established(session));
+                                self.retain_session(conn_id, SessionState::Established(session));
                             }
                         }
                     }
@@ -530,8 +520,7 @@ impl IngressServer {
                     Ok(()) => {
                         // Dispatch any complete HTTP requests
                         if self.dispatch_requests(conn_id, &mut session) {
-                            self.sessions
-                                .insert(conn_id, SessionState::Established(session));
+                            self.retain_session(conn_id, SessionState::Established(session));
                         }
                     }
                     Err(e) => {
@@ -798,7 +787,7 @@ impl IngressServer {
             return false;
         }
         if self.queue_deferred_ready(id, &mut session, ready, slot.close || failed) {
-            self.sessions.insert(id, SessionState::Established(session));
+            self.retain_session(id, SessionState::Established(session));
         } else {
             self.paused_stream_reads.remove(&id);
             self.pending_dispatch.remove(&id);
@@ -943,7 +932,7 @@ impl IngressServer {
             }
         };
         if keep {
-            self.sessions.insert(id, SessionState::Established(session));
+            self.retain_session(id, SessionState::Established(session));
         } else {
             self.pending_dispatch.remove(&id);
             self.write_windows.borrow_mut().remove(&id);
@@ -1427,20 +1416,18 @@ impl IngressServer {
 
 impl Drop for IngressServer {
     fn drop(&mut self) {
-        // Close all active sessions
-        let conn_ids: Vec<u32> = self.sessions.keys().copied().collect();
-        for conn_id in conn_ids {
-            if let Some(state) = self.sessions.remove(&conn_id) {
-                if let SessionState::Established(mut session)
-                | SessionState::Handshaking(mut session) = state
-                {
-                    let close_bytes = session.close_notify();
-                    if !close_bytes.is_empty() {
-                        self.send_to_proxy(conn_id, &close_bytes);
-                    }
+        // Consuming iteration retains paid backing and preserves original
+        // ascending close order without a second connection-ID allocation.
+        for (conn_id, state) in core::mem::take(&mut self.sessions) {
+            if let SessionState::Established(mut session) | SessionState::Handshaking(mut session) =
+                state
+            {
+                let close_bytes = session.close_notify();
+                if !close_bytes.is_empty() {
+                    self.send_to_proxy(conn_id, &close_bytes);
                 }
-                self.send_close(conn_id);
             }
+            self.send_close(conn_id);
         }
     }
 }

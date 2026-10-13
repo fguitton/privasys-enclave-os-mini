@@ -120,6 +120,9 @@ fn replacement_rejects_buffered_requests_and_re_attestation() {
     crate::deferred_ingress::check_context_physical_for_native();
     checked_ordinary_context_admission();
     super::channel_output::check();
+    checked_pending_client_hello();
+    super::ordered_map::check();
+    checked_session_table_refusal();
     let store = CertStore::new();
     register(&store, "a.test");
     let (mut client, mut session) = pair(&store, "a.test");
@@ -1371,4 +1374,77 @@ fn checked_ordinary_context_admission() {
         .is_err());
     assert!(session.channel_binder().is_none());
     assert_eq!(pool.used(), 0);
+}
+
+fn checked_pending_client_hello() {
+    super::pending_client::check();
+    let store = CertStore::new();
+    register(&store, "a.test");
+    let (mut client, mut session) = pair(&store, "a.test");
+    let hello = flight(&mut client);
+    let peer = b"actual-peer";
+    let maximum = super::pending_client::MAX_PENDING_CLIENTHELLO
+        .checked_add(enclave_os_common::channel::MAX_CHANNEL_PAYLOAD)
+        .unwrap();
+    let split = hello.len() / 2;
+    let first = enclave_os_common::allocation::bounded_vec_capacity(split, maximum).unwrap();
+    let final_size =
+        enclave_os_common::allocation::bounded_vec_capacity(hello.len(), maximum).unwrap();
+    let pool =
+        enclave_os_common::allocation::AllocationPoolV1::new(peer.len() + first + final_size)
+            .unwrap();
+    let mut pending =
+        super::pending_client::PendingClientHello::admitted(peer, Some(Arc::clone(&pool))).unwrap();
+    pending.append(&hello[..split]).unwrap();
+    pending.append(&hello[split..]).unwrap();
+    assert_eq!(pending.buffered(), hello);
+    session.feed_tls_bytes(pending.buffered()).unwrap();
+    drop(pending);
+    assert_eq!(pool.used(), 0);
+    handshake(&mut client, &mut session);
+    assert!(session
+        .export_hctx(b"pending-client-original", &[1; 32])
+        .is_ok());
+    eprintln!("PENDING-CLIENT-TLS: real fragmented client flight and original handshake PASS");
+}
+
+fn checked_session_table_refusal() {
+    let store = CertStore::new();
+    register(&store, "a.test");
+    let (mut client, mut first) = pair(&store, "a.test");
+    handshake(&mut client, &mut first);
+    let (mut other_client, mut rejected) = pair(&store, "a.test");
+    handshake(&mut other_client, &mut rejected);
+    let bytes = core::alloc::Layout::array::<(u32, RaTlsSession)>(1)
+        .unwrap()
+        .size();
+    let pool = enclave_os_common::allocation::AllocationPoolV1::new(bytes).unwrap();
+    let mut table = super::ordered_map::OrderedMap::default();
+    assert!(table.insert_for_fixture(1, first, &pool).is_ok());
+    let rejected = table.insert_for_fixture(2, rejected, &pool);
+    let Err((id, rejected)) = rejected else {
+        panic!("unpaid session admitted");
+    };
+    assert_eq!(id, 2);
+    drop(rejected);
+    assert!(!table.contains_key(&2));
+    assert!(table
+        .get_mut(&1)
+        .unwrap()
+        .export_hctx(b"retained-session", &[1; 32])
+        .is_ok());
+    assert_eq!(pool.used(), bytes);
+    let first = table.remove(&1).unwrap();
+    assert!(
+        table.insert_for_fixture(3, first, &pool).is_ok(),
+        "paid empty capacity supports reuse"
+    );
+    assert!(table
+        .get_mut(&3)
+        .unwrap()
+        .export_hctx(b"reused-slot", &[1; 32])
+        .is_ok());
+    drop(table);
+    assert_eq!(pool.used(), 0);
+    eprintln!("SESSION-MAP-TLS: real rejected session leaves original live authority intact and paid slot reusable PASS");
 }
