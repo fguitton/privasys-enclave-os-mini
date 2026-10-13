@@ -2979,8 +2979,8 @@ impl IngressServer {
         http_req: &enclave_os_common::protocol::HttpRequest,
     ) -> HttpHandleResult {
         use enclave_os_common::attest::{
-            self as at, AttestRequest, AttestResponse, CONTEXT_LEN, EXPORTER_LABEL_CLIENT,
-            EXPORTER_LABEL_SERVER, PROTOCOL_VERSION,
+            self as at, AttestRequest, CONTEXT_LEN, EXPORTER_LABEL_CLIENT, EXPORTER_LABEL_SERVER,
+            PROTOCOL_VERSION,
         };
         use enclave_os_common::protocol::HttpMethod;
 
@@ -3002,16 +3002,24 @@ impl IngressServer {
         if req.v != PROTOCOL_VERSION {
             return HttpHandleResult::err(400, "unsupported protocol version");
         }
+        let Some(decode_pool) = crate::local_allocation_pool() else {
+            return HttpHandleResult::err(503, "attestation decoding unavailable");
+        };
+        use super::session::decoded_attest::{Decoded, Refusal};
+        let decode = |value: &str| Decoded::new(&decode_pool, value);
         let now = ocall::get_current_time().unwrap_or(0);
 
         match req.mode.as_str() {
             "deterministic" | "challenge" => {
                 session.begin_attestation();
-                let leaf = match at::b64_decode(&req.leaf) {
+                let leaf = match decode(&req.leaf) {
                     Ok(h) if h.len() == 32 => {
                         let mut a = [0u8; 32];
-                        a.copy_from_slice(&h);
+                        a.copy_from_slice(h.bytes());
                         a
+                    }
+                    Err(Refusal::Unavailable) => {
+                        return HttpHandleResult::err(503, "attestation decoding unavailable")
                     }
                     _ => {
                         return HttpHandleResult::err(
@@ -3055,8 +3063,11 @@ impl IngressServer {
                         }
                     }
                 } else {
-                    let ctx = match req.context.as_deref().map(at::b64_decode) {
+                    let ctx = match req.context.as_deref().map(decode) {
                         Some(Ok(c)) if c.len() == CONTEXT_LEN => c,
+                        Some(Err(Refusal::Unavailable)) => {
+                            return HttpHandleResult::err(503, "attestation decoding unavailable")
+                        }
                         _ => {
                             return HttpHandleResult::err(
                                 400,
@@ -3073,7 +3084,7 @@ impl IngressServer {
                             )
                         }
                     };
-                    context = Some(ctx.as_slice().try_into().expect("context length checked"));
+                    context = Some(ctx.bytes().try_into().expect("context length checked"));
                     exporter = Some(hctx);
                     let rd = at::challenge_report_data(&key.spki_der, &ctx, &hctx, None);
                     let Some(pool) = crate::local_allocation_pool() else {
@@ -3114,19 +3125,7 @@ impl IngressServer {
                     "challenge"
                 });
                 session.set_local_evidence_paid(evidence);
-                let mut resp = AttestResponse {
-                    v: PROTOCOL_VERSION,
-                    mode: req.mode.clone(),
-                    tee: "sgx".to_string(),
-                    quote: at::b64_encode(quote.bytes()),
-                    gpu_evidence: None,
-                    // Response JSON working ownership is separate from the
-                    // retained cache timestamp and remains at its caller.
-                    quote_time: quote_time.text().to_owned(),
-                    client_evidence: "none".to_string(),
-                    client_context: None,
-                    error: None,
-                };
+                let mut response_context = None;
                 // A caller whose client certificate claims a fleet identity (the
                 // workload app-id extension) must prove it: a mutual leg, and the
                 // context is remembered for the present message. A bare key-holder
@@ -3134,8 +3133,8 @@ impl IngressServer {
                 // enclave identity, gets no evidence demand and no Tee principal.
                 if session.server_name() == Some(enclave_os_common::modules::HONEST_PEER_SNI)
                     || session
-                        .peer_cert_der()
-                        .map(|d| leaf_claims_enclave_identity(&d))
+                        .peer_cert_der_ref()
+                        .map(leaf_claims_enclave_identity)
                         .unwrap_or(false)
                 {
                     use ring::rand::{SecureRandom, SystemRandom};
@@ -3144,10 +3143,36 @@ impl IngressServer {
                         return HttpHandleResult::err(500, "rng");
                     }
                     session.set_client_context(cc);
-                    resp.client_evidence = "required".to_string();
-                    resp.client_context = Some(at::b64_encode(&cc));
+                    response_context = Some(cc);
                 }
-                HttpHandleResult::ok(serde_json::to_vec(&resp).unwrap_or_default())
+                let response = super::session::attest_response::PaidResponse::new(
+                    &pool,
+                    &super::session::attest_response::ResponseRef {
+                        mode: &req.mode,
+                        quote: quote.bytes(),
+                        quote_time: quote_time.text(),
+                        client_context: response_context.as_ref().map(|value| value.as_slice()),
+                    },
+                )
+                .and_then(|response| response.into_body(&pool));
+                let Some(body) = response else {
+                    session.fail_attestation();
+                    // No allocation or fallback serializer on admission failure.
+                    return HttpHandleResult {
+                        status: 503,
+                        body: Vec::new().into(),
+                        shutdown: false,
+                        content_type: None,
+                        extra_headers: Vec::new(),
+                    };
+                };
+                HttpHandleResult {
+                    status: 200,
+                    body: body.into(),
+                    shutdown: false,
+                    content_type: None,
+                    extra_headers: Vec::new(),
+                }
             }
             "present" => {
                 let Some(peer_der) = session.peer_cert_der() else {
@@ -3159,8 +3184,11 @@ impl IngressServer {
                         "no pending client_context for this connection",
                     );
                 };
-                match req.context.as_deref().map(at::b64_decode) {
-                    Some(Ok(c)) if c == cc => {}
+                match req.context.as_deref().map(decode) {
+                    Some(Ok(c)) if c.bytes() == cc => {}
+                    Some(Err(Refusal::Unavailable)) => {
+                        return HttpHandleResult::err(503, "attestation decoding unavailable")
+                    }
                     _ => {
                         return HttpHandleResult::err(
                             400,
@@ -3168,17 +3196,23 @@ impl IngressServer {
                         )
                     }
                 }
-                let quote = match req.quote.as_deref().map(at::b64_decode) {
+                let quote = match req.quote.as_deref().map(decode) {
                     Some(Ok(q)) if !q.is_empty() => q,
+                    Some(Err(Refusal::Unavailable)) => {
+                        return HttpHandleResult::err(503, "attestation decoding unavailable")
+                    }
                     _ => return HttpHandleResult::err(400, "quote must be base64url"),
                 };
                 let gpu_evidence = match req
                     .gpu_evidence
                     .as_deref()
                     .filter(|g| !g.is_empty())
-                    .map(at::b64_decode)
+                    .map(decode)
                 {
                     Some(Ok(g)) => Some(g),
+                    Some(Err(Refusal::Unavailable)) => {
+                        return HttpHandleResult::err(503, "attestation decoding unavailable")
+                    }
                     Some(Err(_)) => {
                         return HttpHandleResult::err(400, "gpu_evidence must be base64url")
                     }
@@ -3186,8 +3220,8 @@ impl IngressServer {
                 };
                 let Some(tee) = req
                     .tee
-                    .clone()
-                    .filter(|tee| matches!(tee.as_str(), "sgx" | "tdx" | "tdx-gpu"))
+                    .as_deref()
+                    .filter(|tee| matches!(*tee, "sgx" | "tdx" | "tdx-gpu"))
                 else {
                     return HttpHandleResult::err(400, "unsupported or missing client TEE family");
                 };
@@ -3214,7 +3248,7 @@ impl IngressServer {
                 {
                     return HttpHandleResult::err(400, "client quote and TEE family disagree");
                 }
-                let quote_time = req.quote_time.clone().unwrap_or_default();
+                let quote_time = req.quote_time.as_deref().unwrap_or_default();
                 if at::check_quote_time(&quote_time, now as i64).is_err() {
                     return HttpHandleResult::err(400, "quote_time out of range");
                 }
@@ -3251,10 +3285,10 @@ impl IngressServer {
                 let Some(evidence) = super::session::retained_evidence::RetainedEvidence::copy_from(
                     &pool,
                     &super::session::retained_evidence::EvidenceRef {
-                        tee: &tee,
+                        tee,
                         quote: &quote,
                         gpu_evidence: gpu_evidence.as_deref(),
-                        quote_time: &quote_time,
+                        quote_time,
                         context: Some(cc),
                         hctx: Some(hctx),
                     },

@@ -162,6 +162,8 @@ fn replacement_rejects_buffered_requests_and_re_attestation() {
     checked_retained_certificate();
     checked_retained_evidence();
     checked_paid_quote_time();
+    super::attest_response::check();
+    super::decoded_attest::check();
     let store = CertStore::new();
     register(&store, "a.test");
     let (mut client, mut session) = pair(&store, "a.test");

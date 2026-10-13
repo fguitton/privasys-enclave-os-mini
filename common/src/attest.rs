@@ -31,7 +31,7 @@ use std::{
     vec::Vec,
 };
 
-use base64::Engine;
+use base64::{engine::Config, Engine};
 use ring::digest;
 use serde::{Deserialize, Serialize};
 
@@ -142,12 +142,48 @@ pub struct PeerEvidence {
     pub quote_time: String,
 }
 
+const BASE64_URL: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
 pub fn b64_encode(b: &[u8]) -> String {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+    BASE64_URL.encode(b)
+}
+
+/// Complete original engine output length, without allocating.
+#[must_use]
+pub fn b64_encoded_len(length: usize) -> Option<usize> {
+    base64::encoded_len(length, BASE64_URL.config().encode_padding())
+}
+
+/// Encode into existing backing only after complete checked geometry succeeds.
+#[must_use]
+pub fn b64_encode_into(bytes: &[u8], output: &mut [u8]) -> Option<usize> {
+    let length = b64_encoded_len(bytes.len())?;
+    if output.len() < length {
+        return None;
+    }
+    BASE64_URL.encode_slice(bytes, output).ok()
+}
+
+/// Original decoder's required destination capacity, including its last block.
+#[must_use]
+pub fn b64_decoded_capacity(value: &str) -> usize {
+    use base64::engine::DecodeEstimate;
+    BASE64_URL
+        .internal_decoded_len_estimate(value.trim_end_matches('=').len())
+        .decoded_len_estimate()
+}
+
+/// Decode using the original padding acceptance into existing admitted bytes.
+/// Failure returns no allocated diagnostic; legacy `b64_decode` keeps its API.
+#[must_use]
+pub fn b64_decode_into(value: &str, output: &mut [u8]) -> Option<usize> {
+    BASE64_URL
+        .decode_slice(value.trim_end_matches('='), output)
+        .ok()
 }
 
 pub fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD
+    BASE64_URL
         .decode(s.trim_end_matches('='))
         .map_err(|e| format!("base64url: {e}"))
 }
@@ -156,48 +192,52 @@ pub fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
 
 /// `SHA-512( SHA-256(spki_der) || binding )`.
 pub fn report_data(spki_der: &[u8], binding: &[u8]) -> [u8; 64] {
-    let pk = digest::digest(&digest::SHA256, spki_der);
-    let mut buf = Vec::with_capacity(32 + binding.len());
-    buf.extend_from_slice(pk.as_ref());
-    buf.extend_from_slice(binding);
-    let h = digest::digest(&digest::SHA512, &buf);
-    let mut out = [0u8; 64];
-    out.copy_from_slice(h.as_ref());
-    out
+    report_data_parts(spki_der, &[binding], None)
 }
 
-fn fold_gpu(mut binding: Vec<u8>, gpu: Option<&[u8]>) -> Vec<u8> {
-    if let Some(g) = gpu.filter(|g| !g.is_empty()) {
-        binding.extend_from_slice(digest::digest(&digest::SHA256, g).as_ref());
+fn report_data_parts(spki_der: &[u8], parts: &[&[u8]], gpu: Option<&[u8]>) -> [u8; 64] {
+    let pk = digest::digest(&digest::SHA256, spki_der);
+    let mut hash = digest::Context::new(&digest::SHA512);
+    hash.update(pk.as_ref());
+    for part in parts {
+        hash.update(part);
     }
-    binding
+    if let Some(gpu) = gpu.filter(|bytes| !bytes.is_empty()) {
+        hash.update(digest::digest(&digest::SHA256, gpu).as_ref());
+    }
+    let mut out = [0u8; 64];
+    out.copy_from_slice(hash.finish().as_ref());
+    out
 }
 
 /// The `report_data` a server's quote must carry for the leaf `spki_der` and
 /// the evidence `ev`. The verifier predicts it; it never accepts a value from
 /// the peer.
 pub fn expected_report_data(spki_der: &[u8], ev: &Evidence) -> Result<[u8; 64], String> {
-    let binding = match ev.mode {
+    match ev.mode {
         AttestationMode::Deterministic => {
             if ev.quote_time.len() != QUOTE_TIME_LEN {
                 return Err("deterministic evidence needs a quote_time".into());
             }
-            ev.quote_time.as_bytes().to_vec()
+            Ok(deterministic_report_data(
+                spki_der,
+                &ev.quote_time,
+                ev.gpu_evidence.as_deref(),
+            ))
         }
         AttestationMode::Challenge => {
             let (ctx, hctx) = match (ev.context, ev.hctx) {
                 (Some(c), Some(h)) => (c, h),
                 _ => return Err("challenge evidence needs a context and an exporter value".into()),
             };
-            let mut b = ctx.to_vec();
-            b.extend_from_slice(&hctx);
-            b
+            Ok(challenge_report_data(
+                spki_der,
+                &ctx,
+                &hctx,
+                ev.gpu_evidence.as_deref(),
+            ))
         }
-    };
-    Ok(report_data(
-        spki_der,
-        &fold_gpu(binding, ev.gpu_evidence.as_deref()),
-    ))
+    }
 }
 
 /// The deterministic binding of a server quote: `quote_time` (17 bytes) with
@@ -207,7 +247,7 @@ pub fn deterministic_report_data(
     quote_time: &str,
     gpu: Option<&[u8]>,
 ) -> [u8; 64] {
-    report_data(spki_der, &fold_gpu(quote_time.as_bytes().to_vec(), gpu))
+    report_data_parts(spki_der, &[quote_time.as_bytes()], gpu)
 }
 
 /// The challenge binding of a server quote: `context || hctx` with the GPU fold.
@@ -217,9 +257,7 @@ pub fn challenge_report_data(
     hctx: &[u8],
     gpu: Option<&[u8]>,
 ) -> [u8; 64] {
-    let mut b = context.to_vec();
-    b.extend_from_slice(hctx);
-    report_data(spki_der, &fold_gpu(b, gpu))
+    report_data_parts(spki_der, &[context, hctx], gpu)
 }
 
 /// `report_data` of client evidence on a mutual leg (same recipe, the
@@ -459,6 +497,43 @@ mod tests {
 
     #[test]
     fn recipes() {
+        // Independent original concatenate-and-hash recipe, including absent
+        // versus empty GPU data and split boundaries in the streamed input.
+        fn original(spki: &[u8], first: &[u8], second: &[u8], gpu: Option<&[u8]>) -> [u8; 64] {
+            let mut bytes = digest::digest(&digest::SHA256, spki).as_ref().to_vec();
+            bytes.extend_from_slice(first);
+            bytes.extend_from_slice(second);
+            if let Some(gpu) = gpu.filter(|value| !value.is_empty()) {
+                bytes.extend_from_slice(digest::digest(&digest::SHA256, gpu).as_ref());
+            }
+            digest::digest(&digest::SHA512, &bytes)
+                .as_ref()
+                .try_into()
+                .unwrap()
+        }
+        for first in [b"".as_slice(), b"a", b"unicode\xe2\x98\x83"] {
+            for second in [b"".as_slice(), b"bc"] {
+                for gpu in [None, Some(b"".as_slice()), Some(b"gpu".as_slice())] {
+                    let expected = original(b"key", first, second, gpu);
+                    assert_eq!(challenge_report_data(b"key", first, second, gpu), expected);
+                    assert_eq!(client_report_data(b"key", first, second, gpu), expected);
+                    if second.is_empty() {
+                        assert_eq!(
+                            deterministic_report_data(
+                                b"key",
+                                core::str::from_utf8(first).unwrap(),
+                                gpu
+                            ),
+                            expected
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                report_data(b"key", first),
+                original(b"key", first, &[], None)
+            );
+        }
         let spki = [7u8; 91];
         let ctx = [1u8; 32];
         let hctx = [2u8; 32];

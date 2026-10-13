@@ -82,6 +82,12 @@ impl SessionEvidence {
         }
     }
 }
+#[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
+#[path = "attest_response.rs"]
+pub(crate) mod attest_response;
+#[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
+#[path = "decoded_attest.rs"]
+pub(crate) mod decoded_attest;
 #[path = "ordered_map.rs"]
 pub(crate) mod ordered_map;
 #[path = "pending_client.rs"]
