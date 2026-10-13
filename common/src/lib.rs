@@ -3,11 +3,13 @@
 
 //! enclave-os-common: shared types and constants between host and enclave.
 //!
-//! This crate is `no_std`-compatible when the `sgx` feature is enabled,
-//! so it can be linked into the enclave.
+//! Pure `no_std` uses `--no-default-features --features sgx`. Explicit `std`
+//! takes precedence and uses the runtime standard library (the SDK on Teaclave).
+//! The mutable attestation-server store requires `std` plus `crypto`; pure
+//! crypto/JWT profiles contain no runtime-global store or synchronization.
 
-#![cfg_attr(feature = "sgx", no_std)]
-#![cfg_attr(all(feature = "fallible-allocation-v1", target_vendor = "teaclave"), feature(allocator_api))]
+#![cfg_attr(all(feature = "sgx", not(feature = "std")), no_std)]
+#![cfg_attr(feature = "fallible-allocation-v1", feature(allocator_api))]
 
 // `alloc` is available in both the no_std (sgx) and std (host) builds, and
 // `oidc.rs` uses `alloc::` unconditionally, so the extern crate must not be
@@ -54,7 +56,9 @@ pub mod aead;
 #[cfg(feature = "crypto")]
 pub mod drbg;
 
-#[cfg(feature = "crypto")]
+// Preserve historical std+crypto availability; the named capability explicitly
+// selects those requirements for runtime consumers.
+#[cfg(all(feature = "crypto", feature = "std"))]
 pub mod attestation_servers;
 
 /// Re-export `ring::digest` for downstream crates that need hashing.

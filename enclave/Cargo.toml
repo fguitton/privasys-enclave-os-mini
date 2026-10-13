@@ -59,7 +59,7 @@ fido2   = ["dep:enclave-os-fido2", "kvstore", "enclave-os-wasm?/fido2", "enclave
 
 [dependencies]
 # Common types
-enclave-os-common = { path = "../common", features = ["crypto"] }
+enclave-os-common = { path = "../common", features = ["crypto", "attestation-server-store"] }
 
 # Teaclave SGX SDK – trusted libraries (Privasys fork: Rust nightly-2026-06-21 + SGX 2.29 patches)
 # NOTE: sgx_tstd is provided by the custom sysroot (rustlib/std), NOT as a crate dep.

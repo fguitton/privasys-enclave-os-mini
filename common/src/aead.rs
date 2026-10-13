@@ -6,6 +6,7 @@
 //! Used to encrypt keys and values before sending them to the host via OCALLs.
 //! The encryption key is generated inside the enclave and sealed with SGX.
 
+use alloc::vec::Vec;
 use crate::types::{AEAD_KEY_SIZE, AEAD_NONCE_SIZE, AEAD_TAG_SIZE};
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use ring::rand::{SecureRandom, SystemRandom};

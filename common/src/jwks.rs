@@ -20,7 +20,7 @@
 //! ```
 
 #[cfg(feature = "sgx")]
-use alloc::{format, string::String, vec::Vec};
+use alloc::{format, string::{String, ToString}, vec::Vec};
 #[cfg(not(feature = "sgx"))]
 use std::{format, string::String, vec::Vec};
 
@@ -266,7 +266,7 @@ fn encode_der_length(buf: &mut Vec<u8>, len: usize) {
 /// Accepts both `ES256` and `RS256` algorithms. Rejects `alg:none`.
 pub fn extract_jwt_kid(token: &str) -> Result<Option<String>, String> {
     let header_b64 = token
-        .splitn(2, '.')
+        .split('.')
         .next()
         .ok_or_else(|| "malformed JWT: no dot".to_string())?;
 

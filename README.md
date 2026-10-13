@@ -174,3 +174,21 @@ Full dependency list and license texts in [THIRD-PARTY-LICENSES](THIRD-PARTY-LIC
 Any modified versions or network services built on this software must make the complete source code available under the same license.
 
 **Commercial licensing** is available for closed-source or proprietary use — contact **legal@privasys.org**.
+
+### Common library capabilities
+
+`enclave-os-common` keeps its default `std` profile. Explicit `std` takes
+precedence over `sgx`; on the Teaclave target this is the real SDK standard
+library and its synchronization primitives. The existing `std` + `crypto`
+combination continues to expose `attestation_servers` with its original
+`RwLock` state, poisoning behavior, replacement API, and token/hash rules.
+The named `attestation-server-store` capability selects `std` + `crypto`;
+the enclave and egress runtime consumers explicitly request it.
+
+Pure `no_std` uses `--no-default-features --features sgx`. Adding `crypto,jwt`
+provides the portable cryptographic/JWT modules, without the mutable runtime
+attestation-server store. Those pure profiles use an allocation-free, immutable
+OCall function-table publication slot, not a spin lock or an ambient `std` link.
+To use the runtime store, explicitly enable `attestation-server-store`; this is
+a runtime `std` profile, not a pure `no_std` claim. Feature availability alone
+does not qualify the target SDK, actor behavior, or total allocator ownership.

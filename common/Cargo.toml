@@ -13,7 +13,11 @@ description = "Shared types and protocol definitions for enclave-os-mini"
 fallible-allocation-v1 = []
 default = ["std"]
 std = []
-# When building for the enclave (no_std), disable std
+# Mutable attestation endpoints/tokens require real runtime synchronization.
+# std+crypto retains the historical public store for existing callers.
+attestation-server-store = ["std", "crypto"]
+# Pure no_std requires --no-default-features --features sgx.
+# Explicit std (including the runtime store) takes precedence over sgx.
 sgx = []
 # Cryptographic primitives (ring) — used by quote::compute_report_data_hash
 crypto = ["dep:ring", "dep:base64"]

@@ -28,7 +28,7 @@ native-sgx-types = ["dep:sgx_types", "enclave-os-common/jwt"]
 
 [dependencies]
 # Shared types, module trait, and OCall vtable
-enclave-os-common = { path = "../../common", features = ["crypto", "jwt"] }
+enclave-os-common = { path = "../../common", features = ["crypto", "jwt", "attestation-server-store"] }
 
 # Standard TLS 1.3; RA-TLS v2 uses the RFC 8446 exporter after the handshake.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

@@ -12,9 +12,9 @@
 
 use crate::modules::AppIdentity;
 use alloc::{string::String, vec::Vec};
-#[cfg(not(feature = "sgx"))]
+#[cfg(any(not(feature = "sgx"), feature = "std"))]
 use std::sync::OnceLock;
-#[cfg(any(feature = "sgx", test))]
+#[cfg(any(all(feature = "sgx", not(feature = "std")), test))]
 mod slot;
 #[cfg(test)]
 pub(crate) use slot::check as check_once_slot;
@@ -64,9 +64,9 @@ pub struct OcallVtable {
     pub cert_store_unregister: fn(&str) -> bool,
 }
 
-#[cfg(not(feature = "sgx"))]
+#[cfg(any(not(feature = "sgx"), feature = "std"))]
 static VTABLE: OnceLock<OcallVtable> = OnceLock::new();
-#[cfg(feature = "sgx")]
+#[cfg(all(feature = "sgx", not(feature = "std")))]
 static VTABLE: slot::OcallSlot = slot::OcallSlot::new();
 
 /// Register the OCall vtable.  Must be called exactly once, before any

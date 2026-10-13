@@ -31,7 +31,7 @@
 //! ```
 
 #[cfg(feature = "sgx")]
-use alloc::{format, string::String, vec::Vec};
+use alloc::{format, string::{String, ToString}, vec::Vec};
 #[cfg(not(feature = "sgx"))]
 use std::{format, string::String, vec::Vec};
 
@@ -247,7 +247,7 @@ pub fn decode_payload_unverified<T: serde::de::DeserializeOwned>(jwt: &[u8]) -> 
 /// Hex-decode a string into bytes. Returns `None` on invalid hex.
 fn hex_decode(hex: &str) -> Option<Vec<u8>> {
     let hex = hex.as_bytes();
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(hex.len() / 2);

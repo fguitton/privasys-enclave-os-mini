@@ -24,6 +24,8 @@ use alloc::{format, string::String, vec::Vec};
 #[cfg(not(feature = "sgx"))]
 use std::{format, string::String, vec::Vec};
 
+#[cfg(all(feature = "sgx", feature = "crypto"))]
+use alloc::string::ToString;
 use core::fmt::Write;
 
 // ---------------------------------------------------------------------------
