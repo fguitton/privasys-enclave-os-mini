@@ -181,6 +181,11 @@ pub struct SpscProducer {
 unsafe impl Send for SpscProducer {}
 unsafe impl Sync for SpscProducer {}
 
+/// A queue send was refused by the existing payload, geometry or space check.
+/// No bytes were published. This does not distinguish transient queue pressure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SendRefused;
+
 impl SpscProducer {
     /// Create a producer from raw pointers to the shared header and buffer.
     ///
@@ -234,9 +239,9 @@ impl SpscProducer {
     }
 
     /// Try to write a message. Oversize and transient queue pressure both refuse.
-    pub fn try_send(&self, msg: &[u8]) -> Result<(), ()> {
+    pub fn try_send(&self, msg: &[u8]) -> Result<(), SendRefused> {
         if !self.message_len_valid(msg.len()) {
-            return Err(());
+            return Err(SendRefused);
         }
         let hdr = unsafe { &*self.header };
         let total = MSG_HEADER_SIZE as u64 + msg.len() as u64;
@@ -246,12 +251,12 @@ impl SpscProducer {
         let tail = hdr.tail.load(Ordering::Acquire);
         let used = head.wrapping_sub(tail);
         if used > self.capacity {
-            return Err(());
+            return Err(SendRefused);
         }
         let free = self.capacity - used;
 
         if free < total {
-            return Err(()); // Queue is full
+            return Err(SendRefused); // Queue is full
         }
 
         // Write length header
@@ -267,14 +272,14 @@ impl SpscProducer {
     }
 
     /// Blocking send with permanent size refusal before waiting for space.
-    pub fn send_bounded(&self, msg: &[u8]) -> Result<(), ()> {
+    pub fn send_bounded(&self, msg: &[u8]) -> Result<(), SendRefused> {
         if !self.message_len_valid(msg.len()) {
-            return Err(());
+            return Err(SendRefused);
         }
         loop {
             match self.try_send(msg) {
                 Ok(()) => return Ok(()),
-                Err(()) => core::hint::spin_loop(),
+                Err(SendRefused) => core::hint::spin_loop(),
             }
         }
     }
@@ -404,7 +409,9 @@ impl SpscConsumer {
     }
 
     /// Immutable actual receive geometry; no read or reservation authority.
-    pub const fn max_message_bytes(&self)->usize{max_message_bytes(self.capacity)}
+    pub const fn max_message_bytes(&self) -> usize {
+        max_message_bytes(self.capacity)
+    }
 
     /// Try to read a message. Returns `Some(Vec<u8>)` or `None` if empty.
     pub fn try_recv(&self) -> Option<Vec<u8>> {
@@ -562,22 +569,22 @@ mod tests {
         let header = Box::into_raw(Box::new(SpscQueueHeader::new(4096)));
         let buffer = vec![0u8; 4096];
         let buf_ptr = Box::into_raw(buffer.into_boxed_slice()) as *mut u8;
-        let (producer, consumer) = unsafe {
-            (
-                SpscProducer::from_raw(header, buf_ptr),
-                SpscConsumer::from_raw(header, buf_ptr),
-            )
-        };
+        {
+            let (producer, consumer) = unsafe {
+                (
+                    SpscProducer::from_raw(header, buf_ptr),
+                    SpscConsumer::from_raw(header, buf_ptr),
+                )
+            };
 
-        unsafe {
-            core::ptr::write_volatile(core::ptr::addr_of_mut!((*header).capacity), 1 << 30);
+            unsafe {
+                core::ptr::write_volatile(core::ptr::addr_of_mut!((*header).capacity), 1 << 30);
+            }
+            producer.try_send(b"bounded").unwrap();
+            assert_eq!(consumer.try_recv().unwrap(), b"bounded");
+            // The validated scalar remains authoritative even when the untrusted
+            // header changes before handle construction, as at the ECALL boundary.
         }
-        producer.try_send(b"bounded").unwrap();
-        assert_eq!(consumer.try_recv().unwrap(), b"bounded");
-        // The validated scalar remains authoritative even when the untrusted
-        // header changes before handle construction, as at the ECALL boundary.
-        drop(producer);
-        drop(consumer);
         let (producer, consumer) = unsafe {
             (
                 SpscProducer::from_raw_with_capacity(header, buf_ptr, 4096),

@@ -206,9 +206,9 @@ mod client_tests;
 //  Typed request/response payloads (compact binary encoding)
 // ========================================================================
 
-/// We use a minimal hand-rolled binary encoding for each method's arguments
-/// and return values. This avoids pulling in a heavy serialization framework
-/// in the enclave (postcard is an alternative if more complex types are needed).
+// We use a minimal hand-rolled binary encoding for each method's arguments
+// and return values. This avoids pulling in a heavy serialization framework
+// in the enclave (postcard is an alternative if more complex types are needed).
 
 // -- NetTcpListen --
 pub fn encode_net_tcp_listen_req(port: u16, backlog: i32) -> Vec<u8> {
@@ -318,7 +318,7 @@ pub fn decode_net_recv_req(p: &[u8]) -> Option<(i32, u32)> {
     let max_len = u32::from_le_bytes(p[4..8].try_into().ok()?);
     Some((fd, max_len))
 }
-/// Response payload: the raw bytes received (or empty if error/status != 0)
+// Response payload: the raw bytes received (or empty if error/status != 0)
 
 // -- NetClose --
 /// Payload: just fd
@@ -644,7 +644,9 @@ pub fn encode_kv_scan_req(table: &[u8], start: &[u8], end: &[u8], limit: u32) ->
     buf.extend_from_slice(end);
     buf
 }
-pub fn decode_kv_scan_req(p: &[u8]) -> Option<(&[u8], &[u8], &[u8], u32)> {
+/// Borrowed table, start, end and limit from the existing scan wire.
+pub type KvScanRequest<'a> = (&'a [u8], &'a [u8], &'a [u8], u32);
+pub fn decode_kv_scan_req(p: &[u8]) -> Option<KvScanRequest<'_>> {
     if p.len() < 2 {
         return None;
     }
@@ -708,7 +710,7 @@ pub fn decode_kv_scan_resp(p: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
 }
 
 // -- GetCurrentTime --
-/// Request: no payload
+// Request: no payload
 /// Response: [u64 timestamp LE]
 pub fn encode_u64(v: u64) -> Vec<u8> {
     v.to_le_bytes().to_vec()
@@ -738,12 +740,12 @@ pub fn decode_log_req(p: &[u8]) -> Option<(i32, &str)> {
 }
 
 // -- QeGetTargetInfo --
-/// Request: no payload
-/// Response: [512 bytes target_info] (sgx_target_info_t)
+// Request: no payload
+// Response: [512 bytes target_info] (sgx_target_info_t)
 
 // -- QeGetQuote --
-/// Request: the raw SGX report bytes (432 bytes, sgx_report_t)
-/// Response: the full DCAP Quote v3 bytes (variable length)
+// Request: the raw SGX report bytes (432 bytes, sgx_report_t)
+// Response: the full DCAP Quote v3 bytes (variable length)
 
 // ========================================================================
 //  Tests

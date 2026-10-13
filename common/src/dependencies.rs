@@ -108,7 +108,7 @@ impl DependencySet {
         let mut out = self.clone();
         for e in out.entries.iter_mut() {
             e.measurements
-                .sort_by(|a, b| a.canonical().cmp(&b.canonical()));
+                .sort_by_key(|a| a.canonical());
             e.required_oids
                 .sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
         }

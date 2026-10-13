@@ -1,56 +1,43 @@
-//! Ordered transport metadata with explicit backing admission, not authority.
-use enclave_os_common::allocation::{AllocationLeaseV1, AllocationPoolV1};
+//! Server adapter: empty startup allocates nothing; first admission binds the
+//! actual immutable SDK pool. Native owning fixtures supply their explicit pool.
+use enclave_os_common::allocation::{
+    ordered_map::{PaidMapEntriesV1, PaidOrderedMapV1},
+    AllocationPoolV1,
+};
 use std::sync::Arc;
-
 pub(crate) struct OrderedMap<K, V> {
-    entries: Vec<(K, V)>,
-    allocation: Option<AllocationLeaseV1>,
+    inner: Option<PaidOrderedMapV1<K, V>>,
 }
 impl<K, V> Default for OrderedMap<K, V> {
     fn default() -> Self {
-        Self {
-            entries: Vec::new(),
-            allocation: None,
-        }
+        Self { inner: None }
     }
 }
 impl<K: Ord, V> OrderedMap<K, V> {
-    fn position(&self, key: &K) -> Result<usize, usize> {
-        self.entries.binary_search_by(|entry| entry.0.cmp(key))
-    }
     pub(crate) fn get(&self, key: &K) -> Option<&V> {
-        self.position(key).ok().map(|i| &self.entries[i].1)
+        self.inner.as_ref()?.get(key)
     }
     pub(crate) fn get_mut(&mut self, key: &K) -> Option<&mut V> {
-        self.position(key).ok().map(|i| &mut self.entries[i].1)
+        self.inner.as_mut()?.get_mut(key)
     }
     pub(crate) fn contains_key(&self, key: &K) -> bool {
-        self.position(key).is_ok()
+        self.get(key).is_some()
     }
     pub(crate) fn remove(&mut self, key: &K) -> Option<V> {
-        self.position(key).ok().map(|i| self.entries.remove(i).1)
+        self.inner.as_mut()?.remove(key)
     }
     pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = (&K, &V)> {
-        self.entries.iter().map(|(key, value)| (key, value))
+        self.inner.iter().flat_map(PaidOrderedMapV1::iter)
     }
-    pub(crate) fn after(&self, key: &K) -> impl Iterator<Item = (&K, &V)> {
-        let start = match self.position(key) {
-            Ok(i) => i + 1,
-            Err(i) => i,
-        };
-        self.entries[start..]
-            .iter()
-            .map(|(key, value)| (key, value))
+    pub(crate) fn after<'a>(&'a self, key: &'a K) -> impl Iterator<Item = (&'a K, &'a V)> {
+        self.inner.iter().flat_map(move |map| map.after(key))
     }
+    #[cfg(target_env = "sgx")]
     pub(crate) fn try_insert(&mut self, key: K, value: V) -> Result<Option<V>, (K, V)> {
-        #[cfg(target_env = "sgx")]
-        let pool = match crate::local_allocation_pool() {
-            Some(pool) => Some(pool),
-            None => return Err((key, value)),
+        let Some(pool) = crate::local_allocation_pool() else {
+            return Err((key, value));
         };
-        #[cfg(not(target_env = "sgx"))]
-        let pool = None;
-        self.insert_admitted(key, value, pool.as_ref())
+        self.insert_admitted(key, value, Some(&pool))
     }
     #[cfg(test)]
     pub(super) fn insert_for_fixture(
@@ -67,54 +54,16 @@ impl<K: Ord, V> OrderedMap<K, V> {
         value: V,
         pool: Option<&Arc<AllocationPoolV1>>,
     ) -> Result<Option<V>, (K, V)> {
-        // Vec<ZST> reports usize::MAX capacity without calling grow.
-        // Refuse this unsupported private-map representation before that path.
-        if core::mem::size_of::<(K, V)>() == 0 {
+        let Some(pool) = pool else {
             return Err((key, value));
-        }
-        let position = match self.position(&key) {
-            Ok(i) => return Ok(Some(core::mem::replace(&mut self.entries[i].1, value))),
-            Err(i) => i,
         };
-        if self.entries.len() == self.entries.capacity() && self.grow(pool).is_err() {
+        if self.inner.as_ref().is_some_and(|map| !map.uses_pool(pool)) {
             return Err((key, value));
         }
-        self.entries.insert(position, (key, value));
-        Ok(None)
-    }
-    fn grow(&mut self, pool: Option<&Arc<AllocationPoolV1>>) -> Result<(), ()> {
-        let capacity = self
-            .entries
-            .len()
-            .checked_add(1)
-            .and_then(usize::checked_next_power_of_two)
-            .ok_or(())?;
-        let backing = core::alloc::Layout::array::<(K, V)>(capacity)
-            .map_err(|_| ())?
-            .size();
-        // This private transport map stores real nonzero metadata tuples;
-        // zero-sized generic storage is unsupported, never charged as one byte.
-        if backing == 0 {
-            return Err(());
-        }
-        let allocation = pool
-            .map(|pool| pool.reserve_unpublished(backing).ok_or(()))
-            .transpose()?;
-        // A separate allocation preserves the old map exactly on failure. Its
-        // backing remains paid throughout copying/moving into the new buffer.
-        let mut entries = Vec::new();
-        entries.try_reserve_exact(capacity).map_err(|_| ())?;
-        if entries.capacity() != capacity {
-            drop(entries);
-            return Err(());
-        }
-        entries.extend(self.entries.drain(..));
-        drop(core::mem::replace(&mut self.entries, entries));
-        drop(core::mem::replace(&mut self.allocation, allocation));
-        if let Some(credit) = &self.allocation {
-            credit.activate_release_notification();
-        }
-        Ok(())
+        let map = self
+            .inner
+            .get_or_insert_with(|| PaidOrderedMapV1::new(Arc::clone(pool)));
+        map.try_insert(key, value)
     }
 }
 impl<K: Ord, V> core::ops::Index<&K> for OrderedMap<K, V> {
@@ -123,17 +72,13 @@ impl<K: Ord, V> core::ops::Index<&K> for OrderedMap<K, V> {
         self.get(key).expect("no entry found for key")
     }
 }
-
-/// Consuming iteration keeps the vector allocation paid even after its last
-/// item; no borrowed map or raw allocation handle escapes.
 pub(crate) struct Entries<K, V> {
-    entries: std::vec::IntoIter<(K, V)>,
-    _allocation: Option<AllocationLeaseV1>,
+    inner: Option<PaidMapEntriesV1<K, V>>,
 }
 impl<K, V> Iterator for Entries<K, V> {
     type Item = (K, V);
     fn next(&mut self) -> Option<Self::Item> {
-        self.entries.next()
+        self.inner.as_mut()?.next()
     }
 }
 impl<K, V> IntoIterator for OrderedMap<K, V> {
@@ -141,8 +86,7 @@ impl<K, V> IntoIterator for OrderedMap<K, V> {
     type IntoIter = Entries<K, V>;
     fn into_iter(self) -> Self::IntoIter {
         Entries {
-            entries: self.entries.into_iter(),
-            _allocation: self.allocation,
+            inner: self.inner.map(IntoIterator::into_iter),
         }
     }
 }
@@ -151,6 +95,13 @@ impl<K, V> IntoIterator for OrderedMap<K, V> {
 pub(super) fn check() {
     use std::collections::BTreeMap;
     type Map = OrderedMap<u32, u64>;
+    const ORACLE_STEPS: usize = 64;
+    let oracle_pool = AllocationPoolV1::new(
+        core::alloc::Layout::array::<(u32, u64)>(ORACLE_STEPS * 2)
+            .unwrap()
+            .size(),
+    )
+    .unwrap();
     let unit = core::alloc::Layout::array::<(u32, u64)>(1).unwrap().size();
     for maximum in [unit - 1, unit, unit + 1] {
         let pool = AllocationPoolV1::new(maximum).unwrap();
@@ -177,6 +128,10 @@ pub(super) fn check() {
     map.insert_admitted(1, 9, Some(&pool)).unwrap();
     assert_eq!(pool.used(), unit * 2);
     assert_eq!(map.insert_admitted(3, 8, Some(&pool)), Ok(Some(7)));
+    let foreign = AllocationPoolV1::new(pool.capacity()).unwrap();
+    assert_eq!(map.insert_for_fixture(3, 9, &foreign), Err((3, 9)));
+    assert_eq!(foreign.used(), 0);
+    assert_eq!(map.get(&3), Some(&8));
     assert_eq!(map.remove(&1), Some(9));
     assert_eq!(map.remove(&3), Some(8));
     assert_eq!(pool.used(), unit * 2, "empty map retains backing");
@@ -192,7 +147,8 @@ pub(super) fn check() {
     for i in 0_u32..64 {
         let key = (i * 17) % 31;
         assert_eq!(
-            map.try_insert(key, u64::from(i)).unwrap(),
+            map.insert_for_fixture(key, u64::from(i), &oracle_pool)
+                .unwrap(),
             reference.insert(key, u64::from(i))
         );
         if i % 3 == 0 {
@@ -245,7 +201,7 @@ pub(super) fn check() {
     for identity in [1, 2] {
         assert_eq!(
             actual
-                .try_insert(Key { order: 1, identity }, identity)
+                .insert_for_fixture(Key { order: 1, identity }, identity, &oracle_pool)
                 .unwrap(),
             original.insert(Key { order: 1, identity }, identity)
         );
@@ -261,7 +217,7 @@ pub(super) fn check() {
     );
     let mut zero = OrderedMap::<(), ()>::default();
     assert_eq!(
-        zero.try_insert((), ()),
+        zero.insert_for_fixture((), (), &oracle_pool),
         Err(((), ())),
         "zero-sized tuples explicitly unsupported"
     );
@@ -270,7 +226,9 @@ pub(super) fn check() {
     for i in 0_u32..64 {
         let key = (i * 17) % 31;
         assert_eq!(
-            set.try_insert(key, ()).unwrap().is_none(),
+            set.insert_for_fixture(key, (), &oracle_pool)
+                .unwrap()
+                .is_none(),
             reference.insert(key)
         );
         if i % 3 == 0 {

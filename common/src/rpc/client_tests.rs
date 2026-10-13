@@ -436,7 +436,7 @@ fn check_get_batch_codec(){
     assert!(worker_get_batch_request_demand(1,core::iter::empty()).is_none());
     assert!(worker_get_batch_request_demand(1,[0]).is_none());
     assert!(worker_get_batch_request_demand(1,[usize::MAX]).is_none());
-    assert!(worker_get_batch_request_demand(1,core::iter::repeat(key.len()).take(MAX_WORKER_STORAGE_BATCH_RECORDS+1)).is_none());
+    assert!(worker_get_batch_request_demand(1,core::iter::repeat_n(key.len(),MAX_WORKER_STORAGE_BATCH_RECORDS+1)).is_none());
 
     for count in [MAX_WORKER_STORAGE_BATCH_RECORDS-1,MAX_WORKER_STORAGE_BATCH_RECORDS]{
         let records=vec![(key,5);count];

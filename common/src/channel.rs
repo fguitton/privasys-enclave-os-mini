@@ -392,6 +392,56 @@ pub fn decode_tcp_connect_failed(payload: &[u8]) -> Option<(u64, TcpConnectFailu
 //  Tests
 // ========================================================================
 
+/// Optional bounded socket-read control. A newer revision replaces the prior
+/// pause state; stale messages never rearm a newer pause. No authority follows.
+pub const TCP_READ_CONTROL_WORD_BYTES: usize = core::mem::size_of::<u64>();
+const TCP_READ_CONTROL_COUNTERS: usize = 2;
+pub const TCP_READ_CONTROL_PAYLOAD_BYTES: usize =
+    core::mem::size_of::<[u64; TCP_READ_CONTROL_COUNTERS]>() + core::mem::size_of::<u8>();
+pub fn encode_tcp_read_control(
+    conn_id: u32,
+    generation: u64,
+    revision: u64,
+    paused: bool,
+) -> Vec<u8> {
+    let mut payload = [0u8; TCP_READ_CONTROL_PAYLOAD_BYTES];
+    payload[..TCP_READ_CONTROL_WORD_BYTES].copy_from_slice(&generation.to_be_bytes());
+    payload[TCP_READ_CONTROL_WORD_BYTES..TCP_READ_CONTROL_COUNTERS * TCP_READ_CONTROL_WORD_BYTES]
+        .copy_from_slice(&revision.to_be_bytes());
+    payload[TCP_READ_CONTROL_COUNTERS * TCP_READ_CONTROL_WORD_BYTES] = u8::from(paused);
+    encode_channel_msg(ChannelMsgType::TcpReadControl, conn_id, &payload)
+}
+pub fn decode_tcp_read_control(payload: &[u8]) -> Option<(u64, u64, bool)> {
+    if payload.len() != TCP_READ_CONTROL_PAYLOAD_BYTES
+        || payload[TCP_READ_CONTROL_COUNTERS * TCP_READ_CONTROL_WORD_BYTES] > 1
+    {
+        return None;
+    }
+    let generation = u64::from_be_bytes(payload[..TCP_READ_CONTROL_WORD_BYTES].try_into().ok()?);
+    let revision = u64::from_be_bytes(
+        payload
+            [TCP_READ_CONTROL_WORD_BYTES..TCP_READ_CONTROL_COUNTERS * TCP_READ_CONTROL_WORD_BYTES]
+            .try_into()
+            .ok()?,
+    );
+    (generation != 0 && revision != 0).then_some((
+        generation,
+        revision,
+        payload[TCP_READ_CONTROL_COUNTERS * TCP_READ_CONTROL_WORD_BYTES] != 0,
+    ))
+}
+pub fn encode_tcp_read_identity(conn_id: u32, generation: u64) -> Vec<u8> {
+    encode_channel_msg(
+        ChannelMsgType::TcpReadIdentity,
+        conn_id,
+        &generation.to_be_bytes(),
+    )
+}
+pub fn decode_tcp_read_identity(payload: &[u8]) -> Option<u64> {
+    let generation = u64::from_be_bytes(payload.try_into().ok()?);
+    (generation != 0).then_some(generation)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,54 +599,4 @@ mod tests {
         unknown_reason[8] = 0xff;
         assert!(decode_tcp_connect_failed(&unknown_reason).is_none());
     }
-}
-
-/// Optional bounded socket-read control. A newer revision replaces the prior
-/// pause state; stale messages never rearm a newer pause. No authority follows.
-pub const TCP_READ_CONTROL_WORD_BYTES: usize = core::mem::size_of::<u64>();
-const TCP_READ_CONTROL_COUNTERS: usize = 2;
-pub const TCP_READ_CONTROL_PAYLOAD_BYTES: usize =
-    core::mem::size_of::<[u64; TCP_READ_CONTROL_COUNTERS]>() + core::mem::size_of::<u8>();
-pub fn encode_tcp_read_control(
-    conn_id: u32,
-    generation: u64,
-    revision: u64,
-    paused: bool,
-) -> Vec<u8> {
-    let mut payload = [0u8; TCP_READ_CONTROL_PAYLOAD_BYTES];
-    payload[..TCP_READ_CONTROL_WORD_BYTES].copy_from_slice(&generation.to_be_bytes());
-    payload[TCP_READ_CONTROL_WORD_BYTES..TCP_READ_CONTROL_COUNTERS * TCP_READ_CONTROL_WORD_BYTES]
-        .copy_from_slice(&revision.to_be_bytes());
-    payload[TCP_READ_CONTROL_COUNTERS * TCP_READ_CONTROL_WORD_BYTES] = u8::from(paused);
-    encode_channel_msg(ChannelMsgType::TcpReadControl, conn_id, &payload)
-}
-pub fn decode_tcp_read_control(payload: &[u8]) -> Option<(u64, u64, bool)> {
-    if payload.len() != TCP_READ_CONTROL_PAYLOAD_BYTES
-        || payload[TCP_READ_CONTROL_COUNTERS * TCP_READ_CONTROL_WORD_BYTES] > 1
-    {
-        return None;
-    }
-    let generation = u64::from_be_bytes(payload[..TCP_READ_CONTROL_WORD_BYTES].try_into().ok()?);
-    let revision = u64::from_be_bytes(
-        payload
-            [TCP_READ_CONTROL_WORD_BYTES..TCP_READ_CONTROL_COUNTERS * TCP_READ_CONTROL_WORD_BYTES]
-            .try_into()
-            .ok()?,
-    );
-    (generation != 0 && revision != 0).then_some((
-        generation,
-        revision,
-        payload[TCP_READ_CONTROL_COUNTERS * TCP_READ_CONTROL_WORD_BYTES] != 0,
-    ))
-}
-pub fn encode_tcp_read_identity(conn_id: u32, generation: u64) -> Vec<u8> {
-    encode_channel_msg(
-        ChannelMsgType::TcpReadIdentity,
-        conn_id,
-        &generation.to_be_bytes(),
-    )
-}
-pub fn decode_tcp_read_identity(payload: &[u8]) -> Option<u64> {
-    let generation = u64::from_be_bytes(payload.try_into().ok()?);
-    (generation != 0).then_some(generation)
 }

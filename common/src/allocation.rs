@@ -1,4 +1,6 @@
 //! Shared transient allocation admission. Numeric capacity grants no authority.
+/// Pool-bound fallible ordered metadata backing; child admission remains separate.
+pub mod ordered_map;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -206,6 +208,7 @@ impl<T,C> Drop for SharedAllocationV1<T,C> {
 
 #[cfg(test)]
 pub(crate) fn check_allocation_owner() {
+    ordered_map::check();
     assert_eq!(bounded_vec_capacity(0, 3), None);
     assert_eq!(bounded_vec_capacity(2, 3), Some(2));
     assert_eq!(bounded_vec_capacity(3, 3), Some(3));

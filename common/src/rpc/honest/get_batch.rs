@@ -54,7 +54,7 @@ pub fn worker_get_batch_geometry(table:&[u8],key:usize,value:usize,request_maxim
         .min(request_payload.checked_sub(header)?/record)
         .min(response_payload.checked_sub(WORKER_GET_BATCH_RESPONSE_HEADER_BYTES)?/value.checked_add(WORKER_GET_BATCH_VALUE_HEADER_BYTES)?);
     if count==0{return None;}
-    Some((count,worker_get_batch_request_demand(table.len(),core::iter::repeat(key).take(count))?))
+    Some((count,worker_get_batch_request_demand(table.len(),core::iter::repeat_n(key,count))?))
 }
 pub fn worker_get_batch_encoded_len(scope:[u8;32],table:&[u8],requests:&[(&[u8],usize)],request_maximum:usize,response_maximum:usize)->Option<usize>{
     if scope==[0;32]||table.is_empty()||table.len()>MAX_WORKER_STORAGE_BATCH_TABLE_BYTES||requests.is_empty()||requests.len()>MAX_WORKER_STORAGE_BATCH_RECORDS{return None;}
@@ -78,7 +78,9 @@ pub fn encode_worker_get_batch(scope:[u8;32],table:&[u8],requests:&[(&[u8],usize
     for(key,maximum)in requests{out.extend_from_slice(&u16::try_from(key.len()).ok()?.to_le_bytes());out.extend_from_slice(&u32::try_from(*maximum).ok()?.to_le_bytes());out.extend_from_slice(key);}Some(out)
 }
 fn take<'a>(input:&mut &'a[u8],count:usize)->Option<&'a[u8]>{let(head,tail)=input.split_at_checked(count)?;*input=tail;Some(head)}
-pub fn decode_worker_get_batch(mut bytes:&[u8],request_maximum:usize,response_maximum:usize)->Option<([u8;32],&[u8],Vec<(&[u8],usize)>)>{
+/// Borrowed decoded scope/table and bounded request records; existing wire unchanged.
+pub type WorkerGetBatchRequest<'a> = ([u8;32], &'a [u8], Vec<(&'a [u8],usize)>);
+pub fn decode_worker_get_batch(mut bytes:&[u8],request_maximum:usize,response_maximum:usize)->Option<WorkerGetBatchRequest<'_>>{
     let scope=take(&mut bytes,SCOPE_BYTES)?.try_into().ok()?;
     let table_length=usize::from(u16::from_le_bytes(take(&mut bytes,2)?.try_into().ok()?));
     let table=take(&mut bytes,table_length)?;

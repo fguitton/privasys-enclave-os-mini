@@ -13,6 +13,19 @@
 use crate::modules::AppIdentity;
 use std::sync::OnceLock;
 
+/// Stored encrypted key/value entries in original scan order.
+pub type StoredEntries = Vec<(Vec<u8>, Vec<u8>)>;
+/// Original host put callback.
+pub type StorePut = fn(&[u8], &[u8], &[u8]) -> Result<(), i32>;
+/// Original host get callback.
+pub type StoreGet = fn(&[u8], &[u8]) -> Result<Option<Vec<u8>>, i32>;
+/// Original host key-list callback.
+pub type StoreListKeys = fn(&[u8], &[u8]) -> Result<Vec<Vec<u8>>, i32>;
+/// Original host multi-get callback; missing values retain their positions.
+pub type StoreMultiGet = fn(&[u8], &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, i32>;
+/// Original host range-scan callback.
+pub type StoreScan = fn(&[u8], &[u8], &[u8], u32) -> Result<StoredEntries, i32>;
+
 /// Function-pointer table for host services (network, KV store, time, log)
 /// and enclave-internal services (cert store) that module crates need.
 ///
@@ -28,13 +41,13 @@ pub struct OcallVtable {
     pub net_close: fn(i32),
 
     // ── KV store ─────────────────────────────────────────────────────
-    pub kv_store_put: fn(&[u8], &[u8], &[u8]) -> Result<(), i32>,
-    pub kv_store_get: fn(&[u8], &[u8]) -> Result<Option<Vec<u8>>, i32>,
+    pub kv_store_put: StorePut,
+    pub kv_store_get: StoreGet,
     pub kv_store_delete: fn(&[u8], &[u8]) -> Result<bool, i32>,
-    pub kv_store_list_keys: fn(&[u8], &[u8]) -> Result<Vec<Vec<u8>>, i32>,
+    pub kv_store_list_keys: StoreListKeys,
     pub kv_store_write_batch: fn(&[u8], &[crate::rpc::KvBatchOp]) -> Result<(), i32>,
-    pub kv_store_multi_get: fn(&[u8], &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, i32>,
-    pub kv_store_scan: fn(&[u8], &[u8], &[u8], u32) -> Result<Vec<(Vec<u8>, Vec<u8>)>, i32>,
+    pub kv_store_multi_get: StoreMultiGet,
+    pub kv_store_scan: StoreScan,
 
     // ── Utility ──────────────────────────────────────────────────────
     pub get_current_time: fn() -> Result<u64, i32>,
@@ -124,7 +137,7 @@ pub fn kv_store_scan(
     start: &[u8],
     end: &[u8],
     limit: u32,
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>, i32> {
+) -> Result<StoredEntries, i32> {
     (vt().kv_store_scan)(table, start, end, limit)
 }
 

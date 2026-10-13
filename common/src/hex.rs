@@ -6,7 +6,7 @@
 /// Decode a hex string into bytes. Returns `None` on invalid input.
 pub fn hex_decode(hex: &str) -> Option<Vec<u8>> {
     let hex = hex.as_bytes();
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(hex.len() / 2);
