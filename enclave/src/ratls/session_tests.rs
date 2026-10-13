@@ -111,6 +111,7 @@ fn replacement_rejects_buffered_requests_and_re_attestation() {
     checked_plaintext_backing();
     checked_tls_output_backing();
     checked_http_request_admission();
+    checked_stream_header_admission();
     let store = CertStore::new();
     register(&store, "a.test");
     let (mut client, mut session) = pair(&store, "a.test");
@@ -693,6 +694,19 @@ fn streamed_request_preserves_tls_and_following_request() {
     assert!(header.body.is_empty());
     assert_eq!(length, body.len());
     assert!(session.validate_stream_head());
+    // Reparse these actual decrypted bytes with the real pool, then move that
+    // exact paid header through the original Work/begin callback below.
+    drop(header);
+    let header_bytes = &session.read_buf[session.read_offset..];
+    let header_charge =
+        enclave_os_common::protocol::http_request_head_allocation_bound(header_bytes).unwrap();
+    let header_pool = enclave_os_common::allocation::AllocationPoolV1::new(header_charge).unwrap();
+    let (header, paid_head, paid_length) =
+        super::PaidHttpRequest::parse_head(header_bytes, Some(&header_pool), false)
+            .unwrap()
+            .unwrap();
+    assert_eq!((paid_head, paid_length), (head_bytes, length));
+    assert_eq!(header_pool.used(), header_charge);
     let working = RaTlsSession::stream_allocation_bytes().unwrap();
     let slot_bytes = crate::stream_ingress::SlotCharge::metadata_bytes().unwrap();
     let physical =
@@ -745,6 +759,11 @@ fn streamed_request_preserves_tls_and_following_request() {
         pending: false,
     };
     assert!(crate::stream_ingress::run_work(fixture_begin, &mut work).is_none());
+    assert_eq!(
+        header_pool.used(),
+        0,
+        "original begin consumes header before metadata credit refund"
+    );
     for part in body.chunks(32 * 1024) {
         write_requests(&mut client, &mut session, part);
     }
@@ -1261,4 +1280,48 @@ fn checked_http_request_admission() {
         assert!(super::PaidHttpRequest::parse(b"bad\r\n\r\n", Some(&pool)).is_err());
         assert_eq!(pool.used(), 0);
     }
+}
+
+fn checked_stream_header_admission() {
+    use enclave_os_common::{allocation::AllocationPoolV1, protocol};
+    let raw = b"POST /paid HTTP/1.1\r\nHost: MiXeD.test:443\r\nContent-Length: 4\r\n\r\nbody";
+    let head = raw.len() - b"body".len();
+    let needed = protocol::http_request_head_allocation_bound(raw).unwrap();
+    assert_eq!(
+        needed,
+        protocol::http_request_head_allocation_bound(&raw[..head]).unwrap()
+    );
+    let small = AllocationPoolV1::new(needed - 1).unwrap();
+    assert!(super::PaidHttpRequest::parse_head(raw, Some(&small), false).is_err());
+    assert_eq!(small.used(), 0);
+    for limit in [needed, needed + 1] {
+        let pool = AllocationPoolV1::new(limit).unwrap();
+        let (header, consumed, body) = super::PaidHttpRequest::parse_head(raw, Some(&pool), true)
+            .unwrap()
+            .unwrap();
+        assert_eq!((consumed, body), (head, 4));
+        assert_eq!(header.host.as_deref(), Some("mixed.test"));
+        assert!(header.body.is_empty());
+        assert_eq!(pool.used(), needed);
+        drop(header);
+        assert_eq!(pool.used(), 0);
+    }
+    let duplicate = b"POST /paid HTTP/1.1\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\n";
+    let pool =
+        AllocationPoolV1::new(protocol::http_request_head_allocation_bound(duplicate).unwrap())
+            .unwrap();
+    assert!(
+        super::PaidHttpRequest::parse_head(duplicate, Some(&pool), false)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(pool.used(), 0);
+    assert!(super::PaidHttpRequest::parse_head(duplicate, Some(&pool), true).is_err());
+    assert_eq!(pool.used(), 0);
+    assert!(
+        super::PaidHttpRequest::parse_head(&raw[..head - 1], Some(&pool), true)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(pool.used(), 0);
 }

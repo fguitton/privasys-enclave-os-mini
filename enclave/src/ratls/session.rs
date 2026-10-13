@@ -338,16 +338,27 @@ impl RaTlsSession {
 
     pub(crate) fn stream_head(
         &mut self,
-    ) -> Result<Option<(protocol::HttpRequest, usize, usize)>, &'static str> {
+    ) -> Result<Option<(PaidHttpRequest, usize, usize)>, &'static str> {
         self.require_current_configuration()?;
-        match protocol::peek_http_stream_request_head(&self.read_buf[self.read_offset..]) {
-            Ok(value) => Ok(Some(value)),
-            Err(protocol::HttpParseError::Incomplete) => Ok(None),
-            Err(_) => Err("malformed streaming HTTP header"),
-        }
+        #[cfg(target_env = "sgx")]
+        let pool = Some(crate::local_allocation_pool().ok_or("SDK heap unavailable")?);
+        #[cfg(not(target_env = "sgx"))]
+        let pool = None;
+        PaidHttpRequest::parse_head(&self.read_buf[self.read_offset..], pool.as_ref(), false)
     }
     pub(crate) fn validate_stream_head(&self) -> bool {
-        protocol::parse_http_stream_request_head(&self.read_buf[self.read_offset..]).is_ok()
+        #[cfg(target_env = "sgx")]
+        let Some(pool) = crate::local_allocation_pool() else {
+            return false;
+        };
+        #[cfg(target_env = "sgx")]
+        let pool = Some(pool);
+        #[cfg(not(target_env = "sgx"))]
+        let pool = None;
+        matches!(
+            PaidHttpRequest::parse_head(&self.read_buf[self.read_offset..], pool.as_ref(), true),
+            Ok(Some(_))
+        )
     }
     // Reuse the old parser Vec plus full-body copy allowance. This is a
     // physical capacity bound; unread bytes keep the original separate cap.

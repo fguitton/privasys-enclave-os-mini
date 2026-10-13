@@ -359,17 +359,31 @@ pub enum HttpParseError {
 /// Body copying cannot exceed the actual available suffix (including pipeline).
 /// This grants no parse acceptance, request authority, or declared body credit.
 pub fn http_request_allocation_bound(buf: &[u8]) -> Result<usize, HttpParseError> {
-    let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
-    let mut req = httparse::Request::new(&mut headers);
-    let header = match req.parse(buf) {
-        Ok(httparse::Status::Complete(length)) => length,
-        Ok(httparse::Status::Partial) => return Err(HttpParseError::Incomplete),
-        Err(_) => return Err(HttpParseError::Malformed),
-    };
+    let header = http_request_header_len(buf)?;
     header
         .checked_mul(2)
         .and_then(|n| n.checked_add(buf.len().checked_sub(header)?))
         .ok_or(HttpParseError::BodyTooLarge)
+}
+/// Original header-only framing ceiling; distinct from response header policy.
+pub const MAX_REQUEST_HEAD_BYTES: usize = 16 * 1024;
+/// Physical metadata peak of either original header-only parser, excluding body.
+/// This borrowed preflight grants neither strict framing nor request authority.
+pub fn http_request_head_allocation_bound(buf: &[u8]) -> Result<usize, HttpParseError> {
+    let header = http_request_header_len(buf)?;
+    if header > MAX_REQUEST_HEAD_BYTES {
+        return Err(HttpParseError::TooManyHeaders);
+    }
+    header.checked_mul(2).ok_or(HttpParseError::BodyTooLarge)
+}
+fn http_request_header_len(buf: &[u8]) -> Result<usize, HttpParseError> {
+    let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
+    let mut req = httparse::Request::new(&mut headers);
+    match req.parse(buf) {
+        Ok(httparse::Status::Complete(length)) => Ok(length),
+        Ok(httparse::Status::Partial) => Err(HttpParseError::Incomplete),
+        Err(_) => Err(HttpParseError::Malformed),
+    }
 }
 
 pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseError> {
@@ -389,9 +403,9 @@ pub fn parse_http_request_head(buf: &[u8]) -> Result<(HttpRequest, usize, usize)
     if buf
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
-        .is_none_or(|n| n + 4 > 16 * 1024)
+        .is_none_or(|n| n + 4 > MAX_REQUEST_HEAD_BYTES)
     {
-        return if buf.len() > 16 * 1024 {
+        return if buf.len() > MAX_REQUEST_HEAD_BYTES {
             Err(HttpParseError::TooManyHeaders)
         } else {
             Err(HttpParseError::Incomplete)
@@ -404,7 +418,7 @@ pub fn peek_http_request_head(buf: &[u8]) -> Result<(HttpRequest, usize, usize),
     if buf
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
-        .is_none_or(|n| n + 4 > 16 * 1024)
+        .is_none_or(|n| n + 4 > MAX_REQUEST_HEAD_BYTES)
     {
         return Err(HttpParseError::Incomplete);
     }
@@ -418,9 +432,9 @@ pub fn parse_http_stream_request_head(
     if buf
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
-        .is_none_or(|n| n + 4 > 16 * 1024)
+        .is_none_or(|n| n + 4 > MAX_REQUEST_HEAD_BYTES)
     {
-        return if buf.len() > 16 * 1024 {
+        return if buf.len() > MAX_REQUEST_HEAD_BYTES {
             Err(HttpParseError::TooManyHeaders)
         } else {
             Err(HttpParseError::Incomplete)
@@ -436,7 +450,7 @@ pub fn peek_http_stream_request_head(
     if buf
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
-        .is_none_or(|n| n + 4 > 16 * 1024)
+        .is_none_or(|n| n + 4 > MAX_REQUEST_HEAD_BYTES)
     {
         return Err(HttpParseError::Incomplete);
     }
