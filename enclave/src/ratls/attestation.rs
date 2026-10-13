@@ -294,10 +294,75 @@ pub fn mint_client_identity(
     ))
 }
 
+#[cfg(all(feature = "mock", not(feature = "sgx-sim-attestation")))]
+const MOCK_QUOTE_PREFIX: &[u8] = b"MOCK_QUOTE:";
+
 /// Produce an SGX DCAP quote over `report_data` (the attest endpoint and the
 /// client-evidence path).
 pub fn sgx_quote(report_data: &[u8; 64]) -> Result<Vec<u8>, String> {
     generate_sgx_quote(report_data)
+}
+
+/// Paid quote construction for the live server/cache route. Public legacy
+/// Vec-returning APIs below remain separate; this value grants no authority.
+pub(crate) fn sgx_quote_paid(
+    report_data: &[u8; 64],
+) -> Result<super::session::retained_quote::RetainedQuote, String> {
+    let pool = crate::local_allocation_pool().ok_or_else(String::new)?;
+    generate_sgx_quote_paid(&pool, report_data)
+}
+
+#[cfg(all(not(feature = "mock"), not(feature = "sgx-sim-attestation")))]
+fn generate_sgx_quote_paid(
+    pool: &std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
+    report_data: &[u8; 64],
+) -> Result<super::session::retained_quote::RetainedQuote, String> {
+    use sgx_types::types::{Report, ReportData, TargetInfo};
+    let rpc = crate::rpc_client_ref();
+    let target: TargetInfo = rpc
+        .with_qe_target_info(pool, |bytes| {
+            if bytes.len() != core::mem::size_of::<TargetInfo>() {
+                return Err(-22);
+            }
+            // SAFETY: exact fixed-size SGX value is copied before working credit ends.
+            Ok(unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<TargetInfo>()) })
+        })
+        .map_err(|error| format!("QeGetTargetInfo RPC failed: status={error}"))?;
+    let mut data = ReportData::default();
+    data.d.copy_from_slice(report_data);
+    let report = <Report as sgx_tse::EnclaveReport>::for_target(&target, &data)
+        .map_err(|error| format!("sgx_create_report failed: {error:?}"))?;
+    // SAFETY: borrow the original initialized SGX report for its exact layout.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&report as *const Report).cast::<u8>(),
+            core::mem::size_of::<Report>(),
+        )
+    };
+    rpc.with_qe_quote(pool, bytes, |quote| {
+        super::session::retained_quote::RetainedQuote::copy_from(pool, quote).ok_or(-12)
+    })
+    .map_err(|error| format!("QeGetQuote RPC failed: status={error}"))
+}
+
+#[cfg(any(feature = "mock", feature = "sgx-sim-attestation"))]
+fn generate_sgx_quote_paid(
+    pool: &std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
+    report_data: &[u8; 64],
+) -> Result<super::session::retained_quote::RetainedQuote, String> {
+    // The original selected mock/SIM producer has a fixed codec-owned bound.
+    // Retain its temporary separately from the resulting shared copy.
+    #[cfg(feature = "sgx-sim-attestation")]
+    let temporary = enclave_os_common::quote::SGX_SIM_REPORT_SIZE;
+    #[cfg(all(feature = "mock", not(feature = "sgx-sim-attestation")))]
+    let temporary = MOCK_QUOTE_PREFIX.len() + core::mem::size_of::<[u8; 64]>();
+    let credit = pool.reserve(temporary).ok_or_else(String::new)?;
+    let bytes = generate_sgx_quote(report_data)?;
+    let retained = super::session::retained_quote::RetainedQuote::copy_from(pool, &bytes)
+        .ok_or_else(String::new);
+    drop(bytes);
+    drop(credit);
+    retained
 }
 
 // ---------------------------------------------------------------------------
@@ -359,8 +424,8 @@ fn generate_sgx_quote(report_data: &[u8; 64]) -> Result<Vec<u8>, String> {
 
 #[cfg(all(feature = "mock", not(feature = "sgx-sim-attestation")))]
 fn generate_sgx_quote(report_data: &[u8; 64]) -> Result<Vec<u8>, String> {
-    let mut quote = Vec::with_capacity(11 + 64);
-    quote.extend_from_slice(b"MOCK_QUOTE:");
+    let mut quote = Vec::with_capacity(MOCK_QUOTE_PREFIX.len() + report_data.len());
+    quote.extend_from_slice(MOCK_QUOTE_PREFIX);
     quote.extend_from_slice(report_data);
     Ok(quote)
 }

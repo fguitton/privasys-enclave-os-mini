@@ -84,6 +84,40 @@ pub struct RpcClient {
     in_flight_request_id: AtomicU64,
 }
 
+// Request encoding and raw response coexist. The decoded payload is borrowed;
+// a callback that retains it must admit its own child before copying.
+struct QeWorking {
+    request: Vec<u8>,
+    response: Vec<u8>,
+    _allocation: enclave_os_common::allocation::AllocationLeaseV1,
+}
+impl QeWorking {
+    fn new(
+        pool: &std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
+        request: usize,
+        response: usize,
+    ) -> Option<Self> {
+        let allocation = pool.reserve_unpublished(request.checked_add(response)?)?;
+        let mut request_bytes = Vec::new();
+        request_bytes.try_reserve_exact(request).ok()?;
+        if request_bytes.capacity() != request {
+            return None;
+        }
+        let mut response_bytes = Vec::new();
+        response_bytes.try_reserve_exact(response).ok()?;
+        if response_bytes.capacity() != response {
+            return None;
+        }
+        response_bytes.resize(response, 0);
+        allocation.activate_release_notification();
+        Some(Self {
+            request: request_bytes,
+            response: response_bytes,
+            _allocation: allocation,
+        })
+    }
+}
+
 /// Token owned by the execution worker while one host operation is in flight.
 ///
 /// Its complete framed identity is private; only the submitting client may
@@ -167,7 +201,12 @@ impl RpcClient {
     }
 
     /// Immutable endpoint sizes; metadata grants no IO or owner authority.
-    pub fn queue_geometry(&self)->(usize,usize){(self.request_tx.max_message_bytes(),self.response_rx.max_message_bytes())}
+    pub fn queue_geometry(&self) -> (usize, usize) {
+        (
+            self.request_tx.max_message_bytes(),
+            self.response_rx.max_message_bytes(),
+        )
+    }
 
     fn try_reserve_request(&self) -> Result<u64, RequestReserveError> {
         let request_id = next_req_id().ok_or(RequestReserveError::OperationIdExhausted)?;
@@ -725,6 +764,105 @@ impl RpcClient {
     // ====================================================================
     //  DCAP attestation calls
     // ====================================================================
+
+    /// Actual simultaneous request/raw-response backing for a QE exchange.
+    /// Geometry comes from this client's immutable queue endpoints.
+    pub(crate) fn qe_working_bytes(&self, payload: usize) -> Option<usize> {
+        if !rpc::framed_payload_len_valid(
+            payload,
+            rpc::REQ_HEADER_SIZE,
+            self.request_tx.max_message_bytes(),
+        ) {
+            return None;
+        }
+        rpc::REQ_HEADER_SIZE
+            .checked_add(payload)?
+            .checked_add(self.response_rx.max_message_bytes())
+    }
+
+    pub(crate) fn with_qe_target_info<T>(
+        &self,
+        pool: &std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
+        accept: impl FnOnce(&[u8]) -> Result<T, i32>,
+    ) -> Result<T, i32> {
+        self.qe_call_admitted(pool, RpcMethod::QeGetTargetInfo, &[], accept)
+    }
+
+    pub(crate) fn with_qe_quote<T>(
+        &self,
+        pool: &std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
+        report: &[u8],
+        accept: impl FnOnce(&[u8]) -> Result<T, i32>,
+    ) -> Result<T, i32> {
+        self.qe_call_admitted(pool, RpcMethod::QeGetQuote, report, accept)
+    }
+
+    fn qe_call_admitted<T>(
+        &self,
+        pool: &std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
+        method: RpcMethod,
+        payload: &[u8],
+        accept: impl FnOnce(&[u8]) -> Result<T, i32>,
+    ) -> Result<T, i32> {
+        self.qe_working_bytes(payload.len()).ok_or(-22)?;
+        let request_length = rpc::REQ_HEADER_SIZE.checked_add(payload.len()).ok_or(-22)?;
+        let mut working =
+            QeWorking::new(pool, request_length, self.response_rx.max_message_bytes())
+                .ok_or(-12)?;
+        let exchange = self.synchronous_exchange.lock().map_err(|_| -1)?;
+        let req_id = self.try_reserve_request().map_err(|error| match error {
+            RequestReserveError::Busy => -16,
+            RequestReserveError::OperationIdExhausted => -75,
+        })?;
+        if rpc::encode_request_into_bounded(
+            req_id,
+            method,
+            payload,
+            self.request_tx.max_message_bytes(),
+            &mut working.request,
+        )
+        .is_none()
+        {
+            self.release_request(req_id);
+            return Err(-22);
+        }
+        if self.request_tx.send_bounded(&working.request).is_err() {
+            self.release_request(req_id);
+            return Err(-22);
+        }
+        notify_host();
+        loop {
+            let count = match self.response_rx.try_recv_into(&mut working.response) {
+                Ok(Some(count)) => count,
+                Ok(None) => {
+                    core::hint::spin_loop();
+                    continue;
+                }
+                Err(_) => {
+                    self.release_request(req_id);
+                    return Err(-22);
+                }
+            };
+            if let Some((response_id, status, bytes)) =
+                rpc::decode_response(&working.response[..count])
+            {
+                if response_id == req_id {
+                    self.release_request(req_id);
+                    // The paid response belongs to working, independently of
+                    // the exchange. Callers may start another RPC while they
+                    // inspect these bytes; both working buffers stay admitted.
+                    drop(exchange);
+                    return if status == 0 {
+                        accept(bytes)
+                    } else {
+                        Err(status)
+                    };
+                }
+            }
+            // Preserve original legacy wait semantics for malformed/mismatched
+            // replies. No extra receive allocation, acquisition or request ID.
+        }
+    }
 
     /// Get the Quoting Enclave's target info (512-byte `sgx_target_info_t`).
     ///

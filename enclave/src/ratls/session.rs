@@ -53,6 +53,8 @@ pub(crate) fn response_credit(
 #[path = "tls_output.rs"]
 mod tls_output;
 pub use tls_output::TlsOutput;
+#[path = "cancellation.rs"]
+pub(crate) mod cancellation;
 #[path = "channel_output.rs"]
 pub(crate) mod channel_output;
 #[path = "http_request.rs"]
@@ -60,18 +62,19 @@ mod http_request;
 #[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
 #[path = "leaf_key.rs"]
 pub(crate) mod leaf_key;
+#[path = "ordered_map.rs"]
+pub(crate) mod ordered_map;
+#[path = "pending_client.rs"]
+pub(crate) mod pending_client;
+#[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
+#[path = "retained_certificate.rs"]
+pub(crate) mod retained_certificate;
 #[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
 #[path = "retained_name.rs"]
 pub(crate) mod retained_name;
 #[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
-#[path = "retained_certificate.rs"]
-pub(crate) mod retained_certificate;
-#[path = "ordered_map.rs"]
-pub(crate) mod ordered_map;
-#[path = "cancellation.rs"]
-pub(crate) mod cancellation;
-#[path = "pending_client.rs"]
-pub(crate) mod pending_client;
+#[path = "retained_quote.rs"]
+pub(crate) mod retained_quote;
 pub use http_request::PaidHttpRequest;
 
 #[cfg(test)]
@@ -261,8 +264,13 @@ impl RaTlsSession {
         attested_endpoint: Option<enclave_os_common::modules::AttestedEndpointIdentity>,
         configuration: ConfigurationLease,
     ) -> Self {
-        Self::with_certificate(tls_conn, LocalCertificate::Legacy(local_cert_der),
-            server_name, attested_endpoint, configuration)
+        Self::with_certificate(
+            tls_conn,
+            LocalCertificate::Legacy(local_cert_der),
+            server_name,
+            attested_endpoint,
+            configuration,
+        )
     }
 
     #[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
@@ -273,8 +281,13 @@ impl RaTlsSession {
         attested_endpoint: Option<enclave_os_common::modules::AttestedEndpointIdentity>,
         configuration: ConfigurationLease,
     ) -> Self {
-        Self::with_certificate(tls_conn, LocalCertificate::Paid(local_cert_der),
-            server_name, attested_endpoint, configuration)
+        Self::with_certificate(
+            tls_conn,
+            LocalCertificate::Paid(local_cert_der),
+            server_name,
+            attested_endpoint,
+            configuration,
+        )
     }
 
     fn with_certificate(

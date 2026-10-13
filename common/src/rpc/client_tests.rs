@@ -3,6 +3,9 @@
 #[path = "../../../enclave/src/rpc_client.rs"]
 mod client;
 
+#[path = "../../../enclave/src/ratls/retained_quote.rs"]
+mod retained_quote;
+
 use super::*;
 use crate::queue::{SpscConsumer, SpscProducer, SpscQueueHeader};
 use std::sync::{mpsc, Arc};
@@ -62,6 +65,7 @@ fn receive(queue: &SpscConsumer) -> Vec<u8> {
 
 pub(super) fn check_synchronous_ownership() {
     check_actual_capacity_refusal();
+    check_paid_qe_exchange();
     check_synchronous_pair(false);
     check_synchronous_pair(true);
     check_polled_owner();
@@ -341,13 +345,16 @@ fn check_worker_storage_reservation() {
             .is_none()
     );
     assert!(worker_storage_put_batch_encoded_len(b"t", &[]).is_none());
-    for count in [MAX_WORKER_STORAGE_BATCH_RECORDS-1,MAX_WORKER_STORAGE_BATCH_RECORDS]{
-        let records=vec![(b"k".as_slice(),b"v".as_slice());count];
-        let wire=encode_worker_storage_put_batch(b"t",&records).unwrap();
-        assert_eq!(decode_worker_storage_put_batch(&wire).unwrap().1,records);
+    for count in [
+        MAX_WORKER_STORAGE_BATCH_RECORDS - 1,
+        MAX_WORKER_STORAGE_BATCH_RECORDS,
+    ] {
+        let records = vec![(b"k".as_slice(), b"v".as_slice()); count];
+        let wire = encode_worker_storage_put_batch(b"t", &records).unwrap();
+        assert_eq!(decode_worker_storage_put_batch(&wire).unwrap().1, records);
     }
-    let excessive=vec![(b"k".as_slice(),b"v".as_slice());MAX_WORKER_STORAGE_BATCH_RECORDS+1];
-    assert!(encode_worker_storage_put_batch(b"t",&excessive).is_none());
+    let excessive = vec![(b"k".as_slice(), b"v".as_slice()); MAX_WORKER_STORAGE_BATCH_RECORDS + 1];
+    assert!(encode_worker_storage_put_batch(b"t", &excessive).is_none());
     println!("WORKER-STORAGE-RPC: actual framedtoken/role/size/nestedBusy/releasednetworkreservation PASS");
 }
 
@@ -410,67 +417,265 @@ fn check_ready_recheck() {
     println!("EXECUTION-READY-RECHECK: actual exact queue fastcompletion skipsOCALL, finiteempty64 thenretainedwait, eventcompletion PASS");
 }
 
-fn check_get_batch_codec(){
-    let capacity=crate::queue::max_message_bytes(crate::queue::DEFAULT_QUEUE_CAPACITY);
-    let scope=[7;32];let key=b"key".as_slice();
-    let maximum=128*1024+36+1024; // Independent existing canonical-node v2 vector.
-    assert_eq!(worker_get_batch_response_demand(&[maximum;8]),Some(1_057_090));
-    assert!(worker_get_batch_encoded_len(scope,b"t",&[(key,maximum);8],capacity,capacity).is_none());
-    let group=[(key,maximum);7];let wire=encode_worker_get_batch(scope,b"t",&group,capacity,capacity).unwrap();
-    let(count,length)=worker_get_batch_geometry(b"t",key.len(),maximum,capacity,capacity).unwrap();
-    assert_eq!(count,group.len());assert_eq!(length,wire.len(),"size-only owner must match actual codec bytes");
-    assert_eq!(worker_get_batch_request_demand(b"t".len(),group.iter().map(|(key,_)|key.len())),Some(wire.len()));
+fn check_get_batch_codec() {
+    let capacity = crate::queue::max_message_bytes(crate::queue::DEFAULT_QUEUE_CAPACITY);
+    let scope = [7; 32];
+    let key = b"key".as_slice();
+    let maximum = 128 * 1024 + 36 + 1024; // Independent existing canonical-node v2 vector.
+    assert_eq!(
+        worker_get_batch_response_demand(&[maximum; 8]),
+        Some(1_057_090)
+    );
+    assert!(
+        worker_get_batch_encoded_len(scope, b"t", &[(key, maximum); 8], capacity, capacity)
+            .is_none()
+    );
+    let group = [(key, maximum); 7];
+    let wire = encode_worker_get_batch(scope, b"t", &group, capacity, capacity).unwrap();
+    let (count, length) =
+        worker_get_batch_geometry(b"t", key.len(), maximum, capacity, capacity).unwrap();
+    assert_eq!(count, group.len());
+    assert_eq!(
+        length,
+        wire.len(),
+        "size-only owner must match actual codec bytes"
+    );
+    assert_eq!(
+        worker_get_batch_request_demand(b"t".len(), group.iter().map(|(key, _)| key.len())),
+        Some(wire.len())
+    );
     // Real maximum table/key/count encoding and heterogeneous keys exercise
     // the shared size owner, not a second handwritten length formula.
-    let max_table=vec![b't';MAX_WORKER_STORAGE_BATCH_TABLE_BYTES];
-    let max_key=vec![b'k';MAX_WORKER_STORAGE_BATCH_KEY_BYTES];
-    let max_records=vec![(max_key.as_slice(),1);MAX_WORKER_STORAGE_BATCH_RECORDS];
-    let max_encoded=encode_worker_get_batch(scope,&max_table,&max_records,capacity,capacity).unwrap();
-    assert_eq!(worker_get_batch_request_demand(max_table.len(),max_records.iter().map(|(key,_)|key.len())),Some(max_encoded.len()));
-    assert_eq!(decode_worker_get_batch(&max_encoded,capacity,capacity).unwrap().2,max_records);
-    let mixed=[(key,1),(max_key.as_slice(),1)];
-    let mixed_encoded=encode_worker_get_batch(scope,b"t",&mixed,capacity,capacity).unwrap();
-    assert_eq!(worker_get_batch_request_demand(1,mixed.iter().map(|(key,_)|key.len())),Some(mixed_encoded.len()));
-    assert!(worker_get_batch_request_demand(0,[key.len()]).is_none());
-    assert!(worker_get_batch_request_demand(usize::MAX,[key.len()]).is_none());
-    assert!(worker_get_batch_request_demand(1,core::iter::empty()).is_none());
-    assert!(worker_get_batch_request_demand(1,[0]).is_none());
-    assert!(worker_get_batch_request_demand(1,[usize::MAX]).is_none());
-    assert!(worker_get_batch_request_demand(1,core::iter::repeat_n(key.len(),MAX_WORKER_STORAGE_BATCH_RECORDS+1)).is_none());
+    let max_table = vec![b't'; MAX_WORKER_STORAGE_BATCH_TABLE_BYTES];
+    let max_key = vec![b'k'; MAX_WORKER_STORAGE_BATCH_KEY_BYTES];
+    let max_records = vec![(max_key.as_slice(), 1); MAX_WORKER_STORAGE_BATCH_RECORDS];
+    let max_encoded =
+        encode_worker_get_batch(scope, &max_table, &max_records, capacity, capacity).unwrap();
+    assert_eq!(
+        worker_get_batch_request_demand(
+            max_table.len(),
+            max_records.iter().map(|(key, _)| key.len())
+        ),
+        Some(max_encoded.len())
+    );
+    assert_eq!(
+        decode_worker_get_batch(&max_encoded, capacity, capacity)
+            .unwrap()
+            .2,
+        max_records
+    );
+    let mixed = [(key, 1), (max_key.as_slice(), 1)];
+    let mixed_encoded = encode_worker_get_batch(scope, b"t", &mixed, capacity, capacity).unwrap();
+    assert_eq!(
+        worker_get_batch_request_demand(1, mixed.iter().map(|(key, _)| key.len())),
+        Some(mixed_encoded.len())
+    );
+    assert!(worker_get_batch_request_demand(0, [key.len()]).is_none());
+    assert!(worker_get_batch_request_demand(usize::MAX, [key.len()]).is_none());
+    assert!(worker_get_batch_request_demand(1, core::iter::empty()).is_none());
+    assert!(worker_get_batch_request_demand(1, [0]).is_none());
+    assert!(worker_get_batch_request_demand(1, [usize::MAX]).is_none());
+    assert!(worker_get_batch_request_demand(
+        1,
+        core::iter::repeat_n(key.len(), MAX_WORKER_STORAGE_BATCH_RECORDS + 1)
+    )
+    .is_none());
 
-    for count in [MAX_WORKER_STORAGE_BATCH_RECORDS-1,MAX_WORKER_STORAGE_BATCH_RECORDS]{
-        let records=vec![(key,5);count];
-        let encoded=encode_worker_get_batch(scope,b"t",&records,capacity,capacity).unwrap();
-        assert_eq!(decode_worker_get_batch(&encoded,capacity,capacity).unwrap().2,records);
+    for count in [
+        MAX_WORKER_STORAGE_BATCH_RECORDS - 1,
+        MAX_WORKER_STORAGE_BATCH_RECORDS,
+    ] {
+        let records = vec![(key, 5); count];
+        let encoded = encode_worker_get_batch(scope, b"t", &records, capacity, capacity).unwrap();
+        assert_eq!(
+            decode_worker_get_batch(&encoded, capacity, capacity)
+                .unwrap()
+                .2,
+            records
+        );
     }
-    let excessive=vec![(key,5);MAX_WORKER_STORAGE_BATCH_RECORDS+1];
-    assert!(encode_worker_get_batch(scope,b"t",&excessive,capacity,capacity).is_none());
-    assert!(worker_get_batch_geometry(b"",key.len(),5,capacity,capacity).is_none());
-    assert!(worker_get_batch_geometry(b"t",0,5,capacity,capacity).is_none());
-    assert!(worker_get_batch_geometry(b"t",usize::MAX,5,capacity,capacity).is_none());
-    assert!(worker_get_batch_geometry(b"t",key.len(),usize::MAX,capacity,capacity).is_none());
-    assert!(worker_get_batch_geometry(b"t",key.len(),5,0,capacity).is_none());
-    let(decoded_scope,table,requests)=decode_worker_get_batch(&wire,capacity,capacity).unwrap();
-    assert_eq!(decoded_scope,scope);assert_eq!(table,b"t");assert_eq!(requests,group);
-    for cut in 0..wire.len(){assert!(decode_worker_get_batch(&wire[..cut],capacity,capacity).is_none());}
-    let mut trailing=wire.clone();trailing.push(0);assert!(decode_worker_get_batch(&trailing,capacity,capacity).is_none());
-    assert!(encode_worker_get_batch([0;32],b"t",&group,capacity,capacity).is_none());
-    assert!(worker_get_batch_encoded_len(scope,b"t",&[(key,0)],capacity,capacity).is_none());
-    let value=[9;5];let reply=encode_worker_get_batch_response(&[&value,&value],&[5,5],capacity).unwrap();
-    assert_eq!(decode_worker_get_batch_response(&reply,&[5,5]).unwrap(),[value.as_slice(),value.as_slice()]);
-    for cut in 0..reply.len(){assert!(decode_worker_get_batch_response(&reply[..cut],&[5,5]).is_none());}
-    assert!(decode_worker_get_batch_response(&reply,&[4,5]).is_none());
-    let mut tail=reply;tail.push(0);assert!(decode_worker_get_batch_response(&tail,&[5,5]).is_none());
-    let request_length=worker_get_batch_encoded_len(scope,b"t",&[(key,5)],capacity,capacity).unwrap();
-    let request_frame=request_length+1+HONEST_REQ_HEADER_SIZE;
-    let reply_frame=2+4+5+HONEST_RESP_HEADER_SIZE;
-    assert_eq!(worker_get_batch_geometry(b"t",key.len(),5,request_frame,reply_frame),Some((1,request_length)));
-    assert_eq!(worker_get_batch_geometry(b"t",key.len(),5,request_frame+1,reply_frame),Some((1,request_length)));
-    assert_eq!(worker_get_batch_geometry(b"t",key.len(),5,request_frame,reply_frame+1),Some((1,request_length)));
-    assert_eq!(worker_get_batch_geometry(b"t",key.len(),5,request_frame+1,reply_frame+1),Some((1,request_length)));
-    assert!(worker_get_batch_geometry(b"t",key.len(),5,request_frame-1,reply_frame).is_none());
-    assert!(worker_get_batch_geometry(b"t",key.len(),5,request_frame,reply_frame-1).is_none());
-    assert!(worker_get_batch_encoded_len(scope,b"t",&[(key,5)],request_frame,reply_frame).is_some());
-    assert!(worker_get_batch_encoded_len(scope,b"t",&[(key,5)],request_frame-1,reply_frame).is_none());
-    assert!(worker_get_batch_encoded_len(scope,b"t",&[(key,5)],request_frame,reply_frame-1).is_none());
+    let excessive = vec![(key, 5); MAX_WORKER_STORAGE_BATCH_RECORDS + 1];
+    assert!(encode_worker_get_batch(scope, b"t", &excessive, capacity, capacity).is_none());
+    assert!(worker_get_batch_geometry(b"", key.len(), 5, capacity, capacity).is_none());
+    assert!(worker_get_batch_geometry(b"t", 0, 5, capacity, capacity).is_none());
+    assert!(worker_get_batch_geometry(b"t", usize::MAX, 5, capacity, capacity).is_none());
+    assert!(worker_get_batch_geometry(b"t", key.len(), usize::MAX, capacity, capacity).is_none());
+    assert!(worker_get_batch_geometry(b"t", key.len(), 5, 0, capacity).is_none());
+    let (decoded_scope, table, requests) =
+        decode_worker_get_batch(&wire, capacity, capacity).unwrap();
+    assert_eq!(decoded_scope, scope);
+    assert_eq!(table, b"t");
+    assert_eq!(requests, group);
+    for cut in 0..wire.len() {
+        assert!(decode_worker_get_batch(&wire[..cut], capacity, capacity).is_none());
+    }
+    let mut trailing = wire.clone();
+    trailing.push(0);
+    assert!(decode_worker_get_batch(&trailing, capacity, capacity).is_none());
+    assert!(encode_worker_get_batch([0; 32], b"t", &group, capacity, capacity).is_none());
+    assert!(worker_get_batch_encoded_len(scope, b"t", &[(key, 0)], capacity, capacity).is_none());
+    let value = [9; 5];
+    let reply = encode_worker_get_batch_response(&[&value, &value], &[5, 5], capacity).unwrap();
+    assert_eq!(
+        decode_worker_get_batch_response(&reply, &[5, 5]).unwrap(),
+        [value.as_slice(), value.as_slice()]
+    );
+    for cut in 0..reply.len() {
+        assert!(decode_worker_get_batch_response(&reply[..cut], &[5, 5]).is_none());
+    }
+    assert!(decode_worker_get_batch_response(&reply, &[4, 5]).is_none());
+    let mut tail = reply;
+    tail.push(0);
+    assert!(decode_worker_get_batch_response(&tail, &[5, 5]).is_none());
+    let request_length =
+        worker_get_batch_encoded_len(scope, b"t", &[(key, 5)], capacity, capacity).unwrap();
+    let request_frame = request_length + 1 + HONEST_REQ_HEADER_SIZE;
+    let reply_frame = 2 + 4 + 5 + HONEST_RESP_HEADER_SIZE;
+    assert_eq!(
+        worker_get_batch_geometry(b"t", key.len(), 5, request_frame, reply_frame),
+        Some((1, request_length))
+    );
+    assert_eq!(
+        worker_get_batch_geometry(b"t", key.len(), 5, request_frame + 1, reply_frame),
+        Some((1, request_length))
+    );
+    assert_eq!(
+        worker_get_batch_geometry(b"t", key.len(), 5, request_frame, reply_frame + 1),
+        Some((1, request_length))
+    );
+    assert_eq!(
+        worker_get_batch_geometry(b"t", key.len(), 5, request_frame + 1, reply_frame + 1),
+        Some((1, request_length))
+    );
+    assert!(
+        worker_get_batch_geometry(b"t", key.len(), 5, request_frame - 1, reply_frame).is_none()
+    );
+    assert!(
+        worker_get_batch_geometry(b"t", key.len(), 5, request_frame, reply_frame - 1).is_none()
+    );
+    assert!(
+        worker_get_batch_encoded_len(scope, b"t", &[(key, 5)], request_frame, reply_frame)
+            .is_some()
+    );
+    assert!(
+        worker_get_batch_encoded_len(scope, b"t", &[(key, 5)], request_frame - 1, reply_frame)
+            .is_none()
+    );
+    assert!(
+        worker_get_batch_encoded_len(scope, b"t", &[(key, 5)], request_frame, reply_frame - 1)
+            .is_none()
+    );
+}
+
+fn check_paid_qe_exchange() {
+    use crate::allocation::{AllocationPoolV1, SharedAllocationV1};
+    let (tx, host_rx) = queue();
+    let (host_tx, rx) = queue();
+    let rpc = Arc::new(client::RpcClient::new(tx, rx));
+    let report = b"original-report-bytes";
+    let working = rpc.qe_working_bytes(report.len()).unwrap();
+    let short = AllocationPoolV1::new(working - 1).unwrap();
+    assert_eq!(rpc.with_qe_quote(&short, report, |_| Ok(())), Err(-12));
+    assert_eq!(short.used(), 0);
+    assert!(host_rx.try_recv().is_none());
+    assert!(rpc.qe_working_bytes(usize::MAX).is_none());
+    let quote = b"actual-opaque-host-quote";
+    let retained = SharedAllocationV1::<Vec<u8>>::required_bytes(quote.len()).unwrap();
+    let pool = AllocationPoolV1::new(working + retained).unwrap();
+    let child_pool = pool.clone();
+    let child_rpc = rpc.clone();
+    let job = std::thread::spawn(move || {
+        child_rpc.with_qe_quote(&child_pool, report, |bytes| {
+            assert_eq!(child_pool.used(), working);
+            retained_quote::RetainedQuote::copy_from(&child_pool, bytes).ok_or(-12)
+        })
+    });
+    let request = receive(&host_rx);
+    let (id, method, payload) = decode_request(&request).unwrap();
+    assert_eq!(method, RpcMethod::QeGetQuote);
+    assert_eq!(payload, report);
+    assert_eq!(request, encode_request(id, method, report));
+    // Original malformed/wrong-ID wait behavior remains; no fresh operation.
+    host_tx.send(&[0]);
+    host_tx.send(&encode_response(id + 1, 0, quote));
+    host_tx.send(&encode_response(id, 0, quote));
+    let held = job.join().unwrap().unwrap();
+    assert_eq!(held.bytes(), quote);
+    assert_eq!(pool.used(), retained);
+    let alias = held.clone();
+    drop(held);
+    assert_eq!(pool.used(), retained);
+    drop(alias);
+    assert_eq!(pool.used(), 0);
+    let required = rpc.qe_working_bytes(0).unwrap();
+    for maximum in [required, required + 1] {
+        let pool = AllocationPoolV1::new(maximum).unwrap();
+        let child_pool = pool.clone();
+        let child_rpc = rpc.clone();
+        let job = std::thread::spawn(move || {
+            child_rpc.with_qe_target_info(&child_pool, |bytes| {
+                assert_eq!(child_pool.used(), required);
+                Ok(bytes.len())
+            })
+        });
+        let request = receive(&host_rx);
+        let (id, method, payload) = decode_request(&request).unwrap();
+        assert_eq!(method, RpcMethod::QeGetTargetInfo);
+        assert!(payload.is_empty());
+        host_tx.send(&encode_response(id, 0, b"fixed-target"));
+        assert_eq!(job.join().unwrap(), Ok(b"fixed-target".len()));
+        assert_eq!(pool.used(), 0);
+    }
+    // A callback may issue a second real request while the outer response
+    // remains borrowed. Admit both working buffers and the retained quote.
+    let outer_working = rpc.qe_working_bytes(0).unwrap();
+    let nested_working = rpc.qe_working_bytes(report.len()).unwrap();
+    let maximum = outer_working
+        .checked_add(nested_working)
+        .and_then(|bytes| bytes.checked_add(retained))
+        .unwrap();
+    let pool = AllocationPoolV1::new(maximum).unwrap();
+    let child_pool = pool.clone();
+    let child_rpc = rpc.clone();
+    let job = std::thread::spawn(move || {
+        child_rpc.with_qe_target_info(&child_pool, |outer| {
+            assert_eq!(outer, b"outer-target");
+            assert_eq!(child_pool.used(), outer_working);
+            let quote = child_rpc.with_qe_quote(&child_pool, report, |bytes| {
+                assert_eq!(child_pool.used(), outer_working + nested_working);
+                retained_quote::RetainedQuote::copy_from(&child_pool, bytes).ok_or(-12)
+            })?;
+            assert_eq!(outer, b"outer-target");
+            assert_eq!(child_pool.used(), outer_working + retained);
+            Ok(quote)
+        })
+    });
+    let outer_request = receive(&host_rx);
+    let (outer_id, method, payload) = decode_request(&outer_request).unwrap();
+    assert_eq!(method, RpcMethod::QeGetTargetInfo);
+    assert!(payload.is_empty());
+    host_tx.send(&encode_response(outer_id, 0, b"outer-target"));
+    let nested_request = receive(&host_rx);
+    let (nested_id, method, payload) = decode_request(&nested_request).unwrap();
+    assert_ne!(nested_id, outer_id);
+    assert_eq!(method, RpcMethod::QeGetQuote);
+    assert_eq!(payload, report);
+    assert_eq!(nested_request, encode_request(nested_id, method, report));
+    host_tx.send(&encode_response(nested_id, 0, quote));
+    let held = job.join().unwrap().unwrap();
+    assert_eq!(held.bytes(), quote);
+    assert_eq!(pool.used(), retained);
+    drop(held);
+    assert_eq!(pool.used(), 0);
+    // The real queue refuses short output before copying/consuming the frame.
+    let mut short = [42; 8];
+    let (send, receive) = queue();
+    send.send(b"unchanged");
+    let positions = send.diagnostic_positions();
+    assert_eq!(receive.try_recv_into(&mut short), Err(9));
+    assert_eq!(short, [42; 8]);
+    assert_eq!(send.diagnostic_positions(), positions);
+    let mut exact = [0; 9];
+    assert_eq!(receive.try_recv_into(&mut exact), Ok(Some(9)));
+    assert_eq!(&exact, b"unchanged");
 }

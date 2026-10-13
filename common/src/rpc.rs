@@ -143,11 +143,37 @@ pub fn encode_response_bounded(
 /// Format: `[u64 req_id LE] [u16 method LE] [u32 payload_len LE] [payload]`
 pub fn encode_request(req_id: u64, method: RpcMethod, payload: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(REQ_HEADER_SIZE + payload.len());
+    append_request(&mut buf, req_id, method, payload);
+    buf
+}
+
+fn append_request(buf: &mut Vec<u8>, req_id: u64, method: RpcMethod, payload: &[u8]) {
     buf.extend_from_slice(&req_id.to_le_bytes());
     buf.extend_from_slice(&(method as u16).to_le_bytes());
     buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     buf.extend_from_slice(payload);
-    buf
+}
+
+/// Encode using the original request writer into already admitted storage.
+/// Returns `None` before mutation if the complete wire or backing is too small.
+/// This method never grows the buffer or allocates.
+pub fn encode_request_into_bounded(
+    req_id: u64,
+    method: RpcMethod,
+    payload: &[u8],
+    maximum: usize,
+    buffer: &mut Vec<u8>,
+) -> Option<()> {
+    if !framed_payload_len_valid(payload.len(), REQ_HEADER_SIZE, maximum) {
+        return None;
+    }
+    let length = REQ_HEADER_SIZE.checked_add(payload.len())?;
+    if buffer.capacity() < length {
+        return None;
+    }
+    buffer.clear();
+    append_request(buffer, req_id, method, payload);
+    Some(())
 }
 
 /// Decode an RPC request header. Returns `(req_id, method, payload)`.

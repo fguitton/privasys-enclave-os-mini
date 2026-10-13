@@ -413,8 +413,9 @@ impl SpscConsumer {
         max_message_bytes(self.capacity)
     }
 
-    /// Try to read a message. Returns `Some(Vec<u8>)` or `None` if empty.
-    pub fn try_recv(&self) -> Option<Vec<u8>> {
+    // Validate immutable endpoint geometry and the complete available frame
+    // before either allocation or a write into caller-provided storage.
+    fn readable_frame(&self) -> Option<(u64, usize)> {
         let hdr = unsafe { &*self.header };
 
         let head = hdr.head.load(Ordering::Acquire);
@@ -436,7 +437,7 @@ impl SpscConsumer {
         if msg_len > max_message_bytes(self.capacity) as u64 {
             // Corrupted message – skip and advance tail past the header
             hdr.tail
-                .store(tail + MSG_HEADER_SIZE as u64, Ordering::Release);
+                .store(tail.wrapping_add(MSG_HEADER_SIZE as u64), Ordering::Release);
             return None;
         }
 
@@ -445,13 +446,44 @@ impl SpscConsumer {
             return None; // Incomplete message (shouldn't happen with proper producer)
         }
 
-        // Read payload
-        let mut payload = vec![0u8; msg_len as usize];
-        self.read_bytes(tail + MSG_HEADER_SIZE as u64, &mut payload);
+        Some((tail, msg_len as usize))
+    }
 
-        // Advance tail
-        hdr.tail.store(tail + total, Ordering::Release);
+    /// Try to read into caller-owned storage without allocating.
+    /// An empty queue returns `Ok(None)`; malformed framing keeps the original
+    /// consumer behavior. Insufficient storage does not copy or consume a frame.
+    ///
+    /// # Errors
+    /// Returns the required payload length when `output` is too short.
+    pub fn try_recv_into(&self, output: &mut [u8]) -> Result<Option<usize>, usize> {
+        let Some((tail, length)) = self.readable_frame() else {
+            return Ok(None);
+        };
+        if output.len() < length {
+            return Err(length);
+        }
+        self.read_bytes(
+            tail.wrapping_add(MSG_HEADER_SIZE as u64),
+            &mut output[..length],
+        );
+        let end = tail
+            .wrapping_add(MSG_HEADER_SIZE as u64)
+            .wrapping_add(length as u64);
+        // SAFETY: the handle owns this validated queue endpoint.
+        unsafe { &*self.header }.tail.store(end, Ordering::Release);
+        Ok(Some(length))
+    }
 
+    /// Try to read a message. Returns `Some(Vec<u8>)` or `None` if empty.
+    pub fn try_recv(&self) -> Option<Vec<u8>> {
+        let (tail, length) = self.readable_frame()?;
+        let mut payload = vec![0u8; length];
+        self.read_bytes(tail.wrapping_add(MSG_HEADER_SIZE as u64), &mut payload);
+        let end = tail
+            .wrapping_add(MSG_HEADER_SIZE as u64)
+            .wrapping_add(length as u64);
+        // SAFETY: the handle owns this validated queue endpoint.
+        unsafe { &*self.header }.tail.store(end, Ordering::Release);
         Some(payload)
     }
 
@@ -701,6 +733,7 @@ mod tests {
 
     #[test]
     fn test_exact_capacity_fill_drain() {
+        check_receive_into();
         // Capacity 4096, msg_header = 4 bytes per message.
         // A 1020-byte payload uses 1024 bytes total.  4096 / 1024 = exactly 4.
         let (producer, consumer) = alloc_test_queue(4096);
@@ -914,5 +947,55 @@ mod tests {
 
         enclave.join().unwrap();
         host.join().unwrap();
+    }
+
+    fn check_receive_into() {
+        let capacity = MIN_SHARED_QUEUE_CAPACITY;
+        let maximum = max_message_bytes(capacity);
+        for length in [0, 1, maximum - 1, maximum] {
+            let (producer, consumer) = alloc_test_queue(capacity);
+            let message = vec![7; length];
+            producer.try_send(&message).unwrap();
+            let mut output = vec![42; maximum];
+            if length > 0 {
+                let before = producer.diagnostic_positions();
+                assert_eq!(
+                    consumer.try_recv_into(&mut output[..length - 1]),
+                    Err(length)
+                );
+                assert!(output.iter().all(|byte| *byte == 42));
+                assert_eq!(producer.diagnostic_positions(), before);
+            }
+            assert_eq!(consumer.try_recv_into(&mut output), Ok(Some(length)));
+            assert_eq!(&output[..length], message);
+            assert!(consumer.is_empty());
+        }
+        let (producer, consumer) = alloc_test_queue(capacity);
+        let mut output = [42; 8];
+        producer.write_bytes(0, &u32::try_from(maximum + 1).unwrap().to_le_bytes());
+        // SAFETY: fixture owns the complete queue allocation; emulate host framing.
+        unsafe { &*producer.header }
+            .head
+            .store(MSG_HEADER_SIZE as u64, Ordering::Release);
+        assert_eq!(consumer.try_recv_into(&mut output), Ok(None));
+        assert_eq!(output, [42; 8]);
+        assert_eq!(producer.diagnostic_positions().1, MSG_HEADER_SIZE as u64);
+        // A complete valid frame can cross the monotonic u64 counter boundary.
+        let start = u64::MAX - 1;
+        let bytes = b"wrapped";
+        producer.write_bytes(start, &u32::try_from(bytes.len()).unwrap().to_le_bytes());
+        producer.write_bytes(start.wrapping_add(MSG_HEADER_SIZE as u64), bytes);
+        let end = start
+            .wrapping_add(MSG_HEADER_SIZE as u64)
+            .wrapping_add(bytes.len() as u64);
+        unsafe { &*producer.header }
+            .tail
+            .store(start, Ordering::Release);
+        unsafe { &*producer.header }
+            .head
+            .store(end, Ordering::Release);
+        assert_eq!(consumer.try_recv_into(&mut output), Ok(Some(bytes.len())));
+        assert_eq!(&output[..bytes.len()], bytes);
+        assert_eq!(producer.diagnostic_positions(), (end, end));
     }
 }

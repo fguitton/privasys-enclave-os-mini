@@ -29,10 +29,10 @@ use std::string::String;
 use std::sync::Arc;
 use std::vec::Vec;
 
+use super::session::leaf_key::RetainedLeafKey;
 use crate::modules;
 use crate::ocall;
 use crate::ratls::attestation::{self, CaContext, LeafKey};
-use super::session::leaf_key::RetainedLeafKey;
 use crate::ratls::cert_store;
 use crate::ratls::session::RaTlsSession;
 use crate::{enclave_log_error, enclave_log_info};
@@ -110,12 +110,18 @@ pub struct IngressServer {
     /// Shutdown flag.
     shutdown: bool,
     /// Per-hostname cached TLS configs (leaf certificate + key).
-    cached_configs: super::session::ordered_map::OrderedMap<super::session::retained_name::PaidName, CachedConfig>,
+    cached_configs: super::session::ordered_map::OrderedMap<
+        super::session::retained_name::PaidName,
+        CachedConfig,
+    >,
     /// Bounded ciphertext backlog when the host-side SPSC queue has no credit.
     pending_output: RefCell<ChannelQueue>,
     output_failed: Cell<bool>,
     /// Per-hostname leaf keys, kept 24 h across re-mints (RA-TLS v2).
-    leaf_keys: super::session::ordered_map::OrderedMap<super::session::retained_name::PaidName, RetainedLeafKey>,
+    leaf_keys: super::session::ordered_map::OrderedMap<
+        super::session::retained_name::PaidName,
+        RetainedLeafKey,
+    >,
     /// Every answerable leaf key by SHA-256(SPKI): current keys and keys
     /// rotated less than 15 minutes ago (the `leaf` of an attest request).
     leaf_by_spki: super::session::ordered_map::OrderedMap<[u8; 32], RetainedLeafKey>,
@@ -136,7 +142,7 @@ struct CachedConfig {
 /// The deterministic quote of a leaf key: report_data commits to the key and
 /// the minute it was minted.
 struct DetQuote {
-    quote: Vec<u8>,
+    quote: super::session::retained_quote::RetainedQuote,
     quote_time: String,
     minted: u64,
 }
@@ -1370,7 +1376,9 @@ impl IngressServer {
 
         // Metadata refusal must not create a new TLS/crypto payload. Empty
         // errors allocate nothing on physical-admission refusal.
-        self.cached_configs.reserve_entry(cache_key).map_err(|()| String::new())?;
+        self.cached_configs
+            .reserve_entry(cache_key)
+            .map_err(|()| String::new())?;
         let pool = crate::local_allocation_pool().ok_or_else(String::new)?;
         let retained_name = super::session::retained_name::PaidName::new(&pool, cache_key)
             .ok_or_else(String::new)?;
@@ -1499,12 +1507,14 @@ fn build_tls_config(
         None => attestation::generate_ratls_certificate(ca, key, now)?,
     };
 
-    let initial_leaf = result.cert_chain_der.first()
+    let initial_leaf = result
+        .cert_chain_der
+        .first()
         .ok_or_else(|| "RA-TLS certificate chain is empty".to_string())?;
     let pool = crate::local_allocation_pool().ok_or_else(String::new)?;
-    let local_cert_der = super::session::retained_certificate::RetainedCertificate::copy_from(
-        &pool, initial_leaf,
-    ).ok_or_else(String::new)?;
+    let local_cert_der =
+        super::session::retained_certificate::RetainedCertificate::copy_from(&pool, initial_leaf)
+            .ok_or_else(String::new)?;
     let certs: Vec<CertificateDer<'static>> = result
         .cert_chain_der
         .into_iter()
@@ -2905,11 +2915,15 @@ impl IngressServer {
                 return Ok(k.clone());
             }
         }
-        self.leaf_keys.reserve_entry(sni).map_err(|()| String::new())?;
-        self.leaf_by_spki.reserve_new_entry().map_err(|()| String::new())?;
+        self.leaf_keys
+            .reserve_entry(sni)
+            .map_err(|()| String::new())?;
+        self.leaf_by_spki
+            .reserve_new_entry()
+            .map_err(|()| String::new())?;
         let pool = crate::local_allocation_pool().ok_or_else(String::new)?;
-        let retained_name = super::session::retained_name::PaidName::new(&pool, sni)
-            .ok_or_else(String::new)?;
+        let retained_name =
+            super::session::retained_name::PaidName::new(&pool, sni).ok_or_else(String::new)?;
         let k = RetainedLeafKey::new(&pool, now)?;
         self.leaf_keys.insert_prepared(retained_name, k.clone());
         self.leaf_by_spki.insert_prepared(k.spki_hash, k.clone());
@@ -2921,17 +2935,19 @@ impl IngressServer {
         &mut self,
         key: &LeafKey,
         now: u64,
-    ) -> Result<(Vec<u8>, String), String> {
+    ) -> Result<(super::session::retained_quote::RetainedQuote, String), String> {
         if let Some(d) = self.det_quotes.get(&key.spki_hash) {
             if now < d.minted + attestation::DETERMINISTIC_VALIDITY_SECS {
                 return Ok((d.quote.clone(), d.quote_time.clone()));
             }
         }
-        self.det_quotes.reserve_entry(&key.spki_hash).map_err(|()| String::new())?;
+        self.det_quotes
+            .reserve_entry(&key.spki_hash)
+            .map_err(|()| String::new())?;
         let quote_time = enclave_os_common::attest::format_quote_time(now as i64);
         let rd =
             enclave_os_common::attest::deterministic_report_data(&key.spki_der, &quote_time, None);
-        let quote = attestation::sgx_quote(&rd)?;
+        let quote = attestation::sgx_quote_paid(&rd)?;
         self.det_quotes.insert_prepared(
             key.spki_hash,
             DetQuote {
@@ -3006,7 +3022,9 @@ impl IngressServer {
                                 cert.public_key().subject_public_key.as_ref(),
                             ) {
                                 Some(hash) => hash,
-                                None => return HttpHandleResult::err(500, "session leaf unavailable"),
+                                None => {
+                                    return HttpHandleResult::err(500, "session leaf unavailable")
+                                }
                             }
                         }
                         Err(_) => return HttpHandleResult::err(500, "session leaf unavailable"),
@@ -3047,7 +3065,7 @@ impl IngressServer {
                     context = Some(ctx.as_slice().try_into().expect("context length checked"));
                     exporter = Some(hctx);
                     let rd = at::challenge_report_data(&key.spki_der, &ctx, &hctx, None);
-                    match attestation::sgx_quote(&rd) {
+                    match attestation::sgx_quote_paid(&rd) {
                         Ok(q) => (q, at::format_quote_time(now as i64)),
                         Err(e) => {
                             enclave_log_error!("challenge quote failed: {}", e);
@@ -3062,7 +3080,7 @@ impl IngressServer {
                 });
                 session.set_local_evidence(enclave_os_common::modules::PeerEvidence {
                     tee: "sgx".into(),
-                    quote: quote.clone(),
+                    quote: quote.bytes().to_vec(),
                     quote_time: quote_time.clone(),
                     gpu_evidence: None,
                     context,
@@ -3072,7 +3090,7 @@ impl IngressServer {
                     v: PROTOCOL_VERSION,
                     mode: req.mode.clone(),
                     tee: "sgx".to_string(),
-                    quote: at::b64_encode(&quote),
+                    quote: at::b64_encode(quote.bytes()),
                     gpu_evidence: None,
                     quote_time,
                     client_evidence: "none".to_string(),
