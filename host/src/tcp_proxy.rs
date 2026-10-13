@@ -253,6 +253,7 @@ pub struct TcpProxy {
 
 impl TcpProxy {
     /// Create a new TCP proxy bound to the given ingress port.
+    #[cfg(test)]
     pub fn new(
         port: u16,
         backlog: i32,
@@ -265,6 +266,7 @@ impl TcpProxy {
 
     /// Create the shared ciphertext multiplexer with an optional Unix local
     /// control listener. Both listener classes terminate TLS in the enclave.
+    #[cfg(test)]
     pub fn new_with_local_control(
         port: u16,
         backlog: i32,
@@ -1770,7 +1772,11 @@ mod tests {
                 while let Some(message) = fixture.from_host.try_recv() {
                     let (kind, id, payload) = channel::decode_channel_msg(&message).unwrap();
                     if kind == ChannelMsgType::TcpReadIdentity {
-                        assert!(cfg!(feature = "stream-read-credit"));
+                        assert!(crate::build_contract::compiled()["features"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|feature| feature == "stream-read-credit"));
                         let generation = channel::decode_tcp_read_identity(payload).unwrap();
                         assert_ne!(generation, 0);
                         assert_eq!(
@@ -1861,10 +1867,14 @@ mod tests {
             // independently check every byte, including the deferred socket.
             let mut bulk = TransportFixture::with_capacity(2 * 1024 * 1024);
             let address = bulk.proxy.listener.local_addr().unwrap();
-            let mut clients: Vec<_> = (0..9)
-                .map(|_| TcpStream::connect(address).unwrap())
-                .collect();
-            bulk.proxy.accept_connections();
+            let mut clients = Vec::new();
+            for _ in 0..9 {
+                clients.push(TcpStream::connect_timeout(&address, Duration::from_secs(5)).unwrap());
+                // The real listener has backlog one. Accept each completed
+                // connect before creating the next; all nine remain ready
+                // together for the unchanged aggregate-overflow oracle.
+                bulk.proxy.accept_connections();
+            }
             let accepted = bulk.messages(9);
             assert!(accepted
                 .iter()
@@ -1968,6 +1978,7 @@ mod tests {
 
     #[test]
     fn enclave_close_drains_buffered_ciphertext_before_socket_close() {
+        crate::build_contract::check();
         #[cfg(feature = "stream-read-credit")]
         read_pause_rearm_isolated_and_revision_bound();
         // Frequent small writes grant only their actual cumulative byte count.

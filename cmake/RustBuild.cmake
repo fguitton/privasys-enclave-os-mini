@@ -83,7 +83,44 @@ endif()
 #   The host crate's build.rs handles EDL generation and C compilation itself.
 #   NOTE: host is a workspace member → target dir is at the workspace root.
 # ---------------------------------------------------------------------------
+set(HOST_FEATURES "" CACHE STRING "Comma-separated Cargo host features")
+set(HOST_REQUIRED_FEATURES "" CACHE STRING "Required protocol capabilities declared by the producer")
+option(RUST_HOST_RELEASE_DEBUG_ASSERTIONS "Host release debug assertions, independent of enclave profile" OFF)
+find_program(RUST_HOST_CONTRACT_PYTHON python3 REQUIRED)
+
 function(rust_build_host CRATE_DIR OUTPUT_NAME)
+    set(_HOST_FEATURE_ARGS "")
+    if(NOT HOST_FEATURES STREQUAL "")
+        set(_HOST_FEATURE_ARGS --features "${HOST_FEATURES}")
+    endif()
+    if(RUST_HOST_RELEASE_DEBUG_ASSERTIONS)
+        set(_HOST_RELEASE_DEBUG "true")
+    else()
+        set(_HOST_RELEASE_DEBUG "false")
+    endif()
+    set(_HOST_CONTRACT_SCRIPT "${CMAKE_SOURCE_DIR}/scripts/host-build-contract.py")
+    set(_HOST_DECLARATION "${CMAKE_BINARY_DIR}/host-build-inputs-v1.json")
+    set(_HOST_CONSUMER_ARGS "")
+    if(CUSTOM_ENCLAVE_DIR)
+        set(_HOST_CONSUMER_ARGS --enclave-manifest "${CUSTOM_ENCLAVE_DIR}/Cargo.toml"
+            --enclave-features "${CUSTOM_ENCLAVE_FEATURES}")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CUSTOM_ENCLAVE_DIR}/Cargo.toml")
+    endif()
+    if(CUSTOM_ENCLAVE_CONFIG)
+        list(APPEND _HOST_CONSUMER_ARGS --enclave-config "${CUSTOM_ENCLAVE_CONFIG}")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CUSTOM_ENCLAVE_CONFIG}")
+    endif()
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${CRATE_DIR}/Cargo.toml" "${_HOST_CONTRACT_SCRIPT}")
+    execute_process(COMMAND "${RUST_HOST_CONTRACT_PYTHON}" "${_HOST_CONTRACT_SCRIPT}"
+        --manifest "${CRATE_DIR}/Cargo.toml" --features "${HOST_FEATURES}"
+        --required "${HOST_REQUIRED_FEATURES}" ${_HOST_CONSUMER_ARGS}
+        --build-type "${CMAKE_BUILD_TYPE}" --release-debug-assertions "${_HOST_RELEASE_DEBUG}"
+        --sgx-mode "${SGX_MODE}" --output "${_HOST_DECLARATION}"
+        RESULT_VARIABLE _HOST_CONTRACT_STATUS)
+    if(NOT _HOST_CONTRACT_STATUS EQUAL 0)
+        message(FATAL_ERROR "Host feature/profile declaration refused")
+    endif()
     add_custom_target(${OUTPUT_NAME} ALL
         COMMAND ${CMAKE_COMMAND} -E env
             "SGX_SDK_PATH=${SGX_SDK_PATH}"
@@ -91,12 +128,19 @@ function(rust_build_host CRATE_DIR OUTPUT_NAME)
             "RUSTUP_TOOLCHAIN=${RUST_ENCLAVE_TOOLCHAIN}"
             "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}"
             "CARGO_TARGET_DIR=${RUST_HOST_TARGET_DIR}"
+            "CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=${_HOST_RELEASE_DEBUG}"
+            "CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=true"
             "CC=${CMAKE_C_COMPILER}"
             "CXX=${CMAKE_CXX_COMPILER}"
             ${CARGO_EXECUTABLE} build
                 ${CARGO_BUILD_TYPE}
                 --locked
+                ${_HOST_FEATURE_ARGS}
                 --manifest-path "${CRATE_DIR}/Cargo.toml"
+        COMMAND "${RUST_HOST_CONTRACT_PYTHON}" "${_HOST_CONTRACT_SCRIPT}"
+            --actual "${RUST_HOST_TARGET_DIR}/${CARGO_OUT_DIR}/${OUTPUT_NAME}"
+            --declared "${_HOST_DECLARATION}"
+            --output "${CMAKE_BINARY_DIR}/host-build-actual-v1.json"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
         COMMENT "Building host Rust crate: ${OUTPUT_NAME}"
         VERBATIM

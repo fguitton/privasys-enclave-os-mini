@@ -11,6 +11,7 @@
 //! - Provide the CLI entry point
 
 mod c3_endpoints;
+mod build_contract;
 #[cfg(all(target_os = "linux", not(sgx_mode_sim), not(feature = "mock")))]
 mod dcap;
 mod dispatcher;
@@ -84,6 +85,10 @@ impl EnclaveTestSelection {
     about = "Host for enclave-os-mini SGX application"
 )]
 struct Cli {
+    /// Print compiled capabilities without loading an enclave or opening stores.
+    #[arg(long)]
+    build_contract: bool,
+
     /// Path to the signed enclave binary (.signed.so)
     #[arg(short, long, default_value = "enclave.signed.so")]
     enclave_path: String,
@@ -333,6 +338,10 @@ fn validate_long_lived_ecall_results(control: i32, execution: i32) -> Result<()>
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.build_contract {
+        println!("{}", build_contract::compiled());
+        return Ok(());
+    }
 
     // Initialise logging
     let log_level = if cli.debug { "debug" } else { "info" };

@@ -14,6 +14,13 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
+    let mut features: Vec<_> = env::vars()
+        .filter_map(|(name, _)| name.strip_prefix("CARGO_FEATURE_").map(str::to_owned))
+        .map(|name| name.to_ascii_lowercase().replace('_', "-"))
+        .collect();
+    features.sort_unstable();
+    println!("cargo:rustc-env=ENCLAVE_OS_HOST_COMPILED_FEATURES={}", features.join(","));
+    println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rustc-check-cfg=cfg(sgx_mode_sim)");
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let mock = env::var("CARGO_FEATURE_MOCK").is_ok();
