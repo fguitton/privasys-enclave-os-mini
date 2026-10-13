@@ -117,6 +117,13 @@ impl<K: Ord, V> OrderedMap<K, V> {
         Ok(())
     }
 }
+impl<K: Ord, V> core::ops::Index<&K> for OrderedMap<K, V> {
+    type Output = V;
+    fn index(&self, key: &K) -> &V {
+        self.get(key).expect("no entry found for key")
+    }
+}
+
 /// Consuming iteration keeps the vector allocation paid even after its last
 /// item; no borrowed map or raw allocation handle escapes.
 pub(crate) struct Entries<K, V> {
@@ -258,5 +265,37 @@ pub(super) fn check() {
         Err(((), ())),
         "zero-sized tuples explicitly unsupported"
     );
+    let mut set = OrderedMap::<u32, ()>::default();
+    let mut reference = std::collections::BTreeSet::new();
+    for i in 0_u32..64 {
+        let key = (i * 17) % 31;
+        assert_eq!(
+            set.try_insert(key, ()).unwrap().is_none(),
+            reference.insert(key)
+        );
+        if i % 3 == 0 {
+            let remove = (i * 7) % 31;
+            assert_eq!(set.remove(&remove).is_some(), reference.remove(&remove));
+        }
+        assert_eq!(
+            set.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+            reference.iter().copied().collect::<Vec<_>>()
+        );
+        assert_eq!(set.contains_key(&key), reference.contains(&key));
+        if set.contains_key(&key) {
+            assert_eq!(set[&key], ());
+        }
+    }
+    let bytes = core::alloc::Layout::array::<(u32, ())>(1).unwrap().size();
+    let pool = AllocationPoolV1::new(bytes).unwrap();
+    let mut set = OrderedMap::<u32, ()>::default();
+    set.insert_for_fixture(7, (), &pool).unwrap();
+    assert_eq!(set.insert_for_fixture(8, (), &pool), Err((8, ())));
+    assert!(set.contains_key(&7));
+    assert!(!set.contains_key(&8));
+    assert_eq!(pool.used(), bytes);
+    drop(set);
+    assert_eq!(pool.used(), 0);
+    eprintln!("DISPATCH-SET-PAID: original set ordering/dedup/removal and real metadata refusal/refund PASS");
     eprintln!("SESSION-MAP-PAID: original ordered-map oracle, real backing peak/refusal/empty/iterator refund PASS");
 }

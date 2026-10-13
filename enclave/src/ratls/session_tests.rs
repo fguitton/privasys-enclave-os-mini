@@ -124,6 +124,7 @@ fn replacement_rejects_buffered_requests_and_re_attestation() {
     super::ordered_map::check();
     checked_session_table_refusal();
     checked_connection_metadata_tables();
+    checked_fixed_channel_binder();
     let store = CertStore::new();
     register(&store, "a.test");
     let (mut client, mut session) = pair(&store, "a.test");
@@ -1482,4 +1483,39 @@ fn checked_connection_metadata_tables() {
     drop(windows);
     assert_eq!(pool.used(), 0);
     eprintln!("CONNECTION-METADATA-PAID: actual class/window layout refusal preserves original retained entry PASS");
+}
+
+fn checked_fixed_channel_binder() {
+    let store = CertStore::new();
+    register(&store, "a.test");
+    let (mut client, mut session) = pair(&store, "a.test");
+    assert!(session.channel_binder_bytes().is_none());
+    assert!(
+        session.channel_binder_cache.get().is_none(),
+        "incomplete handshake not memoized"
+    );
+    handshake(&mut client, &mut session);
+    let expected = session
+        .export_hctx(b"EXPORTER-honest-peer-channel-v2", &[])
+        .unwrap();
+    assert_eq!(session.channel_binder_bytes(), Some(expected));
+    assert_eq!(session.channel_binder_cache.get(), Some(&expected));
+    assert_eq!(session.channel_binder_bytes(), Some(expected));
+    assert_eq!(session.channel_binder().unwrap(), expected);
+    register(&store, "a.test");
+    assert!(
+        session.channel_binder_bytes().is_none(),
+        "cache never bypasses currentness"
+    );
+    assert!(session.channel_binder().is_none());
+    let (mut fresh_client, mut fresh) = pair(&store, "a.test");
+    assert!(fresh.channel_binder_bytes().is_none());
+    handshake(&mut fresh_client, &mut fresh);
+    assert!(fresh.channel_binder_bytes().is_some());
+    assert_ne!(
+        fresh.channel_binder_bytes(),
+        Some(expected),
+        "new connection has its own exporter"
+    );
+    eprintln!("CHANNEL-BINDER-FIXED: genuine handshake success-only cache, original exporter equality, replacement refusal PASS");
 }

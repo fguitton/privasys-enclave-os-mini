@@ -25,7 +25,7 @@
 //! separate RPC channel.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::string::String;
 use std::sync::Arc;
 use std::vec::Vec;
@@ -88,7 +88,7 @@ pub struct IngressServer {
     output_cursor: u32,
     /// One deferred parse turn after a response completes, including a small
     /// response completed synchronously during dispatch.
-    pending_dispatch: BTreeSet<u32>,
+    pending_dispatch: super::session::ordered_map::OrderedMap<u32, ()>,
     /// Fixed charged slots survive extraction until exact nonce/session join.
     deferred_owner: crate::deferred_ingress::CancellationOwner,
     next_deferred: u64,
@@ -101,8 +101,8 @@ pub struct IngressServer {
     next_stream: u64,
     stream_cursor: u32,
     read_revision: u64,
-    stream_generations: BTreeMap<u32, u64>,
-    paused_stream_reads: BTreeSet<u32>,
+    stream_generations: super::session::ordered_map::OrderedMap<u32, u64>,
+    paused_stream_reads: super::session::ordered_map::OrderedMap<u32, ()>,
     /// Intermediary CA for certificate generation.
     ca: Arc<CaContext>,
     /// Producer for `data_enc_to_host` — sends TLS bytes to the TCP proxy.
@@ -152,15 +152,15 @@ impl IngressServer {
             sessions: super::session::ordered_map::OrderedMap::default(),
             write_windows: RefCell::new(super::session::ordered_map::OrderedMap::default()),
             output_cursor: 0,
-            pending_dispatch: BTreeSet::new(),
+            pending_dispatch: super::session::ordered_map::OrderedMap::default(),
             deferred_owner: crate::deferred_ingress::CancellationOwner::default(),
             next_deferred: 0,
             stream_owner: crate::stream_ingress::CancellationOwner::default(),
             next_stream: 0,
             stream_cursor: 0,
             read_revision: 0,
-            stream_generations: BTreeMap::new(),
-            paused_stream_reads: BTreeSet::new(),
+            stream_generations: super::session::ordered_map::OrderedMap::default(),
+            paused_stream_reads: super::session::ordered_map::OrderedMap::default(),
             deferred_cursor: 0,
             ingress_classes: super::session::ordered_map::OrderedMap::default(),
             ca,
@@ -317,7 +317,14 @@ impl IngressServer {
                             self.invalidate_deferred(conn_id);
                             self.close_deferred_transport(conn_id);
                         } else {
-                            self.stream_generations.insert(conn_id, generation);
+                            if self
+                                .stream_generations
+                                .try_insert(conn_id, generation)
+                                .is_err()
+                            {
+                                self.invalidate_deferred(conn_id);
+                                self.close_deferred_transport(conn_id);
+                            }
                         }
                     } else {
                         self.invalidate_deferred(conn_id);
@@ -373,7 +380,7 @@ impl IngressServer {
         // Round robin among response producers. A slow socket cannot prevent
         // another connection or the control hook from making bounded progress.
         let eligible = |id: &u32, state: &SessionState| {
-            matches!(state, SessionState::Established(session) if session.has_pending_response() || (*dispatch_budget > 0 && self.pending_dispatch.contains(id) && !self.deferred_owner.pending.contains_key(id)))
+            matches!(state, SessionState::Established(session) if session.has_pending_response() || (*dispatch_budget > 0 && self.pending_dispatch.contains_key(id) && !self.deferred_owner.pending.contains_key(id)))
                 && self.write_windows.borrow().get(id).is_some_and(|window| {
                     super::session::response_socket_credit_ready(window.available())
                 })
@@ -426,8 +433,8 @@ impl IngressServer {
                     self.send_close(conn_id);
                     return false;
                 }
-                if !session.has_pending_response() {
-                    self.pending_dispatch.insert(conn_id);
+                if !session.has_pending_response() && !self.mark_dispatch(conn_id) {
+                    return false;
                 }
                 true
             }
@@ -594,7 +601,7 @@ impl IngressServer {
     // Actual header/stage consumption controls socket reads only. The original
     // independent plaintext/ciphertext bounds remain enforced if a host lies.
     fn stream_read_control(&mut self, id: u32, paused: bool) -> bool {
-        if self.paused_stream_reads.contains(&id) == paused {
+        if self.paused_stream_reads.contains_key(&id) == paused {
             return true;
         }
         let Some(revision) = self.read_revision.checked_add(1) else {
@@ -603,7 +610,11 @@ impl IngressServer {
         };
         self.read_revision = revision;
         if paused {
-            self.paused_stream_reads.insert(id);
+            if self.paused_stream_reads.try_insert(id, ()).is_err() {
+                self.invalidate_deferred(id);
+                self.close_deferred_transport(id);
+                return false;
+            }
         } else {
             self.paused_stream_reads.remove(&id);
         }
@@ -647,7 +658,7 @@ impl IngressServer {
             !seen.contains(&slot.nonce)
                 && (slot.header.is_some()
                     || slot.started.elapsed() >= std::time::Duration::from_secs(60)
-                    || !matches!(self.sessions.get(id),Some(SessionState::Established(s)) if !s.attestation_failed() && s.channel_binder().as_deref()==Some(slot.binding.as_slice()))
+                    || !matches!(self.sessions.get(id),Some(SessionState::Established(s)) if !s.attestation_failed() && s.channel_binder_bytes()==Some(slot.binding))
                     || (!slot.parked
                         && slot.receiver.is_some()
                         && (!slot.fragment.is_empty()
@@ -677,7 +688,7 @@ impl IngressServer {
                     && s.require_current_configuration().is_ok()
                     && !s.attestation_failed()
                     && self.stream_generations.get(&id) == Some(&slot.generation)
-                    && s.channel_binder().as_deref() == Some(slot.binding.as_slice())
+                    && s.channel_binder_bytes() == Some(slot.binding)
                 {
                     charge = s
                         .context_allocation_bound()
@@ -748,7 +759,7 @@ impl IngressServer {
                 Some(SessionState::Established(s)) => {
                     s.require_current_configuration().is_ok()
                         && !s.attestation_failed()
-                        && s.channel_binder().as_deref() == Some(work.binding.as_slice())
+                        && s.channel_binder_bytes() == Some(work.binding)
                 }
                 _ => false,
             };
@@ -835,7 +846,7 @@ impl IngressServer {
             Some(SessionState::Established(session)) if !expired => {
                 if session.require_current_configuration().is_err()
                     || session.attestation_failed()
-                    || session.channel_binder().as_deref() != Some(binding.as_slice())
+                    || session.channel_binder_bytes() != Some(binding)
                 {
                     None
                 } else {
@@ -905,7 +916,7 @@ impl IngressServer {
                 Some(SessionState::Established(session)) => {
                     session.require_current_configuration().is_ok()
                         && !session.attestation_failed()
-                        && session.channel_binder().as_deref() == Some(work.binding.as_slice())
+                        && session.channel_binder_bytes() == Some(work.binding)
                 }
                 _ => false,
             };
@@ -931,10 +942,7 @@ impl IngressServer {
             slot.close,
             false,
         ) {
-            Ok(()) => {
-                self.pending_dispatch.insert(id);
-                true
-            }
+            Ok(()) => self.mark_dispatch(id),
             Err((_, body)) => {
                 *response = Some(crate::HonestIngressResponse {
                     status: ready.status,
@@ -952,6 +960,17 @@ impl IngressServer {
             self.write_windows.borrow_mut().remove(&id);
             self.ingress_classes.remove(&id);
         }
+        false
+    }
+
+    /// A response may require one future parse turn. Admission failure must
+    /// close that connection, not silently discard its only readiness marker.
+    fn mark_dispatch(&mut self, connection: u32) -> bool {
+        if self.pending_dispatch.try_insert(connection, ()).is_ok() {
+            return true;
+        }
+        self.invalidate_deferred(connection);
+        self.close_deferred_transport(connection);
         false
     }
 
@@ -976,7 +995,9 @@ impl IngressServer {
             self.send_close(conn_id);
             return false;
         }
-        self.pending_dispatch.insert(conn_id);
+        if !self.mark_dispatch(conn_id) {
+            return false;
+        }
         let credit = self
             .write_windows
             .borrow()
@@ -1014,11 +1035,7 @@ impl IngressServer {
                             self.send_close(conn_id);
                             return false;
                         }
-                        let Some(binding) = session
-                            .channel_binder()
-                            .as_deref()
-                            .and_then(|b| <[u8; 32]>::try_from(b).ok())
-                        else {
+                        let Some(binding) = session.channel_binder_bytes() else {
                             self.send_close(conn_id);
                             return false;
                         };

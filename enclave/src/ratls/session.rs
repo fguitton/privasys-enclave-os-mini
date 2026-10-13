@@ -25,7 +25,7 @@ pub(crate) fn current_data_session(session: Option<&mut RaTlsSession>) -> bool {
     session.is_some_and(|session| {
         session.require_current_configuration().is_ok()
             && !session.attestation_failed()
-            && session.channel_binder().is_some()
+            && session.channel_binder_bytes().is_some()
     })
 }
 
@@ -119,6 +119,7 @@ pub struct RaTlsSession {
     /// Client context issued in the last attest response that required
     /// client evidence (mutual leg), consumed by the present message.
     client_context: Option<[u8; 32]>,
+    channel_binder_cache: std::sync::OnceLock<[u8; RaTlsSession::CHANNEL_BINDER_BYTES]>,
     /// The peer's evidence accepted at present time (binding verified).
     peer_evidence: Option<enclave_os_common::modules::PeerEvidence>,
     local_evidence: Option<enclave_os_common::modules::PeerEvidence>,
@@ -245,6 +246,7 @@ impl RaTlsSession {
             attested_endpoint,
             attestation: "none",
             client_context: None,
+            channel_binder_cache: std::sync::OnceLock::new(),
             peer_evidence: None,
             local_evidence: None,
             attestation_failed: false,
@@ -1133,19 +1135,27 @@ impl RaTlsSession {
         })
     }
 
+    /// Owned context child; actual callers reserve the copied-context quote.
     pub fn channel_binder(&self) -> Option<Vec<u8>> {
-        // This Option-only caller never needs the public String error adapter.
-        // Keep the same currentness/exporter binding without allocating a
-        // discarded error string outside the copied-context child quote.
+        self.channel_binder_bytes().map(|value| value.to_vec())
+    }
+
+    /// Fixed exporter output for comparisons. Only a successful connection
+    /// exporter is cached; every use rechecks the original configuration lease.
+    pub(crate) fn channel_binder_bytes(&self) -> Option<[u8; Self::CHANNEL_BINDER_BYTES]> {
         self.configuration.is_current().then_some(())?;
-        self.tls_conn
+        if let Some(value) = self.channel_binder_cache.get() {
+            return Some(*value);
+        }
+        let value = self
+            .tls_conn
             .export_keying_material(
                 [0u8; Self::CHANNEL_BINDER_BYTES],
                 b"EXPORTER-honest-peer-channel-v2",
                 Some(&[]),
             )
-            .ok()
-            .map(|value| value.to_vec())
+            .ok()?;
+        Some(*self.channel_binder_cache.get_or_init(|| value))
     }
 
     /// Remember the client context issued with an attest response that
