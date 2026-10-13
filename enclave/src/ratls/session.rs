@@ -228,7 +228,7 @@ const TLS_RESPONSE_STEP_HEADROOM_BYTES: usize = 4 * 1024;
 const TLS_RESPONSE_PLAINTEXT_STEP_BYTES: usize =
     match TLS_RESPONSE_STEP_BYTES.checked_sub(TLS_RESPONSE_STEP_HEADROOM_BYTES) {
         Some(bytes) if bytes > 0 => bytes,
-        _ => panic!("invalid TLS response plaintext policy"),
+        _ => core::panic!("invalid TLS response plaintext policy"),
     };
 const MAX_RESPONSE_HEADER_BYTES: usize = 32 * 1024;
 struct PendingResponse {
