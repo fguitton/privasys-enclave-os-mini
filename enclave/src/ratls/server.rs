@@ -109,12 +109,12 @@ pub struct IngressServer {
     /// Shutdown flag.
     shutdown: bool,
     /// Per-hostname cached TLS configs (leaf certificate + key).
-    cached_configs: super::session::ordered_map::OrderedMap<String, CachedConfig>,
+    cached_configs: super::session::ordered_map::OrderedMap<super::session::retained_name::PaidName, CachedConfig>,
     /// Bounded ciphertext backlog when the host-side SPSC queue has no credit.
     pending_output: RefCell<ChannelQueue>,
     output_failed: Cell<bool>,
     /// Per-hostname leaf keys, kept 24 h across re-mints (RA-TLS v2).
-    leaf_keys: super::session::ordered_map::OrderedMap<String, LeafKey>,
+    leaf_keys: super::session::ordered_map::OrderedMap<super::session::retained_name::PaidName, LeafKey>,
     /// Every answerable leaf key by SHA-256(SPKI): current keys and keys
     /// rotated less than 15 minutes ago (the `leaf` of an attest request).
     leaf_by_spki: super::session::ordered_map::OrderedMap<[u8; 32], LeafKey>,
@@ -1370,6 +1370,9 @@ impl IngressServer {
         // Metadata refusal must not create a new TLS/crypto payload. Empty
         // errors allocate nothing on physical-admission refusal.
         self.cached_configs.reserve_entry(cache_key).map_err(|()| String::new())?;
+        let pool = crate::local_allocation_pool().ok_or_else(String::new)?;
+        let retained_name = super::session::retained_name::PaidName::new(&pool, cache_key)
+            .ok_or_else(String::new)?;
         let require_peer_client_auth =
             sni.as_deref() == Some(enclave_os_common::modules::HONEST_PEER_SNI);
         let tls_result = build_tls_config(
@@ -1381,7 +1384,7 @@ impl IngressServer {
             configuration,
         )?;
         self.cached_configs.insert_prepared(
-            cache_key.to_owned(),
+            retained_name,
             CachedConfig {
                 config: tls_result.config.clone(),
                 local_cert_der: tls_result.local_cert_der.clone(),
@@ -2903,8 +2906,11 @@ impl IngressServer {
         }
         self.leaf_keys.reserve_entry(sni).map_err(|()| String::new())?;
         self.leaf_by_spki.reserve_new_entry().map_err(|()| String::new())?;
+        let pool = crate::local_allocation_pool().ok_or_else(String::new)?;
+        let retained_name = super::session::retained_name::PaidName::new(&pool, sni)
+            .ok_or_else(String::new)?;
         let k = attestation::new_leaf_key(now)?;
-        self.leaf_keys.insert_prepared(sni.to_string(), k.clone());
+        self.leaf_keys.insert_prepared(retained_name, k.clone());
         self.leaf_by_spki.insert_prepared(k.spki_hash, k.clone());
         Ok(k)
     }

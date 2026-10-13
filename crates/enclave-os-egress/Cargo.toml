@@ -13,6 +13,8 @@ description = "HTTPS egress module for enclave-os — outbound TLS from inside S
 name = "enclave_os_egress"
 
 [features]
+# Match the shared Session owner's optional fallible paid-container path.
+fallible-allocation-v1 = ["enclave-os-common/fallible-allocation-v1"]
 # Untrusted elapsed observations only; disabled in product builds.
 diagnostic-transfer-profile = []
 # Mock mode — accepts MOCK_QUOTE: prefixed quotes without verification.
