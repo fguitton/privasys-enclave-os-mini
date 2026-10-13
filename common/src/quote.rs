@@ -440,26 +440,6 @@ pub fn compute_report_data_hash(pubkey_bytes: &[u8], binding: &[u8]) -> ring::di
     context.finish()
 }
 
-#[cfg(test)]
-mod simulation_tests {
-    use super::{parse_sgx_sim_report, SGX_SIM_REPORT_PREFIX};
-
-    #[test]
-    fn typed_simulation_report_is_exact_and_mutation_sensitive() {
-        let mut evidence = SGX_SIM_REPORT_PREFIX.to_vec();
-        evidence.extend_from_slice(&[7; 32]);
-        evidence.extend_from_slice(&[9; 64]);
-        assert_eq!(parse_sgx_sim_report(&evidence).unwrap(), ([7; 32], [9; 64]));
-        evidence.push(0);
-        assert!(parse_sgx_sim_report(&evidence).is_err());
-
-        let mut zero = SGX_SIM_REPORT_PREFIX.to_vec();
-        zero.extend_from_slice(&[0; 32]);
-        zero.extend_from_slice(&[9; 64]);
-        assert!(parse_sgx_sim_report(&zero).is_err());
-    }
-}
-
 // ---------------------------------------------------------------------------
 //  Bidirectional challenge-response verification (requires `ring`)
 // ---------------------------------------------------------------------------
@@ -506,4 +486,24 @@ pub fn verify_challenge_binding(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod simulation_tests {
+    use super::{parse_sgx_sim_report, SGX_SIM_REPORT_PREFIX};
+
+    #[test]
+    fn typed_simulation_report_is_exact_and_mutation_sensitive() {
+        let mut evidence = SGX_SIM_REPORT_PREFIX.to_vec();
+        evidence.extend_from_slice(&[7; 32]);
+        evidence.extend_from_slice(&[9; 64]);
+        assert_eq!(parse_sgx_sim_report(&evidence).unwrap(), ([7; 32], [9; 64]));
+        evidence.push(0);
+        assert!(parse_sgx_sim_report(&evidence).is_err());
+
+        let mut zero = SGX_SIM_REPORT_PREFIX.to_vec();
+        zero.extend_from_slice(&[0; 32]);
+        zero.extend_from_slice(&[9; 64]);
+        assert!(parse_sgx_sim_report(&zero).is_err());
+    }
 }

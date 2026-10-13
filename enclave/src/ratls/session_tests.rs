@@ -27,8 +27,14 @@ fn pair(store: &CertStore, name: &str) -> (ClientConnection, RaTlsSession) {
 }
 
 fn pair_with_certificate(
-    store: &CertStore, name: &str, paid: bool,
-) -> (ClientConnection, RaTlsSession, Option<Arc<enclave_os_common::allocation::AllocationPoolV1>>) {
+    store: &CertStore,
+    name: &str,
+    paid: bool,
+) -> (
+    ClientConnection,
+    RaTlsSession,
+    Option<Arc<enclave_os_common::allocation::AllocationPoolV1>>,
+) {
     let key = rcgen::KeyPair::generate().unwrap();
     let cert = rcgen::CertificateParams::new(vec![name.into()])
         .unwrap()
@@ -57,8 +63,8 @@ fn pair_with_certificate(
     let server = ServerConnection::new(Arc::new(server)).unwrap();
     let endpoint = app.and_then(|app| app.attested_endpoint);
     let (session, pool) = if paid {
-        use enclave_os_common::allocation::{AllocationPoolV1, SharedAllocationV1};
         use super::retained_certificate::RetainedCertificate;
+        use enclave_os_common::allocation::{AllocationPoolV1, SharedAllocationV1};
         let required = SharedAllocationV1::<Vec<u8>>::required_bytes(cert.len()).unwrap();
         let short = AllocationPoolV1::new(required - 1).unwrap();
         assert!(RetainedCertificate::copy_from(&short, &cert).is_none());
@@ -67,9 +73,15 @@ fn pair_with_certificate(
         let retained = RetainedCertificate::copy_from(&pool, &cert).unwrap();
         assert_eq!(retained.bytes(), cert);
         assert_eq!(pool.used(), required);
-        (RaTlsSession::new_paid(server, retained, Some(name.into()), endpoint, lease), Some(pool))
+        (
+            RaTlsSession::new_paid(server, retained, Some(name.into()), endpoint, lease),
+            Some(pool),
+        )
     } else {
-        (RaTlsSession::new(server, cert, Some(name.into()), endpoint, lease), None)
+        (
+            RaTlsSession::new(server, cert, Some(name.into()), endpoint, lease),
+            None,
+        )
     };
     (
         ClientConnection::new(
@@ -148,18 +160,27 @@ fn replacement_rejects_buffered_requests_and_re_attestation() {
     checked_connection_metadata_tables();
     checked_fixed_channel_binder();
     checked_retained_certificate();
+    checked_retained_evidence();
+    checked_paid_quote_time();
     let store = CertStore::new();
     register(&store, "a.test");
     let (mut client, mut session) = pair(&store, "a.test");
     handshake(&mut client, &mut session);
-    assert_eq!(session.local_cert_der_ref(), session.local_cert_der().unwrap());
+    assert_eq!(
+        session.local_cert_der_ref(),
+        session.local_cert_der().unwrap()
+    );
     {
         use x509_parser::prelude::*;
         let (_, served) = X509Certificate::from_der(session.local_cert_der_ref()).unwrap();
         let point = served.public_key().subject_public_key.as_ref();
         let encoded = enclave_os_common::quote::build_p256_spki_der(point);
-        assert_eq!(enclave_os_common::quote::p256_spki_sha256(point).unwrap().as_ref(),
-            ring::digest::digest(&ring::digest::SHA256, &encoded).as_ref());
+        assert_eq!(
+            enclave_os_common::quote::p256_spki_sha256(point)
+                .unwrap()
+                .as_ref(),
+            ring::digest::digest(&ring::digest::SHA256, &encoded).as_ref()
+        );
     }
     write_requests(
         &mut client,
@@ -1559,7 +1580,9 @@ fn checked_retained_certificate() {
     register(&store, "paid.test");
     let (mut client, mut session, pool) = pair_with_certificate(&store, "paid.test", true);
     let pool = pool.unwrap();
-    let super::LocalCertificate::Paid(retained) = &session.local_cert_der else { panic!("paid constructor lost owner") };
+    let super::LocalCertificate::Paid(retained) = &session.local_cert_der else {
+        panic!("paid constructor lost owner")
+    };
     let alias = retained.clone();
     let charged = pool.used();
     assert!(charged > alias.bytes().len());
@@ -1576,4 +1599,89 @@ fn checked_retained_certificate() {
     assert!(!alias.bytes().is_empty());
     drop(alias);
     assert_eq!(pool.used(), 0);
+}
+
+fn checked_retained_evidence() {
+    use super::retained_evidence::{EvidenceRef, RetainedEvidence};
+    use enclave_os_common::allocation::{AllocationPoolV1, SharedAllocationV1};
+    let value = EvidenceRef {
+        tee: "sgx",
+        quote: b"original-evidence",
+        gpu_evidence: Some(b"gpu"),
+        quote_time: "2026-09-08T10:00Z",
+        context: Some([1; 32]),
+        hctx: Some([2; 32]),
+    };
+    let required =
+        SharedAllocationV1::<PeerEvidence>::required_bytes(value.children_bytes().unwrap())
+            .unwrap();
+    let short = AllocationPoolV1::new(required - 1).unwrap();
+    assert!(RetainedEvidence::copy_from(&short, &value).is_none());
+    assert_eq!(short.used(), 0);
+    for maximum in [required, required + 1] {
+        let pool = AllocationPoolV1::new(maximum).unwrap();
+        let held = RetainedEvidence::copy_from(&pool, &value).unwrap();
+        assert_eq!(pool.used(), required);
+        assert_eq!(held.evidence().quote, value.quote);
+        assert_eq!(held.evidence().quote_time, value.quote_time);
+        assert_eq!(held.evidence().tee, value.tee);
+        assert_eq!(held.evidence().gpu_evidence.as_deref(), value.gpu_evidence);
+        assert_eq!(held.evidence().context, value.context);
+        assert_eq!(held.evidence().hctx, value.hctx);
+        let store = CertStore::new();
+        register(&store, "a.test");
+        let (mut client, mut session) = pair(&store, "a.test");
+        handshake(&mut client, &mut session);
+        session.set_local_evidence_paid(held.clone());
+        session.set_peer_evidence_paid(held.clone());
+        assert_eq!(pool.used(), required);
+        assert_eq!(session.local_evidence().unwrap().quote, value.quote);
+        assert_eq!(session.peer_evidence().unwrap().quote, value.quote);
+        register(&store, "a.test");
+        assert!(session.local_evidence().is_none());
+        assert!(session.peer_evidence().is_none());
+        session.begin_attestation();
+        drop(session);
+        assert_eq!(pool.used(), required);
+        drop(held);
+        assert_eq!(pool.used(), 0);
+    }
+    let empty = EvidenceRef {
+        tee: "",
+        quote: &[],
+        gpu_evidence: Some(&[]),
+        quote_time: "",
+        context: None,
+        hctx: None,
+    };
+    let required = SharedAllocationV1::<PeerEvidence>::required_bytes(0).unwrap();
+    let pool = AllocationPoolV1::new(required).unwrap();
+    let held = RetainedEvidence::copy_from(&pool, &empty).unwrap();
+    assert_eq!(pool.used(), required);
+    assert_eq!(held.evidence().gpu_evidence.as_deref(), Some(&[][..]));
+    drop(held);
+    assert_eq!(pool.used(), 0);
+}
+
+fn checked_paid_quote_time() {
+    use enclave_os_common::allocation::{AllocationPoolV1, SharedAllocationV1};
+    for unix in [0, -1, -60, 59, 60, 1_788_523_200, 253_402_300_800] {
+        let expected = enclave_os_common::attest::format_quote_time(unix);
+        let required = SharedAllocationV1::<String>::required_bytes(expected.len()).unwrap();
+        let short = AllocationPoolV1::new(required - 1).unwrap();
+        assert!(super::quote_time::QuoteTime::new(&short, unix).is_none());
+        assert_eq!(short.used(), 0);
+        for maximum in [required, required + 1] {
+            let pool = AllocationPoolV1::new(maximum).unwrap();
+            let value = super::quote_time::QuoteTime::new(&pool, unix).unwrap();
+            assert_eq!(value.text(), expected);
+            assert_eq!(pool.used(), required);
+            let alias = value.clone();
+            drop(value);
+            assert_eq!(alias.text(), expected);
+            assert_eq!(pool.used(), required);
+            drop(alias);
+            assert_eq!(pool.used(), 0);
+        }
+    }
 }

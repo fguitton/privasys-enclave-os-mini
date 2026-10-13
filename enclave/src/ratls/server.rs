@@ -143,7 +143,7 @@ struct CachedConfig {
 /// the minute it was minted.
 struct DetQuote {
     quote: super::session::retained_quote::RetainedQuote,
-    quote_time: String,
+    quote_time: super::session::quote_time::QuoteTime,
     minted: u64,
 }
 
@@ -2935,7 +2935,13 @@ impl IngressServer {
         &mut self,
         key: &LeafKey,
         now: u64,
-    ) -> Result<(super::session::retained_quote::RetainedQuote, String), String> {
+    ) -> Result<
+        (
+            super::session::retained_quote::RetainedQuote,
+            super::session::quote_time::QuoteTime,
+        ),
+        String,
+    > {
         if let Some(d) = self.det_quotes.get(&key.spki_hash) {
             if now < d.minted + attestation::DETERMINISTIC_VALIDITY_SECS {
                 return Ok((d.quote.clone(), d.quote_time.clone()));
@@ -2944,9 +2950,14 @@ impl IngressServer {
         self.det_quotes
             .reserve_entry(&key.spki_hash)
             .map_err(|()| String::new())?;
-        let quote_time = enclave_os_common::attest::format_quote_time(now as i64);
-        let rd =
-            enclave_os_common::attest::deterministic_report_data(&key.spki_der, &quote_time, None);
+        let pool = crate::local_allocation_pool().ok_or_else(String::new)?;
+        let quote_time = super::session::quote_time::QuoteTime::new(&pool, now as i64)
+            .ok_or_else(String::new)?;
+        let rd = enclave_os_common::attest::deterministic_report_data(
+            &key.spki_der,
+            quote_time.text(),
+            None,
+        );
         let quote = attestation::sgx_quote_paid(&rd)?;
         self.det_quotes.insert_prepared(
             key.spki_hash,
@@ -3065,34 +3076,53 @@ impl IngressServer {
                     context = Some(ctx.as_slice().try_into().expect("context length checked"));
                     exporter = Some(hctx);
                     let rd = at::challenge_report_data(&key.spki_der, &ctx, &hctx, None);
+                    let Some(pool) = crate::local_allocation_pool() else {
+                        return HttpHandleResult::err(503, "quote timestamp unavailable");
+                    };
+                    let Some(quote_time) =
+                        super::session::quote_time::QuoteTime::new(&pool, now as i64)
+                    else {
+                        return HttpHandleResult::err(503, "quote timestamp unavailable");
+                    };
                     match attestation::sgx_quote_paid(&rd) {
-                        Ok(q) => (q, at::format_quote_time(now as i64)),
+                        Ok(q) => (q, quote_time),
                         Err(e) => {
                             enclave_log_error!("challenge quote failed: {}", e);
                             return HttpHandleResult::err(503, "quote provider unavailable");
                         }
                     }
                 };
+                let Some(pool) = crate::local_allocation_pool() else {
+                    return HttpHandleResult::err(503, "evidence storage unavailable");
+                };
+                let Some(evidence) = super::session::retained_evidence::RetainedEvidence::copy_from(
+                    &pool,
+                    &super::session::retained_evidence::EvidenceRef {
+                        tee: "sgx",
+                        quote: quote.bytes(),
+                        quote_time: quote_time.text(),
+                        gpu_evidence: None,
+                        context,
+                        hctx: exporter,
+                    },
+                ) else {
+                    return HttpHandleResult::err(503, "evidence storage unavailable");
+                };
                 session.set_attestation(if req.mode == "deterministic" {
                     "deterministic"
                 } else {
                     "challenge"
                 });
-                session.set_local_evidence(enclave_os_common::modules::PeerEvidence {
-                    tee: "sgx".into(),
-                    quote: quote.bytes().to_vec(),
-                    quote_time: quote_time.clone(),
-                    gpu_evidence: None,
-                    context,
-                    hctx: exporter,
-                });
+                session.set_local_evidence_paid(evidence);
                 let mut resp = AttestResponse {
                     v: PROTOCOL_VERSION,
                     mode: req.mode.clone(),
                     tee: "sgx".to_string(),
                     quote: at::b64_encode(quote.bytes()),
                     gpu_evidence: None,
-                    quote_time,
+                    // Response JSON working ownership is separate from the
+                    // retained cache timestamp and remains at its caller.
+                    quote_time: quote_time.text().to_owned(),
                     client_evidence: "none".to_string(),
                     client_context: None,
                     error: None,
@@ -3215,14 +3245,23 @@ impl IngressServer {
                 if actual[..] != expected[..] {
                     return HttpHandleResult::err(403, "client evidence does not commit to the presented certificate and this connection");
                 }
-                session.set_peer_evidence(enclave_os_common::modules::PeerEvidence {
-                    tee,
-                    quote,
-                    gpu_evidence,
-                    quote_time,
-                    context: Some(cc),
-                    hctx: Some(hctx),
-                });
+                let Some(pool) = crate::local_allocation_pool() else {
+                    return HttpHandleResult::err(503, "evidence storage unavailable");
+                };
+                let Some(evidence) = super::session::retained_evidence::RetainedEvidence::copy_from(
+                    &pool,
+                    &super::session::retained_evidence::EvidenceRef {
+                        tee: &tee,
+                        quote: &quote,
+                        gpu_evidence: gpu_evidence.as_deref(),
+                        quote_time: &quote_time,
+                        context: Some(cc),
+                        hctx: Some(hctx),
+                    },
+                ) else {
+                    return HttpHandleResult::err(503, "evidence storage unavailable");
+                };
+                session.set_peer_evidence_paid(evidence);
                 HttpHandleResult {
                     status: 204,
                     body: Vec::new().into(),

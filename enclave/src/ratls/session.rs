@@ -62,17 +62,40 @@ mod http_request;
 #[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
 #[path = "leaf_key.rs"]
 pub(crate) mod leaf_key;
+#[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
+#[path = "retained_evidence.rs"]
+pub(crate) mod retained_evidence;
+
+// Public legacy setters keep their original value API; target producers use
+// the opaque paid variant and never fall back when admission is refused.
+enum SessionEvidence {
+    Legacy(enclave_os_common::modules::PeerEvidence),
+    #[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
+    Paid(retained_evidence::RetainedEvidence),
+}
+impl SessionEvidence {
+    fn evidence(&self) -> &enclave_os_common::modules::PeerEvidence {
+        match self {
+            Self::Legacy(value) => value,
+            #[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
+            Self::Paid(value) => value.evidence(),
+        }
+    }
+}
 #[path = "ordered_map.rs"]
 pub(crate) mod ordered_map;
 #[path = "pending_client.rs"]
 pub(crate) mod pending_client;
+#[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
+#[path = "quote_time.rs"]
+pub(crate) mod quote_time;
 #[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
 #[path = "retained_certificate.rs"]
 pub(crate) mod retained_certificate;
 #[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
 #[path = "retained_name.rs"]
 pub(crate) mod retained_name;
-#[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
+#[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
 #[path = "retained_quote.rs"]
 pub(crate) mod retained_quote;
 pub use http_request::PaidHttpRequest;
@@ -135,8 +158,8 @@ pub struct RaTlsSession {
     client_context: Option<[u8; 32]>,
     channel_binder_cache: std::sync::OnceLock<[u8; RaTlsSession::CHANNEL_BINDER_BYTES]>,
     /// The peer's evidence accepted at present time (binding verified).
-    peer_evidence: Option<enclave_os_common::modules::PeerEvidence>,
-    local_evidence: Option<enclave_os_common::modules::PeerEvidence>,
+    peer_evidence: Option<SessionEvidence>,
+    local_evidence: Option<SessionEvidence>,
     attestation_failed: bool,
     configuration: ConfigurationLease,
     /// FIDO2 identity, set after a successful FIDO2 ceremony on this
@@ -1115,11 +1138,21 @@ impl RaTlsSession {
 
     pub fn local_evidence(&self) -> Option<&enclave_os_common::modules::PeerEvidence> {
         self.configuration.is_current().then_some(())?;
-        self.local_evidence.as_ref()
+        self.local_evidence.as_ref().map(SessionEvidence::evidence)
     }
 
     pub fn set_local_evidence(&mut self, evidence: enclave_os_common::modules::PeerEvidence) {
-        self.local_evidence = Some(evidence);
+        self.local_evidence = Some(SessionEvidence::Legacy(evidence));
+    }
+
+    #[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
+    pub(crate) fn set_local_evidence_paid(&mut self, value: retained_evidence::RetainedEvidence) {
+        self.local_evidence = Some(SessionEvidence::Paid(value));
+    }
+
+    #[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
+    pub(crate) fn set_peer_evidence_paid(&mut self, value: retained_evidence::RetainedEvidence) {
+        self.peer_evidence = Some(SessionEvidence::Paid(value));
     }
 
     /// Requested child allocation lengths of the actual fresh_context copies.
@@ -1148,7 +1181,7 @@ impl RaTlsSession {
             .into_iter()
             .flatten()
         {
-            bytes = bytes.checked_add(evidence(value)?)?;
+            bytes = bytes.checked_add(evidence(value.evidence())?)?;
         }
         Some(bytes)
     }
@@ -1242,13 +1275,13 @@ impl RaTlsSession {
     /// The peer's evidence accepted at present time, if any.
     pub fn peer_evidence(&self) -> Option<&enclave_os_common::modules::PeerEvidence> {
         self.configuration.is_current().then_some(())?;
-        self.peer_evidence.as_ref()
+        self.peer_evidence.as_ref().map(SessionEvidence::evidence)
     }
 
     /// Retain evidence whose key/exporter binding was checked. Its quote
     /// signature and admission policy still require application appraisal.
     pub fn set_peer_evidence(&mut self, ev: enclave_os_common::modules::PeerEvidence) {
-        self.peer_evidence = Some(ev);
+        self.peer_evidence = Some(SessionEvidence::Legacy(ev));
     }
 
     /// Existing exporter protocol width, shared by its allocation consumers.

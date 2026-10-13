@@ -237,9 +237,22 @@ pub fn client_report_data(
 
 /// Formats seconds since the epoch as `YYYY-MM-DDTHH:MMZ` (minute precision).
 pub fn format_quote_time(unix: i64) -> String {
-    let minute = unix - unix.rem_euclid(60);
-    let days = minute.div_euclid(86400);
-    let secs = minute.rem_euclid(86400);
+    let mut output = String::new();
+    // String's formatting writer cannot refuse. This preserves the legacy
+    // allocating API; paid callers use the measured writer below.
+    let _ = write_quote_time(unix, &mut output);
+    output
+}
+
+/// Write the original minute-precision representation without allocating.
+///
+/// # Errors
+/// Returns the destination writer's formatting refusal.
+pub fn write_quote_time(unix: i64, output: &mut impl core::fmt::Write) -> core::fmt::Result {
+    // The formatter omits seconds directly. Avoid subtracting a minute's
+    // remainder from i64::MIN before computing the identical civil date.
+    let days = unix.div_euclid(86400);
+    let secs = unix.rem_euclid(86400);
     // Civil from days (Howard Hinnant).
     let z = days + 719468;
     let era = z.div_euclid(146097);
@@ -251,7 +264,8 @@ pub fn format_quote_time(unix: i64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    format!(
+    write!(
+        output,
         "{:04}-{:02}-{:02}T{:02}:{:02}Z",
         y,
         m,
@@ -259,6 +273,21 @@ pub fn format_quote_time(unix: i64) -> String {
         secs / 3600,
         (secs % 3600) / 60
     )
+}
+
+/// Measure using the exact original timestamp writer; no temporary String.
+#[must_use]
+pub fn quote_time_encoded_len(unix: i64) -> Option<usize> {
+    struct Count(usize);
+    impl core::fmt::Write for Count {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            self.0 = self.0.checked_add(text.len()).ok_or(core::fmt::Error)?;
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    write_quote_time(unix, &mut count).ok()?;
+    Some(count.0)
 }
 
 /// Parses `YYYY-MM-DDTHH:MMZ` to seconds since the epoch.
@@ -398,6 +427,31 @@ mod tests {
         assert_eq!(t, 1788523200);
         assert_eq!(format_quote_time(t + 37), "2026-09-04T12:00Z");
         assert_eq!(format_quote_time(0), "1970-01-01T00:00Z");
+        for value in [
+            i64::MIN,
+            -60,
+            -1,
+            0,
+            59,
+            60,
+            t,
+            t + 37,
+            253_402_300_800,
+            i64::MAX,
+        ] {
+            let original = format_quote_time(value);
+            assert_eq!(quote_time_encoded_len(value), Some(original.len()));
+            let mut actual = String::new();
+            write_quote_time(value, &mut actual).unwrap();
+            assert_eq!(actual, original);
+        }
+        struct Refuse;
+        impl core::fmt::Write for Refuse {
+            fn write_str(&mut self, _: &str) -> core::fmt::Result {
+                Err(core::fmt::Error)
+            }
+        }
+        assert!(write_quote_time(t, &mut Refuse).is_err());
         assert!(check_quote_time("2026-09-04T11:59Z", t).is_ok());
         assert!(check_quote_time("2026-09-03T11:50Z", t).is_err());
         assert!(check_quote_time("2026-09-04T12:06Z", t).is_err());
