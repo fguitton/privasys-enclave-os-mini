@@ -352,6 +352,26 @@ pub enum HttpParseError {
 /// Returns `Ok((request, consumed))` where `consumed` is the number of
 /// bytes consumed from the front of `buf`, or `Err(Incomplete)` if the
 /// buffer does not yet contain a complete request.
+/// Physical child-buffer ceiling for the original owned request parser.
+/// Borrowed header parsing allocates nothing. Retained strings fit the encoded
+/// header span; Host additionally holds lowercase and split strings together.
+/// Two complete header spans cover that temporary plus replaced header values.
+/// Body copying cannot exceed the actual available suffix (including pipeline).
+/// This grants no parse acceptance, request authority, or declared body credit.
+pub fn http_request_allocation_bound(buf: &[u8]) -> Result<usize, HttpParseError> {
+    let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
+    let mut req = httparse::Request::new(&mut headers);
+    let header = match req.parse(buf) {
+        Ok(httparse::Status::Complete(length)) => length,
+        Ok(httparse::Status::Partial) => return Err(HttpParseError::Incomplete),
+        Err(_) => return Err(HttpParseError::Malformed),
+    };
+    header
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(buf.len().checked_sub(header)?))
+        .ok_or(HttpParseError::BodyTooLarge)
+}
+
 pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseError> {
     let (mut request, header_len, body_len) = parse_http_metadata(buf, false, MAX_BODY_SIZE)?;
     let total = header_len + body_len;

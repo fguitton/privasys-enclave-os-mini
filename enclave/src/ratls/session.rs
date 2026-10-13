@@ -50,9 +50,35 @@ pub(crate) fn response_credit(
     )
 }
 
+#[path = "tls_output.rs"]
+mod tls_output;
+pub use tls_output::TlsOutput;
+#[path = "http_request.rs"]
+mod http_request;
+pub use http_request::PaidHttpRequest;
+
 #[cfg(test)]
 #[path = "session_tests.rs"]
 mod tests;
+
+type StreamChunk = (Vec<u8>, usize);
+pub(crate) type StreamAllocation = enclave_os_common::allocation::SharedAllocationV1<StreamOwner>;
+/// Data-only retained geometry; no stream or request authority.
+pub(crate) struct StreamOwner {
+    pool: std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
+    bytes: usize,
+}
+impl StreamOwner {
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+    pub(crate) fn reserve_slot(
+        &self,
+        bytes: usize,
+    ) -> Option<enclave_os_common::allocation::AllocationLeaseV1> {
+        self.pool.reserve_unpublished(bytes)
+    }
+}
 
 /// A TLS session backed by a rustls `ServerConnection`.
 ///
@@ -69,11 +95,12 @@ pub struct RaTlsSession {
     tls_conn: rustls::ServerConnection,
     /// Accumulation buffer for incomplete application-level frames.
     read_buf: Vec<u8>,
+    read_allocation: Option<enclave_os_common::allocation::AllocationLeaseV1>,
     read_offset: usize,
-    stream_chunks: Option<std::collections::VecDeque<(Vec<u8>, usize)>>,
+    stream_chunks: Option<std::collections::VecDeque<StreamChunk>>,
     // Retained after logical EOF because finish_stream_input can preserve the
     // inherited allocation for a following request. Slot/work aliases share it.
-    stream_allocation: Option<std::sync::Arc<enclave_os_common::allocation::AllocationLeaseV1>>,
+    stream_allocation: Option<StreamAllocation>,
     response: Option<PendingResponse>,
     /// Exact v2 leaf served on this connection (evidence is exchanged separately).
     local_cert_der: Vec<u8>,
@@ -136,6 +163,8 @@ struct ResponseCost {
     steps: u64,
     tls_bytes: usize,
 }
+pub(crate) const TLS_RESPONSE_STEP_BYTES: usize = 64 * 1024;
+const TLS_RESPONSE_FRAMING_MARGIN: usize = 4 * 1024;
 const MAX_RESPONSE_HEADER_BYTES: usize = 32 * 1024;
 struct PendingResponse {
     #[cfg(feature = "diagnostic-transfer-profile")]
@@ -181,6 +210,7 @@ impl RaTlsSession {
         Self {
             tls_conn,
             read_buf: Vec::new(),
+            read_allocation: None,
             read_offset: 0,
             stream_chunks: None,
             stream_allocation: None,
@@ -263,14 +293,14 @@ impl RaTlsSession {
     ///
     /// The caller must send the returned bytes to the peer via the data
     /// channel.  Returns an empty Vec if there is nothing to send.
-    pub fn collect_tls_output(&mut self) -> Result<Vec<u8>, &'static str> {
-        let mut output = Vec::new();
-        let mut buf = vec![0u8; 16384];
+    pub fn collect_tls_output(&mut self) -> Result<TlsOutput, &'static str> {
+        let mut output = TlsOutput::default();
+        let mut buf = [0u8; Self::PLAINTEXT_READ_CHUNK_BYTES];
         loop {
             let mut cursor = std::io::Cursor::new(&mut buf[..]);
             match self.tls_conn.write_tls(&mut cursor) {
                 Ok(0) => break,
-                Ok(n) => output.extend_from_slice(&buf[..n]),
+                Ok(n) => output.append(&buf[..n])?,
                 Err(_) => return Err("TLS write_tls failed"),
             }
         }
@@ -288,20 +318,21 @@ impl RaTlsSession {
     /// - `Ok(Some(request))` — a complete HTTP request is available
     /// - `Ok(None)` — more data needed (partial request)
     /// - `Err` — fatal TLS or parse error
-    pub fn recv_http_request(&mut self) -> Result<Option<protocol::HttpRequest>, &'static str> {
+    pub fn recv_http_request(&mut self) -> Result<Option<PaidHttpRequest>, &'static str> {
         self.require_current_configuration()?;
         // Drain any available decrypted plaintext into read_buf
         self.drain_plaintext()?;
 
-        match protocol::parse_http_request(&self.read_buf[self.read_offset..]) {
-            Ok((request, consumed)) => {
+        #[cfg(target_env = "sgx")]
+        let pool = Some(crate::local_allocation_pool().ok_or("SDK heap unavailable")?);
+        #[cfg(not(target_env = "sgx"))]
+        let pool = None;
+        match PaidHttpRequest::parse(&self.read_buf[self.read_offset..], pool.as_ref())? {
+            Some((request, consumed)) => {
                 self.read_offset += consumed;
                 Ok(Some(request))
             }
-            Err(protocol::HttpParseError::Incomplete) => Ok(None),
-            Err(protocol::HttpParseError::TooManyHeaders) => Err("HTTP: too many headers"),
-            Err(protocol::HttpParseError::BodyTooLarge) => Err("HTTP body too large"),
-            Err(_) => Err("malformed HTTP request"),
+            None => Ok(None),
         }
     }
 
@@ -323,35 +354,47 @@ impl RaTlsSession {
     pub(crate) const STREAM_INPUT_CAPACITY: usize =
         (protocol::MAX_BODY_SIZE + crate::MAX_STREAM_INGRESS_FRAGMENT).next_power_of_two()
             + protocol::MAX_BODY_SIZE;
+    // At most one inherited short segment plus capacity / fragment full segments.
+    const STREAM_CHUNK_SLOTS: usize =
+        Self::STREAM_INPUT_CAPACITY / crate::MAX_STREAM_INGRESS_FRAGMENT + 1;
+    fn stream_child_bytes() -> Option<usize> {
+        let queue = core::alloc::Layout::array::<StreamChunk>(Self::STREAM_CHUNK_SLOTS)
+            .ok()?
+            .size();
+        Self::STREAM_INPUT_CAPACITY
+            .checked_add(crate::MAX_STREAM_INGRESS_FRAGMENT)?
+            .checked_add(queue)
+    }
     pub(crate) fn stream_allocation_bytes() -> Option<usize> {
-        Self::STREAM_INPUT_CAPACITY.checked_add(crate::MAX_STREAM_INGRESS_FRAGMENT)
+        StreamAllocation::required_bytes(Self::stream_child_bytes()?)
     }
     // Native actual TLS fixtures use an explicit bounded inert resource pool;
     // production SGX always supplies the SDK-rooted owner below.
     pub(crate) fn admit_stream_allocation(
         &mut self,
         pool: &std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
-    ) -> Result<std::sync::Arc<enclave_os_common::allocation::AllocationLeaseV1>, &'static str>
-    {
+    ) -> Result<StreamAllocation, &'static str> {
         let bytes = Self::stream_allocation_bytes().ok_or("stream allocation geometry overflow")?;
         if let Some(lease) = &self.stream_allocation {
-            if !lease.covers(pool, bytes) {
+            if !std::sync::Arc::ptr_eq(&lease.pool, pool) || lease.bytes != bytes {
                 return Err("foreign stream allocation pool");
             }
             return Ok(lease.clone());
         }
-        let lease = std::sync::Arc::new(
-            pool.reserve(bytes)
-                .ok_or("stream allocation admission exhausted")?,
-        );
+        let reservation = StreamAllocation::reserve(
+            pool,
+            Self::stream_child_bytes().ok_or("stream allocation geometry overflow")?,
+        )
+        .ok_or("stream allocation admission exhausted")?;
+        let lease = reservation.finish(StreamOwner {
+            pool: pool.clone(),
+            bytes,
+        });
         self.stream_allocation = Some(lease.clone());
         Ok(lease)
     }
     #[cfg(target_env = "sgx")]
-    pub(crate) fn reserve_stream_allocation(
-        &mut self,
-    ) -> Result<std::sync::Arc<enclave_os_common::allocation::AllocationLeaseV1>, &'static str>
-    {
+    pub(crate) fn reserve_stream_allocation(&mut self) -> Result<StreamAllocation, &'static str> {
         let pool = crate::local_allocation_pool().ok_or("SDK heap unavailable")?;
         self.admit_stream_allocation(&pool)
     }
@@ -368,9 +411,23 @@ impl RaTlsSession {
         {
             return Err("stream inherited input capacity exceeded bound");
         }
+        let mut chunks = self.stream_chunks.take().unwrap_or_default();
+        chunks.clear();
+        if chunks.capacity() == 0 {
+            chunks
+                .try_reserve_exact(Self::STREAM_CHUNK_SLOTS)
+                .map_err(|_| "stream queue allocation failed")?;
+        }
+        if chunks.capacity() != Self::STREAM_CHUNK_SLOTS {
+            return Err("stream queue capacity exceeded admission");
+        }
+        // The pre-admitted stream owner now covers this inherited backing.
+        // Transfer coverage only after that real reservation has succeeded.
         let bytes = std::mem::take(&mut self.read_buf);
+        if self.stream_allocation.is_some() {
+            drop(self.read_allocation.take());
+        }
         self.read_offset = 0;
-        let mut chunks = std::collections::VecDeque::new();
         if bytes.len() > offset {
             chunks.push_back((bytes, offset));
         }
@@ -460,30 +517,20 @@ impl RaTlsSession {
         status: u16,
         body: &[u8],
         close: bool,
-    ) -> Result<Vec<u8>, &'static str> {
-        let response = protocol::format_http_response(status, body, close);
-        let mut all_output = Vec::new();
-        self.write_plaintext_chunked(&response, &mut all_output)?;
-        let final_output = self.collect_tls_output()?;
-        all_output.extend_from_slice(&final_output);
-        Ok(all_output)
+    ) -> Result<TlsOutput, &'static str> {
+        self.send_http_response_with_headers(status, "application/json", &[], body, close)
     }
-
-    /// Like [`send_http_response`] but lets the caller pick the
-    /// `Content-Type` (e.g. `application/privasys-sealed+cbor`).
+    /// Same original response with an explicit content type.
     pub fn send_http_response_typed(
         &mut self,
         status: u16,
         content_type: &str,
         body: &[u8],
         close: bool,
-    ) -> Result<Vec<u8>, &'static str> {
+    ) -> Result<TlsOutput, &'static str> {
         self.send_http_response_with_headers(status, content_type, &[], body, close)
     }
-
-    /// Like [`Self::send_http_response_typed`] but with extra response
-    /// headers (e.g. the session-relay `X-Privasys-EncAuth-Reject`
-    /// diagnostic).
+    /// Header and body enter the original TLS writer without a whole-response copy.
     pub fn send_http_response_with_headers(
         &mut self,
         status: u16,
@@ -491,19 +538,31 @@ impl RaTlsSession {
         extra_headers: &[(String, String)],
         body: &[u8],
         close: bool,
-    ) -> Result<Vec<u8>, &'static str> {
-        let response = protocol::format_http_response_with_headers(
+    ) -> Result<TlsOutput, &'static str> {
+        self.require_current_configuration()?;
+        let length = protocol::response_head_encoded_len(
             status,
             content_type,
             extra_headers,
-            body,
+            body.len(),
             close,
-        );
-        let mut all_output = Vec::new();
-        self.write_plaintext_chunked(&response, &mut all_output)?;
-        let final_output = self.collect_tls_output()?;
-        all_output.extend_from_slice(&final_output);
-        Ok(all_output)
+        )
+        .ok_or("HTTP header length overflow")?;
+        let head = TlsOutput::encoded(length, || {
+            protocol::format_http_response_head_bounded(
+                status,
+                content_type,
+                extra_headers,
+                body.len(),
+                close,
+                length,
+            )
+        })?;
+        let mut output = TlsOutput::default();
+        self.write_plaintext_chunked(&head, &mut output)?;
+        self.write_plaintext_chunked(body, &mut output)?;
+        output.append(&self.collect_tls_output()?)?;
+        Ok(output)
     }
 
     pub fn has_pending_response(&self) -> bool {
@@ -620,14 +679,14 @@ impl RaTlsSession {
 
     /// Caller reserves 64 KiB of socket credit before each step. Configuration
     /// revocation is checked even while a previously admitted body is draining.
-    pub fn progress_http_response(&mut self) -> Result<(Vec<u8>, bool, bool), &'static str> {
+    pub fn progress_http_response(&mut self) -> Result<(TlsOutput, bool, bool), &'static str> {
         self.require_current_configuration()?;
         let mut response = self.response.take().ok_or("no pending response")?;
         #[cfg(feature = "diagnostic-transfer-profile")]
         let step_started = response.cost.as_ref().map(|_| std::time::Instant::now());
-        let mut output = Vec::new();
+        let mut output = TlsOutput::bounded(TLS_RESPONSE_STEP_BYTES);
         // Keep 4 KiB of the admitted 64 KiB socket step for TLS framing.
-        let mut remaining = 60 * 1024;
+        let mut remaining = TLS_RESPONSE_STEP_BYTES - TLS_RESPONSE_FRAMING_MARGIN;
         if !response.head.is_empty() {
             self.write_plaintext_chunked(&response.head, &mut output)?;
             remaining -= response.head.len();
@@ -646,8 +705,8 @@ impl RaTlsSession {
             self.write_plaintext_chunked(part, &mut output)?;
             response.offset += part.len();
         }
-        output.extend_from_slice(&self.collect_tls_output()?);
-        if output.len() > 64 * 1024 {
+        output.append(&self.collect_tls_output()?)?;
+        if output.len() > TLS_RESPONSE_STEP_BYTES {
             return Err("bounded TLS response exceeded credit");
         }
         #[cfg(feature = "diagnostic-transfer-profile")]
@@ -679,10 +738,84 @@ impl RaTlsSession {
         }
     }
 
+    const PLAINTEXT_READ_CHUNK_BYTES: usize = 16 * 1024;
+    const MAX_PENDING_HTTP_BYTES: usize =
+        protocol::MAX_BODY_SIZE + crate::MAX_STREAM_INGRESS_FRAGMENT;
+    fn append_plaintext_admitted(
+        &mut self,
+        input: &[u8],
+        pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
+    ) -> Result<(), &'static str> {
+        let required = self
+            .read_buf
+            .len()
+            .checked_add(input.len())
+            .ok_or("pending HTTP input overflow")?;
+        if required > Self::MAX_PENDING_HTTP_BYTES {
+            return Err("pending HTTP input exceeded bound");
+        }
+        if required > self.read_buf.capacity() {
+            let maximum = Self::MAX_PENDING_HTTP_BYTES
+                .checked_next_power_of_two()
+                .ok_or("HTTP capacity overflow")?;
+            let capacity = enclave_os_common::allocation::bounded_vec_capacity(required, maximum)
+                .ok_or("HTTP capacity overflow")?;
+            // The stream owner already prepaid this old/new parser overlap.
+            // Ordinary sessions reserve new backing while the old lease lives.
+            let covered = self.stream_allocation.is_some();
+            if covered
+                && self
+                    .read_buf
+                    .capacity()
+                    .checked_add(capacity)
+                    .is_none_or(|n| n > Self::STREAM_INPUT_CAPACITY)
+            {
+                return Err("stream parser replacement exceeds admission");
+            }
+            let allocation = if covered {
+                None
+            } else {
+                match pool {
+                    Some(pool) => Some(
+                        pool.reserve_unpublished(capacity)
+                            .ok_or("HTTP input admission exhausted")?,
+                    ),
+                    None => None,
+                }
+            };
+            self.read_buf
+                .try_reserve_exact(capacity - self.read_buf.len())
+                .map_err(|_| "HTTP input allocation failed")?;
+            if self.read_buf.capacity() != capacity {
+                // Refusal must not retain new backing after its temporary
+                // reservation refunds. The caller closes this failed stream.
+                drop(core::mem::take(&mut self.read_buf));
+                drop(self.read_allocation.take());
+                self.read_offset = 0;
+                return Err("HTTP input capacity exceeds admission");
+            }
+            if !covered {
+                // Successful realloc freed the old backing before this credit.
+                let old = core::mem::replace(&mut self.read_allocation, allocation);
+                drop(old);
+                if let Some(credit) = &self.read_allocation {
+                    credit.activate_release_notification();
+                }
+            }
+        }
+        self.read_buf.extend_from_slice(input);
+        Ok(())
+    }
+
     /// Drain all available decrypted plaintext from the TLS reader into
     /// the internal accumulation buffer.
     fn drain_plaintext(&mut self) -> Result<(), &'static str> {
-        let mut buf = vec![0u8; 16384];
+        // Fixed reader scratch uses the existing thread stack, not a hidden Vec.
+        let mut buf = [0u8; Self::PLAINTEXT_READ_CHUNK_BYTES];
+        #[cfg(target_env = "sgx")]
+        let pool = Some(crate::local_allocation_pool().ok_or("SDK heap unavailable")?);
+        #[cfg(not(target_env = "sgx"))]
+        let pool = None;
         loop {
             let mut reader = self.tls_conn.reader();
             use std::io::Read;
@@ -703,6 +836,9 @@ impl RaTlsSession {
                             {
                                 return Err("stream input capacity exceeded bound");
                             }
+                            if chunks.len() == Self::STREAM_CHUNK_SLOTS {
+                                return Err("stream queue full");
+                            }
                             chunks.push_back((
                                 Vec::with_capacity(crate::MAX_STREAM_INGRESS_FRAGMENT),
                                 0,
@@ -721,6 +857,9 @@ impl RaTlsSession {
                                     > Self::STREAM_INPUT_CAPACITY
                                 {
                                     return Err("stream input capacity exceeded bound");
+                                }
+                                if chunks.len() == Self::STREAM_CHUNK_SLOTS {
+                                    return Err("stream queue full");
                                 }
                                 chunks.push_back((
                                     Vec::with_capacity(crate::MAX_STREAM_INGRESS_FRAGMENT),
@@ -741,10 +880,7 @@ impl RaTlsSession {
                         self.read_buf.drain(..self.read_offset);
                         self.read_offset = 0;
                     }
-                    if self.read_buf.len().saturating_add(n) > protocol::MAX_BODY_SIZE + 64 * 1024 {
-                        return Err("pending HTTP input exceeded bound");
-                    }
-                    self.read_buf.extend_from_slice(&buf[..n]);
+                    self.append_plaintext_admitted(&buf[..n], pool.as_ref())?;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) => {
@@ -768,7 +904,7 @@ impl RaTlsSession {
     fn write_plaintext_chunked(
         &mut self,
         data: &[u8],
-        output: &mut Vec<u8>,
+        output: &mut TlsOutput,
     ) -> Result<(), &'static str> {
         self.require_current_configuration()?;
         use std::io::Write;
@@ -800,7 +936,7 @@ impl RaTlsSession {
                     );
                     return Err("TLS write stalled: no progress");
                 }
-                output.extend_from_slice(&flushed);
+                output.append(&flushed)?;
             } else {
                 offset += n;
             }
@@ -961,7 +1097,7 @@ impl RaTlsSession {
     ///
     /// Returns the raw TLS bytes to send to the peer. The caller should
     /// send these via the data channel, then close the connection.
-    pub fn close_notify(&mut self) -> Vec<u8> {
+    pub fn close_notify(&mut self) -> TlsOutput {
         self.tls_conn.send_close_notify();
         self.collect_tls_output().unwrap_or_default()
     }

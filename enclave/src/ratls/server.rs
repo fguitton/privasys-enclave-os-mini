@@ -357,11 +357,9 @@ impl IngressServer {
         // another connection or the control hook from making bounded progress.
         let eligible = |id: &u32, state: &SessionState| {
             matches!(state, SessionState::Established(session) if session.has_pending_response() || (*dispatch_budget > 0 && self.pending_dispatch.contains(id) && !self.deferred_owner.pending.contains_key(id)))
-                && self
-                    .write_windows
-                    .borrow()
-                    .get(id)
-                    .is_some_and(|window| window.available() >= 64 * 1024)
+                && self.write_windows.borrow().get(id).is_some_and(|window| {
+                    window.available() >= super::session::TLS_RESPONSE_STEP_BYTES
+                })
         };
         let next = self
             .sessions
@@ -981,7 +979,7 @@ impl IngressServer {
             .write_windows
             .borrow()
             .get(&conn_id)
-            .is_some_and(|window| window.available() >= 64 * 1024);
+            .is_some_and(|window| window.available() >= super::session::TLS_RESPONSE_STEP_BYTES);
         !credit || self.flush_response(conn_id, session)
     }
 
@@ -1221,7 +1219,9 @@ impl IngressServer {
                     .write_windows
                     .borrow()
                     .get(&conn_id)
-                    .is_some_and(|window| window.available() >= 64 * 1024);
+                    .is_some_and(|window| {
+                        window.available() >= super::session::TLS_RESPONSE_STEP_BYTES
+                    });
                 return !credit || self.flush_response(conn_id, session);
             }
             Ok(None) => return true, // no more complete requests

@@ -5,7 +5,7 @@
 //! quote-verification claim: these exercise configuration revocation boundaries.
 
 use super::super::cert_store::CertStore;
-use super::{FidoIdentity, RaTlsSession};
+use super::{FidoIdentity, RaTlsSession, TlsOutput};
 use enclave_os_common::modules::{AppIdentity, PeerEvidence};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection};
@@ -108,6 +108,9 @@ fn replacement_during_handshake_requires_a_new_connection() {
 #[test]
 fn replacement_rejects_buffered_requests_and_re_attestation() {
     streamed_request_preserves_tls_and_following_request();
+    checked_plaintext_backing();
+    checked_tls_output_backing();
+    checked_http_request_admission();
     let store = CertStore::new();
     register(&store, "a.test");
     let (mut client, mut session) = pair(&store, "a.test");
@@ -162,6 +165,7 @@ fn owned_body(
 
 #[test]
 fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
+    legacy_response_keeps_original_bytes();
     let allocation_pool = enclave_os_common::allocation::AllocationPoolV1::new(1).unwrap();
     let lease = allocation_pool.reserve_unpublished(1).unwrap();
     let paid_body = crate::HttpResponseBody::with_allocation(vec![7], Some(lease));
@@ -690,15 +694,27 @@ fn streamed_request_preserves_tls_and_following_request() {
     assert_eq!(length, body.len());
     assert!(session.validate_stream_head());
     let working = RaTlsSession::stream_allocation_bytes().unwrap();
-    let physical = enclave_os_common::allocation::AllocationPoolV1::new(working).unwrap();
+    let slot_bytes = crate::stream_ingress::SlotCharge::metadata_bytes().unwrap();
+    let physical =
+        enclave_os_common::allocation::AllocationPoolV1::new(working + slot_bytes).unwrap();
     let insufficient = enclave_os_common::allocation::AllocationPoolV1::new(working - 1).unwrap();
     assert!(session.admit_stream_allocation(&insufficient).is_err());
     assert_eq!(insufficient.used(), 0);
     let allocation = session.admit_stream_allocation(&physical).unwrap();
     assert_eq!(physical.used(), working);
+    let remaining = physical.reserve(slot_bytes).unwrap();
     assert!(physical.reserve(1).is_none());
+    assert!(
+        crate::stream_ingress::SlotCharge::reserve_with_allocation(allocation.clone()).is_none()
+    );
+    drop(remaining);
+    assert_eq!(physical.used(), working);
     assert!(session.admit_stream_allocation(&insufficient).is_err());
     session.consume_stream_head(head_bytes).unwrap();
+    assert_eq!(
+        session.stream_chunks.as_ref().unwrap().capacity(),
+        RaTlsSession::STREAM_CHUNK_SLOTS
+    );
     let context = enclave_os_common::modules::RequestContext {
         ingress_class: enclave_os_common::modules::IngressClass::ExternalNetwork,
         connection_id: 7,
@@ -860,8 +876,8 @@ fn streamed_request_preserves_tls_and_following_request() {
     drop(allocation);
     assert_eq!(
         physical.used(),
-        working,
-        "outside-STATE fragment/work owns allocation after session teardown"
+        working + slot_bytes,
+        "outside-STATE fragment/work owns allocation and slot metadata after session teardown"
     );
     drop(work);
     assert_eq!(physical.used(), 0);
@@ -1111,4 +1127,138 @@ fn segmented_response_lifecycle() {
     assert!(!session.has_pending_response());
     assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 3);
     assert_eq!(Arc::strong_count(&bytes), 1);
+}
+
+// Original Session owner: actual pool refusal precedes growth and retains old bytes.
+fn checked_plaintext_backing() {
+    use enclave_os_common::allocation::AllocationPoolV1;
+    let store = CertStore::new();
+    register(&store, "read-budget.test");
+    let (_, mut session) = pair(&store, "read-budget.test");
+    let pool = AllocationPoolV1::new(12).unwrap();
+    session
+        .append_plaintext_admitted(&[1; 4], Some(&pool))
+        .unwrap();
+    assert_eq!(session.read_buf.capacity(), 4);
+    assert_eq!(pool.used(), 4);
+    let refusal = pool.reserve(1).unwrap();
+    let old = session.read_buf.as_ptr();
+    assert!(session
+        .append_plaintext_admitted(&[2], Some(&pool))
+        .is_err());
+    assert_eq!(session.read_buf.as_ptr(), old);
+    assert_eq!(session.read_buf, vec![1; 4]);
+    assert_eq!(pool.used(), 5);
+    drop(refusal);
+    session
+        .append_plaintext_admitted(&[2], Some(&pool))
+        .unwrap();
+    assert_eq!(session.read_buf.capacity(), 8);
+    assert_eq!(
+        pool.used(),
+        8,
+        "old4/new8 fit exactly12; old backing is retired before refund"
+    );
+    assert_eq!(session.read_buf, vec![1, 1, 1, 1, 2]);
+    session.read_buf.clear();
+    assert_eq!(pool.used(), 8, "empty buffer retains its backing credit");
+    drop(session);
+    assert_eq!(pool.used(), 0);
+    let (_, mut refused) = pair(&store, "read-budget.test");
+    let small = AllocationPoolV1::new(3).unwrap();
+    assert!(refused
+        .append_plaintext_admitted(&[1; 4], Some(&small))
+        .is_err());
+    assert_eq!(refused.read_buf.capacity(), 0);
+    assert_eq!(small.used(), 0);
+    let exact = AllocationPoolV1::new(4).unwrap();
+    refused
+        .append_plaintext_admitted(&[1; 4], Some(&exact))
+        .unwrap();
+    drop(refused);
+    assert_eq!(exact.used(), 0);
+}
+
+fn checked_tls_output_backing() {
+    use enclave_os_common::allocation::AllocationPoolV1;
+    let pool = AllocationPoolV1::new(12).unwrap();
+    let mut output = TlsOutput::bounded(8);
+    output.append_admitted(&[1; 4], Some(&pool)).unwrap();
+    assert_eq!(pool.used(), 4);
+    let held = pool.reserve(1).unwrap();
+    assert!(output.append_admitted(&[2], Some(&pool)).is_err());
+    assert_eq!(output.as_ref(), &[1; 4]);
+    drop(held);
+    output.append_admitted(&[2; 4], Some(&pool)).unwrap();
+    assert_eq!(pool.used(), 8);
+    assert!(output.append_admitted(&[3], Some(&pool)).is_err());
+    assert_eq!(output.len(), 8);
+    drop(output);
+    assert_eq!(pool.used(), 0);
+    let short = AllocationPoolV1::new(3).unwrap();
+    let mut empty = TlsOutput::default();
+    assert!(empty.append_admitted(&[1; 4], Some(&short)).is_err());
+    assert!(empty.is_empty());
+    assert_eq!(short.used(), 0);
+}
+
+fn legacy_response_keeps_original_bytes() {
+    let store = CertStore::new();
+    register(&store, "legacy-response.test");
+    let (mut client, mut session) = pair(&store, "legacy-response.test");
+    handshake(&mut client, &mut session);
+    let body = vec![0x5a; 70 * 1024 + 17];
+    let expected = enclave_os_common::protocol::format_http_response(200, &body, false);
+    let flight = session.send_http_response(200, &body, false).unwrap();
+    let mut input = Cursor::new(flight);
+    let mut received = Vec::new();
+    while input.position() < input.get_ref().len() as u64 {
+        client.read_tls(&mut input).unwrap();
+        client.process_new_packets().unwrap();
+        let mut bytes = [0; 8192];
+        loop {
+            match std::io::Read::read(&mut client.reader(), &mut bytes) {
+                Ok(0) => break,
+                Ok(n) => received.extend_from_slice(&bytes[..n]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("legacy response: {error}"),
+            }
+        }
+    }
+    assert_eq!(received, expected);
+}
+
+fn checked_http_request_admission() {
+    use enclave_os_common::{allocation::AllocationPoolV1, protocol};
+    let raw = b"POST /paid HTTP/1.1\r\nHost: MiXeD.test:443\r\nContent-Type: APPLICATION/JSON\r\nContent-Length: 4\r\n\r\nbody";
+    let needed = protocol::http_request_allocation_bound(raw).unwrap();
+    let too_small = AllocationPoolV1::new(needed - 1).unwrap();
+    assert!(super::PaidHttpRequest::parse(raw, Some(&too_small)).is_err());
+    assert_eq!(too_small.used(), 0);
+    for limit in [needed, needed + 1] {
+        let pool = AllocationPoolV1::new(limit).unwrap();
+        let (request, used) = super::PaidHttpRequest::parse(raw, Some(&pool))
+            .unwrap()
+            .unwrap();
+        assert_eq!(used, raw.len());
+        assert_eq!(request.path, "/paid");
+        assert_eq!(request.host.as_deref(), Some("mixed.test"));
+        assert_eq!(request.content_type.as_deref(), Some("application/json"));
+        assert_eq!(request.body, b"body");
+        assert_eq!(pool.used(), needed);
+        drop(request);
+        assert_eq!(pool.used(), 0);
+        assert!(
+            super::PaidHttpRequest::parse(&raw[..raw.len() - 1], Some(&pool))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            pool.used(),
+            0,
+            "original incomplete body frees metadata before credit"
+        );
+        assert!(super::PaidHttpRequest::parse(b"bad\r\n\r\n", Some(&pool)).is_err());
+        assert_eq!(pool.used(), 0);
+    }
 }

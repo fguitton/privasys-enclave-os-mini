@@ -40,11 +40,35 @@ pub type HonestStreamIngressBegin =
 pub(crate) type Hooks = (HonestStreamIngressEligible, HonestStreamIngressBegin);
 
 pub(crate) struct SlotCharge {
-    _allocation: Option<std::sync::Arc<enclave_os_common::allocation::AllocationLeaseV1>>,
+    _allocation: Option<crate::ratls::session::StreamAllocation>,
+    metadata: Option<enclave_os_common::allocation::AllocationLeaseV1>,
+}
+#[derive(Clone)]
+pub(crate) struct SlotLease(Option<std::sync::Arc<SlotCharge>>);
+impl SlotLease {
+    fn same(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(self.0.as_ref().unwrap(), other.0.as_ref().unwrap())
+    }
+}
+impl Drop for SlotLease {
+    fn drop(&mut self) {
+        if let Some(owner) = self.0.take() {
+            drop(std::sync::Arc::into_inner(owner));
+        }
+    }
 }
 static OWNED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 impl SlotCharge {
-    pub(crate) fn reserve() -> Option<std::sync::Arc<Self>> {
+    pub(crate) fn metadata_bytes() -> Option<usize> {
+        enclave_os_common::allocation::shared_allocation_bytes::<Self>()
+    }
+    pub(crate) fn reserve() -> Option<SlotLease> {
+        Self::reserve_inner(None, None)
+    }
+    fn reserve_inner(
+        allocation: Option<crate::ratls::session::StreamAllocation>,
+        metadata: Option<enclave_os_common::allocation::AllocationLeaseV1>,
+    ) -> Option<SlotLease> {
         OWNED
             .fetch_update(
                 std::sync::atomic::Ordering::AcqRel,
@@ -52,7 +76,12 @@ impl SlotCharge {
                 |n| (n < MAX_STREAM_INGRESS_SESSIONS).then_some(n + 1),
             )
             .ok()
-            .map(|_| std::sync::Arc::new(Self { _allocation: None }))
+            .map(|_| {
+                SlotLease(Some(std::sync::Arc::new(Self {
+                    _allocation: allocation,
+                    metadata,
+                })))
+            })
     }
 }
 #[cfg(target_env = "sgx")]
@@ -61,20 +90,23 @@ impl SlotCharge {
     // actual session/fragment owner, retained through terminal receiver teardown.
     pub(crate) fn reserve_for_session(
         session: &mut crate::ratls::session::RaTlsSession,
-    ) -> Option<std::sync::Arc<Self>> {
+    ) -> Option<SlotLease> {
         let allocation = session.reserve_stream_allocation().ok()?;
         Self::reserve_with_allocation(allocation)
     }
 }
 impl SlotCharge {
     pub(crate) fn reserve_with_allocation(
-        allocation: std::sync::Arc<enclave_os_common::allocation::AllocationLeaseV1>,
-    ) -> Option<std::sync::Arc<Self>> {
+        allocation: crate::ratls::session::StreamAllocation,
+    ) -> Option<SlotLease> {
         if allocation.bytes() < crate::ratls::session::RaTlsSession::stream_allocation_bytes()? {
             return None;
         }
-        let mut slot = Self::reserve()?;
-        std::sync::Arc::get_mut(&mut slot)?._allocation = Some(allocation);
+        let metadata = allocation.reserve_slot(Self::metadata_bytes()?)?;
+        let slot = Self::reserve_inner(Some(allocation), Some(metadata))?;
+        if let Some(credit) = &slot.0.as_ref()?.metadata {
+            credit.activate_release_notification();
+        }
         Some(slot)
     }
 }
@@ -85,7 +117,7 @@ impl Drop for SlotCharge {
 }
 pub(crate) struct ChargedReceiver {
     pub value: Box<dyn HonestStreamIngressReceiver>,
-    pub lease: std::sync::Arc<SlotCharge>,
+    pub lease: SlotLease,
 }
 pub(crate) struct Slot {
     pub nonce: u64,
@@ -100,7 +132,7 @@ pub(crate) struct Slot {
     pub close: bool,
     pub started: std::time::Instant,
     // Actual fragment/context/receiver fields die before the final credit alias.
-    pub lease: std::sync::Arc<SlotCharge>,
+    pub lease: SlotLease,
 }
 /// The fixed session marker remains reserved during this move-only work. The
 /// actual TLS context is checked again before committing any completion.
@@ -118,7 +150,7 @@ pub(crate) struct Work {
     pub remaining: usize,
     pub pending: bool,
     // Release the transport charge after receiver/body/context destruction.
-    pub lease: std::sync::Arc<SlotCharge>,
+    pub lease: SlotLease,
 }
 /// Restore one exact selected fragment after the caller's fresh TLS/nonce join.
 /// This private accounting helper performs no application authorization or I/O.
@@ -127,7 +159,7 @@ pub(crate) fn retain_work(slot: &mut Slot, work: &mut Work) -> Result<(), ()> {
         || slot.generation != work.generation
         || slot.binding != work.binding
         || slot.receiver.is_some()
-        || !std::sync::Arc::ptr_eq(&slot.lease, &work.lease)
+        || !slot.lease.same(&work.lease)
         || !slot.fragment.is_empty()
         || slot.remaining.checked_sub(work.bytes.len()) != Some(work.remaining)
         || work.bytes.len() > MAX_STREAM_INGRESS_FRAGMENT
