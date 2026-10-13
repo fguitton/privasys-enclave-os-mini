@@ -1,0 +1,674 @@
+--- a/sgx_alloc/src/fallible.rs
++++ b/sgx_alloc/src/fallible.rs
+@@ -1,14 +1,17 @@
+ //! Private opt-in allocator ABI. Only fallible Box/Arc/collection constructors
+ //! may select it. The default global System and C allocator remain unchanged.
++use super::System;
+ use core::alloc::{AllocError, Allocator, GlobalAlloc, Layout};
+ use core::ptr::{self, NonNull};
+-use super::System;
+ 
+ /// Opaque fixed admission identity. Its provider retains stable origin/loan
+ /// state until release, even after the allocating actor or thread returns.
+ #[derive(Clone, Copy)]
+ #[repr(C)]
+-pub struct AllocationTicket { pub owner: usize, pub loan: usize }
++pub struct AllocationTicket {
++    pub owner: usize,
++    pub loan: usize,
++}
+ /// Callbacks are trusted, process-lifetime, nonallocating and non-unwinding.
+ /// Each admits the complete requested backend layout before System allocates.
+ /// A loan spends an existing reservation rather than creating a second charge.
+@@ -24,11 +27,24 @@
+     origin: AllocationTicket,
+ }
+ impl FallibleSystem {
++    /// Complete backend layout used by this allocator, including its header.
++    /// This is a physical quote, never caller or publication authority.
++    /// # Errors
++    /// Refuses layout arithmetic overflow.
++    pub fn requested_backend_layout(user: Layout) -> Result<Layout, AllocError> {
++        if user.size() == 0 {
++            return Ok(user);
++        }
++        geometry(user).map(|(layout, _)| layout)
++    }
+     /// # Safety
+     /// Callback origin and loan state must remain valid through the final
+     /// deallocation, not merely the dynamic operation scope. Callbacks must
+     /// not allocate, unwind, wait or grant any semantic authority.
+-    pub const unsafe fn new(hooks: &'static FallibleAllocationHooks, origin: AllocationTicket) -> Self {
++    pub const unsafe fn new(
++        hooks: &'static FallibleAllocationHooks,
++        origin: AllocationTicket,
++    ) -> Self {
+         Self { hooks, origin }
+     }
+ }
+@@ -41,54 +57,87 @@
+     ticket: AllocationTicket,
+ }
+ fn geometry(user: Layout) -> Result<(Layout, usize), AllocError> {
+-    Layout::new::<Header>().extend(user)
++    Layout::new::<Header>()
++        .extend(user)
+         .map(|(layout, offset)| (layout.pad_to_align(), offset))
+         .map_err(|_| AllocError)
+ }
+ unsafe fn header(pointer: NonNull<u8>) -> Header {
+     // Private metadata precedes, and is outside, the user's requested range.
+-    unsafe { pointer.as_ptr().sub(core::mem::size_of::<Header>()).cast::<Header>().read() }
++    unsafe {
++        pointer
++            .as_ptr()
++            .sub(core::mem::size_of::<Header>())
++            .cast::<Header>()
++            .read()
++    }
+ }
+ impl FallibleSystem {
+-    fn allocate_at(hooks: &'static FallibleAllocationHooks, origin: AllocationTicket, user: Layout, zeroed: bool)
+-        -> Result<NonNull<[u8]>, AllocError>
+-    {
++    fn allocate_at(
++        hooks: &'static FallibleAllocationHooks,
++        origin: AllocationTicket,
++        user: Layout,
++        zeroed: bool,
++    ) -> Result<NonNull<[u8]>, AllocError> {
+         if user.size() == 0 {
+             return Ok(NonNull::slice_from_raw_parts(user.dangling_ptr(), 0));
+         }
+         let (layout, offset) = geometry(user)?;
+         let ticket = (hooks.admit)(origin, layout)?;
+         let raw = unsafe {
+-            if zeroed { System.alloc_zeroed(layout) } else { System.alloc(layout) }
++            if zeroed {
++                System.alloc_zeroed(layout)
++            } else {
++                System.alloc(layout)
++            }
+         };
+         let Some(raw) = NonNull::new(raw) else {
+             (hooks.release)(ticket, layout);
+             return Err(AllocError);
+         };
+         let user_pointer = unsafe { NonNull::new_unchecked(raw.as_ptr().add(offset)) };
+-        let metadata = Header { raw, size: layout.size(), align: layout.align(), hooks, ticket };
++        let metadata = Header {
++            raw,
++            size: layout.size(),
++            align: layout.align(),
++            hooks,
++            ticket,
++        };
+         unsafe {
+-            user_pointer.as_ptr().sub(core::mem::size_of::<Header>()).cast::<Header>().write(metadata);
++            user_pointer
++                .as_ptr()
++                .sub(core::mem::size_of::<Header>())
++                .cast::<Header>()
++                .write(metadata);
+         }
+         Ok(NonNull::slice_from_raw_parts(user_pointer, user.size()))
+     }
+-    unsafe fn resize(pointer: NonNull<u8>, old: Layout, new: Layout, zeroed: bool)
+-        -> Result<NonNull<[u8]>, AllocError>
+-    {
++    unsafe fn resize(
++        pointer: NonNull<u8>,
++        old: Layout,
++        new: Layout,
++        zeroed: bool,
++    ) -> Result<NonNull<[u8]>, AllocError> {
+         if old.size() == 0 {
+             // Caller must use its own allocator for this no-origin case.
+             return Err(AllocError);
+         }
+         let origin = unsafe { header(pointer) };
+         if new.size() == 0 {
+-            unsafe { Self::release(pointer); }
++            unsafe {
++                Self::release(pointer);
++            }
+             return Ok(NonNull::slice_from_raw_parts(new.dangling_ptr(), 0));
+         }
+         // Keep the old allocation and its admission while requesting the entire
+         // new block. Even a different current actor cannot change its origin.
+         let next = Self::allocate_at(origin.hooks, origin.ticket, new, zeroed)?;
+         unsafe {
+-            ptr::copy_nonoverlapping(pointer.as_ptr(), next.as_mut_ptr(), old.size().min(new.size()));
++            ptr::copy_nonoverlapping(
++                pointer.as_ptr(),
++                next.as_mut_ptr(),
++                old.size().min(new.size()),
++            );
+             Self::release(pointer);
+         }
+         Ok(next)
+@@ -96,7 +145,9 @@
+     unsafe fn release(pointer: NonNull<u8>) {
+         let metadata = unsafe { header(pointer) };
+         let layout = unsafe { Layout::from_size_align_unchecked(metadata.size, metadata.align) };
+-        unsafe { System.dealloc(metadata.raw.as_ptr(), layout); }
++        unsafe {
++            System.dealloc(metadata.raw.as_ptr(), layout);
++        }
+         (metadata.hooks.release)(metadata.ticket, layout);
+     }
+ }
+@@ -108,23 +159,40 @@
+         Self::allocate_at(self.hooks, self.origin, layout, true)
+     }
+     unsafe fn deallocate(&self, pointer: NonNull<u8>, layout: Layout) {
+-        if layout.size() != 0 { unsafe { Self::release(pointer); } }
++        if layout.size() != 0 {
++            unsafe {
++                Self::release(pointer);
++            }
++        }
+     }
+-    unsafe fn grow(&self, pointer: NonNull<u8>, old: Layout, new: Layout)
+-        -> Result<NonNull<[u8]>, AllocError>
+-    {
+-        if old.size() == 0 { return self.allocate(new); }
++    unsafe fn grow(
++        &self,
++        pointer: NonNull<u8>,
++        old: Layout,
++        new: Layout,
++    ) -> Result<NonNull<[u8]>, AllocError> {
++        if old.size() == 0 {
++            return self.allocate(new);
++        }
+         unsafe { Self::resize(pointer, old, new, false) }
+     }
+-    unsafe fn grow_zeroed(&self, pointer: NonNull<u8>, old: Layout, new: Layout)
+-        -> Result<NonNull<[u8]>, AllocError>
+-    {
+-        if old.size() == 0 { return self.allocate_zeroed(new); }
++    unsafe fn grow_zeroed(
++        &self,
++        pointer: NonNull<u8>,
++        old: Layout,
++        new: Layout,
++    ) -> Result<NonNull<[u8]>, AllocError> {
++        if old.size() == 0 {
++            return self.allocate_zeroed(new);
++        }
+         unsafe { Self::resize(pointer, old, new, true) }
+     }
+-    unsafe fn shrink(&self, pointer: NonNull<u8>, old: Layout, new: Layout)
+-        -> Result<NonNull<[u8]>, AllocError>
+-    {
++    unsafe fn shrink(
++        &self,
++        pointer: NonNull<u8>,
++        old: Layout,
++        new: Layout,
++    ) -> Result<NonNull<[u8]>, AllocError> {
+         unsafe { Self::resize(pointer, old, new, false) }
+     }
+ }
+--- a/sgx_sync/src/lib.rs
++++ b/sgx_sync/src/lib.rs
+@@ -20,6 +20,7 @@
+ #![deny(unused_features)]
+ #![allow(internal_features)]
+ #![feature(const_trait_impl)]
++#![feature(allocator_api)]
+ #![feature(dropck_eyepatch)]
+ #![feature(hashmap_internals)]
+ #![feature(linked_list_remove)]
+@@ -64,3 +65,6 @@
+ pub use remutex::{ReentrantMutex, ReentrantMutexGuard};
+ pub use rwlock::{MovableRwLock, StaticRwLock, StaticRwLockReadGuard, StaticRwLockWriteGuard};
+ pub use spin::{SpinMutex, SpinMutexGuard, SpinRwLock, SpinRwLockReadGuard, SpinRwLockWriteGuard};
++
++/// Explicit measured-TCS storage admission; allocator lifetime is enclave-wide.
++pub use sys::fixed_futex::{initialize as initialize_fixed_futex, required_layout as fixed_futex_layout};
+--- /dev/null
++++ b/sgx_sync/src/sys/fixed_futex.rs
+@@ -0,0 +1,116 @@
++//! SDK-only opt-in fixed waiter backend. No live legacy backend migration.
++use super::fixed_futex_table::Table;
++use super::ocall::{self, Timeout};
++use core::alloc::{AllocError, Allocator, Layout};
++use sgx_trts::{
++    sync::SpinMutex,
++    tcs::{self, TcsId},
++};
++use sgx_types::error::{
++    errno::{EAGAIN, EINVAL},
++    OsResult,
++};
++type Admission = &'static (dyn Allocator + Send + Sync);
++type Waiters = Table<TcsId, Admission>;
++struct Selection {
++    legacy_used: bool,
++    waiters: Option<Waiters>,
++}
++static SELECTION: SpinMutex<Selection> = SpinMutex::new(Selection {
++    legacy_used: false,
++    waiters: None,
++});
++/// Complete user allocation shape; the chosen allocator owns its own header.
++pub fn required_layout() -> Result<Layout, AllocError> {
++    Waiters::requested_layout(tcs::tcs_max_num())
++}
++/// The allocator must remain live for the enclave process. Refuse switching
++/// after ANY legacy use, so an outstanding old waiter never loses its waker.
++pub fn initialize(allocator: Admission) -> Result<(), AllocError> {
++    let waiters = Waiters::try_new(tcs::tcs_max_num(), allocator)?;
++    let mut selected = SELECTION.lock();
++    if selected.legacy_used || selected.waiters.is_some() {
++        return Err(AllocError);
++    }
++    selected.waiters = Some(waiters);
++    Ok(())
++}
++pub(super) fn wait(
++    key: usize,
++    bucket: usize,
++    expected: u32,
++    bitset: u32,
++    timeout: Option<Timeout>,
++    load: impl FnOnce() -> u32,
++) -> Option<OsResult> {
++    let current = tcs::current().id();
++    let ticket = {
++        let mut selected = SELECTION.lock();
++        let Some(waiters) = selected.waiters.as_mut() else {
++            selected.legacy_used = true;
++            return None;
++        };
++        if load() != expected {
++            return Some(Err(EAGAIN));
++        }
++        match waiters.register(current, key, bucket, bitset) {
++            Ok(ticket) => ticket,
++            Err(_) => return Some(Err(EAGAIN)),
++        }
++    };
++    let result = loop {
++        let woken = {
++            let selected = SELECTION.lock();
++            selected.waiters.as_ref().unwrap().woken(ticket)
++        };
++        match woken {
++            Ok(true) => break Ok(()),
++            Ok(false) => (),
++            Err(_) => break Err(EINVAL),
++        }
++        if let Err(error) = ocall::thread_wait_event_ex(current, timeout) {
++            break Err(error);
++        }
++    };
++    // Acknowledgement under the same lock occurs on EVERY return, including
++    // timeout after requeue and unusual host errors. Slot lifetime is independent
++    // of its old key and no allocating Arc is needed for the waiting alias.
++    let mut selected = SELECTION.lock();
++    if selected.waiters.as_mut().unwrap().finish(ticket).is_err() {
++        return Some(Err(EINVAL));
++    }
++    Some(result)
++}
++pub(super) fn wake(key: usize, bitset: u32, maximum: usize) -> Option<OsResult<usize>> {
++    let mut selected = SELECTION.lock();
++    let Some(waiters) = selected.waiters.as_mut() else {
++        selected.legacy_used = true;
++        return None;
++    };
++    Some(Ok(waiters.wake(key, bitset, maximum, |tcs| {
++        let _ = ocall::thread_set_event(tcs);
++    })))
++}
++pub(super) fn requeue(
++    old: usize,
++    new: usize,
++    new_bucket: usize,
++    max_wake: usize,
++    max_requeue: usize,
++    expected: Option<u32>,
++    load: impl FnOnce() -> u32,
++) -> Option<OsResult<(usize, usize)>> {
++    let mut selected = SELECTION.lock();
++    let Some(waiters) = selected.waiters.as_mut() else {
++        selected.legacy_used = true;
++        return None;
++    };
++    if expected.is_some_and(|expected| load() != expected) {
++        return Some(Err(EAGAIN));
++    }
++    let wakes = waiters.wake(old, u32::MAX, max_wake, |tcs| {
++        let _ = ocall::thread_set_event(tcs);
++    });
++    let moved = waiters.requeue(old, new, new_bucket, max_requeue);
++    Some(Ok((wakes, moved)))
++}
+--- /dev/null
++++ b/sgx_sync/src/sys/fixed_futex_table.rs
+@@ -0,0 +1,206 @@
++//! Fixed waiter metadata: one slot per actual measured TCS, no CPU bucket array.
++//! SDK adaptation must supply sgx_trts::tcs::tcs_max_num(), not a copied profile.
++use alloc::boxed::Box;
++use core::alloc::{AllocError, Allocator, Layout};
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum State {
++    Vacant,
++    Waiting,
++    Woken,
++}
++struct Slot<T> {
++    tcs: Option<T>,
++    key: usize,
++    bucket: usize,
++    bitset: u32,
++    generation: u64,
++    state: State,
++    next: Option<usize>,
++}
++impl<T> Slot<T> {
++    fn empty() -> Self {
++        Self {
++            tcs: None,
++            key: 0,
++            bucket: 0,
++            bitset: 0,
++            generation: 0,
++            state: State::Vacant,
++            next: None,
++        }
++    }
++}
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Ticket<T> {
++    index: usize,
++    generation: u64,
++    tcs: T,
++}
++pub struct Table<T: Copy + Eq, A: Allocator> {
++    slots: Box<[Slot<T>], A>,
++    head: Option<usize>,
++    tail: Option<usize>,
++}
++impl<T: Copy + Eq, A: Allocator> Table<T, A> {
++    pub fn requested_layout(measured_tcs: usize) -> Result<Layout, AllocError> {
++        if measured_tcs == 0 {
++            return Err(AllocError);
++        }
++        Layout::array::<Slot<T>>(measured_tcs).map_err(|_| AllocError)
++    }
++    pub fn try_new(measured_tcs: usize, allocator: A) -> Result<Self, AllocError> {
++        Self::requested_layout(measured_tcs)?;
++        let mut slots = Box::<[Slot<T>], A>::try_new_uninit_slice_in(measured_tcs, allocator)?;
++        for slot in slots.iter_mut() {
++            slot.write(Slot::empty());
++        }
++        let slots = unsafe { slots.assume_init() };
++        Ok(Self {
++            slots,
++            head: None,
++            tail: None,
++        })
++    }
++    fn append(&mut self, index: usize) {
++        self.slots[index].next = None;
++        if let Some(tail) = self.tail {
++            self.slots[tail].next = Some(index)
++        } else {
++            self.head = Some(index)
++        }
++        self.tail = Some(index);
++    }
++    fn unlink(&mut self, index: usize) {
++        let mut prior: Option<usize> = None;
++        let mut at = self.head;
++        while let Some(current) = at {
++            if current == index {
++                let next = self.slots[current].next;
++                if let Some(prior) = prior {
++                    self.slots[prior].next = next
++                } else {
++                    self.head = next
++                }
++                if self.tail == Some(current) {
++                    self.tail = prior
++                }
++                self.slots[current].next = None;
++                return;
++            }
++            prior = at;
++            at = self.slots[current].next;
++        }
++    }
++    pub fn register(
++        &mut self,
++        tcs: T,
++        key: usize,
++        bucket: usize,
++        bitset: u32,
++    ) -> Result<Ticket<T>, AllocError> {
++        if self
++            .slots
++            .iter()
++            .any(|s| s.state != State::Vacant && s.tcs == Some(tcs))
++        {
++            return Err(AllocError);
++        }
++        let index = self
++            .slots
++            .iter()
++            .position(|s| s.state == State::Vacant)
++            .ok_or(AllocError)?;
++        let generation = self.slots[index]
++            .generation
++            .checked_add(1)
++            .ok_or(AllocError)?;
++        self.slots[index] = Slot {
++            tcs: Some(tcs),
++            key,
++            bucket,
++            bitset,
++            generation,
++            state: State::Waiting,
++            next: None,
++        };
++        self.append(index);
++        Ok(Ticket {
++            index,
++            generation,
++            tcs,
++        })
++    }
++    fn valid(&self, ticket: Ticket<T>) -> bool {
++        self.slots.get(ticket.index).is_some_and(|s| {
++            s.state != State::Vacant
++                && s.tcs == Some(ticket.tcs)
++                && s.generation == ticket.generation
++        })
++    }
++    pub fn woken(&self, ticket: Ticket<T>) -> Result<bool, AllocError> {
++        if !self.valid(ticket) {
++            return Err(AllocError);
++        }
++        Ok(self.slots[ticket.index].state == State::Woken)
++    }
++    /// Successful wake retains the slot until original waiter acknowledges it;
++    /// no timeout/requeue race can recycle a live waiter's identity.
++    pub fn wake(
++        &mut self,
++        key: usize,
++        bitset: u32,
++        maximum: usize,
++        mut notify: impl FnMut(T),
++    ) -> usize {
++        let mut count = 0;
++        let mut at = self.head;
++        while let Some(index) = at {
++            let next = self.slots[index].next;
++            if count < maximum
++                && self.slots[index].key == key
++                && (self.slots[index].bitset & bitset) != 0
++            {
++                self.unlink(index);
++                self.slots[index].state = State::Woken;
++                notify(self.slots[index].tcs.expect("occupied waiter"));
++                count += 1;
++            }
++            at = next;
++        }
++        count
++    }
++    /// Same-bucket original requeue keeps position; cross-bucket original
++    /// requeue appends to target FIFO. Traversal stops at the old tail so moving
++    /// source nodes to the tail cannot select them repeatedly.
++    pub fn requeue(&mut self, old: usize, new: usize, new_bucket: usize, maximum: usize) -> usize {
++        let stop = self.tail;
++        let mut at = self.head;
++        let mut count = 0;
++        while let Some(index) = at {
++            let next = self.slots[index].next;
++            if count < maximum && self.slots[index].key == old {
++                if self.slots[index].bucket != new_bucket {
++                    self.unlink(index);
++                    self.append(index);
++                }
++                self.slots[index].key = new;
++                self.slots[index].bucket = new_bucket;
++                count += 1;
++            }
++            if Some(index) == stop {
++                break;
++            }
++            at = next;
++        }
++        count
++    }
++    pub fn finish(&mut self, ticket: Ticket<T>) -> Result<(), AllocError> {
++        if !self.valid(ticket) {
++            return Err(AllocError);
++        }
++        self.unlink(ticket.index);
++        self.slots[ticket.index].state = State::Vacant;
++        self.slots[ticket.index].tcs = None;
++        Ok(())
++    }
++}
+--- a/sgx_sync/src/sys/futex.rs
++++ b/sgx_sync/src/sys/futex.rs
+@@ -61,6 +61,16 @@
+     }
+ 
+     fn wait_with_timeout(&self, expected: u32, timeout: Option<Timeout>, bitset: u32) -> OsResult {
++        if let Some(result) = super::fixed_futex::wait(
++            self.addr(),
++            bucket_index(self),
++            expected,
++            bitset,
++            timeout,
++            || self.load_val(),
++        ) {
++            return result;
++        }
+         let (_, bucket) = FUTEX_BUCKETS.get_bucket(self);
+         let mut futex_bucket = bucket.lock();
+ 
+@@ -85,6 +95,9 @@
+     pub fn wake_bitset(&self, max_count: usize, bitset: u32) -> OsResult<usize> {
+         if max_count > i32::MAX as usize {
+             bail!(EINVAL);
++        }
++        if let Some(result) = super::fixed_futex::wake(self.addr(), bitset, max_count) {
++            return result;
+         }
+         // Get and lock the futex bucket
+         let (_, bucket) = FUTEX_BUCKETS.get_bucket(self);
+@@ -133,6 +146,17 @@
+             return self.wake(max_nwakes).map(|n| (n, 0));
+         }
+ 
++        if let Some(result) = super::fixed_futex::requeue(
++            self.addr(),
++            new_futex.addr(),
++            bucket_index(new_futex),
++            max_nwakes,
++            max_nrequeues,
++            expected,
++            || self.load_val(),
++        ) {
++            return result;
++        }
+         let (bucket_idx, bucket) = FUTEX_BUCKETS.get_bucket(self);
+         let (new_bucket_idx, new_bucket) = FUTEX_BUCKETS.get_bucket(new_futex);
+         let total_number = {
+@@ -178,7 +202,12 @@
+     }
+ 
+     fn load_val(&self) -> u32 {
+-        unsafe { { use core::sync::atomic::{AtomicU32, Ordering}; (*((self.0 as *const u32) as *const AtomicU32)).load(Ordering::SeqCst) } }
++        unsafe {
++            {
++                use core::sync::atomic::{AtomicU32, Ordering};
++                (*((self.0 as *const u32) as *const AtomicU32)).load(Ordering::SeqCst)
++            }
++        }
+     }
+ 
+     fn addr(&self) -> usize {
+@@ -273,10 +302,18 @@
+     }
+ }
+ 
+-static BUCKET_COUNT: LazyLock<usize> =
+-    LazyLock::new(|| ((1 << 8) * (trts::cpu_core_num())).next_power_of_two() as usize);
+-static BUCKET_MASK: LazyLock<usize> = LazyLock::new(|| *BUCKET_COUNT - 1);
++fn bucket_count() -> usize {
++    ((1 << 8) * trts::cpu_core_num()).next_power_of_two() as usize
++}
++static BUCKET_COUNT: LazyLock<usize> = LazyLock::new(bucket_count);
+ static FUTEX_BUCKETS: LazyLock<FutexBuckets> = LazyLock::new(|| FutexBuckets::new(*BUCKET_COUNT));
++
++fn bucket_index(futex: &Futex) -> usize {
++    let addr = futex.addr() >> 2;
++    let mut hasher = SipHasher13::new();
++    addr.hash(&mut hasher);
++    (bucket_count() - 1) & hasher.finish() as usize
++}
+ 
+ #[derive(Debug)]
+ struct FutexBuckets {
+@@ -296,13 +333,7 @@
+     }
+ 
+     fn get_bucket(&self, futex: &Futex) -> (usize, BucketRef) {
+-        let idx = *BUCKET_MASK & {
+-            // The addr is the multiples of 4, so we ignore the last 2 bits
+-            let addr = futex.addr() >> 2;
+-            let mut hasher = SipHasher13::new();
+-            addr.hash(&mut hasher);
+-            hasher.finish() as usize
+-        };
++        let idx = bucket_index(futex);
+         (idx, self.vec[idx].clone())
+     }
+ }
+--- a/sgx_sync/src/sys/mod.rs
++++ b/sgx_sync/src/sys/mod.rs
+@@ -19,3 +19,6 @@
+ pub mod lazy_box;
+ pub mod locks;
+ pub mod ocall;
++
++pub mod fixed_futex;
++mod fixed_futex_table;
+--- a/sgx_tstd/src/sync/mod.rs
++++ b/sgx_tstd/src/sync/mod.rs
+@@ -199,3 +199,6 @@
+ mod poison;
+ mod remutex;
+ mod rwlock;
++
++/// Opt-in fixed waiter storage, before any legacy futex operation.
++pub use sgx_sync::{fixed_futex_layout, initialize_fixed_futex};

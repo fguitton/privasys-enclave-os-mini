@@ -488,3 +488,6 @@ pub fn enclave_heap_bytes() -> usize {
 
 #[cfg(all(feature = "fallible-allocation-v1", target_vendor = "teaclave"))]
 pub use allocation_admission::LoanAllocator;
+
+#[cfg(all(feature = "fallible-allocation-v1", target_vendor = "teaclave"))]
+pub use allocation_admission::{initialize_fixed_futex_storage, initialize_fixed_futex_storage_once};

@@ -62,6 +62,12 @@ pub struct LoanAllocator {
     owner: Loan,
 }
 impl LoanAllocator {
+    /// Complete physical backend quote from the same SDK allocator owner.
+    /// # Errors
+    /// Refuses header/alignment layout arithmetic overflow.
+    pub fn required_backend_bytes(layout: Layout) -> Result<usize, AllocError> {
+        FallibleSystem::requested_backend_layout(layout).map(|layout| layout.size())
+    }
     /// Move original physical credit into a loan with separately paid metadata.
     ///
     /// # Errors

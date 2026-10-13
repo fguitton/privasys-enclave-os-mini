@@ -11,6 +11,10 @@
     {
       "path": "thread-construction.patch",
       "sha256": "04f78f6d03c54dfd865aae68d7dd7c8f59ffd8b3f5af8cc43b6f4bcade9b55be"
+    },
+    {
+      "path": "fixed-futex.patch",
+      "sha256": "8793907eda1c6db81ff58596c42a8eb9960fceedb78182117b0dc6cf9d8132e2"
     }
   ],
   "files": [
@@ -32,7 +36,7 @@
     {
       "path": "sgx_alloc/src/fallible.rs",
       "before_sha256": null,
-      "after_sha256": "8d4083c0b60b8cd58c28374b38c3d739bb2611c7bba33e47067bba115a83303a"
+      "after_sha256": "73828f6cced17b331c36ec711e9b8b6d53dbfa566ae37bba613575650c59b22b"
     },
     {
       "path": "sgx_tstd/src/thread/mod.rs",
@@ -53,6 +57,36 @@
       "path": "sgx_trts/src/thread/task.rs",
       "before_sha256": "4bdb8e5b813c1a165f4cfdd2844e31020e9f15cacfc8bf32eb9b2f6920c587f5",
       "after_sha256": "b8aa1656ef2a5c225c2f4f0c4bf524af73d29f4cc82ae5db2f34c96c3a379b74"
+    },
+    {
+      "path": "sgx_sync/src/lib.rs",
+      "before_sha256": "4045d34ee5b8446538fda282d7ce2a72475eb1dad9982bc34110415785c99eb2",
+      "after_sha256": "58fe378742f3cf81d080a7fa88e930103d9cae9683544fb8f42d82d82f53677b"
+    },
+    {
+      "path": "sgx_sync/src/sys/fixed_futex.rs",
+      "before_sha256": null,
+      "after_sha256": "788ed946cc3ce18c452e0f0156b57c58379642fb692a1c28cc2f06b9d3669052"
+    },
+    {
+      "path": "sgx_sync/src/sys/fixed_futex_table.rs",
+      "before_sha256": null,
+      "after_sha256": "e859c48271eda0708ae49422ba91bb25f3ae47faa008cdee75faab58e28888d5"
+    },
+    {
+      "path": "sgx_sync/src/sys/futex.rs",
+      "before_sha256": "2468cc1a57eb24f80301ed1d7b46fe21c12cb91811f50f4b848ba3408dc813d2",
+      "after_sha256": "c55b8cc570c804c81be982e3f10069eeec6c6b05f8d80ca03a7642aa0d2f8ad4"
+    },
+    {
+      "path": "sgx_sync/src/sys/mod.rs",
+      "before_sha256": "677e7a786dd6b753d7da27fc3cfc97ca350ec3a27dabf7479ab8ab14fcce7f4f",
+      "after_sha256": "c17c891e1a8331824d3edd7a034f04427446769442288ad247706bbba6725443"
+    },
+    {
+      "path": "sgx_tstd/src/sync/mod.rs",
+      "before_sha256": "b7771e76d506aa276f6dfb530f3786acd9d93d69e6ce2473ab9759053643e8e7",
+      "after_sha256": "e59daabe3d88f1b05e09efd308cf885ecdf3e6450e1407b58f68ef8d7c1cbaad"
     }
   ],
   "preserved": [
@@ -66,7 +100,8 @@
     "Exact actual-provider owner/loan lending and lifetime",
     "TLS/config/crypto fallible allocation graph",
     "Connected C allocation and raw ownership compatibility",
-    "New std/native/trusted/signed-SIM owning qualification"
+    "New std/native/trusted/signed-SIM owning qualification",
+    "Early fixed-futex SDK startup/consumer runtime qualification; source wired, experimental profile remains default-off"
   ],
   "activation": "Never enable a global hard quota behind unclosed infallible allocations. This source profile adds explicit fallible ABI and partial thread Result paths only.",
   "build_inputs": [
