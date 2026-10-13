@@ -62,6 +62,7 @@ impl SlotCharge {
     pub(crate) fn metadata_bytes() -> Option<usize> {
         enclave_os_common::allocation::shared_allocation_bytes::<Self>()
     }
+    #[cfg(any(test, not(any(target_env = "sgx", target_vendor = "teaclave"))))]
     pub(crate) fn reserve() -> Option<SlotLease> {
         Self::reserve_inner(None, None)
     }
@@ -117,7 +118,8 @@ impl Drop for SlotCharge {
 }
 pub(crate) struct ChargedReceiver {
     pub value: Box<dyn HonestStreamIngressReceiver>,
-    pub lease: SlotLease,
+    // Destruction of the receiver precedes its retained final slot alias.
+    pub _lease: SlotLease,
 }
 pub(crate) struct Slot {
     pub nonce: u64,
@@ -170,7 +172,7 @@ pub(crate) fn retain_work(slot: &mut Slot, work: &mut Work) -> Result<(), ()> {
     let receiver = work.receiver.take().ok_or(())?;
     slot.receiver = Some(ChargedReceiver {
         value: receiver,
-        lease: work.lease.clone(),
+        _lease: work.lease.clone(),
     });
     slot.parked = work.pending;
     if work.pending {
@@ -395,7 +397,7 @@ pub(crate) fn check_slot_ownership() {
             header: None,
             receiver: Some(ChargedReceiver {
                 value: Box::new(ChargedDropCheck(observed.clone())),
-                lease: lease.clone(),
+                _lease: lease.clone(),
             }),
             remaining: 0,
             fragment: Vec::new(),

@@ -63,6 +63,9 @@ pub(crate) mod leaf_key;
 #[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
 #[path = "retained_name.rs"]
 pub(crate) mod retained_name;
+#[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
+#[path = "retained_certificate.rs"]
+pub(crate) mod retained_certificate;
 #[path = "ordered_map.rs"]
 pub(crate) mod ordered_map;
 #[path = "cancellation.rs"]
@@ -117,7 +120,7 @@ pub struct RaTlsSession {
     stream_allocation: Option<StreamAllocation>,
     response: Option<PendingResponse>,
     /// Exact v2 leaf served on this connection (evidence is exchanged separately).
-    local_cert_der: Vec<u8>,
+    local_cert_der: LocalCertificate,
     /// SNI and endpoint identity selected with the served leaf.
     server_name: Option<String>,
     attested_endpoint: Option<enclave_os_common::modules::AttestedEndpointIdentity>,
@@ -228,6 +231,23 @@ pub struct FidoIdentity {
 // is Send. Ready for future multi-threaded worker dispatch.
 unsafe impl Send for RaTlsSession {}
 
+// Public legacy callers retain their original owned Vec contract. Production
+// cache/session construction uses Paid and never selects Legacy on refusal.
+enum LocalCertificate {
+    Legacy(Vec<u8>),
+    #[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
+    Paid(retained_certificate::RetainedCertificate),
+}
+impl LocalCertificate {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Legacy(bytes) => bytes,
+            #[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
+            Self::Paid(bytes) => bytes.bytes(),
+        }
+    }
+}
+
 impl RaTlsSession {
     /// Create a session from a `ServerConnection`.
     ///
@@ -237,6 +257,29 @@ impl RaTlsSession {
     pub fn new(
         tls_conn: rustls::ServerConnection,
         local_cert_der: Vec<u8>,
+        server_name: Option<String>,
+        attested_endpoint: Option<enclave_os_common::modules::AttestedEndpointIdentity>,
+        configuration: ConfigurationLease,
+    ) -> Self {
+        Self::with_certificate(tls_conn, LocalCertificate::Legacy(local_cert_der),
+            server_name, attested_endpoint, configuration)
+    }
+
+    #[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
+    pub(crate) fn new_paid(
+        tls_conn: rustls::ServerConnection,
+        local_cert_der: retained_certificate::RetainedCertificate,
+        server_name: Option<String>,
+        attested_endpoint: Option<enclave_os_common::modules::AttestedEndpointIdentity>,
+        configuration: ConfigurationLease,
+    ) -> Self {
+        Self::with_certificate(tls_conn, LocalCertificate::Paid(local_cert_der),
+            server_name, attested_endpoint, configuration)
+    }
+
+    fn with_certificate(
+        tls_conn: rustls::ServerConnection,
+        local_cert_der: LocalCertificate,
         server_name: Option<String>,
         attested_endpoint: Option<enclave_os_common::modules::AttestedEndpointIdentity>,
         configuration: ConfigurationLease,
@@ -1017,12 +1060,12 @@ impl RaTlsSession {
     /// Borrow the immutable served leaf for identity comparisons. This is data,
     /// not a currentness grant; dispatch/exporter checks retain their authority.
     pub(crate) fn local_cert_der_ref(&self) -> &[u8] {
-        &self.local_cert_der
+        self.local_cert_der.bytes()
     }
 
     /// Exact DER leaf served by this session.
     pub fn local_cert_der(&self) -> Option<Vec<u8>> {
-        Some(self.local_cert_der.clone())
+        Some(self.local_cert_der.bytes().to_vec())
     }
 
     pub fn server_name(&self) -> Option<&str> {
@@ -1080,7 +1123,7 @@ impl RaTlsSession {
         }
         let mut bytes = Self::CHANNEL_BINDER_BYTES
             .checked_add(self.attestation().len())?
-            .checked_add(self.local_cert_der.len())?
+            .checked_add(self.local_cert_der.bytes().len())?
             .checked_add(self.server_name.as_ref().map_or(0, String::len))?
             .checked_add(
                 self.tls_conn

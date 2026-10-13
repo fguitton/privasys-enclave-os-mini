@@ -21,6 +21,14 @@ fn register(store: &CertStore, name: &str) {
 }
 
 fn pair(store: &CertStore, name: &str) -> (ClientConnection, RaTlsSession) {
+    let (client, session, pool) = pair_with_certificate(store, name, false);
+    assert!(pool.is_none());
+    (client, session)
+}
+
+fn pair_with_certificate(
+    store: &CertStore, name: &str, paid: bool,
+) -> (ClientConnection, RaTlsSession, Option<Arc<enclave_os_common::allocation::AllocationPoolV1>>) {
     let key = rcgen::KeyPair::generate().unwrap();
     let cert = rcgen::CertificateParams::new(vec![name.into()])
         .unwrap()
@@ -46,19 +54,31 @@ fn pair(store: &CertStore, name: &str) -> (ClientConnection, RaTlsSession) {
         .with_root_certificates(roots)
         .with_no_client_auth();
     let (app, lease) = store.snapshot(Some(name)).unwrap();
+    let server = ServerConnection::new(Arc::new(server)).unwrap();
+    let endpoint = app.and_then(|app| app.attested_endpoint);
+    let (session, pool) = if paid {
+        use enclave_os_common::allocation::{AllocationPoolV1, SharedAllocationV1};
+        use super::retained_certificate::RetainedCertificate;
+        let required = SharedAllocationV1::<Vec<u8>>::required_bytes(cert.len()).unwrap();
+        let short = AllocationPoolV1::new(required - 1).unwrap();
+        assert!(RetainedCertificate::copy_from(&short, &cert).is_none());
+        assert_eq!(short.used(), 0);
+        let pool = AllocationPoolV1::new(required).unwrap();
+        let retained = RetainedCertificate::copy_from(&pool, &cert).unwrap();
+        assert_eq!(retained.bytes(), cert);
+        assert_eq!(pool.used(), required);
+        (RaTlsSession::new_paid(server, retained, Some(name.into()), endpoint, lease), Some(pool))
+    } else {
+        (RaTlsSession::new(server, cert, Some(name.into()), endpoint, lease), None)
+    };
     (
         ClientConnection::new(
             Arc::new(client),
             ServerName::try_from(name.to_owned()).unwrap(),
         )
         .unwrap(),
-        RaTlsSession::new(
-            ServerConnection::new(Arc::new(server)).unwrap(),
-            cert,
-            Some(name.into()),
-            app.and_then(|app| app.attested_endpoint),
-            lease,
-        ),
+        session,
+        pool,
     )
 }
 
@@ -127,6 +147,7 @@ fn replacement_rejects_buffered_requests_and_re_attestation() {
     checked_session_table_refusal();
     checked_connection_metadata_tables();
     checked_fixed_channel_binder();
+    checked_retained_certificate();
     let store = CertStore::new();
     register(&store, "a.test");
     let (mut client, mut session) = pair(&store, "a.test");
@@ -1529,4 +1550,30 @@ fn checked_fixed_channel_binder() {
         "new connection has its own exporter"
     );
     eprintln!("CHANNEL-BINDER-FIXED: genuine handshake success-only cache, original exporter equality, replacement refusal PASS");
+}
+
+// Same genuine certificate store, rustls handshake and original currentness
+// boundary, with the production paid constructor and no new test identity.
+fn checked_retained_certificate() {
+    let store = CertStore::new();
+    register(&store, "paid.test");
+    let (mut client, mut session, pool) = pair_with_certificate(&store, "paid.test", true);
+    let pool = pool.unwrap();
+    let super::LocalCertificate::Paid(retained) = &session.local_cert_der else { panic!("paid constructor lost owner") };
+    let alias = retained.clone();
+    let charged = pool.used();
+    assert!(charged > alias.bytes().len());
+    handshake(&mut client, &mut session);
+    assert_eq!(session.local_cert_der_ref(), alias.bytes());
+    assert!(session.export_hctx(b"paid-test", &[1; 32]).is_ok());
+    assert_eq!(pool.used(), charged);
+    register(&store, "paid.test");
+    assert!(session.feed_tls_bytes(&[]).is_err());
+    assert!(session.attestation_failed());
+    assert_eq!(pool.used(), charged);
+    drop(session);
+    assert_eq!(pool.used(), charged);
+    assert!(!alias.bytes().is_empty());
+    drop(alias);
+    assert_eq!(pool.used(), 0);
 }

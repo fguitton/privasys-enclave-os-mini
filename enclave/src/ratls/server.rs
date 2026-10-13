@@ -126,7 +126,7 @@ pub struct IngressServer {
 /// A cached ServerConfig for deterministic (non-challenge) connections.
 struct CachedConfig {
     config: Arc<ServerConfig>,
-    local_cert_der: Vec<u8>,
+    local_cert_der: super::session::retained_certificate::RetainedCertificate,
     expires_at: u64,
     configuration: cert_store::ConfigurationLease,
     /// SHA-256(SPKI) of the leaf key the config serves.
@@ -1319,7 +1319,7 @@ impl IngressServer {
         };
 
         // Capture the exact static leaf and routing identity for this session.
-        let mut session = RaTlsSession::new(
+        let mut session = RaTlsSession::new_paid(
             server_conn,
             tls_result.local_cert_der,
             hello.sni,
@@ -1478,7 +1478,7 @@ impl Drop for IngressServer {
 /// Result of building a TLS config for a single connection.
 struct TlsConfigResult {
     config: Arc<ServerConfig>,
-    local_cert_der: Vec<u8>,
+    local_cert_der: super::session::retained_certificate::RetainedCertificate,
     attested_endpoint: Option<enclave_os_common::modules::AttestedEndpointIdentity>,
     configuration: cert_store::ConfigurationLease,
 }
@@ -1499,12 +1499,12 @@ fn build_tls_config(
         None => attestation::generate_ratls_certificate(ca, key, now)?,
     };
 
-    let initial_leaf = result
-        .cert_chain_der
-        .first()
-        .cloned()
+    let initial_leaf = result.cert_chain_der.first()
         .ok_or_else(|| "RA-TLS certificate chain is empty".to_string())?;
-    let local_cert_der = initial_leaf;
+    let pool = crate::local_allocation_pool().ok_or_else(String::new)?;
+    let local_cert_der = super::session::retained_certificate::RetainedCertificate::copy_from(
+        &pool, initial_leaf,
+    ).ok_or_else(String::new)?;
     let certs: Vec<CertificateDer<'static>> = result
         .cert_chain_der
         .into_iter()
