@@ -59,6 +59,8 @@ pub(crate) mod channel_output;
 mod http_request;
 #[path = "ordered_map.rs"]
 pub(crate) mod ordered_map;
+#[path = "cancellation.rs"]
+pub(crate) mod cancellation;
 #[path = "pending_client.rs"]
 pub(crate) mod pending_client;
 pub use http_request::PaidHttpRequest;

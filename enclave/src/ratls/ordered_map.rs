@@ -1,5 +1,6 @@
 //! Server adapter: empty startup allocates nothing; first admission binds the
 //! actual immutable SDK pool. Native owning fixtures supply their explicit pool.
+use core::borrow::Borrow;
 use enclave_os_common::allocation::{
     ordered_map::{PaidMapEntriesV1, PaidOrderedMapV1},
     AllocationPoolV1,
@@ -14,16 +15,113 @@ impl<K, V> Default for OrderedMap<K, V> {
     }
 }
 impl<K: Ord, V> OrderedMap<K, V> {
-    pub(crate) fn get(&self, key: &K) -> Option<&V> {
+    pub(crate) fn has_admission(&self) -> bool {
+        self.inner.is_some()
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.inner.as_ref().map_or(0, PaidOrderedMapV1::len)
+    }
+    #[cfg(test)]
+    pub(crate) fn clear(&mut self) {
+        if let Some(inner) = &mut self.inner {
+            inner.clear();
+        }
+    }
+    pub(crate) fn retain(&mut self, keep: impl FnMut(&K, &mut V) -> bool) {
+        if let Some(inner) = &mut self.inner {
+            inner.retain(keep);
+        }
+    }
+    // Request tuple capacity before computing independently owned children.
+    // The existing entry remains unchanged if later payload creation refuses.
+    fn reserve_new_from(&mut self, pool: &Arc<AllocationPoolV1>) -> Result<(), ()> {
+        let capacity = self.len().checked_add(1).ok_or(())?;
+        self.prepare_from(pool, capacity)
+    }
+    #[cfg(target_env = "sgx")]
+    pub(crate) fn reserve_new_entry(&mut self) -> Result<(), ()> {
+        let pool = crate::local_allocation_pool().ok_or(())?;
+        self.reserve_new_from(&pool)
+    }
+    #[cfg(target_env = "sgx")]
+    pub(crate) fn reserve_entry<Q: Ord + ?Sized>(&mut self, key: &Q) -> Result<(), ()>
+    where
+        K: Borrow<Q>,
+    {
+        if self.contains_key(key) {
+            return Ok(());
+        }
+        self.reserve_new_entry()
+    }
+    pub(crate) fn values_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut V> {
+        self.inner.iter_mut().flat_map(PaidOrderedMapV1::values_mut)
+    }
+    pub(crate) fn range<R: core::ops::RangeBounds<K>>(
+        &self,
+        range: R,
+    ) -> impl DoubleEndedIterator<Item = (&K, &V)> {
+        self.inner
+            .as_ref()
+            .map(|inner| inner.range(range))
+            .into_iter()
+            .flatten()
+    }
+    pub(crate) fn prepared_for(&self, pool: &Arc<AllocationPoolV1>, capacity: usize) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| inner.uses_pool(pool) && inner.capacity() >= capacity)
+    }
+    pub(crate) fn prepare_from(
+        &mut self,
+        pool: &Arc<AllocationPoolV1>,
+        capacity: usize,
+    ) -> Result<(), ()> {
+        if self
+            .inner
+            .as_ref()
+            .is_some_and(|inner| !inner.uses_pool(pool))
+        {
+            return Err(());
+        }
+        let inner = self
+            .inner
+            .get_or_insert_with(|| PaidOrderedMapV1::new(Arc::clone(pool)));
+        inner.try_reserve_capacity(capacity).map_err(|_| ())
+    }
+    // Cancellation owners pre-admit their entire original maximum before any
+    // adopter receives a marker. Invalidation can never trigger map growth.
+    pub(crate) fn insert_prepared(&mut self, key: K, value: V) -> Option<V> {
+        let inner = self
+            .inner
+            .as_mut()
+            .expect("pending backing admitted before adopter");
+        assert!(inner.contains_key(&key) || inner.len() < inner.capacity());
+        inner
+            .try_insert(key, value)
+            .unwrap_or_else(|_| panic!("pre-admitted nonzero tuple backing"))
+    }
+    pub(crate) fn get<Q: Ord + ?Sized>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+    {
         self.inner.as_ref()?.get(key)
     }
-    pub(crate) fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+    pub(crate) fn get_mut<Q: Ord + ?Sized>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: Borrow<Q>,
+    {
         self.inner.as_mut()?.get_mut(key)
     }
-    pub(crate) fn contains_key(&self, key: &K) -> bool {
+    pub(crate) fn contains_key<Q: Ord + ?Sized>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+    {
         self.get(key).is_some()
     }
-    pub(crate) fn remove(&mut self, key: &K) -> Option<V> {
+    pub(crate) fn remove<Q: Ord + ?Sized>(&mut self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+    {
         self.inner.as_mut()?.remove(key)
     }
     pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = (&K, &V)> {
@@ -253,6 +351,37 @@ pub(super) fn check() {
     assert!(!set.contains_key(&8));
     assert_eq!(pool.used(), bytes);
     drop(set);
+    assert_eq!(pool.used(), 0);
+    // Borrowed lookup never copies a hostname. Preflight failure must precede
+    // child construction and preserve every previously cached entry.
+    let unit = core::alloc::Layout::array::<(String, u64)>(1)
+        .unwrap()
+        .size();
+    let pool = AllocationPoolV1::new(unit).unwrap();
+    let mut names = OrderedMap::<String, u64>::default();
+    names.reserve_new_from(&pool).unwrap();
+    names.insert_prepared("one".into(), 1);
+    assert_eq!(names.get("one"), Some(&1));
+    assert!(names.reserve_new_from(&pool).is_err());
+    assert_eq!(names.get("one"), Some(&1));
+    assert!(!names.contains_key("two"));
+    *names.get_mut("one").unwrap() = 2;
+    let mut reference = BTreeMap::from([("one".to_owned(), 2)]);
+    names.retain(|name, value| {
+        *value += u64::try_from(name.len()).unwrap();
+        true
+    });
+    reference.retain(|name, value| {
+        *value += u64::try_from(name.len()).unwrap();
+        true
+    });
+    assert_eq!(
+        names.iter().collect::<Vec<_>>(),
+        reference.iter().collect::<Vec<_>>()
+    );
+    assert_eq!(names.remove("one"), reference.remove("one"));
+    assert_eq!(pool.used(), unit, "empty cached backing remains paid");
+    drop(names);
     assert_eq!(pool.used(), 0);
     eprintln!("DISPATCH-SET-PAID: original set ordering/dedup/removal and real metadata refusal/refund PASS");
     eprintln!("SESSION-MAP-PAID: original ordered-map oracle, real backing peak/refusal/empty/iterator refund PASS");

@@ -912,13 +912,13 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
 
     let _ = control_opportunity(hook, ControlLoopOpportunity::Shutdown);
     crate::signal_shutdown();
-    let mut cancelled = Vec::new();
-    let mut cancelled_stream = Vec::new();
+    let mut cancelled = None;
+    let mut cancelled_stream = None;
     if let Some(state) = crate::try_state() {
         if let Ok(mut st) = state.lock() {
             if let Some(server) = st.ingress_server.as_mut() {
-                cancelled = server.drain_deferred_tokens();
-                cancelled_stream = server.drain_stream_receivers();
+                cancelled = Some(server.drain_deferred_tokens());
+                cancelled_stream = Some(server.drain_stream_receivers());
             }
             st.ingress_server = None;
         }
@@ -928,7 +928,7 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
         drop(crate::stream_ingress::take_terminal());
     }
     if let Some((_, _, _, _, cancel)) = crate::HONEST_DEFERRED_INGRESS_HOOK.get() {
-        for token in cancelled {
+        for token in cancelled.into_iter().flatten() {
             cancel(token);
         }
         for _ in 0..crate::MAX_DEFERRED_INGRESS_REQUESTS {

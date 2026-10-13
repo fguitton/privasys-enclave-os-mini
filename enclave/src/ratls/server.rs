@@ -25,7 +25,6 @@
 //! separate RPC channel.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
 use std::string::String;
 use std::sync::Arc;
 use std::vec::Vec;
@@ -110,17 +109,17 @@ pub struct IngressServer {
     /// Shutdown flag.
     shutdown: bool,
     /// Per-hostname cached TLS configs (leaf certificate + key).
-    cached_configs: BTreeMap<String, CachedConfig>,
+    cached_configs: super::session::ordered_map::OrderedMap<String, CachedConfig>,
     /// Bounded ciphertext backlog when the host-side SPSC queue has no credit.
     pending_output: RefCell<ChannelQueue>,
     output_failed: Cell<bool>,
     /// Per-hostname leaf keys, kept 24 h across re-mints (RA-TLS v2).
-    leaf_keys: BTreeMap<String, LeafKey>,
+    leaf_keys: super::session::ordered_map::OrderedMap<String, LeafKey>,
     /// Every answerable leaf key by SHA-256(SPKI): current keys and keys
     /// rotated less than 15 minutes ago (the `leaf` of an attest request).
-    leaf_by_spki: BTreeMap<[u8; 32], LeafKey>,
+    leaf_by_spki: super::session::ordered_map::OrderedMap<[u8; 32], LeafKey>,
     /// Deterministic quotes, one per leaf key, cached for the key's lifetime.
-    det_quotes: BTreeMap<[u8; 32], DetQuote>,
+    det_quotes: super::session::ordered_map::OrderedMap<[u8; 32], DetQuote>,
 }
 
 /// A cached ServerConfig for deterministic (non-challenge) connections.
@@ -166,12 +165,12 @@ impl IngressServer {
             ca,
             data_tx,
             shutdown: false,
-            cached_configs: BTreeMap::new(),
+            cached_configs: super::session::ordered_map::OrderedMap::default(),
             pending_output: RefCell::new(ChannelQueue::default()),
             output_failed: Cell::new(false),
-            leaf_keys: BTreeMap::new(),
-            leaf_by_spki: BTreeMap::new(),
-            det_quotes: BTreeMap::new(),
+            leaf_keys: super::session::ordered_map::OrderedMap::default(),
+            leaf_by_spki: super::session::ordered_map::OrderedMap::default(),
+            det_quotes: super::session::ordered_map::OrderedMap::default(),
         }
     }
 
@@ -578,12 +577,7 @@ impl IngressServer {
 
     /// Process all complete HTTP/1.1 requests from a session.
     fn invalidate_stream(&mut self, id: u32) {
-        if let Some(slot) = self.stream_owner.pending.remove(&id) {
-            if let Some(receiver) = slot.receiver {
-                self.stream_owner.cancelled.push_back(receiver);
-            }
-            crate::stream_ingress::notify();
-        }
+        self.stream_owner.invalidate(id);
     }
     fn invalidate_deferred(&mut self, id: u32) {
         self.invalidate_stream(id);
@@ -639,7 +633,7 @@ impl IngressServer {
         self.send_close(id);
     }
 
-    pub(crate) fn drain_deferred_tokens(&mut self) -> Vec<crate::HonestPendingIngress> {
+    pub(crate) fn drain_deferred_tokens(&mut self) -> crate::deferred_ingress::Drain {
         self.deferred_owner.take_tokens()
     }
 
@@ -821,7 +815,7 @@ impl IngressServer {
         }
         false
     }
-    pub(crate) fn drain_stream_receivers(&mut self) -> Vec<crate::stream_ingress::ChargedReceiver> {
+    pub(crate) fn drain_stream_receivers(&mut self) -> crate::stream_ingress::Drain {
         self.stream_owner.take_receivers()
     }
 
@@ -1052,12 +1046,16 @@ impl IngressServer {
                             self.send_close(conn_id);
                             return false;
                         };
+                        if !self.stream_owner.prepare() {
+                            self.send_close(conn_id);
+                            return false;
+                        }
                         let close = header.connection_close;
                         if session.consume_stream_head(head).is_err() {
                             self.send_close(conn_id);
                             return false;
                         }
-                        self.stream_owner.pending.insert(
+                        self.stream_owner.pending.insert_prepared(
                             conn_id,
                             crate::stream_ingress::Slot {
                                 lease,
@@ -1180,8 +1178,11 @@ impl IngressServer {
                                     return false;
                                 };
                                 self.next_deferred = nonce;
+                                if !self.deferred_owner.prepare() {
+                                    return false;
+                                }
                                 // Reserve before the adopter may allocate its bounded request.
-                                self.deferred_owner.pending.insert(
+                                self.deferred_owner.pending.insert_prepared(
                                     conn_id,
                                     crate::deferred_ingress::PendingSession {
                                         nonce,
@@ -1348,11 +1349,11 @@ impl IngressServer {
     /// so a deterministic quote minted for it stays valid.
     fn tls_config_for(&mut self, sni: &Option<String>) -> Result<TlsConfigResult, String> {
         let (app_data, configuration) = cert_store::cert_store().snapshot(sni.as_deref())?;
-        let cache_key = sni.clone().unwrap_or_default();
+        let cache_key = sni.as_deref().unwrap_or_default();
         let now = ocall::get_current_time().unwrap_or(0);
-        let key = self.leaf_key_for(&cache_key, now)?;
+        let key = self.leaf_key_for(cache_key, now)?;
 
-        if let Some(cached) = self.cached_configs.get(&cache_key) {
+        if let Some(cached) = self.cached_configs.get(cache_key) {
             if now < cached.expires_at
                 && cached.configuration.is_current()
                 && cached.spki_hash == key.spki_hash
@@ -1366,6 +1367,9 @@ impl IngressServer {
             }
         }
 
+        // Metadata refusal must not create a new TLS/crypto payload. Empty
+        // errors allocate nothing on physical-admission refusal.
+        self.cached_configs.reserve_entry(cache_key).map_err(|()| String::new())?;
         let require_peer_client_auth =
             sni.as_deref() == Some(enclave_os_common::modules::HONEST_PEER_SNI);
         let tls_result = build_tls_config(
@@ -1376,8 +1380,8 @@ impl IngressServer {
             now,
             configuration,
         )?;
-        self.cached_configs.insert(
-            cache_key,
+        self.cached_configs.insert_prepared(
+            cache_key.to_owned(),
             CachedConfig {
                 config: tls_result.config.clone(),
                 local_cert_der: tls_result.local_cert_der.clone(),
@@ -2883,24 +2887,25 @@ impl IngressServer {
     fn leaf_key_for(&mut self, sni: &str, now: u64) -> Result<LeafKey, String> {
         let retire_before = now
             .saturating_sub(attestation::DETERMINISTIC_VALIDITY_SECS + PREVIOUS_KEY_RETENTION_SECS);
-        let stale: Vec<[u8; 32]> = self
-            .leaf_by_spki
-            .iter()
-            .filter(|(_, k)| k.created < retire_before)
-            .map(|(h, _)| *h)
-            .collect();
-        for h in stale {
-            self.leaf_by_spki.remove(&h);
-            self.det_quotes.remove(&h);
-        }
+        let quotes = &mut self.det_quotes;
+        self.leaf_by_spki.retain(|hash, key| {
+            if key.created < retire_before {
+                quotes.remove(hash);
+                false
+            } else {
+                true
+            }
+        });
         if let Some(k) = self.leaf_keys.get(sni) {
             if now < k.created + attestation::DETERMINISTIC_VALIDITY_SECS {
                 return Ok(k.clone());
             }
         }
+        self.leaf_keys.reserve_entry(sni).map_err(|()| String::new())?;
+        self.leaf_by_spki.reserve_new_entry().map_err(|()| String::new())?;
         let k = attestation::new_leaf_key(now)?;
-        self.leaf_keys.insert(sni.to_string(), k.clone());
-        self.leaf_by_spki.insert(k.spki_hash, k.clone());
+        self.leaf_keys.insert_prepared(sni.to_string(), k.clone());
+        self.leaf_by_spki.insert_prepared(k.spki_hash, k.clone());
         Ok(k)
     }
 
@@ -2915,11 +2920,12 @@ impl IngressServer {
                 return Ok((d.quote.clone(), d.quote_time.clone()));
             }
         }
+        self.det_quotes.reserve_entry(&key.spki_hash).map_err(|()| String::new())?;
         let quote_time = enclave_os_common::attest::format_quote_time(now as i64);
         let rd =
             enclave_os_common::attest::deterministic_report_data(&key.spki_der, &quote_time, None);
         let quote = attestation::sgx_quote(&rd)?;
-        self.det_quotes.insert(
+        self.det_quotes.insert_prepared(
             key.spki_hash,
             DetQuote {
                 quote: quote.clone(),

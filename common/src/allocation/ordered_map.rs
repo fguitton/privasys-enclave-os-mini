@@ -1,6 +1,7 @@
 //! Fallible ordered metadata backing. Children require their own admission.
 use super::{AllocationLeaseV1, AllocationPoolV1};
 use alloc::{sync::Arc, vec::Vec};
+use core::borrow::Borrow;
 
 /// An ordered map bound permanently to the caller's original physical pool.
 /// No operation implicitly clones keys, values or their independently owned children.
@@ -9,6 +10,9 @@ pub struct PaidOrderedMapV1<K, V> {
     allocation: Option<AllocationLeaseV1>,
     pool: Arc<AllocationPoolV1>,
 }
+/// Refused checked backing geometry, pool admission or allocator reservation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MapAdmissionRefusedV1;
 /// Failure of metadata admission or the caller's fallible child clone.
 #[derive(Debug, PartialEq, Eq)]
 pub enum MapCloneErrorV1<E> {
@@ -38,21 +42,59 @@ impl<K: Ord, V> PaidOrderedMapV1<K, V> {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
-    fn position(&self, key: &K) -> Result<usize, usize> {
-        self.entries.binary_search_by(|entry| entry.0.cmp(key))
+    /// Actual admitted tuple capacity, without any permission to grow children.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.entries.capacity()
+    }
+    /// Pre-admit an absolute tuple capacity before publishing external work.
+    /// Existing backing remains live during growth; smaller requests do nothing.
+    /// # Errors
+    /// Refuses zero-sized tuple storage, overflow, pool exhaustion or allocation
+    /// failure without changing entries or their existing backing.
+    pub fn try_reserve_capacity(&mut self, capacity: usize) -> Result<(), MapAdmissionRefusedV1> {
+        if core::mem::size_of::<(K, V)>() == 0 {
+            return Err(MapAdmissionRefusedV1);
+        }
+        if capacity <= self.entries.capacity() {
+            return Ok(());
+        }
+        self.reserve_backing(capacity)
+            .map_err(|()| MapAdmissionRefusedV1)?;
+        self.publish_backing();
+        Ok(())
+    }
+    fn position<Q: Ord + ?Sized>(&self, key: &Q) -> Result<usize, usize>
+    where
+        K: Borrow<Q>,
+    {
+        self.entries
+            .binary_search_by(|entry| entry.0.borrow().cmp(key))
     }
     #[must_use]
-    pub fn get(&self, key: &K) -> Option<&V> {
+    pub fn get<Q: Ord + ?Sized>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+    {
         self.position(key).ok().map(|i| &self.entries[i].1)
     }
-    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+    pub fn get_mut<Q: Ord + ?Sized>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: Borrow<Q>,
+    {
         self.position(key).ok().map(|i| &mut self.entries[i].1)
     }
     #[must_use]
-    pub fn contains_key(&self, key: &K) -> bool {
+    pub fn contains_key<Q: Ord + ?Sized>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+    {
         self.position(key).is_ok()
     }
-    pub fn remove(&mut self, key: &K) -> Option<V> {
+    pub fn remove<Q: Ord + ?Sized>(&mut self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+    {
         self.position(key).ok().map(|i| self.entries.remove(i).1)
     }
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = (&K, &V)> {
@@ -240,6 +282,29 @@ impl<K, V> IntoIterator for PaidOrderedMapV1<K, V> {
 
 #[cfg(test)]
 pub(super) fn check() {
+    let unit = core::alloc::Layout::array::<(u32, u64)>(3).unwrap().size();
+    for maximum in [unit - 1, unit, unit + 1] {
+        let pool = AllocationPoolV1::new(maximum).unwrap();
+        let mut reserved = PaidOrderedMapV1::<u32, u64>::new(Arc::clone(&pool));
+        assert_eq!(reserved.try_reserve_capacity(3).is_ok(), maximum >= unit);
+        assert_eq!(pool.used(), if maximum >= unit { unit } else { 0 });
+        if maximum >= unit {
+            assert_eq!(reserved.capacity(), 3);
+            reserved.try_insert(2, 20).unwrap();
+            reserved.try_insert(1, 10).unwrap();
+            reserved.try_insert(3, 30).unwrap();
+            assert_eq!(pool.used(), unit);
+            assert!(reserved.try_reserve_capacity(usize::MAX).is_err());
+            assert_eq!(
+                reserved.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>(),
+                [(1, 10), (2, 20), (3, 30)]
+            );
+            assert!(reserved.try_reserve_capacity(0).is_ok());
+            assert_eq!(pool.used(), unit);
+        }
+        drop(reserved);
+        assert_eq!(pool.used(), 0);
+    }
     check_borrowed_mutation();
     // Actual child backing carries independent credit; no plain Clone escape.
     struct Child {

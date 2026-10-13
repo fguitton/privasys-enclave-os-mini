@@ -230,18 +230,75 @@ pub(crate) fn terminal_count() -> usize {
 }
 #[derive(Default)]
 pub(crate) struct CancellationOwner {
-    pub pending: std::collections::BTreeMap<u32, Slot>,
-    pub cancelled: std::collections::VecDeque<ChargedReceiver>,
+    pub pending: crate::ratls::session::ordered_map::OrderedMap<u32, Slot>,
+    pub cancelled: crate::ratls::session::cancellation::Queue<ChargedReceiver>,
 }
 impl CancellationOwner {
-    pub fn take_receivers(&mut self) -> Vec<ChargedReceiver> {
-        std::mem::take(&mut self.pending)
-            .into_values()
-            .filter_map(|s| s.receiver)
-            .chain(self.cancelled.drain(..))
-            .collect()
+    pub(crate) fn invalidate(&mut self, id: u32) {
+        if let Some(slot) = self.pending.remove(&id) {
+            if let Some(receiver) = slot.receiver {
+                self.cancelled.push_back(receiver);
+            }
+            notify();
+        }
+    }
+    pub(crate) fn prepare_from(
+        &mut self,
+        pool: &std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
+    ) -> bool {
+        if self.pending.prepared_for(pool, MAX_STREAM_INGRESS_SESSIONS)
+            && self
+                .cancelled
+                .prepared_for(pool, MAX_STREAM_INGRESS_SESSIONS)
+        {
+            return true;
+        }
+        if self.pending.has_admission() || self.cancelled.has_admission() {
+            return false;
+        }
+        let mut pending = crate::ratls::session::ordered_map::OrderedMap::default();
+        if pending
+            .prepare_from(pool, MAX_STREAM_INGRESS_SESSIONS)
+            .is_err()
+        {
+            return false;
+        }
+        let Some(cancelled) =
+            crate::ratls::session::cancellation::Queue::new(pool, MAX_STREAM_INGRESS_SESSIONS)
+        else {
+            return false;
+        };
+        self.pending = pending;
+        self.cancelled = cancelled;
+        true
+    }
+    #[cfg(target_env = "sgx")]
+    pub(crate) fn prepare(&mut self) -> bool {
+        crate::local_allocation_pool().is_some_and(|pool| self.prepare_from(&pool))
+    }
+    pub(crate) fn take_receivers(&mut self) -> Drain {
+        Drain {
+            pending: std::mem::take(&mut self.pending).into_iter(),
+            cancelled: std::mem::take(&mut self.cancelled).into_iter(),
+        }
     }
 }
+pub(crate) struct Drain {
+    pending: crate::ratls::session::ordered_map::Entries<u32, Slot>,
+    cancelled: crate::ratls::session::cancellation::Drain<ChargedReceiver>,
+}
+impl Iterator for Drain {
+    type Item = ChargedReceiver;
+    fn next(&mut self) -> Option<ChargedReceiver> {
+        for (_, slot) in self.pending.by_ref() {
+            if let Some(value) = slot.receiver {
+                return Some(value);
+            }
+        }
+        self.cancelled.next()
+    }
+}
+
 impl Drop for CancellationOwner {
     fn drop(&mut self) {
         for receiver in self.take_receivers() {
@@ -251,6 +308,33 @@ impl Drop for CancellationOwner {
 }
 #[cfg(test)]
 pub(crate) fn check_slot_ownership() {
+    use enclave_os_common::allocation::AllocationPoolV1;
+    let bytes = core::alloc::Layout::array::<(u32, Slot)>(MAX_STREAM_INGRESS_SESSIONS)
+        .unwrap()
+        .size()
+        + crate::ratls::session::cancellation::Queue::<ChargedReceiver>::bytes(
+            MAX_STREAM_INGRESS_SESSIONS,
+        )
+        .unwrap();
+    for maximum in [bytes - 1, bytes, bytes + 1] {
+        let pool = AllocationPoolV1::new(maximum).unwrap();
+        let mut owner = CancellationOwner::default();
+        assert_eq!(owner.prepare_from(&pool), maximum >= bytes);
+        assert_eq!(pool.used(), if maximum >= bytes { bytes } else { 0 });
+        if maximum >= bytes {
+            let foreign = AllocationPoolV1::new(bytes).unwrap();
+            assert!(!owner.prepare_from(&foreign));
+            assert_eq!(foreign.used(), 0);
+            // Extracting an empty drain still owns both allocated backings.
+            let drained = owner.take_receivers();
+            drop(owner);
+            assert_eq!(pool.used(), bytes);
+            drop(drained);
+        } else {
+            drop(owner);
+        }
+        assert_eq!(pool.used(), 0);
+    }
     let mut slots = Vec::new();
     for _ in 0..MAX_STREAM_INGRESS_SESSIONS {
         slots.push(SlotCharge::reserve().unwrap());
@@ -294,6 +378,68 @@ pub(crate) fn check_slot_ownership() {
     let replacement =
         SlotCharge::reserve().expect("credit released only after receiver destructor");
     drop(replacement);
+    // The real invalidation owner and destructor retain the receiver while
+    // STATE is held; terminal release and the final logical alias are outside.
+    let pool = AllocationPoolV1::new(bytes).unwrap();
+    let mut owner = CancellationOwner::default();
+    assert!(owner.prepare_from(&pool));
+    let lease = SlotCharge::reserve().unwrap();
+    let retained = lease.clone();
+    observed.store(false, std::sync::atomic::Ordering::Release);
+    owner.pending.insert_prepared(
+        1,
+        Slot {
+            nonce: 1,
+            generation: 1,
+            binding: [0; 32],
+            header: None,
+            receiver: Some(ChargedReceiver {
+                value: Box::new(ChargedDropCheck(observed.clone())),
+                lease: lease.clone(),
+            }),
+            remaining: 0,
+            fragment: Vec::new(),
+            parked: false,
+            length: 0,
+            close: false,
+            started: std::time::Instant::now(),
+            lease,
+        },
+    );
+    owner.invalidate(1);
+    assert_eq!(owner.pending.len(), 0);
+    assert_eq!(owner.cancelled.len(), 1);
+    owner.invalidate(1);
+    assert_eq!(
+        owner.cancelled.len(),
+        1,
+        "same invalidation never duplicates debt"
+    );
+    assert_eq!(
+        pool.used(),
+        bytes,
+        "invalidation neither reallocates nor releases backing"
+    );
+    let state = std::sync::Mutex::new(());
+    let state_guard = state.lock().unwrap();
+    drop(owner);
+    assert_eq!(
+        pool.used(),
+        0,
+        "drained metadata dies before its final credit"
+    );
+    assert!(!observed.load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(terminal_count(), 1);
+    assert!(SlotCharge::reserve().is_none());
+    drop(state_guard);
+    drop(take_terminal().unwrap());
+    assert!(observed.load(std::sync::atomic::Ordering::Acquire));
+    assert!(
+        SlotCharge::reserve().is_none(),
+        "outside-STATE retained alias still owns claim"
+    );
+    drop(retained);
+    drop(SlotCharge::reserve().expect("last receiver alias releases original claim"));
     drop(slots);
 }
 

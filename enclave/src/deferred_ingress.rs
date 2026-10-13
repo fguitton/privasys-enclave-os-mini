@@ -125,7 +125,7 @@ impl Drop for ContextCharge {
 }
 
 pub(crate) fn select_pending(
-    slots: &std::collections::BTreeMap<u32, PendingSession>,
+    slots: &crate::ratls::session::ordered_map::OrderedMap<u32, PendingSession>,
     cursor: u32,
     seen: &[u64],
 ) -> Option<u32> {
@@ -149,7 +149,7 @@ impl PendingSession {
 }
 #[cfg(test)]
 pub(crate) fn check_pending_for_native() {
-    use std::collections::BTreeMap;
+    use enclave_os_common::allocation::AllocationPoolV1;
     assert!(metadata_fits(Some(256)));
     assert!(metadata_fits(Some(4096)));
     assert!(!metadata_fits(Some(4097)));
@@ -158,9 +158,28 @@ pub(crate) fn check_pending_for_native() {
     // fit even when the independently bounded original request is 4220 bytes.
     assert!(!metadata_fits(Some(4220)));
 
-    let mut slots = BTreeMap::new();
+    let bytes = core::alloc::Layout::array::<(u32, PendingSession)>(MAX_DEFERRED_INGRESS_REQUESTS)
+        .unwrap()
+        .size()
+        + crate::ratls::session::cancellation::Queue::<HonestPendingIngress>::bytes(
+            MAX_DEFERRED_INGRESS_REQUESTS,
+        )
+        .unwrap();
+    for maximum in [bytes - 1, bytes, bytes + 1] {
+        let pool = AllocationPoolV1::new(maximum).unwrap();
+        let mut owner = CancellationOwner::default();
+        assert_eq!(owner.prepare_from(&pool), maximum >= bytes);
+        assert_eq!(pool.used(), if maximum >= bytes { bytes } else { 0 });
+        drop(owner);
+        assert_eq!(pool.used(), 0);
+    }
+    let pool = AllocationPoolV1::new(bytes * 2).unwrap();
+    let mut slots = crate::ratls::session::ordered_map::OrderedMap::default();
+    slots
+        .prepare_from(&pool, MAX_DEFERRED_INGRESS_REQUESTS)
+        .unwrap();
     for id in 1..=16 {
-        slots.insert(
+        slots.insert_prepared(
             id,
             PendingSession {
                 nonce: id as u64,
@@ -193,7 +212,7 @@ pub(crate) fn check_pending_for_native() {
     assert!(select_pending(&slots, cursor, &seen).is_none());
     assert_eq!(select_pending(&slots, cursor, &[]), Some(1));
     let old = slots.remove(&1).unwrap();
-    slots.insert(
+    slots.insert_prepared(
         1,
         PendingSession {
             nonce: 99,
@@ -204,10 +223,12 @@ pub(crate) fn check_pending_for_native() {
         },
     );
     assert!(!slots[&1].matches_inflight(old.nonce, old.binding));
-    let mut cancelled = std::collections::VecDeque::new();
+    let mut cancelled =
+        crate::ratls::session::cancellation::Queue::new(&pool, MAX_DEFERRED_INGRESS_REQUESTS)
+            .unwrap();
     slots.clear();
     for id in 1..=16 {
-        slots.insert(
+        slots.insert_prepared(
             id,
             PendingSession {
                 nonce: id as u64,
@@ -248,8 +269,9 @@ pub(crate) fn check_pending_for_native() {
         "publication after take stays pending"
     );
     let mut owner = CancellationOwner::default();
+    assert!(owner.prepare_from(&pool));
     for id in 1..=16 {
-        owner.pending.insert(
+        owner.pending.insert_prepared(
             id,
             PendingSession {
                 nonce: id as u64,
@@ -268,6 +290,11 @@ pub(crate) fn check_pending_for_native() {
     let held_state = simulated_state.lock().unwrap();
     // The actual lifecycle destructor performs no adopter callbacks here.
     drop(owner);
+    assert_eq!(
+        pool.used(),
+        bytes,
+        "retired metadata freed, independent original table retained"
+    );
     assert_eq!(
         terminal_count(),
         15,
@@ -292,6 +319,9 @@ pub(crate) fn check_pending_for_native() {
         pending_capacity(0, terminal_count()),
         "outside-STATE cancel permits readmission"
     );
+    drop(slots);
+    drop(cancelled);
+    assert_eq!(pool.used(), 0, "last retained metadata backing refunded");
     let lease = ContextCharge::reserve(128 * 1024).unwrap();
     assert!(ContextCharge::reserve(1).is_none());
     drop(lease);
@@ -308,8 +338,8 @@ pub(crate) fn pending_capacity(pending: usize, cancelled: usize) -> bool {
         .is_some_and(|count| count < MAX_DEFERRED_INGRESS_REQUESTS)
 }
 pub(crate) fn invalidate_pending(
-    slots: &mut std::collections::BTreeMap<u32, PendingSession>,
-    cancelled: &mut std::collections::VecDeque<HonestPendingIngress>,
+    slots: &mut crate::ratls::session::ordered_map::OrderedMap<u32, PendingSession>,
+    cancelled: &mut crate::ratls::session::cancellation::Queue<HonestPendingIngress>,
     id: u32,
 ) {
     if let Some(slot) = slots.remove(&id) {
@@ -358,18 +388,69 @@ pub(crate) fn terminal_count() -> usize {
 /// fixed tokens; the adopter callback is invoked later after STATE is released.
 #[derive(Default)]
 pub(crate) struct CancellationOwner {
-    pub pending: std::collections::BTreeMap<u32, PendingSession>,
-    pub cancelled: std::collections::VecDeque<HonestPendingIngress>,
+    pub pending: crate::ratls::session::ordered_map::OrderedMap<u32, PendingSession>,
+    pub cancelled: crate::ratls::session::cancellation::Queue<HonestPendingIngress>,
 }
 impl CancellationOwner {
-    pub(crate) fn take_tokens(&mut self) -> Vec<HonestPendingIngress> {
-        std::mem::take(&mut self.pending)
-            .into_values()
-            .filter_map(|slot| slot.token)
-            .chain(self.cancelled.drain(..))
-            .collect()
+    pub(crate) fn prepare_from(
+        &mut self,
+        pool: &std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
+    ) -> bool {
+        if self
+            .pending
+            .prepared_for(pool, MAX_DEFERRED_INGRESS_REQUESTS)
+            && self
+                .cancelled
+                .prepared_for(pool, MAX_DEFERRED_INGRESS_REQUESTS)
+        {
+            return true;
+        }
+        if self.pending.has_admission() || self.cancelled.has_admission() {
+            return false;
+        }
+        let mut pending = crate::ratls::session::ordered_map::OrderedMap::default();
+        if pending
+            .prepare_from(pool, MAX_DEFERRED_INGRESS_REQUESTS)
+            .is_err()
+        {
+            return false;
+        }
+        let Some(cancelled) =
+            crate::ratls::session::cancellation::Queue::new(pool, MAX_DEFERRED_INGRESS_REQUESTS)
+        else {
+            return false;
+        };
+        self.pending = pending;
+        self.cancelled = cancelled;
+        true
+    }
+    #[cfg(target_env = "sgx")]
+    pub(crate) fn prepare(&mut self) -> bool {
+        crate::local_allocation_pool().is_some_and(|pool| self.prepare_from(&pool))
+    }
+    pub(crate) fn take_tokens(&mut self) -> Drain {
+        Drain {
+            pending: std::mem::take(&mut self.pending).into_iter(),
+            cancelled: std::mem::take(&mut self.cancelled).into_iter(),
+        }
     }
 }
+pub(crate) struct Drain {
+    pending: crate::ratls::session::ordered_map::Entries<u32, PendingSession>,
+    cancelled: crate::ratls::session::cancellation::Drain<HonestPendingIngress>,
+}
+impl Iterator for Drain {
+    type Item = HonestPendingIngress;
+    fn next(&mut self) -> Option<HonestPendingIngress> {
+        for (_, slot) in self.pending.by_ref() {
+            if let Some(value) = slot.token {
+                return Some(value);
+            }
+        }
+        self.cancelled.next()
+    }
+}
+
 impl Drop for CancellationOwner {
     fn drop(&mut self) {
         for token in self.take_tokens() {
