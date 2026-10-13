@@ -165,8 +165,8 @@ fn tcp_mutual_renewal_preserves_channel_but_rejects_old_and_cross_connection_pro
     wire.send(200, b"before renewal").unwrap();
     assert!(wire.client.re_attest().is_err());
     assert_eq!(
-        wire.client.take_plaintext(),
-        enclave_os_common::protocol::format_http_response(200, b"before renewal", false)
+        wire.client.take_plaintext().as_ref(),
+        enclave_os_common::protocol::format_http_response(200, b"before renewal", false).as_slice()
     );
 
     wire.client.re_attest().unwrap();

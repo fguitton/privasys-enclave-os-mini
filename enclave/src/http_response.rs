@@ -12,18 +12,25 @@ pub struct HttpResponseBody {
     // Declaration order frees the allocation before dropping its reservation.
     bytes: Vec<u8>,
     owner: Option<Arc<dyn Any + Send + Sync>>,
+    allocation: Option<enclave_os_common::allocation::AllocationLeaseV1>,
 }
 impl HttpResponseBody {
+    /// The adopter reserved this exact Vec before copying the HTTP body.
+    /// Actual bytes are destroyed before the move-only allocation credit.
+    pub fn with_allocation(bytes: Vec<u8>, allocation: Option<enclave_os_common::allocation::AllocationLeaseV1>) -> Self {
+        Self { bytes, owner: None, allocation }
+    }
     pub fn with_owner(bytes: Vec<u8>, owner: Arc<dyn Any + Send + Sync>) -> Self {
         Self {
             bytes,
             owner: Some(owner),
+            allocation: None,
         }
     }
 }
 impl From<Vec<u8>> for HttpResponseBody {
     fn from(bytes: Vec<u8>) -> Self {
-        Self { bytes, owner: None }
+        Self { bytes, owner: None, allocation: None }
     }
 }
 impl Deref for HttpResponseBody {
@@ -38,6 +45,7 @@ impl fmt::Debug for HttpResponseBody {
             .field("bytes", &self.bytes.len())
             .field("capacity", &self.bytes.capacity())
             .field("has_owner", &self.owner.is_some())
+            .field("has_allocation", &self.allocation.is_some())
             .finish()
     }
 }

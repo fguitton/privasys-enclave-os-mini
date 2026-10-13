@@ -107,7 +107,7 @@ pub use client::{
     verify_webpki_client_certificate_chain_at, verify_webpki_server_certificate_chain_at,
     BoundedHttpsRequest, ClientCertIdentity, EnclaveAttestationProvider, EnclaveClientCertSigner,
     ExpectedOid, HttpResponse, HttpsBodyLimitsV1, HttpsFetchError, HttpsFetchFailurePhase,
-    IncrementalTlsClient, InterruptibleBlockingNetIo, RaTlsPolicy, ReportDataBinding,
+    IncrementalTlsClient, IncrementalTlsOutput, IncrementalTlsPlaintext, InterruptibleBlockingNetIo, RaTlsPolicy, ReportDataBinding,
     ResourceBoundHttpsRequest, SgxPeerCertificateEvidence, TeeType, TlsPeerCertificateChain,
     TlsPeerCertificateEvidence, MAX_INCREMENTAL_PLAINTEXT, MAX_INCREMENTAL_REQUEST,
     MAX_INCREMENTAL_TLS_FRAGMENT, MAX_INCREMENTAL_TLS_OUTPUT, MAX_REQUEST_BODY,

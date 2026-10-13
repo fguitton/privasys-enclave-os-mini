@@ -162,6 +162,14 @@ fn owned_body(
 
 #[test]
 fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
+    let allocation_pool = enclave_os_common::allocation::AllocationPoolV1::new(1).unwrap();
+    let lease = allocation_pool.reserve_unpublished(1).unwrap();
+    let paid_body = crate::HttpResponseBody::with_allocation(vec![7], Some(lease));
+    assert_eq!(&*paid_body, &[7]);
+    assert_eq!(allocation_pool.used(), 1);
+    assert!(allocation_pool.reserve_unpublished(1).is_none());
+    drop(paid_body);
+    assert_eq!(allocation_pool.used(), 0);
     segmented_response_lifecycle();
     fixed_peer_configuration_boundary();
     #[cfg(feature = "native-deferred-fixture")]

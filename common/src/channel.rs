@@ -80,7 +80,7 @@ pub const MAX_CHANNEL_PAYLOAD: usize = 1024 * 1024;
 // Ten-millisecond retry hints must not wait for a hundred-millisecond tick.
 // Both host and adopter derive their nominal counter from this exact constant.
 pub const SCHEDULING_TICK_INTERVAL_MILLIS: u64 = 10;
-const CONNECT_REQUEST_ID_BYTES: usize = 8;
+pub const CONNECT_REQUEST_ID_BYTES: usize = core::mem::size_of::<u64>();
 
 // ========================================================================
 //  Message types
