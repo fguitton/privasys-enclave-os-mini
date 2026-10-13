@@ -4,10 +4,6 @@ use std::fmt;
 use std::ops::Deref;
 use std::sync::Arc;
 
-/// An immutable body and its optional shared reservation. The adopter acquires
-/// admission before allocating or growing the body; this wrapper only carries
-/// that admission through HTTP/TLS ownership. It confers no request authority.
-/// There is no method that separates a leased allocation from its owner.
 // The function pointer retains the exact concrete credit type without another
 // allocation. The erased Arcs remain private and no Weak owner can escape.
 struct PairedCredit {
@@ -26,6 +22,10 @@ fn release_paired_credit<C: Any + Send + Sync>(credit: Arc<dyn Any + Send + Sync
     let credit = Arc::downcast::<C>(credit).unwrap_or_else(|_| unreachable!("paired credit type"));
     drop(Arc::into_inner(credit));
 }
+/// An immutable body and its optional shared reservation. The adopter acquires
+/// admission before allocating or growing the body; this wrapper only carries
+/// that admission through HTTP/TLS ownership. It confers no request authority.
+/// There is no method that separates a leased allocation from its owner.
 pub struct HttpResponseBody {
     // Declaration order frees the allocation before dropping its reservation.
     bytes: Vec<u8>,
@@ -61,6 +61,19 @@ impl HttpResponseBody {
         Self {
             bytes,
             owner: Some(payload),
+            allocation: None,
+            paired_credit: Some(PairedCredit {
+                credit: Some(credit),
+                release: release_paired_credit::<C>,
+            }),
+        }
+    }
+    /// A paid credit Arc follows body bytes through final alias destruction.
+    /// The caller admits its Arc layout before allocation and exposes no Weak.
+    pub fn with_shared_credit<C: Any + Send + Sync>(bytes: Vec<u8>, credit: Arc<C>) -> Self {
+        Self {
+            bytes,
+            owner: None,
             allocation: None,
             paired_credit: Some(PairedCredit {
                 credit: Some(credit),
@@ -111,13 +124,16 @@ impl fmt::Debug for HttpResponseBody {
 /// `owner` separately retains the adopter's response/encoding admission.
 pub enum HttpResponsePayload {
     Contiguous(HttpResponseBody),
-    Shared {
-        prefix: Vec<u8>,
-        bytes: Arc<dyn AsRef<[u8]> + Send + Sync>,
-        owner: Arc<dyn Any + Send + Sync>,
-        length: usize,
-    },
+    Shared(SharedResponse),
 }
+/// Private fields prevent separating shared range metadata from its admission.
+pub struct SharedResponse {
+    prefix: Vec<u8>,
+    bytes: Arc<dyn AsRef<[u8]> + Send + Sync>,
+    owner: HttpResponseBody,
+    length: usize,
+}
+
 impl HttpResponsePayload {
     pub fn shared(
         prefix: Vec<u8>,
@@ -128,17 +144,35 @@ impl HttpResponsePayload {
             .len()
             .checked_add(bytes.as_ref().as_ref().len())
             .ok_or("response length overflow")?;
-        Ok(Self::Shared {
+        Ok(Self::Shared(SharedResponse {
+            prefix,
+            bytes,
+            owner: HttpResponseBody::with_owner(Vec::new(), owner),
+            length,
+        }))
+    }
+    /// Carry a separately paid response credit through shared-prefix teardown.
+    pub fn shared_with_credit<C: Any + Send + Sync>(
+        prefix: Vec<u8>,
+        bytes: Arc<dyn AsRef<[u8]> + Send + Sync>,
+        credit: Arc<C>,
+    ) -> Result<Self, &'static str> {
+        let owner = HttpResponseBody::with_shared_credit(Vec::new(), credit);
+        let length = prefix
+            .len()
+            .checked_add(bytes.as_ref().as_ref().len())
+            .ok_or("response length overflow")?;
+        Ok(Self::Shared(SharedResponse {
             prefix,
             bytes,
             owner,
             length,
-        })
+        }))
     }
     pub fn len(&self) -> usize {
         match self {
             Self::Contiguous(body) => body.len(),
-            Self::Shared { length, .. } => *length,
+            Self::Shared(shared) => shared.length,
         }
     }
     pub fn is_empty(&self) -> bool {
@@ -153,7 +187,9 @@ impl HttpResponsePayload {
             Self::Contiguous(body) => {
                 body.get(offset..offset.saturating_add(limit).min(body.len()))
             }
-            Self::Shared { prefix, bytes, .. } => {
+            Self::Shared(shared) => {
+                let prefix = &shared.prefix;
+                let bytes = &shared.bytes;
                 if offset < prefix.len() {
                     prefix.get(offset..offset.saturating_add(limit).min(prefix.len()))
                 } else {
@@ -168,7 +204,7 @@ impl HttpResponsePayload {
     pub fn contiguous(&self) -> Option<&[u8]> {
         match self {
             Self::Contiguous(body) => Some(body),
-            Self::Shared { .. } => None,
+            Self::Shared(_) => None,
         }
     }
 }
@@ -186,7 +222,14 @@ impl fmt::Debug for HttpResponsePayload {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HttpResponsePayload")
             .field("bytes", &self.len())
-            .field("shared", &matches!(self, Self::Shared { .. }))
+            .field("shared", &matches!(self, Self::Shared(_)))
+            .field(
+                "shared_owner",
+                &match self {
+                    Self::Shared(body) => Some(&body.owner),
+                    Self::Contiguous(_) => None,
+                },
+            )
             .finish()
     }
 }

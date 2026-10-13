@@ -208,6 +208,25 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
     drop(second);
     assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(pair_pool.used(), 0);
+    let credit_bytes = enclave_os_common::allocation::shared_allocation_bytes::<
+        enclave_os_common::allocation::AllocationLeaseV1,
+    >()
+    .unwrap()
+        + enclave_os_common::allocation::shared_allocation_bytes::<Vec<u8>>().unwrap();
+    let credit_pool = enclave_os_common::allocation::AllocationPoolV1::new(credit_bytes).unwrap();
+    let credit = Arc::new(credit_pool.reserve_unpublished(credit_bytes).unwrap());
+    let contiguous = crate::HttpResponseBody::with_shared_credit(Vec::new(), credit.clone());
+    let shared = crate::HttpResponsePayload::shared_with_credit(
+        Vec::new(),
+        Arc::new(Vec::<u8>::new()),
+        credit,
+    )
+    .unwrap();
+    drop(contiguous);
+    assert_eq!(credit_pool.used(), credit_bytes);
+    assert!(shared.is_empty());
+    drop(shared);
+    assert_eq!(credit_pool.used(), 0);
     segmented_response_lifecycle();
     fixed_peer_configuration_boundary();
     #[cfg(feature = "native-deferred-fixture")]
