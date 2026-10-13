@@ -11,9 +11,7 @@
 //! Body encoding: `Content-Length` only (no chunked transfer-encoding).
 
 #[cfg(feature = "sgx")]
-use alloc::format;
-#[cfg(feature = "sgx")]
-use alloc::string::String;
+use alloc::string::{String, ToString};
 #[cfg(feature = "sgx")]
 use alloc::vec::Vec;
 #[cfg(not(feature = "sgx"))]

@@ -42,7 +42,11 @@
 //! [`OidcClaims`] in the [`RequestContext`](super::modules::RequestContext).
 
 #[cfg(feature = "sgx")]
-use alloc::{string::String, vec::Vec};
+use alloc::{
+    boxed::Box,
+    string::{String, ToString},
+    vec::Vec,
+};
 #[cfg(not(feature = "sgx"))]
 use std::{string::String, vec::Vec};
 

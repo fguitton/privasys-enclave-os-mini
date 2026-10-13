@@ -11,7 +11,13 @@
 //! to the original `enclave::ocall::*` functions.
 
 use crate::modules::AppIdentity;
+use alloc::{string::String, vec::Vec};
+#[cfg(not(feature = "sgx"))]
 use std::sync::OnceLock;
+#[cfg(any(feature = "sgx", test))]
+mod slot;
+#[cfg(test)]
+pub(crate) use slot::check as check_once_slot;
 
 /// Stored encrypted key/value entries in original scan order.
 pub type StoredEntries = Vec<(Vec<u8>, Vec<u8>)>;
@@ -58,12 +64,15 @@ pub struct OcallVtable {
     pub cert_store_unregister: fn(&str) -> bool,
 }
 
+#[cfg(not(feature = "sgx"))]
 static VTABLE: OnceLock<OcallVtable> = OnceLock::new();
+#[cfg(feature = "sgx")]
+static VTABLE: slot::OcallSlot = slot::OcallSlot::new();
 
 /// Register the OCall vtable.  Must be called exactly once, before any
 /// module code runs.  Panics if called a second time.
 pub fn register(vt: OcallVtable) {
-    VTABLE.set(vt).ok().expect("OcallVtable already registered");
+    assert!(VTABLE.set(vt).is_ok(), "OcallVtable already registered");
 }
 
 // ---------------------------------------------------------------------------

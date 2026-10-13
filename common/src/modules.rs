@@ -12,6 +12,7 @@
 //! the enclave crate optionally pulls them in as feature-gated deps.
 
 use crate::protocol::{HttpMethod, Request, Response};
+use alloc::{string::String, vec::Vec};
 
 pub const HONEST_PEER_SNI: &str = "peer.s1.invalid";
 pub const HONEST_PEER_ROUTE: &str = "/honest/v1/peer";

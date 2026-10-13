@@ -3,6 +3,8 @@
 
 //! Minimal hex encode/decode utilities (no external dependencies).
 
+use alloc::{string::String, vec::Vec};
+
 /// Decode a hex string into bytes. Returns `None` on invalid input.
 pub fn hex_decode(hex: &str) -> Option<Vec<u8>> {
     let hex = hex.as_bytes();

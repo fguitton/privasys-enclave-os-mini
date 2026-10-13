@@ -62,8 +62,6 @@
 //!   proxy-owned outbound connections.
 
 #[cfg(feature = "sgx")]
-use alloc::string::String;
-#[cfg(feature = "sgx")]
 use alloc::vec::Vec;
 
 /// Header size: 1 byte msg_type + 4 bytes conn_id = 5.
