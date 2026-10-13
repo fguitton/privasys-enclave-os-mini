@@ -220,8 +220,14 @@ pub fn conn_id_is_outbound(conn_id: u32) -> bool {
 ///
 /// The caller writes the returned buffer into the SPSC queue (which adds
 /// its own 4-byte length prefix).
+/// Complete encoded message bytes, excluding the independently owned SPSC prefix.
+pub fn channel_message_length(payload_bytes: usize) -> Option<usize> {
+    CHANNEL_MSG_HEADER.checked_add(payload_bytes)
+}
+
 pub fn encode_channel_msg(msg_type: ChannelMsgType, conn_id: u32, payload: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(CHANNEL_MSG_HEADER + payload.len());
+    let mut buf =
+        Vec::with_capacity(channel_message_length(payload.len()).expect("channel length overflow"));
     buf.push(msg_type as u8);
     buf.extend_from_slice(&conn_id.to_le_bytes());
     buf.extend_from_slice(payload);
@@ -301,16 +307,15 @@ impl TcpWriteWindow {
     }
 }
 
+/// Actual scalar codec width used by encoder, decoder and preallocation callers.
+pub const TCP_WRITE_CREDIT_PAYLOAD_BYTES: usize = core::mem::size_of::<u64>();
 pub fn encode_tcp_write_credit(conn_id: u32, written: u64) -> Vec<u8> {
-    encode_channel_msg(
-        ChannelMsgType::TcpWriteCredit,
-        conn_id,
-        &written.to_le_bytes(),
-    )
+    let payload: [u8; TCP_WRITE_CREDIT_PAYLOAD_BYTES] = written.to_le_bytes();
+    encode_channel_msg(ChannelMsgType::TcpWriteCredit, conn_id, &payload)
 }
-
 pub fn decode_tcp_write_credit(payload: &[u8]) -> Option<u64> {
-    Some(u64::from_le_bytes(payload.try_into().ok()?))
+    let encoded: [u8; TCP_WRITE_CREDIT_PAYLOAD_BYTES] = payload.try_into().ok()?;
+    Some(u64::from_le_bytes(encoded))
 }
 
 /// Convenience: encode a TcpClose message.
@@ -412,13 +417,18 @@ mod tests {
     #[test]
     fn test_roundtrip_tcp_data() {
         let control = encode_tcp_read_control(7, 9, 1, true);
+        assert_eq!(
+            control.len(),
+            channel_message_length(TCP_READ_CONTROL_PAYLOAD_BYTES).unwrap()
+        );
+        assert!(channel_message_length(usize::MAX).is_none());
         let (kind, id, payload) = decode_channel_msg(&control).unwrap();
         assert_eq!((kind, id), (ChannelMsgType::TcpReadControl, 7));
         assert_eq!(decode_tcp_read_control(payload), Some((9, 1, true)));
-        assert!(decode_tcp_read_control(&[0; 17]).is_none());
-        assert!(decode_tcp_read_control(&[0; 16]).is_none());
+        assert!(decode_tcp_read_control(&[0; TCP_READ_CONTROL_PAYLOAD_BYTES]).is_none());
+        assert!(decode_tcp_read_control(&[0; TCP_READ_CONTROL_PAYLOAD_BYTES - 1]).is_none());
         let mut bad = payload.to_vec();
-        bad[16] = 2;
+        bad[TCP_READ_CONTROL_PAYLOAD_BYTES - 1] = 2;
         assert!(decode_tcp_read_control(&bad).is_none());
 
         let data = vec![0x16, 0x03, 0x03, 0x00, 0x05]; // fake TLS record
@@ -439,6 +449,10 @@ mod tests {
         assert_eq!(window.available(), 0);
         assert!(!window.acknowledge(TCP_WRITE_WINDOW + 18));
         let encoded = encode_tcp_write_credit(99, TCP_WRITE_WINDOW);
+        assert_eq!(
+            encoded.len(),
+            channel_message_length(TCP_WRITE_CREDIT_PAYLOAD_BYTES).unwrap()
+        );
         let (kind, id, payload) = decode_channel_msg(&encoded).unwrap();
         assert_eq!((kind, id), (ChannelMsgType::TcpWriteCredit, 99));
         assert_eq!(decode_tcp_write_credit(payload), Some(TCP_WRITE_WINDOW));
@@ -539,25 +553,41 @@ mod tests {
 
 /// Optional bounded socket-read control. A newer revision replaces the prior
 /// pause state; stale messages never rearm a newer pause. No authority follows.
+pub const TCP_READ_CONTROL_WORD_BYTES: usize = core::mem::size_of::<u64>();
+const TCP_READ_CONTROL_COUNTERS: usize = 2;
+pub const TCP_READ_CONTROL_PAYLOAD_BYTES: usize =
+    core::mem::size_of::<[u64; TCP_READ_CONTROL_COUNTERS]>() + core::mem::size_of::<u8>();
 pub fn encode_tcp_read_control(
     conn_id: u32,
     generation: u64,
     revision: u64,
     paused: bool,
 ) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(17);
-    payload.extend_from_slice(&generation.to_be_bytes());
-    payload.extend_from_slice(&revision.to_be_bytes());
-    payload.push(u8::from(paused));
+    let mut payload = [0u8; TCP_READ_CONTROL_PAYLOAD_BYTES];
+    payload[..TCP_READ_CONTROL_WORD_BYTES].copy_from_slice(&generation.to_be_bytes());
+    payload[TCP_READ_CONTROL_WORD_BYTES..TCP_READ_CONTROL_COUNTERS * TCP_READ_CONTROL_WORD_BYTES]
+        .copy_from_slice(&revision.to_be_bytes());
+    payload[TCP_READ_CONTROL_COUNTERS * TCP_READ_CONTROL_WORD_BYTES] = u8::from(paused);
     encode_channel_msg(ChannelMsgType::TcpReadControl, conn_id, &payload)
 }
 pub fn decode_tcp_read_control(payload: &[u8]) -> Option<(u64, u64, bool)> {
-    if payload.len() != 17 || payload[16] > 1 {
+    if payload.len() != TCP_READ_CONTROL_PAYLOAD_BYTES
+        || payload[TCP_READ_CONTROL_COUNTERS * TCP_READ_CONTROL_WORD_BYTES] > 1
+    {
         return None;
     }
-    let generation = u64::from_be_bytes(payload[..8].try_into().ok()?);
-    let revision = u64::from_be_bytes(payload[8..16].try_into().ok()?);
-    (generation != 0 && revision != 0).then_some((generation, revision, payload[16] != 0))
+    let generation = u64::from_be_bytes(payload[..TCP_READ_CONTROL_WORD_BYTES].try_into().ok()?);
+    let revision = u64::from_be_bytes(
+        payload
+            [TCP_READ_CONTROL_WORD_BYTES..TCP_READ_CONTROL_COUNTERS * TCP_READ_CONTROL_WORD_BYTES]
+            .try_into()
+            .ok()?,
+    );
+    (generation != 0 && revision != 0).then_some((
+        generation,
+        revision,
+        payload[TCP_READ_CONTROL_COUNTERS * TCP_READ_CONTROL_WORD_BYTES] != 0,
+    ))
 }
 pub fn encode_tcp_read_identity(conn_id: u32, generation: u64) -> Vec<u8> {
     encode_channel_msg(

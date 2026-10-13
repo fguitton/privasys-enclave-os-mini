@@ -47,7 +47,7 @@ use crate::rpc_client::RpcClient;
 use crate::sealed_config::SealedConfig;
 use crate::{enclave_log_error, enclave_log_info, ShutdownOriginV1};
 use enclave_os_common::channel;
-#[cfg(feature = "egress")]
+#[cfg(all(feature = "egress", feature = "default-ecall"))]
 use enclave_os_common::hex::hex_decode;
 use enclave_os_common::hex::hex_encode;
 use enclave_os_common::queue::{SpscConsumer, SpscProducer, SpscQueueHeader};

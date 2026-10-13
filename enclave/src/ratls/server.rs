@@ -25,7 +25,6 @@
 //! separate RPC channel.
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet};
 use std::string::String;
 use std::sync::Arc;
@@ -72,7 +71,9 @@ enum SessionState {
 /// fragmented hello to complete. A TLS record maxes at 16 KiB; a real
 /// ClientHello (even with the RA-TLS challenge extension) is ~1-2 KiB.
 const MAX_PENDING_CLIENTHELLO: usize = 16 * 1024;
-const MAX_PENDING_ENCLAVE_OUTPUT: usize = 4 * 1024 * 1024;
+use super::session::channel_output::{
+    Message as ChannelMessage, Queue as ChannelQueue, MAX_PENDING_ENCLAVE_OUTPUT,
+};
 
 /// Closed reason why the ingress server requested a global enclave stop.
 ///
@@ -120,8 +121,7 @@ pub struct IngressServer {
     /// Per-hostname cached TLS configs (leaf certificate + key).
     cached_configs: BTreeMap<String, CachedConfig>,
     /// Bounded ciphertext backlog when the host-side SPSC queue has no credit.
-    pending_output: RefCell<VecDeque<Vec<u8>>>,
-    pending_output_bytes: Cell<usize>,
+    pending_output: RefCell<ChannelQueue>,
     output_failed: Cell<bool>,
     /// Per-hostname leaf keys, kept 24 h across re-mints (RA-TLS v2).
     leaf_keys: BTreeMap<String, LeafKey>,
@@ -176,8 +176,7 @@ impl IngressServer {
             data_tx,
             shutdown: false,
             cached_configs: BTreeMap::new(),
-            pending_output: RefCell::new(VecDeque::new()),
-            pending_output_bytes: Cell::new(0),
+            pending_output: RefCell::new(ChannelQueue::default()),
             output_failed: Cell::new(false),
             leaf_keys: BTreeMap::new(),
             leaf_by_spki: BTreeMap::new(),
@@ -226,7 +225,9 @@ impl IngressServer {
                 self.write_windows
                     .borrow_mut()
                     .insert(conn_id, channel::TcpWriteWindow::default());
-                self.queue_to_proxy(channel::encode_tcp_write_credit(conn_id, 0));
+                self.queue_to_proxy(channel::TCP_WRITE_CREDIT_PAYLOAD_BYTES, || {
+                    channel::encode_tcp_write_credit(conn_id, 0)
+                });
                 self.sessions.insert(
                     conn_id,
                     SessionState::Pending {
@@ -347,9 +348,7 @@ impl IngressServer {
                 if self.data_tx.try_send(message).is_err() {
                     return false;
                 }
-                let sent = pending.pop_front().expect("front existed");
-                self.pending_output_bytes
-                    .set(self.pending_output_bytes.get() - sent.len());
+                drop(pending.pop_front().expect("front existed"));
                 return true;
             }
         }
@@ -358,7 +357,7 @@ impl IngressServer {
         let eligible = |id: &u32, state: &SessionState| {
             matches!(state, SessionState::Established(session) if session.has_pending_response() || (*dispatch_budget > 0 && self.pending_dispatch.contains(id) && !self.deferred_owner.pending.contains_key(id)))
                 && self.write_windows.borrow().get(id).is_some_and(|window| {
-                    window.available() >= super::session::TLS_RESPONSE_STEP_BYTES
+                    super::session::response_socket_credit_ready(window.available())
                 })
         };
         let next = self
@@ -609,9 +608,9 @@ impl IngressServer {
             self.close_deferred_transport(id);
             return false;
         };
-        self.queue_to_proxy(channel::encode_tcp_read_control(
-            id, generation, revision, paused,
-        ));
+        self.queue_to_proxy(channel::TCP_READ_CONTROL_PAYLOAD_BYTES, || {
+            channel::encode_tcp_read_control(id, generation, revision, paused)
+        });
         !self.output_failed.get()
     }
 
@@ -979,7 +978,7 @@ impl IngressServer {
             .write_windows
             .borrow()
             .get(&conn_id)
-            .is_some_and(|window| window.available() >= super::session::TLS_RESPONSE_STEP_BYTES);
+            .is_some_and(|window| super::session::response_socket_credit_ready(window.available()));
         !credit || self.flush_response(conn_id, session)
     }
 
@@ -1217,7 +1216,7 @@ impl IngressServer {
                     .borrow()
                     .get(&conn_id)
                     .is_some_and(|window| {
-                        window.available() >= super::session::TLS_RESPONSE_STEP_BYTES
+                        super::session::response_socket_credit_ready(window.available())
                     });
                 return !credit || self.flush_response(conn_id, session);
             }
@@ -1389,36 +1388,40 @@ impl IngressServer {
         // Leave room for the 5-byte channel message header.
         const CHUNK: usize = channel::MAX_CHANNEL_PAYLOAD;
         for chunk in tls_bytes.chunks(CHUNK) {
-            let msg = channel::encode_tcp_data(conn_id, chunk);
-            self.queue_to_proxy(msg);
+            self.queue_to_proxy(chunk.len(), || channel::encode_tcp_data(conn_id, chunk));
         }
     }
 
     /// Send a TcpClose to the TCP proxy.
     fn send_close(&self, conn_id: u32) {
-        let msg = channel::encode_tcp_close(conn_id);
-        self.queue_to_proxy(msg);
+        self.queue_to_proxy(0, || channel::encode_tcp_close(conn_id));
     }
 
-    fn queue_to_proxy(&self, message: Vec<u8>) {
+    fn queue_to_proxy(&self, payload: usize, encode: impl FnOnce() -> Vec<u8>) {
+        #[cfg(target_env = "sgx")]
+        let Some(pool) = crate::local_allocation_pool() else {
+            self.output_failed.set(true);
+            return;
+        };
+        #[cfg(target_env = "sgx")]
+        let pool = Some(pool);
+        #[cfg(not(target_env = "sgx"))]
+        let pool = None;
+        let Ok(message) = ChannelMessage::encode(pool.as_ref(), payload, encode) else {
+            self.output_failed.set(true);
+            return;
+        };
         let mut pending = self.pending_output.borrow_mut();
         if pending.is_empty() && self.data_tx.try_send(&message).is_ok() {
             return;
         }
-        let next_size = self
-            .pending_output_bytes
-            .get()
-            .saturating_add(message.len());
-        if next_size > MAX_PENDING_ENCLAVE_OUTPUT {
+        if pending.push(message, pool.as_ref()).is_err() {
             enclave_log_error!(
-                "Enclave-to-host credit backlog exceeded {} bytes",
+                "Enclave-to-host backlog admission refused (byte cap {})",
                 MAX_PENDING_ENCLAVE_OUTPUT
             );
             self.output_failed.set(true);
-            return;
         }
-        self.pending_output_bytes.set(next_size);
-        pending.push_back(message);
     }
 }
 

@@ -116,6 +116,11 @@ impl Drop for ContextCharge {
         // already gone; refund physical storage before reopening logical admission.
         drop(self.allocation.take());
         CONTEXT_BUSY.store(false, std::sync::atomic::Ordering::Release);
+        // The physical-pool callback may already have woken a scheduler while
+        // logical admission was still busy. Publish the logical release too;
+        // both original revisions coalesce without granting authority.
+        notify_deferred_ingress();
+        crate::stream_ingress::notify_honest_stream_ingress();
     }
 }
 
@@ -395,5 +400,42 @@ pub(crate) fn check_context_physical_for_native() {
         assert!(ContextCharge::reserve_from(1, Some(&pool)).is_some());
         assert_eq!(pool.used(), 0);
     }
+    // A real pool callback can run a scheduler between physical refund and
+    // logical release. Consume its wakes while actual admission still refuses.
+    fn released_before_logical_admission() {
+        notify_deferred_ingress();
+        crate::stream_ingress::notify_honest_stream_ingress();
+        assert!(take_deferred_revision());
+        assert!(crate::stream_ingress::take_revision());
+        assert!(crate::stream_ingress::take_credit_ready());
+        assert!(ContextCharge::reserve_from(1, None).is_none());
+    }
+    let pool = AllocationPoolV1::new_with_release(
+        MAX_CONTEXT_BYTES,
+        Some(released_before_logical_admission),
+    )
+    .unwrap();
+    let credit = ContextCharge::reserve_from(MAX_CONTEXT_BYTES, Some(&pool)).unwrap();
+    take_deferred_revision();
+    crate::stream_ingress::take_revision();
+    crate::stream_ingress::take_credit_ready();
+    drop(credit);
+    assert_eq!(pool.used(), 0);
+    assert!(
+        take_deferred_revision(),
+        "logical release republishes deferred wake"
+    );
+    assert!(
+        crate::stream_ingress::take_revision(),
+        "logical release republishes stream wake"
+    );
+    assert!(crate::stream_ingress::take_credit_ready());
+    assert!(!take_deferred_revision(), "wake remains coalesced");
+    assert!(!crate::stream_ingress::take_revision());
+    assert!(!crate::stream_ingress::take_credit_ready());
+    let readmitted = ContextCharge::reserve_from(MAX_CONTEXT_BYTES, Some(&pool)).unwrap();
+    drop(readmitted);
+    assert_eq!(pool.used(), 0);
+    eprintln!("CONTEXT-RELEASE-WAKE: actual pool callback consumed early wake; post-clear re-admission PASS");
     eprintln!("CONTEXT-PHYSICAL: original pool minus/exact/plus/logical rollback/refund PASS");
 }

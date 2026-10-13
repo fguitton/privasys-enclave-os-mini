@@ -53,6 +53,8 @@ pub(crate) fn response_credit(
 #[path = "tls_output.rs"]
 mod tls_output;
 pub use tls_output::TlsOutput;
+#[path = "channel_output.rs"]
+pub(crate) mod channel_output;
 #[path = "http_request.rs"]
 mod http_request;
 pub use http_request::PaidHttpRequest;
@@ -164,6 +166,12 @@ struct ResponseCost {
     tls_bytes: usize,
 }
 pub(crate) const TLS_RESPONSE_STEP_BYTES: usize = 64 * 1024;
+/// Compare the existing output allocation step against socket counter units.
+/// A target that cannot represent the step cannot advertise readiness.
+pub(crate) fn response_socket_credit_ready(available: u64) -> bool {
+    u64::try_from(TLS_RESPONSE_STEP_BYTES).is_ok_and(|step| available >= step)
+}
+
 const TLS_RESPONSE_FRAMING_MARGIN: usize = 4 * 1024;
 const MAX_RESPONSE_HEADER_BYTES: usize = 32 * 1024;
 struct PendingResponse {

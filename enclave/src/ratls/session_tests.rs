@@ -110,10 +110,16 @@ fn replacement_rejects_buffered_requests_and_re_attestation() {
     streamed_request_preserves_tls_and_following_request();
     checked_plaintext_backing();
     checked_tls_output_backing();
+    let step = u64::try_from(super::TLS_RESPONSE_STEP_BYTES).unwrap();
+    assert!(!super::response_socket_credit_ready(step - 1));
+    assert!(super::response_socket_credit_ready(step));
+    assert!(super::response_socket_credit_ready(step + 1));
+
     checked_http_request_admission();
     checked_stream_header_admission();
     crate::deferred_ingress::check_context_physical_for_native();
     checked_ordinary_context_admission();
+    super::channel_output::check();
     let store = CertStore::new();
     register(&store, "a.test");
     let (mut client, mut session) = pair(&store, "a.test");
