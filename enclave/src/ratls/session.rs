@@ -58,6 +58,9 @@ pub(crate) mod channel_output;
 #[path = "http_request.rs"]
 mod http_request;
 #[cfg(any(test, target_env = "sgx"))]
+#[path = "leaf_key.rs"]
+pub(crate) mod leaf_key;
+#[cfg(any(test, target_env = "sgx"))]
 #[path = "retained_name.rs"]
 pub(crate) mod retained_name;
 #[path = "ordered_map.rs"]

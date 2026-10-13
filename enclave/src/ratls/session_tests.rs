@@ -123,6 +123,7 @@ fn replacement_rejects_buffered_requests_and_re_attestation() {
     checked_pending_client_hello();
     super::ordered_map::check();
     super::retained_name::check();
+    super::leaf_key::check();
     checked_session_table_refusal();
     checked_connection_metadata_tables();
     checked_fixed_channel_binder();

@@ -18,7 +18,7 @@
 
 use ring::digest;
 use ring::rand::SystemRandom;
-use ring::signature::{self, EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 use std::string::String;
 use std::vec::Vec;
 use time::OffsetDateTime;
@@ -93,35 +93,7 @@ impl CaContext {
     }
 }
 
-/// A serving leaf key, kept for [`DETERMINISTIC_VALIDITY_SECS`] across
-/// re-mints of the certificate.
-#[derive(Clone)]
-pub struct LeafKey {
-    /// PKCS#8 private key.
-    pub pkcs8: Vec<u8>,
-    /// DER `SubjectPublicKeyInfo` (91 bytes), the input of every
-    /// `report_data` recipe.
-    pub spki_der: Vec<u8>,
-    /// SHA-256 of `spki_der`: the `leaf` id clients name in an attest request.
-    pub spki_hash: [u8; 32],
-    /// Creation time (seconds since the Unix epoch).
-    pub created: u64,
-}
-
-/// Generate a fresh leaf key.
-pub fn new_leaf_key(now: u64) -> Result<LeafKey, String> {
-    let (pkcs8, key_pair) = generate_keypair().map_err(|e| e.to_string())?;
-    let raw_ec_point = signature::KeyPair::public_key(&key_pair).as_ref();
-    let spki_der = enclave_os_common::quote::build_p256_spki_der(raw_ec_point);
-    let mut spki_hash = [0u8; 32];
-    spki_hash.copy_from_slice(digest::digest(&digest::SHA256, &spki_der).as_ref());
-    Ok(LeafKey {
-        pkcs8,
-        spki_der,
-        spki_hash,
-        created: now,
-    })
-}
+pub use super::session::leaf_key::{generate_keypair, new_leaf_key, LeafKey};
 
 /// Result of certificate generation.
 pub struct CertGenerationResult {
@@ -331,17 +303,6 @@ pub fn mint_client_identity(
 /// client-evidence path).
 pub fn sgx_quote(report_data: &[u8; 64]) -> Result<Vec<u8>, String> {
     generate_sgx_quote(report_data)
-}
-
-/// Generate an ECDSA P-256 key pair and return `(pkcs8_bytes, key_pair)`.
-pub fn generate_keypair() -> Result<(Vec<u8>, EcdsaKeyPair), &'static str> {
-    let rng = SystemRandom::new();
-    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)
-        .map_err(|_| "Key generation failed")?;
-    let pkcs8_bytes = pkcs8.as_ref().to_vec();
-    let key_pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &pkcs8_bytes, &rng)
-        .map_err(|_| "Failed to parse generated key")?;
-    Ok((pkcs8_bytes, key_pair))
 }
 
 // ---------------------------------------------------------------------------

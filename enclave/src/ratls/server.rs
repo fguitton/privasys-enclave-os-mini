@@ -32,6 +32,7 @@ use std::vec::Vec;
 use crate::modules;
 use crate::ocall;
 use crate::ratls::attestation::{self, CaContext, LeafKey};
+use super::session::leaf_key::RetainedLeafKey;
 use crate::ratls::cert_store;
 use crate::ratls::session::RaTlsSession;
 use crate::{enclave_log_error, enclave_log_info};
@@ -114,10 +115,10 @@ pub struct IngressServer {
     pending_output: RefCell<ChannelQueue>,
     output_failed: Cell<bool>,
     /// Per-hostname leaf keys, kept 24 h across re-mints (RA-TLS v2).
-    leaf_keys: super::session::ordered_map::OrderedMap<super::session::retained_name::PaidName, LeafKey>,
+    leaf_keys: super::session::ordered_map::OrderedMap<super::session::retained_name::PaidName, RetainedLeafKey>,
     /// Every answerable leaf key by SHA-256(SPKI): current keys and keys
     /// rotated less than 15 minutes ago (the `leaf` of an attest request).
-    leaf_by_spki: super::session::ordered_map::OrderedMap<[u8; 32], LeafKey>,
+    leaf_by_spki: super::session::ordered_map::OrderedMap<[u8; 32], RetainedLeafKey>,
     /// Deterministic quotes, one per leaf key, cached for the key's lifetime.
     det_quotes: super::session::ordered_map::OrderedMap<[u8; 32], DetQuote>,
 }
@@ -2887,7 +2888,7 @@ impl IngressServer {
     /// The leaf key of an SNI, rotated at its 24-hour lifetime; rotated keys
     /// stay answerable for 15 minutes so a client that received the old leaf
     /// just before a rotation can still be served.
-    fn leaf_key_for(&mut self, sni: &str, now: u64) -> Result<LeafKey, String> {
+    fn leaf_key_for(&mut self, sni: &str, now: u64) -> Result<RetainedLeafKey, String> {
         let retire_before = now
             .saturating_sub(attestation::DETERMINISTIC_VALIDITY_SECS + PREVIOUS_KEY_RETENTION_SECS);
         let quotes = &mut self.det_quotes;
@@ -2909,7 +2910,7 @@ impl IngressServer {
         let pool = crate::local_allocation_pool().ok_or_else(String::new)?;
         let retained_name = super::session::retained_name::PaidName::new(&pool, sni)
             .ok_or_else(String::new)?;
-        let k = attestation::new_leaf_key(now)?;
+        let k = RetainedLeafKey::new(&pool, now)?;
         self.leaf_keys.insert_prepared(retained_name, k.clone());
         self.leaf_by_spki.insert_prepared(k.spki_hash, k.clone());
         Ok(k)

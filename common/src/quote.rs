@@ -351,18 +351,50 @@ const P256_ALGO_ID: &[u8] = &[
 /// }
 /// ```
 pub fn build_p256_spki_der(ec_point: &[u8]) -> Vec<u8> {
-    let bit_string_len = 1 + ec_point.len(); // unused-bits byte + point
-    let inner_len = P256_ALGO_ID.len() + 3 + ec_point.len(); // algo + BIT STRING header + point
-
-    let mut spki = Vec::with_capacity(2 + inner_len);
-    spki.push(0x30); // SEQUENCE tag
-    spki.push(inner_len as u8);
+    let (sequence, bits, length) = spki_parts(ec_point.len()).expect("SPKI length overflow");
+    let mut spki = Vec::with_capacity(length);
+    spki.extend_from_slice(&sequence);
     spki.extend_from_slice(P256_ALGO_ID);
-    spki.push(0x03); // BIT STRING tag
-    spki.push(bit_string_len as u8);
-    spki.push(0x00); // unused bits
+    spki.extend_from_slice(&bits);
     spki.extend_from_slice(ec_point);
     spki
+}
+
+// These actual encoder headers also own the complete-length geometry.
+const P256_SEQUENCE_HEAD: [u8; 2] = [0x30, 0];
+const P256_UNUSED_BITS: u8 = 0;
+const P256_BITS_HEAD: [u8; 3] = [0x03, 0, P256_UNUSED_BITS];
+fn spki_parts(point_len: usize) -> Option<([u8; 2], [u8; 3], usize)> {
+    let bit_string_len = point_len.checked_add(core::mem::size_of_val(&P256_UNUSED_BITS))?;
+    let inner_len = P256_ALGO_ID.len().checked_add(P256_BITS_HEAD.len())?.checked_add(point_len)?;
+    let length = P256_SEQUENCE_HEAD.len().checked_add(inner_len)?;
+    let mut sequence = P256_SEQUENCE_HEAD;
+    let mut bits = P256_BITS_HEAD;
+    // Preserve the original encoder's low-byte header behavior. Its public
+    // contract requires the actual uncompressed P-256 point from the key owner.
+    sequence[1] = inner_len.to_le_bytes()[0];
+    bits[1] = bit_string_len.to_le_bytes()[0];
+    Some((sequence, bits, length))
+}
+/// Complete SPKI byte count from the same headers as the actual encoder.
+#[must_use]
+pub fn p256_spki_der_len(point_len: usize) -> Option<usize> {
+    spki_parts(point_len).map(|(_, _, length)| length)
+}
+/// Encode into an exactly preadmitted destination without any allocation.
+/// Returns `None` before writing if length arithmetic or destination size refuses.
+#[must_use]
+pub fn write_p256_spki_der(ec_point: &[u8], output: &mut [u8]) -> Option<()> {
+    let (sequence, bits, length) = spki_parts(ec_point.len())?;
+    if output.len() != length { return None; }
+    let (head, rest) = output.split_at_mut(sequence.len());
+    head.copy_from_slice(&sequence);
+    let (algorithm, rest) = rest.split_at_mut(P256_ALGO_ID.len());
+    algorithm.copy_from_slice(P256_ALGO_ID);
+    let (bit_head, point) = rest.split_at_mut(bits.len());
+    bit_head.copy_from_slice(&bits);
+    point.copy_from_slice(ec_point);
+    Some(())
 }
 
 // ---------------------------------------------------------------------------
