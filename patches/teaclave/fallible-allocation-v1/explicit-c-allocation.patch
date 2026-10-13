@@ -1,0 +1,272 @@
+--- a/sgx_alloc/src/lib.rs
++++ b/sgx_alloc/src/lib.rs
+@@ -45,3 +45,7 @@
+ /// Explicit fallible allocation admission; default global System is unchanged.
+ pub mod fallible;
+ pub use fallible::{AllocationTicket, FallibleAllocationHooks, FallibleSystem};
++
++/// Explicit headerless fallible C-compatible ownership; no C symbol override.
++pub mod fallible_c;
++pub use fallible_c::{drain_pending_c_releases, CAllocationError, CAllocationHandle, FallibleCSystem, OwnedCAllocation};
+--- a/sgx_tstd/src/alloc.rs
++++ b/sgx_tstd/src/alloc.rs
+@@ -79,6 +79,8 @@
+ pub use sgx_alloc::System;
+ /// Explicit fallible allocator; quota refusal never enters a global OOM handler.
+ pub use sgx_alloc::{AllocationTicket, FallibleAllocationHooks, FallibleSystem};
++/// Headerless explicit C allocations, never an infallible/global NULL hook.
++pub use sgx_alloc::{drain_pending_c_releases, CAllocationError, CAllocationHandle, FallibleCSystem, OwnedCAllocation};
+ 
+ static HOOK: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+ 
+--- /dev/null
++++ b/sgx_alloc/src/fallible_c.rs
+@@ -0,0 +1,248 @@
++//! Explicit fallible C-compatible backing; default System/C symbols unchanged.
++use super::{System, fallible::{AllocationTicket, FallibleAllocationHooks}};
++use core::{alloc::{GlobalAlloc, Layout}, cell::UnsafeCell, ptr,
++    sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering}};
++#[derive(Clone, Copy)]
++struct Value {
++    pointer: *mut u8, layout: Layout, quote: Layout,
++    origin: AllocationTicket, ticket: AllocationTicket,
++    hooks: &'static FallibleAllocationHooks, generation: usize,
++}
++struct Record { value: Value, next: *mut Record, pending: AtomicBool }
++struct Ledger { state: AtomicU8, head: UnsafeCell<*mut Record> }
++const HELD: u8 = 1;
++const REQUESTED: u8 = 2;
++// SAFETY: links and values are accessed only under the allocation-free lock.
++// The sole safe owner may mark its record pending, after which it never reads it.
++unsafe impl Sync for Ledger {}
++static LEDGER: Ledger = Ledger { state: AtomicU8::new(0),
++    head: UnsafeCell::new(ptr::null_mut()) };
++static GENERATION: AtomicUsize = AtomicUsize::new(1);
++struct Guard;
++impl Guard {
++    fn lock() -> Result<Self, CAllocationError> {
++        let prior = LEDGER.state.load(Ordering::Acquire);
++        if prior & HELD != 0 { return Err(CAllocationError::Busy); }
++        LEDGER.state.compare_exchange(prior, prior | HELD, Ordering::AcqRel, Ordering::Acquire)
++            .map(|_| Self).map_err(|_| CAllocationError::Busy)
++    }
++}
++impl Drop for Guard {
++    fn drop(&mut self) {
++        let mut detached: *mut Record = ptr::null_mut();
++        loop {
++            LEDGER.state.fetch_and(!REQUESTED, Ordering::AcqRel);
++            detached = detach_pending(detached);
++            #[cfg(test)] pause_release(1);
++            // A final Drop requests retirement before this release. A racing
++            // request prevents unlock, forcing one more scan under the SAME
++            // lock. No new record can publish; each request comes from one
++            // existing move-only owner, bounding retries by live records.
++            if LEDGER.state.compare_exchange(HELD, 0, Ordering::Release, Ordering::Acquire).is_ok() {
++                break;
++            }
++        }
++        #[cfg(test)] pause_release(2);
++        // No allocator, origin-release or wake callback runs under the lock.
++        destroy_list(detached);
++    }
++}
++fn detach_pending(mut removed: *mut Record) -> *mut Record {
++    let mut prior: *mut Record = ptr::null_mut();
++    let mut entry = unsafe { *LEDGER.head.get() };
++    while !entry.is_null() {
++        let next = unsafe { (*entry).next };
++        if unsafe { (*entry).pending.load(Ordering::Acquire) } {
++            unsafe {
++                if prior.is_null() { *LEDGER.head.get() = next; } else { (*prior).next = next; }
++                (*entry).next = removed;
++            }
++            removed = entry;
++        } else { prior = entry; }
++        entry = next;
++    }
++    removed
++}
++fn destroy_list(mut entry: *mut Record) {
++    while !entry.is_null() {
++        let next = unsafe { (*entry).next };
++        let value = unsafe { (*entry).value };
++        destroy(entry, value);
++        entry = next;
++    }
++}
++/// Explicit progress/shutdown drain. Busy hands work to the actual lock holder.
++pub fn drain_pending_c_releases() -> Result<(), CAllocationError> {
++    drop(Guard::lock()?);
++    Ok(())
++}
++/// Raw manual ownership identity. Every access/release requires exclusive ownership.
++#[derive(Clone, Copy)]
++pub struct CAllocationHandle { pointer: *mut u8, generation: usize }
++unsafe impl Send for CAllocationHandle {}
++impl CAllocationHandle { pub fn as_ptr(&self) -> *mut u8 { self.pointer } }
++/// Move-only owner. Drop marks its already admitted record without allocating.
++/// Its pointer is borrowed; releasing it through a raw C allocator is invalid.
++pub struct OwnedCAllocation { handle: CAllocationHandle, record: *mut Record, wake: fn() }
++// SAFETY: moving transfers sole ownership; no shared pointee access is provided.
++unsafe impl Send for OwnedCAllocation {}
++impl OwnedCAllocation {
++    pub fn as_ptr(&self) -> *mut u8 { self.handle.pointer }
++    /// Failure preserves this owner and its original allocation.
++    pub fn resize(&mut self, new: Layout, zero: bool) -> Result<(), CAllocationError> {
++        let (handle, record) = unsafe { resize_record(self.handle, new, zero) }?;
++        self.handle = handle; self.record = record; Ok(())
++    }
++}
++impl Drop for OwnedCAllocation {
++    fn drop(&mut self) {
++        // No subsequent access to the record: a current holder may now free it.
++        unsafe { (*self.record).pending.store(true, Ordering::Release); }
++        let prior = LEDGER.state.fetch_or(REQUESTED, Ordering::AcqRel);
++        if prior & HELD == 0 {
++            // The first requester on an idle ledger owns progress. Another
++            // requester/control drain may win this CAS and inherits that duty.
++            if LEDGER.state.compare_exchange(REQUESTED, HELD | REQUESTED,
++                Ordering::AcqRel, Ordering::Acquire).is_ok() {
++                drop(Guard);
++            }
++        }
++        (self.wake)();
++    }
++}
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum CAllocationError { InvalidLayout, Refused, Busy, UnknownAllocation, GenerationExhausted }
++#[derive(Clone, Copy)]
++pub struct FallibleCSystem { hooks: &'static FallibleAllocationHooks, origin: AllocationTicket }
++impl FallibleCSystem {
++    /// # Safety
++    /// Hooks and wake callbacks must not allocate, unwind or wait. The admission
++    /// owner must remain valid until all original held tickets are released.
++    pub const unsafe fn new(hooks: &'static FallibleAllocationHooks, origin: AllocationTicket) -> Self {
++        Self { hooks, origin }
++    }
++    pub fn requested_layout(user: Layout) -> Result<Layout, CAllocationError> {
++        if user.size() == 0 { return Err(CAllocationError::InvalidLayout); }
++        let size = user.size().checked_add(Layout::new::<Record>().size())
++            .ok_or(CAllocationError::InvalidLayout)?;
++        Layout::from_size_align(size, user.align().max(Layout::new::<Record>().align()))
++            .map_err(|_| CAllocationError::InvalidLayout)
++    }
++    fn prepare(&self, user: Layout, zero: bool) -> Result<Prepared, CAllocationError> {
++        let quote = Self::requested_layout(user)?;
++        let generation = GENERATION.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
++            .map_err(|_| CAllocationError::GenerationExhausted)?;
++        let ticket = (self.hooks.admit)(self.origin, quote).map_err(|_| CAllocationError::Refused)?;
++        let pointer = unsafe { if zero { System.alloc_zeroed(user) } else { System.alloc(user) } };
++        if pointer.is_null() { (self.hooks.release)(ticket, quote); return Err(CAllocationError::Refused); }
++        let entry = unsafe { System.alloc(Layout::new::<Record>()) }.cast::<Record>();
++        if entry.is_null() {
++            unsafe { System.dealloc(pointer, user); }
++            (self.hooks.release)(ticket, quote); return Err(CAllocationError::Refused);
++        }
++        unsafe { entry.write(Record { value: Value { pointer, layout: user, quote,
++            origin: self.origin, ticket, hooks: self.hooks, generation },
++            next: ptr::null_mut(), pending: AtomicBool::new(false) }); }
++        Ok(Prepared(entry))
++    }
++    fn publish(&self, user: Layout, zero: bool) -> Result<(CAllocationHandle, *mut Record), CAllocationError> {
++        let prepared = self.prepare(user, zero)?;
++        let guard = Guard::lock()?;
++        let entry = prepared.into_raw();
++        unsafe { (*entry).next = *LEDGER.head.get(); *LEDGER.head.get() = entry; }
++        let value = unsafe { (*entry).value };
++        drop(guard);
++        Ok((CAllocationHandle { pointer: value.pointer, generation: value.generation }, entry))
++    }
++    pub fn allocate(&self, user: Layout, zero: bool) -> Result<CAllocationHandle, CAllocationError> {
++        self.publish(user, zero).map(|(handle, _)| handle)
++    }
++    /// Wake must be a nonallocating, nonunwinding scheduling notification.
++    pub fn allocate_owned(&self, user: Layout, zero: bool, wake: fn()) -> Result<OwnedCAllocation, CAllocationError> {
++        self.publish(user, zero).map(|(handle, record)| OwnedCAllocation { handle, record, wake })
++    }
++    /// # Safety
++    /// Caller exclusively owns this manual allocation; no safe owner also exists.
++    pub unsafe fn free_owned(handle: CAllocationHandle) -> Result<(), CAllocationError> {
++        let (entry, value) = take(handle)?; destroy(entry, value); Ok(())
++    }
++    /// # Safety
++    /// Caller exclusively owns the allocation. Failure preserves it.
++    pub unsafe fn resize(handle: CAllocationHandle, new: Layout, zero: bool) -> Result<CAllocationHandle, CAllocationError> {
++        unsafe { resize_record(handle, new, zero) }.map(|(handle, _)| handle)
++    }
++}
++unsafe fn resize_record(handle: CAllocationHandle, new: Layout, zero: bool) -> Result<(CAllocationHandle, *mut Record), CAllocationError> {
++    let old = lookup(handle)?;
++    let allocator = FallibleCSystem { hooks: old.hooks, origin: old.origin };
++    let prepared = allocator.prepare(new, zero)?;
++    unsafe { ptr::copy_nonoverlapping(old.pointer, (*prepared.0).value.pointer, old.layout.size().min(new.size())); }
++    let guard = Guard::lock()?;
++    let mut prior: *mut Record = ptr::null_mut(); let mut entry = unsafe { *LEDGER.head.get() };
++    while !entry.is_null() {
++        let value = unsafe { (*entry).value };
++        if matches_handle(entry, handle) {
++            let next = prepared.into_raw();
++            unsafe { (*next).next = (*entry).next;
++                if prior.is_null() { *LEDGER.head.get() = next; } else { (*prior).next = next; } }
++            let result = unsafe { (*next).value };
++            drop(guard); destroy(entry, value);
++            return Ok((CAllocationHandle { pointer: result.pointer, generation: result.generation }, next));
++        }
++        prior = entry; entry = unsafe { (*entry).next };
++    }
++    drop(guard); Err(CAllocationError::UnknownAllocation)
++}
++fn matches_handle(entry: *mut Record, handle: CAllocationHandle) -> bool {
++    let record = unsafe { &*entry };
++    record.value.pointer == handle.pointer && record.value.generation == handle.generation &&
++        !record.pending.load(Ordering::Acquire)
++}
++struct Prepared(*mut Record);
++impl Prepared { fn into_raw(self) -> *mut Record { let p = self.0; core::mem::forget(self); p } }
++impl Drop for Prepared { fn drop(&mut self) { destroy(self.0, unsafe { (*self.0).value }); } }
++fn destroy(entry: *mut Record, value: Value) {
++    unsafe { System.dealloc(entry.cast(), Layout::new::<Record>()); System.dealloc(value.pointer, value.layout); }
++    (value.hooks.release)(value.ticket, value.quote);
++}
++fn lookup(handle: CAllocationHandle) -> Result<Value, CAllocationError> {
++    let _guard = Guard::lock()?; let mut entry = unsafe { *LEDGER.head.get() };
++    while !entry.is_null() {
++        if matches_handle(entry, handle) { return Ok(unsafe { (*entry).value }); }
++        entry = unsafe { (*entry).next };
++    }
++    Err(CAllocationError::UnknownAllocation)
++}
++fn take(handle: CAllocationHandle) -> Result<(*mut Record, Value), CAllocationError> {
++    let guard = Guard::lock()?; let mut prior: *mut Record = ptr::null_mut();
++    let mut entry = unsafe { *LEDGER.head.get() };
++    while !entry.is_null() {
++        let value = unsafe { (*entry).value };
++        if matches_handle(entry, handle) {
++            unsafe { if prior.is_null() { *LEDGER.head.get() = (*entry).next; }
++                else { (*prior).next = (*entry).next; } }
++            drop(guard); return Ok((entry, value));
++        }
++        prior = entry; entry = unsafe { (*entry).next };
++    }
++    Err(CAllocationError::UnknownAllocation)
++}
++#[cfg(test)] pub(super) fn while_locked<R>(run: impl FnOnce() -> R) -> R { let _g = Guard::lock().unwrap(); run() }
++#[cfg(test)] pub(super) fn probe_handle(pointer: *mut u8, generation: usize) -> CAllocationHandle { CAllocationHandle { pointer, generation } }
++#[cfg(test)] pub(super) fn stale_of(h: CAllocationHandle) -> CAllocationHandle { CAllocationHandle { pointer: h.pointer, generation: h.generation.wrapping_sub(1) } }
++
++#[cfg(test)] static PAUSE: AtomicUsize = AtomicUsize::new(0);
++#[cfg(test)] static ENTERED: AtomicBool = AtomicBool::new(false);
++#[cfg(test)] static RESUME: AtomicBool = AtomicBool::new(false);
++#[cfg(test)] fn pause_release(stage: usize) {
++    if PAUSE.compare_exchange(stage, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
++        ENTERED.store(true, Ordering::Release);
++        while !RESUME.load(Ordering::Acquire) { core::hint::spin_loop(); }
++    }
++}
++#[cfg(test)] pub(super) fn arm_pause(stage: usize) {
++    ENTERED.store(false, Ordering::Release); RESUME.store(false, Ordering::Release);
++    PAUSE.store(stage, Ordering::Release);
++}
++#[cfg(test)] pub(super) fn paused() -> bool { ENTERED.load(Ordering::Acquire) }
++#[cfg(test)] pub(super) fn resume() { RESUME.store(true, Ordering::Release); }

@@ -753,6 +753,7 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
     let data_rx = crate::data_rx();
     let mut deferred_event = true;
     while !crate::is_shutdown() {
+        crate::allocation_admission::progress_c_releases(false);
         progress_stream_ingress();
         let published = crate::deferred_ingress::take_deferred_revision();
         if deferred_event || published {
@@ -939,6 +940,7 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
             }
         }
     }
+    crate::allocation_admission::progress_c_releases(true);
     enclave_log_info!("Event loop exited");
     crate::shutdown_return_code()
 }

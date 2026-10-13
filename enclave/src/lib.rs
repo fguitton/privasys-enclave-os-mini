@@ -57,6 +57,8 @@ mod http_response;
 pub use http_response::{HttpResponseBody, HttpResponsePayload};
 
 mod allocation_admission;
+#[cfg(all(feature = "fallible-allocation-v1", target_vendor = "teaclave"))]
+pub use allocation_admission::notify_pending_c_releases;
 pub use allocation_admission::{
     local_allocation_pool, reserve_local_allocation, take_local_allocation_release,
 };

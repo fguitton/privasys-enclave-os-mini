@@ -75,3 +75,25 @@ pub fn initialize_fixed_futex_storage_once() -> Result<(), &'static str> {
         Err(_) => Err("futex startup previously failed"),
     }
 }
+
+// This is a work hint, not a credit-release event or source authority.
+#[cfg(all(feature = "fallible-allocation-v1", target_vendor = "teaclave"))]
+static C_RELEASE_WORK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(all(feature = "fallible-allocation-v1", target_vendor = "teaclave"))]
+pub fn notify_pending_c_releases() {
+    C_RELEASE_WORK.store(true, std::sync::atomic::Ordering::Release);
+    crate::notify_honest_stream_ingress();
+    crate::notify_deferred_ingress();
+}
+/// Drain at control opportunities and after shutdown owners are destroyed.
+/// Busy transfers the obligation to the actual SDK ledger lock holder.
+pub(crate) fn progress_c_releases(force: bool) {
+    #[cfg(not(all(feature = "fallible-allocation-v1", target_vendor = "teaclave")))]
+    let _ = force;
+    #[cfg(all(feature = "fallible-allocation-v1", target_vendor = "teaclave"))]
+    {
+        let notified = C_RELEASE_WORK.swap(false, std::sync::atomic::Ordering::AcqRel);
+        if !force && !notified { return; }
+        let _ = std::alloc::drain_pending_c_releases();
+    }
+}

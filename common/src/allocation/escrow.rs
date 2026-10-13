@@ -97,12 +97,67 @@ impl LoanAllocator {
         owner.activate_release_notification();
         Ok(Self { system, owner })
     }
+    /// Exact C payload plus SDK side-record backing, with no pointer prefix.
+    /// # Errors
+    /// Refuses zero-size or overflowing layouts before original-pool admission.
+    pub fn required_c_backend_bytes(layout: Layout) -> Result<usize, std::alloc::CAllocationError> {
+        std::alloc::FallibleCSystem::requested_layout(layout).map(|layout| layout.size())
+    }
+    /// Allocate a move-only C-compatible owner from this original prepaid loan.
+    /// Each SDK record retains its exact loan pair across thread/allocator Drop.
+    /// # Errors
+    /// Refuses budget, backend allocation, generation exhaustion or lock contention.
+    pub fn allocate_c_owned(
+        &self, layout: Layout, zero: bool, wake: fn(),
+    ) -> Result<LoanCAllocation, std::alloc::CAllocationError> {
+        let raw = self.owner.retain_raw_pair();
+        let origin = AllocationTicket { owner: raw.payload, loan: raw.credit };
+        // Return only the temporary pair. The safe allocator still owns the
+        // original identity while SDK admission issues each retained ticket.
+        drop(unsafe { Loan::from_owned_raw_pair(raw) });
+        let allocator = unsafe { std::alloc::FallibleCSystem::new(&HOOKS, origin) };
+        allocator.allocate_owned(layout, zero, wake)
+            .map(|allocation| LoanCAllocation { allocation, bytes: layout.size(), initialized: zero })
+    }
     /// Backend bytes currently lent, including SDK header/alignment.
     #[must_use]
     pub fn used(&self) -> usize {
         self.owner.used.load(Ordering::Acquire)
     }
 }
+/// Move-only initialized-byte access over the original SDK-owned C record.
+/// No raw handle, allocation owner or credit can be cloned independently.
+pub struct LoanCAllocation {
+    allocation: std::alloc::OwnedCAllocation,
+    bytes: usize,
+    initialized: bool,
+}
+impl LoanCAllocation {
+    /// Initialize every admitted byte without reading an uninitialized payload.
+    pub fn fill(&mut self, byte: u8) {
+        // SAFETY: the exact length was captured from successful SDK allocation;
+        // this exclusive move-only owner has not been resized or released.
+        unsafe { self.allocation.as_ptr().write_bytes(byte, self.bytes); }
+        self.initialized = true;
+    }
+    /// Borrow only fully initialized bytes while the original owner remains live.
+    pub fn bytes(&self) -> Option<&[u8]> {
+        if !self.initialized { return None; }
+        // SAFETY: initialization and extent are tracked by the only owning API;
+        // shared borrowing excludes resize and the owner's final Drop.
+        Some(unsafe { core::slice::from_raw_parts(self.allocation.as_ptr(), self.bytes) })
+    }
+    /// A failed resize leaves the original extent and initialization unchanged.
+    /// # Errors
+    /// Propagates original SDK admission, layout and contention refusal.
+    pub fn resize(&mut self, layout: Layout, zero: bool) -> Result<(), std::alloc::CAllocationError> {
+        let initialized = self.initialized && (layout.size() <= self.bytes || zero);
+        self.allocation.resize(layout, zero)?;
+        self.bytes = layout.size(); self.initialized = initialized;
+        Ok(())
+    }
+}
+
 unsafe impl Allocator for LoanAllocator {
     fn allocate(&self, l: Layout) -> Result<NonNull<[u8]>, AllocError> {
         self.system.allocate(l)

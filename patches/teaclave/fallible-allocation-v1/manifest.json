@@ -15,13 +15,17 @@
     {
       "path": "fixed-futex.patch",
       "sha256": "8793907eda1c6db81ff58596c42a8eb9960fceedb78182117b0dc6cf9d8132e2"
+    },
+    {
+      "path": "explicit-c-allocation.patch",
+      "sha256": "b476efeea6b8778bfc76e2c63f1a0e1d2075105146f6a855616bf7976036aabd"
     }
   ],
   "files": [
     {
       "path": "sgx_alloc/src/lib.rs",
       "before_sha256": "7893e8e98a9d8248a7da0f3555bd3dca69ff4527daeba881e51af01f5525fe21",
-      "after_sha256": "9c8957f171268ee1eb4a2014469cefeee25131050c5c4411c6693a88e0bcb9b4"
+      "after_sha256": "e51f78b12de75dcb9b526a67b8e9bba9b01b5908f3750bb862e5030ff722691f"
     },
     {
       "path": "sgx_alloc/src/system.rs",
@@ -31,7 +35,7 @@
     {
       "path": "sgx_tstd/src/alloc.rs",
       "before_sha256": "77bd807108ac94bc83ce38652003f4ff8814b52d77c18111a3ecd90911916b24",
-      "after_sha256": "3319c3c1604ec67d90d02b02016004313410462cd74994bc49153f180242f0a2"
+      "after_sha256": "88c805b5e4d03d0367245932b2c7c36842aebf87b662ed37b4506895e67d2a38"
     },
     {
       "path": "sgx_alloc/src/fallible.rs",
@@ -87,6 +91,11 @@
       "path": "sgx_tstd/src/sync/mod.rs",
       "before_sha256": "b7771e76d506aa276f6dfb530f3786acd9d93d69e6ce2473ab9759053643e8e7",
       "after_sha256": "e59daabe3d88f1b05e09efd308cf885ecdf3e6450e1407b58f68ef8d7c1cbaad"
+    },
+    {
+      "path": "sgx_alloc/src/fallible_c.rs",
+      "before_sha256": null,
+      "after_sha256": "f7585a89efee1396034116ca52342e1ff5060b16606a31b7a5300d413de30930"
     }
   ],
   "preserved": [
@@ -101,7 +110,8 @@
     "TLS/config/crypto fallible allocation graph",
     "Connected C allocation and raw ownership compatibility",
     "New std/native/trusted/signed-SIM owning qualification",
-    "Early fixed-futex SDK startup/consumer runtime qualification; source wired, experimental profile remains default-off"
+    "Early fixed-futex SDK startup/consumer runtime qualification; source wired, experimental profile remains default-off",
+    "Explicit C-system API is not C free/Drop or global/TLS enforcement: Busy retry, actual held-origin provider, no symbol interposition, fallible library consumer closure required."
   ],
   "activation": "Never enable a global hard quota behind unclosed infallible allocations. This source profile adds explicit fallible ABI and partial thread Result paths only.",
   "build_inputs": [
