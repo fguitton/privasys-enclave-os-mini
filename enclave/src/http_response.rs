@@ -8,29 +8,83 @@ use std::sync::Arc;
 /// admission before allocating or growing the body; this wrapper only carries
 /// that admission through HTTP/TLS ownership. It confers no request authority.
 /// There is no method that separates a leased allocation from its owner.
+// The function pointer retains the exact concrete credit type without another
+// allocation. The erased Arcs remain private and no Weak owner can escape.
+struct PairedCredit {
+    credit: Option<Arc<dyn Any + Send + Sync>>,
+    release: fn(Arc<dyn Any + Send + Sync>),
+}
+impl Drop for PairedCredit {
+    fn drop(&mut self) {
+        if let Some(credit) = self.credit.take() {
+            (self.release)(credit);
+        }
+    }
+}
+fn release_paired_credit<C: Any + Send + Sync>(credit: Arc<dyn Any + Send + Sync>) {
+    // Only with_paired_owner can create this private pair, using this exact C.
+    let credit = Arc::downcast::<C>(credit).unwrap_or_else(|_| unreachable!("paired credit type"));
+    drop(Arc::into_inner(credit));
+}
 pub struct HttpResponseBody {
     // Declaration order frees the allocation before dropping its reservation.
     bytes: Vec<u8>,
     owner: Option<Arc<dyn Any + Send + Sync>>,
     allocation: Option<enclave_os_common::allocation::AllocationLeaseV1>,
+    // Last: both body and payload Arc allocation are gone before credit returns.
+    paired_credit: Option<PairedCredit>,
 }
 impl HttpResponseBody {
     /// The adopter reserved this exact Vec before copying the HTTP body.
     /// Actual bytes are destroyed before the move-only allocation credit.
-    pub fn with_allocation(bytes: Vec<u8>, allocation: Option<enclave_os_common::allocation::AllocationLeaseV1>) -> Self {
-        Self { bytes, owner: None, allocation }
+    pub fn with_allocation(
+        bytes: Vec<u8>,
+        allocation: Option<enclave_os_common::allocation::AllocationLeaseV1>,
+    ) -> Self {
+        Self {
+            bytes,
+            owner: None,
+            allocation,
+            paired_credit: None,
+        }
+    }
+    /// Adopt an already-paid opaque payload/credit pair without allocating.
+    /// The caller must have charged both Arc layouts before creating them and
+    /// keep every alias paired; no external Weak or raw Arc escape is permitted.
+    /// Body bytes drop first, then payload, then the final credit Arc allocation,
+    /// and only then the concrete credit value can return admission.
+    pub fn with_paired_owner<T: Any + Send + Sync, C: Any + Send + Sync>(
+        bytes: Vec<u8>,
+        payload: Arc<T>,
+        credit: Arc<C>,
+    ) -> Self {
+        Self {
+            bytes,
+            owner: Some(payload),
+            allocation: None,
+            paired_credit: Some(PairedCredit {
+                credit: Some(credit),
+                release: release_paired_credit::<C>,
+            }),
+        }
     }
     pub fn with_owner(bytes: Vec<u8>, owner: Arc<dyn Any + Send + Sync>) -> Self {
         Self {
             bytes,
             owner: Some(owner),
             allocation: None,
+            paired_credit: None,
         }
     }
 }
 impl From<Vec<u8>> for HttpResponseBody {
     fn from(bytes: Vec<u8>) -> Self {
-        Self { bytes, owner: None, allocation: None }
+        Self {
+            bytes,
+            owner: None,
+            allocation: None,
+            paired_credit: None,
+        }
     }
 }
 impl Deref for HttpResponseBody {
@@ -46,6 +100,7 @@ impl fmt::Debug for HttpResponseBody {
             .field("capacity", &self.bytes.capacity())
             .field("has_owner", &self.owner.is_some())
             .field("has_allocation", &self.allocation.is_some())
+            .field("has_paired_credit", &self.paired_credit.is_some())
             .finish()
     }
 }

@@ -170,6 +170,44 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
     assert!(allocation_pool.reserve_unpublished(1).is_none());
     drop(paid_body);
     assert_eq!(allocation_pool.used(), 0);
+    // Real pool admission remains until the last body/payload pair releases.
+    // Erasure itself allocates nothing; each original Arc layout is prepaid.
+    struct PairedPayload(Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for PairedPayload {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    struct PairedLease {
+        lease: enclave_os_common::allocation::AllocationLeaseV1,
+        dropped: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Drop for PairedLease {
+        fn drop(&mut self) {
+            assert_eq!(self.dropped.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(self.lease.bytes() > 0);
+        }
+    }
+    let pair_bytes = enclave_os_common::allocation::shared_allocation_bytes::<PairedPayload>()
+        .unwrap()
+        + enclave_os_common::allocation::shared_allocation_bytes::<PairedLease>().unwrap();
+    let pair_pool = enclave_os_common::allocation::AllocationPoolV1::new(pair_bytes).unwrap();
+    let lease = pair_pool.reserve_unpublished(pair_bytes).unwrap();
+    let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let payload = Arc::new(PairedPayload(dropped.clone()));
+    let credit = Arc::new(PairedLease {
+        lease,
+        dropped: dropped.clone(),
+    });
+    let first =
+        crate::HttpResponseBody::with_paired_owner(Vec::new(), payload.clone(), credit.clone());
+    let second = crate::HttpResponseBody::with_paired_owner(Vec::new(), payload, credit);
+    drop(first);
+    assert_eq!(pair_pool.used(), pair_bytes);
+    assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 0);
+    drop(second);
+    assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(pair_pool.used(), 0);
     segmented_response_lifecycle();
     fixed_peer_configuration_boundary();
     #[cfg(feature = "native-deferred-fixture")]
