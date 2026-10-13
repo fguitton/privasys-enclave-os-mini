@@ -174,6 +174,28 @@ if(HONEST_PINNED_TEACLAVE_SIM_SOURCE)
     require_sdk230_teaclave("${TEACLAVE_CHECKOUT}")
 endif()
 
+# The optional allocator source is a verified, build-owned mirror for both
+# HW and SIM. Identity remains the original pinned checkout; no global SDK is
+# edited. Cargo acquisition must select the same owned source explicitly.
+set(HONEST_PINNED_TEACLAVE_FALLIBLE_SOURCE "" CACHE PATH
+    "Build-owned SDK source for the default-off fallible allocation profile")
+if(HONEST_PINNED_TEACLAVE_FALLIBLE_SOURCE)
+    if(NOT HONEST_TEACLAVE_FALLIBLE_ALLOCATION_V1)
+        message(FATAL_ERROR "Fallible SDK mirror requires explicit allocation profile")
+    endif()
+    if(HONEST_PINNED_TEACLAVE_SIM_SOURCE)
+        message(FATAL_ERROR "Use one selected SDK source mirror, not conflicting mirrors")
+    endif()
+    file(REAL_PATH "${HONEST_PINNED_TEACLAVE_FALLIBLE_SOURCE}" _fallible_source_real)
+    file(REAL_PATH "${CMAKE_BINARY_DIR}" _fallible_build_real)
+    string(FIND "${_fallible_source_real}/" "${_fallible_build_real}/" _fallible_inside)
+    if(IS_SYMLINK "${HONEST_PINNED_TEACLAVE_FALLIBLE_SOURCE}" OR NOT _fallible_inside EQUAL 0)
+        message(FATAL_ERROR "Fallible SDK source is not owned by this build")
+    endif()
+    set(TEACLAVE_CHECKOUT "${_fallible_source_real}")
+    require_sdk230_teaclave("${TEACLAVE_CHECKOUT}")
+endif()
+
 message(STATUS "Teaclave SDK: ${TEACLAVE_CHECKOUT}")
 
 # Paths derived from the Teaclave checkout

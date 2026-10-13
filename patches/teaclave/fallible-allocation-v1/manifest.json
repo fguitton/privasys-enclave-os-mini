@@ -1,0 +1,86 @@
+{
+  "schema": 1,
+  "profile": "fallible-allocation-v1",
+  "status": "default-off-source-proposal-not-complete-allocator",
+  "base_sdk_commit": "2330b2a5aa8404d3c0a38e9d3a760144549f4943",
+  "patches": [
+    {
+      "path": "sdk-abi.patch",
+      "sha256": "b11796105a5c8317b3a04a013c6a3a0fa6c8b5b85d485307a4a9c99d73e2bc00"
+    },
+    {
+      "path": "thread-construction.patch",
+      "sha256": "04f78f6d03c54dfd865aae68d7dd7c8f59ffd8b3f5af8cc43b6f4bcade9b55be"
+    }
+  ],
+  "files": [
+    {
+      "path": "sgx_alloc/src/lib.rs",
+      "before_sha256": "7893e8e98a9d8248a7da0f3555bd3dca69ff4527daeba881e51af01f5525fe21",
+      "after_sha256": "9c8957f171268ee1eb4a2014469cefeee25131050c5c4411c6693a88e0bcb9b4"
+    },
+    {
+      "path": "sgx_alloc/src/system.rs",
+      "before_sha256": "50dbb71de2150643f52fbf48e077d615994553cf59591b3b17a892fd11637830",
+      "after_sha256": "50dbb71de2150643f52fbf48e077d615994553cf59591b3b17a892fd11637830"
+    },
+    {
+      "path": "sgx_tstd/src/alloc.rs",
+      "before_sha256": "77bd807108ac94bc83ce38652003f4ff8814b52d77c18111a3ecd90911916b24",
+      "after_sha256": "3319c3c1604ec67d90d02b02016004313410462cd74994bc49153f180242f0a2"
+    },
+    {
+      "path": "sgx_alloc/src/fallible.rs",
+      "before_sha256": null,
+      "after_sha256": "8d4083c0b60b8cd58c28374b38c3d739bb2611c7bba33e47067bba115a83303a"
+    },
+    {
+      "path": "sgx_tstd/src/thread/mod.rs",
+      "before_sha256": "9f312f6d393c2eb3f2a5ae88f0464e94b111ea82f0bd7ab58daf2e6f06ca6a3d",
+      "after_sha256": "ccfd6f5e9ddf3bece83233353825bd7ccda9ed48446936516f042623f62d9905"
+    },
+    {
+      "path": "sgx_tstd/src/sys/thread.rs",
+      "before_sha256": "b7a511afc64e5c722d32b3fca056c7ca8b242f96fde821b816b0af912756a8da",
+      "after_sha256": "259ca8a2e8bc0b01f2b1a5cd2817c14a8b20a7dd50c4e78faef46e3fa831e76a"
+    },
+    {
+      "path": "sgx_trts/src/thread/native.rs",
+      "before_sha256": "fa870ae91aab49b6d5d228e4621377fdabb5433585c14edcda1a096f1f2c86e9",
+      "after_sha256": "8e13f1a0a34d072a0b90731fb2162be879e4dd75920525dcb07bc4fe61652c1c"
+    },
+    {
+      "path": "sgx_trts/src/thread/task.rs",
+      "before_sha256": "4bdb8e5b813c1a165f4cfdd2844e31020e9f15cacfc8bf32eb9b2f6920c587f5",
+      "after_sha256": "b8aa1656ef2a5c225c2f4f0c4bf524af73d29f4cc82ae5db2f34c96c3a379b74"
+    }
+  ],
+  "preserved": [
+    "Default System and C allocator ABI",
+    "Original thread entry/cancellation/join owner and scope accounting",
+    "Source-version and new input-ID requirement"
+  ],
+  "remaining": [
+    "Implicit Thread::new allocations and current-thread initialization",
+    "Bound-TCS futex wait/wake/requeue storage and full NativeThread actor qualification",
+    "Exact actual-provider owner/loan lending and lifetime",
+    "TLS/config/crypto fallible allocation graph",
+    "Connected C allocation and raw ownership compatibility",
+    "New std/native/trusted/signed-SIM owning qualification"
+  ],
+  "activation": "Never enable a global hard quota behind unclosed infallible allocations. This source profile adds explicit fallible ABI and partial thread Result paths only.",
+  "build_inputs": [
+    {
+      "path": "prepare-inputs.sh",
+      "sha256": "55952a383e842c01686c50c65854fcc259868b5122a4dd8f0135267c894de7a2"
+    },
+    {
+      "path": "approved-functions.sh",
+      "sha256": "24acd61c83e3ed9155cf479a92f0fe864476f4be9ac5642aa41d6433ae77ab1c"
+    }
+  ],
+  "autotools_owner": {
+    "path": "scripts/ci/test-teaclave-sim.sh",
+    "sha256": "6bcde05437c6a35c4766bbdf7b759c8c01b3f863693dab3b84759fc85b94dc25"
+  }
+}

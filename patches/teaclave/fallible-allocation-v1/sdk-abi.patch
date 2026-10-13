@@ -1,0 +1,154 @@
+--- a/sgx_alloc/src/lib.rs
++++ b/sgx_alloc/src/lib.rs
+@@ -41,3 +41,7 @@
+ pub mod alignalloc;
+ pub mod alignbox;
+ pub mod capi;
++
++/// Explicit fallible allocation admission; default global System is unchanged.
++pub mod fallible;
++pub use fallible::{AllocationTicket, FallibleAllocationHooks, FallibleSystem};
+--- a/sgx_tstd/src/alloc.rs
++++ b/sgx_tstd/src/alloc.rs
+@@ -77,6 +77,8 @@
+ pub use alloc_crate::alloc::*;
+ 
+ pub use sgx_alloc::System;
++/// Explicit fallible allocator; quota refusal never enters a global OOM handler.
++pub use sgx_alloc::{AllocationTicket, FallibleAllocationHooks, FallibleSystem};
+ 
+ static HOOK: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+ 
+--- /dev/null
++++ b/sgx_alloc/src/fallible.rs
+@@ -0,0 +1,130 @@
++//! Private opt-in allocator ABI. Only fallible Box/Arc/collection constructors
++//! may select it. The default global System and C allocator remain unchanged.
++use core::alloc::{AllocError, Allocator, GlobalAlloc, Layout};
++use core::ptr::{self, NonNull};
++use super::System;
++
++/// Opaque fixed admission identity. Its provider retains stable origin/loan
++/// state until release, even after the allocating actor or thread returns.
++#[derive(Clone, Copy)]
++#[repr(C)]
++pub struct AllocationTicket { pub owner: usize, pub loan: usize }
++/// Callbacks are trusted, process-lifetime, nonallocating and non-unwinding.
++/// Each admits the complete requested backend layout before System allocates.
++/// A loan spends an existing reservation rather than creating a second charge.
++pub struct FallibleAllocationHooks {
++    pub admit: fn(AllocationTicket, Layout) -> Result<AllocationTicket, AllocError>,
++    pub release: fn(AllocationTicket, Layout),
++}
++/// This allocator has no GlobalAlloc implementation: quota refusal must reach
++/// an explicit Result, never an infallible library's allocation error handler.
++#[derive(Clone, Copy)]
++pub struct FallibleSystem {
++    hooks: &'static FallibleAllocationHooks,
++    origin: AllocationTicket,
++}
++impl FallibleSystem {
++    /// # Safety
++    /// Callback origin and loan state must remain valid through the final
++    /// deallocation, not merely the dynamic operation scope. Callbacks must
++    /// not allocate, unwind, wait or grant any semantic authority.
++    pub const unsafe fn new(hooks: &'static FallibleAllocationHooks, origin: AllocationTicket) -> Self {
++        Self { hooks, origin }
++    }
++}
++#[repr(C)]
++struct Header {
++    raw: NonNull<u8>,
++    size: usize,
++    align: usize,
++    hooks: &'static FallibleAllocationHooks,
++    ticket: AllocationTicket,
++}
++fn geometry(user: Layout) -> Result<(Layout, usize), AllocError> {
++    Layout::new::<Header>().extend(user)
++        .map(|(layout, offset)| (layout.pad_to_align(), offset))
++        .map_err(|_| AllocError)
++}
++unsafe fn header(pointer: NonNull<u8>) -> Header {
++    // Private metadata precedes, and is outside, the user's requested range.
++    unsafe { pointer.as_ptr().sub(core::mem::size_of::<Header>()).cast::<Header>().read() }
++}
++impl FallibleSystem {
++    fn allocate_at(hooks: &'static FallibleAllocationHooks, origin: AllocationTicket, user: Layout, zeroed: bool)
++        -> Result<NonNull<[u8]>, AllocError>
++    {
++        if user.size() == 0 {
++            return Ok(NonNull::slice_from_raw_parts(user.dangling_ptr(), 0));
++        }
++        let (layout, offset) = geometry(user)?;
++        let ticket = (hooks.admit)(origin, layout)?;
++        let raw = unsafe {
++            if zeroed { System.alloc_zeroed(layout) } else { System.alloc(layout) }
++        };
++        let Some(raw) = NonNull::new(raw) else {
++            (hooks.release)(ticket, layout);
++            return Err(AllocError);
++        };
++        let user_pointer = unsafe { NonNull::new_unchecked(raw.as_ptr().add(offset)) };
++        let metadata = Header { raw, size: layout.size(), align: layout.align(), hooks, ticket };
++        unsafe {
++            user_pointer.as_ptr().sub(core::mem::size_of::<Header>()).cast::<Header>().write(metadata);
++        }
++        Ok(NonNull::slice_from_raw_parts(user_pointer, user.size()))
++    }
++    unsafe fn resize(pointer: NonNull<u8>, old: Layout, new: Layout, zeroed: bool)
++        -> Result<NonNull<[u8]>, AllocError>
++    {
++        if old.size() == 0 {
++            // Caller must use its own allocator for this no-origin case.
++            return Err(AllocError);
++        }
++        let origin = unsafe { header(pointer) };
++        if new.size() == 0 {
++            unsafe { Self::release(pointer); }
++            return Ok(NonNull::slice_from_raw_parts(new.dangling_ptr(), 0));
++        }
++        // Keep the old allocation and its admission while requesting the entire
++        // new block. Even a different current actor cannot change its origin.
++        let next = Self::allocate_at(origin.hooks, origin.ticket, new, zeroed)?;
++        unsafe {
++            ptr::copy_nonoverlapping(pointer.as_ptr(), next.as_mut_ptr(), old.size().min(new.size()));
++            Self::release(pointer);
++        }
++        Ok(next)
++    }
++    unsafe fn release(pointer: NonNull<u8>) {
++        let metadata = unsafe { header(pointer) };
++        let layout = unsafe { Layout::from_size_align_unchecked(metadata.size, metadata.align) };
++        unsafe { System.dealloc(metadata.raw.as_ptr(), layout); }
++        (metadata.hooks.release)(metadata.ticket, layout);
++    }
++}
++unsafe impl Allocator for FallibleSystem {
++    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
++        Self::allocate_at(self.hooks, self.origin, layout, false)
++    }
++    fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
++        Self::allocate_at(self.hooks, self.origin, layout, true)
++    }
++    unsafe fn deallocate(&self, pointer: NonNull<u8>, layout: Layout) {
++        if layout.size() != 0 { unsafe { Self::release(pointer); } }
++    }
++    unsafe fn grow(&self, pointer: NonNull<u8>, old: Layout, new: Layout)
++        -> Result<NonNull<[u8]>, AllocError>
++    {
++        if old.size() == 0 { return self.allocate(new); }
++        unsafe { Self::resize(pointer, old, new, false) }
++    }
++    unsafe fn grow_zeroed(&self, pointer: NonNull<u8>, old: Layout, new: Layout)
++        -> Result<NonNull<[u8]>, AllocError>
++    {
++        if old.size() == 0 { return self.allocate_zeroed(new); }
++        unsafe { Self::resize(pointer, old, new, true) }
++    }
++    unsafe fn shrink(&self, pointer: NonNull<u8>, old: Layout, new: Layout)
++        -> Result<NonNull<[u8]>, AllocError>
++    {
++        unsafe { Self::resize(pointer, old, new, false) }
++    }
++}
