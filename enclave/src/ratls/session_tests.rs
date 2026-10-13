@@ -301,6 +301,7 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
     drop(shared);
     assert_eq!(credit_pool.used(), 0);
     segmented_response_lifecycle();
+    checked_response_step_policy();
     fixed_peer_configuration_boundary();
     #[cfg(feature = "native-deferred-fixture")]
     crate::actual_control_wake::check();
@@ -1686,4 +1687,39 @@ fn checked_paid_quote_time() {
             assert_eq!(pool.used(), 0);
         }
     }
+}
+
+// A plaintext policy cannot promise that existing encrypted records will fit.
+// Exercise the actual TLS writer and retain the hard output refusal.
+fn checked_response_step_policy() {
+    use enclave_os_common::allocation::AllocationPoolV1;
+    assert_eq!(super::TLS_RESPONSE_PLAINTEXT_STEP_BYTES, 60 * 1024);
+    let store = CertStore::new();
+    register(&store, "step.test");
+    let (mut client, mut session) = pair(&store, "step.test");
+    handshake(&mut client, &mut session);
+    let pending = vec![7; super::TLS_RESPONSE_STEP_HEADROOM_BYTES * 2];
+    session.tls_conn.writer().write_all(&pending).unwrap();
+    let encrypted = session.collect_tls_output().unwrap();
+    assert!(encrypted.len() > pending.len());
+    let pool = AllocationPoolV1::new(encrypted.len()).unwrap();
+    let mut exact = TlsOutput::bounded(encrypted.len());
+    exact.append_admitted(&encrypted, Some(&pool)).unwrap();
+    assert_eq!(exact.as_ref(), encrypted.as_ref());
+    assert!(exact.append_admitted(&[0], Some(&pool)).is_err());
+    assert_eq!(exact.as_ref(), encrypted.as_ref());
+    assert_eq!(pool.used(), encrypted.len());
+    drop(exact);
+    assert_eq!(pool.used(), 0);
+
+    // Keep actual encrypted records pending alongside the next HTTP step.
+    session.tls_conn.writer().write_all(&pending).unwrap();
+    let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let body = owned_body(vec![9; super::TLS_RESPONSE_PLAINTEXT_STEP_BYTES], &drops);
+    session
+        .queue_http_response(200, "application/json", &[], body, false, false)
+        .unwrap();
+    assert!(session.progress_http_response().is_err());
+    assert!(!session.has_pending_response());
+    assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
 }

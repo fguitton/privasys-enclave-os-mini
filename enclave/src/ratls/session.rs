@@ -220,7 +220,16 @@ pub(crate) fn response_socket_credit_ready(available: u64) -> bool {
     u64::try_from(TLS_RESPONSE_STEP_BYTES).is_ok_and(|step| available >= step)
 }
 
-const TLS_RESPONSE_FRAMING_MARGIN: usize = 4 * 1024;
+// Independent plaintext scheduling policy, not a maximum Rustls expansion.
+// Record fragmentation, separate body parts and pending TLS control records
+// can consume more than this headroom. The actual ciphertext bound is enforced
+// by TlsOutput::bounded and append, including all previously queued records.
+const TLS_RESPONSE_STEP_HEADROOM_BYTES: usize = 4 * 1024;
+const TLS_RESPONSE_PLAINTEXT_STEP_BYTES: usize =
+    match TLS_RESPONSE_STEP_BYTES.checked_sub(TLS_RESPONSE_STEP_HEADROOM_BYTES) {
+        Some(bytes) if bytes > 0 => bytes,
+        _ => panic!("invalid TLS response plaintext policy"),
+    };
 const MAX_RESPONSE_HEADER_BYTES: usize = 32 * 1024;
 struct PendingResponse {
     #[cfg(feature = "diagnostic-transfer-profile")]
@@ -816,8 +825,9 @@ impl RaTlsSession {
         #[cfg(feature = "diagnostic-transfer-profile")]
         let step_started = response.cost.as_ref().map(|_| std::time::Instant::now());
         let mut output = TlsOutput::bounded(TLS_RESPONSE_STEP_BYTES);
-        // Keep 4 KiB of the admitted 64 KiB socket step for TLS framing.
-        let mut remaining = TLS_RESPONSE_STEP_BYTES - TLS_RESPONSE_FRAMING_MARGIN;
+        // Admit this much new plaintext; actual pending/framing bytes still
+        // pass the independent ciphertext limit on every append.
+        let mut remaining = TLS_RESPONSE_PLAINTEXT_STEP_BYTES;
         if !response.head.is_empty() {
             self.write_plaintext_chunked(&response.head, &mut output)?;
             remaining -= response.head.len();
