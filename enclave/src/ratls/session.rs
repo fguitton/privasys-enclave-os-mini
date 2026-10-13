@@ -178,6 +178,19 @@ struct PendingResponse {
     shutdown: bool,
 }
 
+/// Ordinary dispatch retains copied context children through the whole callback.
+/// Borrowing this data does not grant application authority or transfer credit.
+pub(crate) struct PaidRequestContext {
+    context: enclave_os_common::modules::RequestContext,
+    _allocation: Option<enclave_os_common::allocation::AllocationLeaseV1>,
+}
+impl core::ops::Deref for PaidRequestContext {
+    type Target = enclave_os_common::modules::RequestContext;
+    fn deref(&self) -> &Self::Target {
+        &self.context
+    }
+}
+
 /// Identity extracted from a successful FIDO2 registration or
 /// authentication ceremony.
 #[derive(Debug, Clone)]
@@ -965,10 +978,13 @@ impl RaTlsSession {
     /// the handshake (mutual RA-TLS), or `None` for unauthenticated
     /// clients (e.g. browsers).
     pub fn peer_cert_der(&self) -> Option<Vec<u8>> {
+        self.peer_cert_der_ref().map(<[u8]>::to_vec)
+    }
+    pub(crate) fn peer_cert_der_ref(&self) -> Option<&[u8]> {
         self.tls_conn
             .peer_certificates()
             .and_then(|certs| certs.first())
-            .map(|cert| cert.as_ref().to_vec())
+            .map(|cert| cert.as_ref())
     }
 
     /// Attestation tag of this connection ("none", "deterministic", "challenge").
@@ -1022,19 +1038,22 @@ impl RaTlsSession {
         self.local_evidence = Some(evidence);
     }
 
-    /// Conservative capacities of every dynamically cloned context field.
+    /// Requested child allocation lengths of the actual fresh_context copies.
+    /// RequestContext itself moves inline in Work; its container is a separate
+    /// owner. Fixed endpoint fields are Copy; oidc_claims is None on this path.
     pub(crate) fn context_allocation_bound(&self) -> Option<usize> {
         fn evidence(value: &enclave_os_common::modules::PeerEvidence) -> Option<usize> {
             value
                 .tee
-                .capacity()
-                .checked_add(value.quote.capacity())?
-                .checked_add(value.quote_time.capacity())?
-                .checked_add(value.gpu_evidence.as_ref().map_or(0, Vec::capacity))
+                .len()
+                .checked_add(value.quote.len())?
+                .checked_add(value.quote_time.len())?
+                .checked_add(value.gpu_evidence.as_ref().map_or(0, Vec::len))
         }
-        let mut bytes = 1024usize
-            .checked_add(self.local_cert_der.capacity())?
-            .checked_add(self.server_name.as_ref().map_or(0, String::capacity))?
+        let mut bytes = Self::CHANNEL_BINDER_BYTES
+            .checked_add(self.attestation().len())?
+            .checked_add(self.local_cert_der.len())?
+            .checked_add(self.server_name.as_ref().map_or(0, String::len))?
             .checked_add(
                 self.tls_conn
                     .peer_certificates()
@@ -1050,8 +1069,69 @@ impl RaTlsSession {
         Some(bytes)
     }
 
+    pub(crate) fn request_context(
+        &self,
+        connection_id: u32,
+        ingress_class: enclave_os_common::modules::IngressClass,
+    ) -> Result<PaidRequestContext, &'static str> {
+        #[cfg(target_env = "sgx")]
+        let pool = Some(crate::local_allocation_pool().ok_or("SDK heap unavailable")?);
+        #[cfg(not(target_env = "sgx"))]
+        let pool = None;
+        self.request_context_with_pool(connection_id, ingress_class, pool.as_ref())
+    }
+    fn request_context_with_pool(
+        &self,
+        connection_id: u32,
+        ingress_class: enclave_os_common::modules::IngressClass,
+        pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
+    ) -> Result<PaidRequestContext, &'static str> {
+        if !self.configuration.is_current() || self.attestation_failed() {
+            return Err("TLS context is not current");
+        }
+        let bytes = self
+            .context_allocation_bound()
+            .ok_or("context size overflow")?;
+        let allocation = match pool {
+            Some(pool) => Some(
+                pool.reserve_unpublished(bytes)
+                    .ok_or("context admission exhausted")?,
+            ),
+            None => None,
+        };
+        let context = enclave_os_common::modules::RequestContext {
+            ingress_class,
+            connection_id,
+            server_name: self.server_name().map(str::to_owned),
+            attested_endpoint: self.attested_endpoint(),
+            local_cert_der: self.local_cert_der(),
+            local_evidence: self.local_evidence().cloned(),
+            channel_binder: self.channel_binder(),
+            peer_cert_der: self.peer_cert_der(),
+            peer_evidence: self.peer_evidence().cloned(),
+            attestation: self.attestation().to_string(),
+            oidc_claims: None,
+        };
+        if let Some(credit) = &allocation {
+            credit.activate_release_notification();
+        }
+        Ok(PaidRequestContext {
+            context,
+            _allocation: allocation,
+        })
+    }
+
     pub fn channel_binder(&self) -> Option<Vec<u8>> {
-        self.export_hctx(b"EXPORTER-honest-peer-channel-v2", &[])
+        // This Option-only caller never needs the public String error adapter.
+        // Keep the same currentness/exporter binding without allocating a
+        // discarded error string outside the copied-context child quote.
+        self.configuration.is_current().then_some(())?;
+        self.tls_conn
+            .export_keying_material(
+                [0u8; Self::CHANNEL_BINDER_BYTES],
+                b"EXPORTER-honest-peer-channel-v2",
+                Some(&[]),
+            )
             .ok()
             .map(|value| value.to_vec())
     }
@@ -1079,14 +1159,21 @@ impl RaTlsSession {
         self.peer_evidence = Some(ev);
     }
 
+    /// Existing exporter protocol width, shared by its allocation consumers.
+    pub const CHANNEL_BINDER_BYTES: usize = 32;
+
     /// The 32-byte RFC 8446 exporter value of this connection for `label` and
     /// `context`, keyed by exporter_master_secret (RA-TLS v2 binding).
-    pub fn export_hctx(&self, label: &[u8], context: &[u8]) -> Result<[u8; 32], String> {
+    pub fn export_hctx(
+        &self,
+        label: &[u8],
+        context: &[u8],
+    ) -> Result<[u8; Self::CHANNEL_BINDER_BYTES], String> {
         if !self.configuration.is_current() {
             return Err("certificate configuration changed; reconnect required".into());
         }
         self.tls_conn
-            .export_keying_material([0u8; 32], label, Some(context))
+            .export_keying_material([0u8; Self::CHANNEL_BINDER_BYTES], label, Some(context))
             .map_err(|e| format!("exporter: {e}"))
     }
 

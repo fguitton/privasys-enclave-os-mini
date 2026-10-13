@@ -112,6 +112,8 @@ fn replacement_rejects_buffered_requests_and_re_attestation() {
     checked_tls_output_backing();
     checked_http_request_admission();
     checked_stream_header_admission();
+    crate::deferred_ingress::check_context_physical_for_native();
+    checked_ordinary_context_admission();
     let store = CertStore::new();
     register(&store, "a.test");
     let (mut client, mut session) = pair(&store, "a.test");
@@ -750,7 +752,7 @@ fn streamed_request_preserves_tls_and_following_request() {
         generation: 1,
         binding: binding.as_slice().try_into().unwrap(),
         context: Some(context),
-        context_charge: None,
+        _context_charge: None,
         header: Some(header),
         receiver: None,
         bytes: vec![],
@@ -1323,5 +1325,44 @@ fn checked_stream_header_admission() {
             .unwrap()
             .is_none()
     );
+    assert_eq!(pool.used(), 0);
+}
+
+fn checked_ordinary_context_admission() {
+    use enclave_os_common::{allocation::AllocationPoolV1, modules::IngressClass};
+    let store = CertStore::new();
+    register(&store, "context.test");
+    let (mut client, mut session) = pair(&store, "context.test");
+    handshake(&mut client, &mut session);
+    let needed = session.context_allocation_bound().unwrap();
+    let small = AllocationPoolV1::new(needed - 1).unwrap();
+    assert!(session
+        .request_context_with_pool(7, IngressClass::ExternalNetwork, Some(&small))
+        .is_err());
+    assert_eq!(small.used(), 0);
+    for limit in [needed, needed + 1] {
+        let pool = AllocationPoolV1::new(limit).unwrap();
+        let context = session
+            .request_context_with_pool(7, IngressClass::ExternalNetwork, Some(&pool))
+            .unwrap();
+        assert_eq!(context.connection_id, 7);
+        assert_eq!(context.server_name.as_deref(), Some("context.test"));
+        assert_eq!(context.local_cert_der, session.local_cert_der());
+        assert_eq!(context.channel_binder, session.channel_binder());
+        assert!(context.oidc_claims.is_none());
+        assert_eq!(pool.used(), needed);
+        assert!(session
+            .request_context_with_pool(8, IngressClass::ExternalNetwork, Some(&pool))
+            .is_err());
+        assert_eq!(pool.used(), needed);
+        drop(context);
+        assert_eq!(pool.used(), 0);
+    }
+    register(&store, "context.test");
+    let pool = AllocationPoolV1::new(needed).unwrap();
+    assert!(session
+        .request_context_with_pool(7, IngressClass::ExternalNetwork, Some(&pool))
+        .is_err());
+    assert!(session.channel_binder().is_none());
     assert_eq!(pool.used(), 0);
 }

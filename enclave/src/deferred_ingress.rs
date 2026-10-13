@@ -59,7 +59,7 @@ pub(crate) struct DeferredWork {
     pub binding: [u8; 32],
     pub token: HonestPendingIngress,
     pub context: Option<RequestContext>,
-    pub context_charge: Option<ContextCharge>,
+    pub _context_charge: Option<ContextCharge>,
 }
 
 static REVISION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
@@ -75,9 +75,21 @@ pub(crate) fn take_deferred_revision() -> bool {
 /// Admission precedes cloning certificate/evidence buffers, not a guessed body.
 const MAX_CONTEXT_BYTES: usize = 128 * 1024;
 static CONTEXT_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-pub(crate) struct ContextCharge;
+pub(crate) struct ContextCharge {
+    allocation: Option<enclave_os_common::allocation::AllocationLeaseV1>,
+}
 impl ContextCharge {
     pub(crate) fn reserve(bytes: usize) -> Option<Self> {
+        #[cfg(target_env = "sgx")]
+        let pool = Some(crate::local_allocation_pool()?);
+        #[cfg(not(target_env = "sgx"))]
+        let pool = None;
+        Self::reserve_from(bytes, pool.as_ref())
+    }
+    fn reserve_from(
+        bytes: usize,
+        pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
+    ) -> Option<Self> {
         if bytes > MAX_CONTEXT_BYTES {
             return None;
         }
@@ -88,12 +100,21 @@ impl ContextCharge {
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Acquire,
             )
-            .ok()
-            .map(|_| Self)
+            .ok()?;
+        // Own logical rollback before attempting the independent physical pool.
+        let mut charge = Self { allocation: None };
+        if let Some(pool) = pool {
+            charge.allocation = Some(pool.reserve_unpublished(bytes)?);
+            charge.allocation.as_ref()?.activate_release_notification();
+        }
+        Some(charge)
     }
 }
 impl Drop for ContextCharge {
     fn drop(&mut self) {
+        // Work declares the copied context before this credit. Its children are
+        // already gone; refund physical storage before reopening logical admission.
+        drop(self.allocation.take());
         CONTEXT_BUSY.store(false, std::sync::atomic::Ordering::Release);
     }
 }
@@ -350,4 +371,29 @@ impl Drop for CancellationOwner {
             handoff_terminal(token);
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn check_context_physical_for_native() {
+    // Exercise the same provider seam used before real fresh_context cloning.
+    use enclave_os_common::allocation::AllocationPoolV1;
+    let small = AllocationPoolV1::new(MAX_CONTEXT_BYTES - 1).unwrap();
+    assert!(ContextCharge::reserve_from(MAX_CONTEXT_BYTES, Some(&small)).is_none());
+    assert_eq!(small.used(), 0);
+    assert!(!CONTEXT_BUSY.load(std::sync::atomic::Ordering::Acquire));
+    for limit in [MAX_CONTEXT_BYTES, MAX_CONTEXT_BYTES + 1] {
+        let pool = AllocationPoolV1::new(limit).unwrap();
+        let credit = ContextCharge::reserve_from(MAX_CONTEXT_BYTES, Some(&pool)).unwrap();
+        assert_eq!(pool.used(), MAX_CONTEXT_BYTES);
+        assert!(ContextCharge::reserve_from(1, Some(&pool)).is_none());
+        assert_eq!(pool.used(), MAX_CONTEXT_BYTES);
+        drop(credit);
+        assert_eq!(pool.used(), 0);
+        assert!(!CONTEXT_BUSY.load(std::sync::atomic::Ordering::Acquire));
+        assert!(ContextCharge::reserve_from(MAX_CONTEXT_BYTES + 1, Some(&pool)).is_none());
+        assert_eq!(pool.used(), 0);
+        assert!(ContextCharge::reserve_from(1, Some(&pool)).is_some());
+        assert_eq!(pool.used(), 0);
+    }
+    eprintln!("CONTEXT-PHYSICAL: original pool minus/exact/plus/logical rollback/refund PASS");
 }

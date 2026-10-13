@@ -720,7 +720,7 @@ impl IngressServer {
             generation: slot.generation,
             binding: slot.binding,
             context,
-            context_charge: charge,
+            _context_charge: charge,
             header,
             receiver: slot.receiver.take().map(|r| r.value),
             bytes,
@@ -847,7 +847,7 @@ impl IngressServer {
                             binding,
                             token,
                             context: None,
-                            context_charge: None,
+                            _context_charge: None,
                         });
                     }
                     Some(fresh_context(
@@ -868,7 +868,7 @@ impl IngressServer {
             binding,
             token,
             context,
-            context_charge,
+            _context_charge: context_charge,
         })
     }
 
@@ -1093,8 +1093,8 @@ impl IngressServer {
                     } else if (session.server_name()
                         == Some(enclave_os_common::modules::HONEST_PEER_SNI)
                         || session
-                            .peer_cert_der()
-                            .is_some_and(|der| leaf_claims_enclave_identity(&der)))
+                            .peer_cert_der_ref()
+                            .is_some_and(leaf_claims_enclave_identity))
                         && session.peer_evidence().is_none()
                     {
                         session.fail_attestation();
@@ -1104,20 +1104,17 @@ impl IngressServer {
                             "mutual evidence required before application traffic",
                         )
                     } else {
-                        let base_ctx = enclave_os_common::modules::RequestContext {
-                            ingress_class: self.ingress_classes.get(&conn_id).copied().unwrap_or(
+                        let base_ctx = match session.request_context(
+                            conn_id,
+                            self.ingress_classes.get(&conn_id).copied().unwrap_or(
                                 enclave_os_common::modules::IngressClass::ExternalNetwork,
                             ),
-                            connection_id: conn_id,
-                            server_name: session.server_name().map(str::to_owned),
-                            attested_endpoint: session.attested_endpoint(),
-                            local_cert_der: session.local_cert_der(),
-                            local_evidence: session.local_evidence().cloned(),
-                            channel_binder: session.channel_binder(),
-                            peer_cert_der: session.peer_cert_der(),
-                            peer_evidence: session.peer_evidence().cloned(),
-                            attestation: session.attestation().to_string(),
-                            oidc_claims: None,
+                        ) {
+                            Ok(context) => context,
+                            Err(_) => {
+                                self.send_close(conn_id);
+                                return false;
+                            }
                         };
                         if crate::honest_ingress_profile_selected()
                             && matches!(enclave_os_common::modules::classify_honest_ingress(
