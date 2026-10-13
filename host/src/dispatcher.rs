@@ -16,8 +16,8 @@
 //! Queue publication and shutdown notify both independent dispatchers.
 
 use log::{debug, error, info, trace, warn};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use enclave_os_common::queue::{SpscConsumer, SpscProducer};
 use enclave_os_common::rpc::{self, HonestRpcIdentity, RpcMethod, RpcRole};
@@ -781,13 +781,13 @@ impl RpcDispatcher {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
 
-    use super::{RpcDispatcher, legacy_role_allows_method};
+    use super::{legacy_role_allows_method, RpcDispatcher};
     use enclave_os_common::queue::{SpscConsumer, SpscProducer, SpscQueueHeader};
     use enclave_os_common::rpc::{
-        self, HonestRpcIdentity, RpcMethod, RpcRole, honest_role_allows_method,
+        self, honest_role_allows_method, HonestRpcIdentity, RpcMethod, RpcRole,
     };
 
     fn queue() -> (SpscProducer, SpscConsumer) {
@@ -1313,20 +1313,16 @@ mod tests {
         let mut trailing = batch.clone();
         trailing.push(0);
         assert!(rpc::decode_worker_storage_put_batch(&trailing).is_none());
-        assert!(
-            rpc::encode_worker_storage_put_batch(
-                table,
-                &[(key.as_slice(), [1u8; 1].as_slice()); 65]
-            )
-            .is_none()
-        );
-        assert!(
-            rpc::encode_worker_storage_put_batch(
-                table,
-                &[(&key, &vec![1; rpc::MAX_WORKER_STORAGE_BATCH_BYTES])]
-            )
-            .is_none()
-        );
+        assert!(rpc::encode_worker_storage_put_batch(
+            table,
+            &[(key.as_slice(), [1u8; 1].as_slice()); 65]
+        )
+        .is_none());
+        assert!(rpc::encode_worker_storage_put_batch(
+            table,
+            &[(&key, &vec![1; rpc::MAX_WORKER_STORAGE_BATCH_BYTES])]
+        )
+        .is_none());
 
         for (operation, payload, expected) in [
             (
