@@ -7,11 +7,14 @@
 //! so it can be linked into the enclave.
 
 #![cfg_attr(feature = "sgx", no_std)]
+#![cfg_attr(all(feature = "fallible-allocation-v1", target_vendor = "teaclave"), feature(allocator_api))]
 
 // `alloc` is available in both the no_std (sgx) and std (host) builds, and
 // `oidc.rs` uses `alloc::` unconditionally, so the extern crate must not be
 // gated on the sgx feature (gating it broke the host build of this crate).
 extern crate alloc;
+#[cfg(all(feature = "fallible-allocation-v1", target_vendor = "teaclave"))]
+extern crate std;
 // Compile the actual enclave RPC client in the native queue regression.
 #[cfg(test)]
 extern crate self as enclave_os_common;

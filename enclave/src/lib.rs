@@ -485,3 +485,6 @@ pub fn run_execution_worker(worker_id: u32) -> i32 {
 pub fn enclave_heap_bytes() -> usize {
     sgx_trts::trts::MmLayout::heap_size()
 }
+
+#[cfg(all(feature = "fallible-allocation-v1", target_vendor = "teaclave"))]
+pub use allocation_admission::LoanAllocator;

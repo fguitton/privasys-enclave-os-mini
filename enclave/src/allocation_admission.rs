@@ -25,3 +25,6 @@ pub fn local_allocation_pool() -> Option<Arc<AllocationPoolV1>> {
 pub fn reserve_local_allocation(bytes: usize) -> Option<AllocationLeaseV1> {
     local_allocation_pool()?.reserve(bytes)
 }
+
+#[cfg(all(feature = "fallible-allocation-v1", target_vendor = "teaclave"))]
+pub use enclave_os_common::allocation::LoanAllocator;

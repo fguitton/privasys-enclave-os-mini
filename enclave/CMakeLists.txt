@@ -51,6 +51,11 @@ if(NOT CUSTOM_ENCLAVE_DIR STREQUAL "")
     get_filename_component(_dir_name "${CUSTOM_ENCLAVE_DIR}" NAME)
     string(REPLACE "-" "_" _ENCLAVE_CRATE_NAME "${_dir_name}")
     set(_ENCLAVE_FEATURES "${CUSTOM_ENCLAVE_FEATURES}")
+    if(_ENCLAVE_FEATURES MATCHES "(^|,)fallible-allocation-v1(,|$)" AND
+       NOT HONEST_TEACLAVE_FALLIBLE_ALLOCATION_V1)
+        message(FATAL_ERROR "Fallible allocator Cargo API requires its verified SDK/std profile")
+    endif()
+
     message(STATUS "Custom enclave crate — building ${_ENCLAVE_CRATE_DIR} (${_ENCLAVE_CRATE_NAME})")
 else()
     # Default: build enclave-os-enclave with composable features

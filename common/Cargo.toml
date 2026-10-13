@@ -9,6 +9,8 @@ license.workspace = true
 description = "Shared types and protocol definitions for enclave-os-mini"
 
 [features]
+# Explicit new-SDK loan API; native/default allocator behavior stays unchanged.
+fallible-allocation-v1 = []
 default = ["std"]
 std = []
 # When building for the enclave (no_std), disable std

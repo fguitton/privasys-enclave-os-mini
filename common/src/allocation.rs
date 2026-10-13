@@ -310,3 +310,9 @@ pub(crate) fn check_allocation_owner() {
     drop(held);
     assert_eq!(full.used(), 0);
 }
+
+// The SDK ABI exists only in the explicitly selected, source-verified sysroot.
+#[cfg(all(feature = "fallible-allocation-v1", target_vendor = "teaclave"))]
+mod escrow;
+#[cfg(all(feature = "fallible-allocation-v1", target_vendor = "teaclave"))]
+pub use escrow::LoanAllocator;
