@@ -1,10 +1,7 @@
 //! Explicit prepaid allocation loans for the verified opt-in SDK ABI.
 //! The caller moves its original physical credit here. This is not a global
 //! allocator and grants no caller, source, signing or publication authority.
-use super::{
-    AllocationLeaseV1, AllocationPoolV1,
-    SharedAllocationV1,
-};
+use super::{AllocationLeaseV1, AllocationPoolV1, SharedAllocationV1};
 use alloc::sync::Arc;
 use core::{
     alloc::{AllocError, Allocator, Layout},
@@ -108,16 +105,27 @@ impl LoanAllocator {
     /// # Errors
     /// Refuses budget, backend allocation, generation exhaustion or lock contention.
     pub fn allocate_c_owned(
-        &self, layout: Layout, zero: bool, wake: fn(),
+        &self,
+        layout: Layout,
+        zero: bool,
+        wake: fn(),
     ) -> Result<LoanCAllocation, std::alloc::CAllocationError> {
         let raw = self.owner.retain_raw_pair();
-        let origin = AllocationTicket { owner: raw.payload, loan: raw.credit };
+        let origin = AllocationTicket {
+            owner: raw.payload,
+            loan: raw.credit,
+        };
         // Return only the temporary pair. The safe allocator still owns the
         // original identity while SDK admission issues each retained ticket.
         drop(unsafe { Loan::from_owned_raw_pair(raw) });
         let allocator = unsafe { std::alloc::FallibleCSystem::new(&HOOKS, origin) };
-        allocator.allocate_owned(layout, zero, wake)
-            .map(|allocation| LoanCAllocation { allocation, bytes: layout.size(), initialized: zero })
+        allocator
+            .allocate_owned(layout, zero, wake)
+            .map(|allocation| LoanCAllocation {
+                allocation,
+                bytes: layout.size(),
+                initialized: zero,
+            })
     }
     /// Backend bytes currently lent, including SDK header/alignment.
     #[must_use]
@@ -137,12 +145,16 @@ impl LoanCAllocation {
     pub fn fill(&mut self, byte: u8) {
         // SAFETY: the exact length was captured from successful SDK allocation;
         // this exclusive move-only owner has not been resized or released.
-        unsafe { self.allocation.as_ptr().write_bytes(byte, self.bytes); }
+        unsafe {
+            self.allocation.as_ptr().write_bytes(byte, self.bytes);
+        }
         self.initialized = true;
     }
     /// Borrow only fully initialized bytes while the original owner remains live.
     pub fn bytes(&self) -> Option<&[u8]> {
-        if !self.initialized { return None; }
+        if !self.initialized {
+            return None;
+        }
         // SAFETY: initialization and extent are tracked by the only owning API;
         // shared borrowing excludes resize and the owner's final Drop.
         Some(unsafe { core::slice::from_raw_parts(self.allocation.as_ptr(), self.bytes) })
@@ -150,10 +162,15 @@ impl LoanCAllocation {
     /// A failed resize leaves the original extent and initialization unchanged.
     /// # Errors
     /// Propagates original SDK admission, layout and contention refusal.
-    pub fn resize(&mut self, layout: Layout, zero: bool) -> Result<(), std::alloc::CAllocationError> {
+    pub fn resize(
+        &mut self,
+        layout: Layout,
+        zero: bool,
+    ) -> Result<(), std::alloc::CAllocationError> {
         let initialized = self.initialized && (layout.size() <= self.bytes || zero);
         self.allocation.resize(layout, zero)?;
-        self.bytes = layout.size(); self.initialized = initialized;
+        self.bytes = layout.size();
+        self.initialized = initialized;
         Ok(())
     }
 }

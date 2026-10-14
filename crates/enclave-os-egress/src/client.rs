@@ -48,8 +48,8 @@ mod renewal;
 mod request;
 
 pub use incremental::{
-    IncrementalTlsClient, IncrementalTlsOutput, IncrementalTlsPlaintext, MAX_INCREMENTAL_PLAINTEXT, MAX_INCREMENTAL_REQUEST,
-    MAX_INCREMENTAL_TLS_FRAGMENT, MAX_INCREMENTAL_TLS_OUTPUT,
+    IncrementalTlsClient, IncrementalTlsOutput, IncrementalTlsPlaintext, MAX_INCREMENTAL_PLAINTEXT,
+    MAX_INCREMENTAL_REQUEST, MAX_INCREMENTAL_TLS_FRAGMENT, MAX_INCREMENTAL_TLS_OUTPUT,
 };
 pub use renewal::{AttestationRenewalBudget, AttestationRenewalPolicy};
 pub use request::{

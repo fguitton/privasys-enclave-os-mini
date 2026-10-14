@@ -10,8 +10,8 @@
 //! - Implement the single OCALL: `ocall_notify()`
 //! - Provide the CLI entry point
 
-mod c3_endpoints;
 mod build_contract;
+mod c3_endpoints;
 #[cfg(all(target_os = "linux", not(sgx_mode_sim), not(feature = "mock")))]
 mod dcap;
 mod dispatcher;

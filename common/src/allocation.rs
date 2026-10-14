@@ -39,8 +39,15 @@ impl AllocationPoolV1 {
     #[cfg(feature = "fallible-allocation-v1")]
     pub fn try_new_with_release(capacity: usize, released: Option<fn()>) -> Option<Arc<Self>> {
         let root_bytes = shared_allocation_bytes::<Self>()?;
-        let available = capacity.checked_sub(root_bytes).filter(|bytes| *bytes != 0)?;
-        Arc::try_new(Self { capacity: available, used: AtomicUsize::new(0), released }).ok()
+        let available = capacity
+            .checked_sub(root_bytes)
+            .filter(|bytes| *bytes != 0)?;
+        Arc::try_new(Self {
+            capacity: available,
+            used: AtomicUsize::new(0),
+            released,
+        })
+        .ok()
     }
     pub fn capacity(&self) -> usize {
         self.capacity
@@ -112,7 +119,9 @@ impl Drop for AllocationLeaseV1 {
 /// This is an allocation capacity, not an encoded wire or useful-data count.
 /// Refuse impossible allocator layouts before physical admission/allocation.
 pub fn bounded_vec_capacity(required: usize, maximum: usize) -> Option<usize> {
-    if required == 0 || required > maximum { return None; }
+    if required == 0 || required > maximum {
+        return None;
+    }
     let capacity = match required.checked_next_power_of_two() {
         Some(next) if next <= maximum => next,
         _ => maximum,
@@ -143,8 +152,12 @@ pub trait SharedAllocationCreditV1 {
     fn activate_release_notification(&self);
 }
 impl SharedAllocationCreditV1 for AllocationLeaseV1 {
-    fn bytes(&self) -> usize { AllocationLeaseV1::bytes(self) }
-    fn activate_release_notification(&self) { AllocationLeaseV1::activate_release_notification(self); }
+    fn bytes(&self) -> usize {
+        AllocationLeaseV1::bytes(self)
+    }
+    fn activate_release_notification(&self) {
+        AllocationLeaseV1::activate_release_notification(self);
+    }
 }
 /// Opaque shared payload: no raw Arc or Weak escapes this owner.
 /// Both Arc layouts and declared retained children share the original credit.
@@ -158,14 +171,25 @@ pub struct SharedAllocationReservationV1<T, C = AllocationLeaseV1> {
     marker: core::marker::PhantomData<T>,
 }
 impl<T> SharedAllocationV1<T> {
-    pub fn reserve(pool: &Arc<AllocationPoolV1>, retained_child_bytes: usize) -> Option<SharedAllocationReservationV1<T>> {
-        Self::from_admission(pool.reserve_unpublished(Self::required_bytes(retained_child_bytes)?)?, retained_child_bytes)
+    pub fn reserve(
+        pool: &Arc<AllocationPoolV1>,
+        retained_child_bytes: usize,
+    ) -> Option<SharedAllocationReservationV1<T>> {
+        Self::from_admission(
+            pool.reserve_unpublished(Self::required_bytes(retained_child_bytes)?)?,
+            retained_child_bytes,
+        )
     }
 }
 /// Failure leaves the original shared value and all its aliases untouched.
 #[cfg(feature = "fallible-allocation-v1")]
 #[derive(Debug)]
-pub enum SharedMutationErrorV1<E> { DifferentPool, Admission, Allocation, Clone(E) }
+pub enum SharedMutationErrorV1<E> {
+    DifferentPool,
+    Admission,
+    Allocation,
+    Clone(E),
+}
 #[cfg(feature = "fallible-allocation-v1")]
 impl<T> SharedAllocationV1<T> {
     /// Reuse a unique payload or independently admit a complete shared copy.
@@ -174,24 +198,46 @@ impl<T> SharedAllocationV1<T> {
     /// # Errors
     /// Refuses a foreign pool, admission, clone failure or actual Arc refusal.
     pub fn try_make_unique_with<E>(
-        &mut self, pool: &Arc<AllocationPoolV1>, retained_child_bytes: usize,
-        clone: impl FnOnce(&T) -> Result<T,E>,
-    ) -> Result<&mut T,SharedMutationErrorV1<E>> {
-        let credit = self.credit.as_ref().ok_or(SharedMutationErrorV1::Allocation)?;
-        if !credit.covers(pool, credit.bytes()) { return Err(SharedMutationErrorV1::DifferentPool); }
+        &mut self,
+        pool: &Arc<AllocationPoolV1>,
+        retained_child_bytes: usize,
+        clone: impl FnOnce(&T) -> Result<T, E>,
+    ) -> Result<&mut T, SharedMutationErrorV1<E>> {
+        let credit = self
+            .credit
+            .as_ref()
+            .ok_or(SharedMutationErrorV1::Allocation)?;
+        if !credit.covers(pool, credit.bytes()) {
+            return Err(SharedMutationErrorV1::DifferentPool);
+        }
         let notify = credit.notify.load(Ordering::Acquire);
-        if self.payload.as_ref().is_some_and(|value| Arc::strong_count(value) == 1) {
-            let required = Self::required_bytes(retained_child_bytes).ok_or(SharedMutationErrorV1::Admission)?;
-            if credit.bytes() < required { return Err(SharedMutationErrorV1::Admission); }
+        if self
+            .payload
+            .as_ref()
+            .is_some_and(|value| Arc::strong_count(value) == 1)
+        {
+            let required = Self::required_bytes(retained_child_bytes)
+                .ok_or(SharedMutationErrorV1::Admission)?;
+            if credit.bytes() < required {
+                return Err(SharedMutationErrorV1::Admission);
+            }
             return self.get_mut().ok_or(SharedMutationErrorV1::Allocation);
         }
-        let reservation = Self::reserve(pool, retained_child_bytes).ok_or(SharedMutationErrorV1::Admission)?;
+        let reservation =
+            Self::reserve(pool, retained_child_bytes).ok_or(SharedMutationErrorV1::Admission)?;
         let value = match clone(self) {
             Ok(value) => value,
-            Err(error) => { drop(reservation); return Err(SharedMutationErrorV1::Clone(error)); }
+            Err(error) => {
+                drop(reservation);
+                return Err(SharedMutationErrorV1::Clone(error));
+            }
         };
-        let replacement = reservation.try_finish_unpublished(value).map_err(|_| SharedMutationErrorV1::Allocation)?;
-        if notify { replacement.activate_release_notification(); }
+        let replacement = reservation
+            .try_finish_unpublished(value)
+            .map_err(|_| SharedMutationErrorV1::Allocation)?;
+        if notify {
+            replacement.activate_release_notification();
+        }
         *self = replacement;
         self.get_mut().ok_or(SharedMutationErrorV1::Allocation)
     }
@@ -206,24 +252,39 @@ impl<T, C> SharedAllocationV1<T, C> {
     /// Identity comparison without exposing raw Arc or Weak ownership.
     #[must_use]
     pub fn ptr_eq(this: &Self, other: &Self) -> bool {
-        match (&this.payload, &other.payload) { (Some(a), Some(b)) => Arc::ptr_eq(a,b), _ => false }
+        match (&this.payload, &other.payload) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
     }
     /// Exclusive construction-time access; fails as soon as a payload is shared.
-    pub fn get_mut(&mut self) -> Option<&mut T> { self.payload.as_mut().and_then(Arc::get_mut) }
+    pub fn get_mut(&mut self) -> Option<&mut T> {
+        self.payload.as_mut().and_then(Arc::get_mut)
+    }
 }
 impl<T, C: SharedAllocationCreditV1> SharedAllocationV1<T, C> {
     /// Transfer an original provider admission; this never creates a new pool.
-    pub fn from_admission(allocation: C, retained_child_bytes: usize) -> Option<SharedAllocationReservationV1<T,C>> {
-        if allocation.bytes() < Self::required_bytes(retained_child_bytes)? { return None; }
-        Some(SharedAllocationReservationV1 { allocation, marker: core::marker::PhantomData })
+    pub fn from_admission(
+        allocation: C,
+        retained_child_bytes: usize,
+    ) -> Option<SharedAllocationReservationV1<T, C>> {
+        if allocation.bytes() < Self::required_bytes(retained_child_bytes)? {
+            return None;
+        }
+        Some(SharedAllocationReservationV1 {
+            allocation,
+            marker: core::marker::PhantomData,
+        })
     }
     /// Called only after the original owner publishes actual retained work.
     pub fn activate_release_notification(&self) {
-        if let Some(credit) = &self.credit { credit.activate_release_notification(); }
+        if let Some(credit) = &self.credit {
+            credit.activate_release_notification();
+        }
     }
 }
-impl<T, C: SharedAllocationCreditV1> SharedAllocationReservationV1<T,C> {
-    pub fn finish(self, value: T) -> SharedAllocationV1<T,C> {
+impl<T, C: SharedAllocationCreditV1> SharedAllocationReservationV1<T, C> {
+    pub fn finish(self, value: T) -> SharedAllocationV1<T, C> {
         let value = self.finish_unpublished(value);
         value.activate_release_notification();
         value
@@ -233,7 +294,7 @@ impl<T, C: SharedAllocationCreditV1> SharedAllocationReservationV1<T,C> {
     /// # Errors
     /// Returns allocator refusal after destroying the value and rolling back credit.
     #[cfg(feature = "fallible-allocation-v1")]
-    pub fn try_finish(self, value: T) -> Result<SharedAllocationV1<T,C>, core::alloc::AllocError> {
+    pub fn try_finish(self, value: T) -> Result<SharedAllocationV1<T, C>, core::alloc::AllocError> {
         let value = self.try_finish_unpublished(value)?;
         value.activate_release_notification();
         Ok(value)
@@ -244,10 +305,17 @@ impl<T, C: SharedAllocationCreditV1> SharedAllocationReservationV1<T,C> {
     /// # Errors
     /// Refuses either real allocator request and refunds the original admission.
     #[cfg(feature = "fallible-allocation-v1")]
-    pub fn try_finish_unpublished(self, value: T) -> Result<SharedAllocationV1<T,C>, core::alloc::AllocError> {
+    pub fn try_finish_unpublished(
+        self,
+        value: T,
+    ) -> Result<SharedAllocationV1<T, C>, core::alloc::AllocError> {
         let mut credit = match Arc::<C>::try_new_uninit() {
             Ok(credit) => credit,
-            Err(error) => { drop(value); drop(self); return Err(error); }
+            Err(error) => {
+                drop(value);
+                drop(self);
+                return Err(error);
+            }
         };
         let payload = match Arc::try_new(value) {
             Ok(payload) => payload,
@@ -259,27 +327,42 @@ impl<T, C: SharedAllocationCreditV1> SharedAllocationReservationV1<T,C> {
                 return Err(error);
             }
         };
-        Arc::get_mut(&mut credit).expect("fresh unaliased credit").write(self.allocation);
+        Arc::get_mut(&mut credit)
+            .expect("fresh unaliased credit")
+            .write(self.allocation);
         // SAFETY: this locally unique Arc was just fully initialized. Neither
         // raw/Weak aliases nor uninitialized credit ever leave this function.
         let credit = unsafe { credit.assume_init() };
-        Ok(SharedAllocationV1 { payload: Some(payload), credit: Some(credit) })
+        Ok(SharedAllocationV1 {
+            payload: Some(payload),
+            credit: Some(credit),
+        })
     }
     /// Keep rollback silent until the actual owning route publishes this value.
-    pub fn finish_unpublished(self, value: T) -> SharedAllocationV1<T,C> {
+    pub fn finish_unpublished(self, value: T) -> SharedAllocationV1<T, C> {
         let payload = Arc::new(value);
         let credit = Arc::new(self.allocation);
-        SharedAllocationV1 { payload: Some(payload), credit: Some(credit) }
+        SharedAllocationV1 {
+            payload: Some(payload),
+            credit: Some(credit),
+        }
     }
 }
-impl<T,C> Clone for SharedAllocationV1<T,C> {
-    fn clone(&self) -> Self { Self { payload: self.payload.clone(), credit: self.credit.clone() } }
+impl<T, C> Clone for SharedAllocationV1<T, C> {
+    fn clone(&self) -> Self {
+        Self {
+            payload: self.payload.clone(),
+            credit: self.credit.clone(),
+        }
+    }
 }
-impl<T,C> core::ops::Deref for SharedAllocationV1<T,C> {
+impl<T, C> core::ops::Deref for SharedAllocationV1<T, C> {
     type Target = T;
-    fn deref(&self) -> &T { self.payload.as_deref().expect("live shared payload") }
+    fn deref(&self) -> &T {
+        self.payload.as_deref().expect("live shared payload")
+    }
 }
-impl<T,C> Drop for SharedAllocationV1<T,C> {
+impl<T, C> Drop for SharedAllocationV1<T, C> {
     fn drop(&mut self) {
         // Every alias releases its payload first. No external Weak is possible.
         drop(self.payload.take());
@@ -299,10 +382,18 @@ pub(crate) fn check_allocation_owner() {
     assert_eq!(bounded_vec_capacity(3, 3), Some(3));
     assert_eq!(bounded_vec_capacity(4, 3), None);
     assert_eq!(bounded_vec_capacity(usize::MAX, usize::MAX), None);
-    struct ObservedDrop { pool: Arc<AllocationPoolV1>, expected: usize, dropped: Arc<AtomicBool> }
+    struct ObservedDrop {
+        pool: Arc<AllocationPoolV1>,
+        expected: usize,
+        dropped: Arc<AtomicBool>,
+    }
     impl Drop for ObservedDrop {
         fn drop(&mut self) {
-            assert_eq!(self.pool.used(), self.expected, "payload dies while full credit is held");
+            assert_eq!(
+                self.pool.used(),
+                self.expected,
+                "payload dies while full credit is held"
+            );
             self.dropped.store(true, Ordering::Release);
         }
     }
@@ -316,11 +407,19 @@ pub(crate) fn check_allocation_owner() {
     let dropped = Arc::new(AtomicBool::new(false));
     let reservation = SharedAllocationV1::<ObservedDrop>::reserve(&shared_pool, 0).unwrap();
     assert_eq!(shared_pool.used(), bytes);
-    let original = reservation.finish(ObservedDrop { pool: shared_pool.clone(), expected: bytes, dropped: dropped.clone() });
+    let original = reservation.finish(ObservedDrop {
+        pool: shared_pool.clone(),
+        expected: bytes,
+        dropped: dropped.clone(),
+    });
     let alias = original.clone();
     drop(original);
     assert!(!dropped.load(Ordering::Acquire));
-    assert_eq!(shared_pool.used(), bytes, "cloning retains one actual allocation charge");
+    assert_eq!(
+        shared_pool.used(),
+        bytes,
+        "cloning retains one actual allocation charge"
+    );
     drop(alias);
     assert!(dropped.load(Ordering::Acquire));
     assert_eq!(shared_pool.used(), 0);
@@ -329,28 +428,53 @@ pub(crate) fn check_allocation_owner() {
         RELEASED.fetch_add(1, Ordering::AcqRel);
     }
     // A second real credit owner preserves silent rollback and exact alias lifetime.
-    struct LocalCredit { lease: AllocationLeaseV1, _layout: [u8; 17] }
+    struct LocalCredit {
+        lease: AllocationLeaseV1,
+        _layout: [u8; 17],
+    }
     impl SharedAllocationCreditV1 for LocalCredit {
-        fn bytes(&self) -> usize { self.lease.bytes() }
-        fn activate_release_notification(&self) { self.lease.activate_release_notification(); }
+        fn bytes(&self) -> usize {
+            self.lease.bytes()
+        }
+        fn activate_release_notification(&self) {
+            self.lease.activate_release_notification();
+        }
     }
     let local_bytes = SharedAllocationV1::<ObservedDrop, LocalCredit>::required_bytes(0).unwrap();
     let local_pool = AllocationPoolV1::new_with_release(local_bytes, Some(released)).unwrap();
     let local_releases = RELEASED.load(Ordering::Acquire);
-    let make = || SharedAllocationV1::<ObservedDrop, LocalCredit>::from_admission(
-        LocalCredit { lease: local_pool.reserve_unpublished(local_bytes).unwrap(), _layout: [0; 17] }, 0
-    ).unwrap().finish_unpublished(ObservedDrop {
-        pool: local_pool.clone(), expected: local_bytes, dropped: Arc::new(AtomicBool::new(false)),
-    });
+    let make = || {
+        SharedAllocationV1::<ObservedDrop, LocalCredit>::from_admission(
+            LocalCredit {
+                lease: local_pool.reserve_unpublished(local_bytes).unwrap(),
+                _layout: [0; 17],
+            },
+            0,
+        )
+        .unwrap()
+        .finish_unpublished(ObservedDrop {
+            pool: local_pool.clone(),
+            expected: local_bytes,
+            dropped: Arc::new(AtomicBool::new(false)),
+        })
+    };
     drop(make());
     assert_eq!(local_pool.used(), 0);
-    assert_eq!(RELEASED.load(Ordering::Acquire), local_releases, "unpublished rollback stays silent");
+    assert_eq!(
+        RELEASED.load(Ordering::Acquire),
+        local_releases,
+        "unpublished rollback stays silent"
+    );
     let mut local = make();
     assert!(local.get_mut().is_some());
     let alias = local.clone();
     assert!(SharedAllocationV1::ptr_eq(&local, &alias));
     assert!(local.get_mut().is_none());
-    assert_eq!(local_pool.used(), local_bytes, "custom owner aliases do not allocate");
+    assert_eq!(
+        local_pool.used(),
+        local_bytes,
+        "custom owner aliases do not allocate"
+    );
     local.activate_release_notification();
     drop(local);
     assert_eq!(local_pool.used(), local_bytes);

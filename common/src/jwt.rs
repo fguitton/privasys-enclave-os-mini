@@ -31,7 +31,11 @@
 //! ```
 
 #[cfg(feature = "sgx")]
-use alloc::{format, string::{String, ToString}, vec::Vec};
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
 #[cfg(not(feature = "sgx"))]
 use std::{format, string::String, vec::Vec};
 

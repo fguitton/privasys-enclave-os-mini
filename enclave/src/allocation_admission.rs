@@ -18,9 +18,13 @@ pub fn take_local_allocation_release() -> bool {
 pub fn local_allocation_pool() -> Option<Arc<AllocationPoolV1>> {
     POOL.get_or_init(|| {
         #[cfg(all(feature = "fallible-allocation-v1", target_vendor = "teaclave"))]
-        { AllocationPoolV1::try_new_with_release(crate::enclave_heap_bytes(), Some(released)) }
+        {
+            AllocationPoolV1::try_new_with_release(crate::enclave_heap_bytes(), Some(released))
+        }
         #[cfg(not(all(feature = "fallible-allocation-v1", target_vendor = "teaclave")))]
-        { AllocationPoolV1::new_with_release(crate::enclave_heap_bytes(), Some(released)) }
+        {
+            AllocationPoolV1::new_with_release(crate::enclave_heap_bytes(), Some(released))
+        }
     })
     .clone()
 }
@@ -40,12 +44,18 @@ pub use enclave_os_common::allocation::LoanAllocator;
 pub fn initialize_fixed_futex_storage() -> Result<(), &'static str> {
     static ADMISSION: OnceLock<LoanAllocator> = OnceLock::new();
     let layout = std::sync::fixed_futex_layout().map_err(|_| "futex layout refused")?;
-    let bytes = LoanAllocator::required_backend_bytes(layout).map_err(|_| "futex backend quote refused")?;
+    let bytes =
+        LoanAllocator::required_backend_bytes(layout).map_err(|_| "futex backend quote refused")?;
     let pool = local_allocation_pool().ok_or("futex physical pool unavailable")?;
     if ADMISSION.get().is_none() {
-        let credit = pool.reserve_unpublished(bytes).ok_or("futex physical admission refused")?;
-        let allocator = LoanAllocator::from_original_lease(&pool, credit).map_err(|_| "futex allocator metadata refused")?;
-        ADMISSION.set(allocator).map_err(|_| "futex startup already in progress")?;
+        let credit = pool
+            .reserve_unpublished(bytes)
+            .ok_or("futex physical admission refused")?;
+        let allocator = LoanAllocator::from_original_lease(&pool, credit)
+            .map_err(|_| "futex allocator metadata refused")?;
+        ADMISSION
+            .set(allocator)
+            .map_err(|_| "futex startup already in progress")?;
     }
     // A failed install ends this process's initialization; no live backend can
     // be replaced and no acquired budget is reset to mask prior legacy use.
@@ -61,15 +71,26 @@ pub fn initialize_fixed_futex_storage() -> Result<(), &'static str> {
 pub fn initialize_fixed_futex_storage_once() -> Result<(), &'static str> {
     use std::sync::atomic::{AtomicU8, Ordering};
     #[repr(u8)]
-    enum Startup { Idle, Installing, Ready, Failed }
+    enum Startup {
+        Idle,
+        Installing,
+        Ready,
+        Failed,
+    }
     static STARTUP: AtomicU8 = AtomicU8::new(Startup::Idle as u8);
     match STARTUP.compare_exchange(
-        Startup::Idle as u8, Startup::Installing as u8,
-        Ordering::AcqRel, Ordering::Acquire,
+        Startup::Idle as u8,
+        Startup::Installing as u8,
+        Ordering::AcqRel,
+        Ordering::Acquire,
     ) {
         Ok(_) => {
             let result = initialize_fixed_futex_storage();
-            let next = if result.is_ok() { Startup::Ready } else { Startup::Failed };
+            let next = if result.is_ok() {
+                Startup::Ready
+            } else {
+                Startup::Failed
+            };
             STARTUP.store(next as u8, Ordering::Release);
             result
         }
@@ -96,7 +117,9 @@ pub(crate) fn progress_c_releases(force: bool) {
     #[cfg(all(feature = "fallible-allocation-v1", target_vendor = "teaclave"))]
     {
         let notified = C_RELEASE_WORK.swap(false, std::sync::atomic::Ordering::AcqRel);
-        if !force && !notified { return; }
+        if !force && !notified {
+            return;
+        }
         let _ = std::alloc::drain_pending_c_releases();
     }
 }

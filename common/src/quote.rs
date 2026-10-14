@@ -366,7 +366,10 @@ const P256_UNUSED_BITS: u8 = 0;
 const P256_BITS_HEAD: [u8; 3] = [0x03, 0, P256_UNUSED_BITS];
 fn spki_parts(point_len: usize) -> Option<([u8; 2], [u8; 3], usize)> {
     let bit_string_len = point_len.checked_add(core::mem::size_of_val(&P256_UNUSED_BITS))?;
-    let inner_len = P256_ALGO_ID.len().checked_add(P256_BITS_HEAD.len())?.checked_add(point_len)?;
+    let inner_len = P256_ALGO_ID
+        .len()
+        .checked_add(P256_BITS_HEAD.len())?
+        .checked_add(point_len)?;
     let length = P256_SEQUENCE_HEAD.len().checked_add(inner_len)?;
     let mut sequence = P256_SEQUENCE_HEAD;
     let mut bits = P256_BITS_HEAD;
@@ -399,7 +402,9 @@ pub fn p256_spki_sha256(ec_point: &[u8]) -> Option<ring::digest::Digest> {
 #[must_use]
 pub fn write_p256_spki_der(ec_point: &[u8], output: &mut [u8]) -> Option<()> {
     let (sequence, bits, length) = spki_parts(ec_point.len())?;
-    if output.len() != length { return None; }
+    if output.len() != length {
+        return None;
+    }
     let (head, rest) = output.split_at_mut(sequence.len());
     head.copy_from_slice(&sequence);
     let (algorithm, rest) = rest.split_at_mut(P256_ALGO_ID.len());

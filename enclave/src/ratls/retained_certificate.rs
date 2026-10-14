@@ -10,7 +10,9 @@ impl RetainedCertificate {
         let reservation = SharedAllocationV1::<Vec<u8>>::reserve(pool, bytes.len())?;
         let mut owned = Vec::new();
         owned.try_reserve_exact(bytes.len()).ok()?;
-        if owned.capacity() != bytes.len() { return None; }
+        if owned.capacity() != bytes.len() {
+            return None;
+        }
         owned.extend_from_slice(bytes);
         #[cfg(feature = "fallible-allocation-v1")]
         let retained = reservation.try_finish(owned).ok()?;
@@ -19,5 +21,7 @@ impl RetainedCertificate {
         let retained = reservation.finish(owned);
         Some(Self(retained))
     }
-    pub(crate) fn bytes(&self) -> &[u8] { self.0.as_slice() }
+    pub(crate) fn bytes(&self) -> &[u8] {
+        self.0.as_slice()
+    }
 }

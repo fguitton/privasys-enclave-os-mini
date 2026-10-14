@@ -27,23 +27,35 @@ impl PaidName {
     }
 }
 impl Clone for PaidName {
-    fn clone(&self) -> Self { Self(self.0.clone()) }
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
 }
 impl Borrow<str> for PaidName {
-    fn borrow(&self) -> &str { self.text() }
+    fn borrow(&self) -> &str {
+        self.text()
+    }
 }
 impl PartialEq for PaidName {
-    fn eq(&self, other: &Self) -> bool { self.text() == other.text() }
+    fn eq(&self, other: &Self) -> bool {
+        self.text() == other.text()
+    }
 }
 impl Eq for PaidName {}
 impl PartialOrd for PaidName {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 impl Ord for PaidName {
-    fn cmp(&self, other: &Self) -> Ordering { self.text().cmp(other.text()) }
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.text().cmp(other.text())
+    }
 }
 impl fmt::Debug for PaidName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { self.text().fmt(f) }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.text().fmt(f)
+    }
 }
 
 #[cfg(test)]
@@ -87,14 +99,23 @@ pub(super) fn check() {
     let original = PaidName::new(&pool, text).unwrap();
     let alias = original.clone();
     let mut reference = BTreeMap::new();
-    assert_eq!(actual.insert_prepared(original, 1), reference.insert(text, 1));
+    assert_eq!(
+        actual.insert_prepared(original, 1),
+        reference.insert(text, 1)
+    );
     assert_eq!(pool.used(), tuple_bytes + required);
     let replacement = PaidName::new(&pool, text).unwrap();
     assert_eq!(pool.used(), tuple_bytes + 2 * required);
-    assert_eq!(actual.insert_prepared(replacement, 2), reference.insert(text, 2));
+    assert_eq!(
+        actual.insert_prepared(replacement, 2),
+        reference.insert(text, 2)
+    );
     assert_eq!(pool.used(), tuple_bytes + required);
     assert_eq!(actual.get(text), reference.get(text));
-    assert!(SharedAllocationV1::ptr_eq(&actual.iter().next().unwrap().0.0, &alias.0));
+    assert!(SharedAllocationV1::ptr_eq(
+        &actual.iter().next().unwrap().0 .0,
+        &alias.0
+    ));
     assert_eq!(actual.remove(text), reference.remove(text));
     assert_eq!(pool.used(), tuple_bytes + required);
     drop(actual);

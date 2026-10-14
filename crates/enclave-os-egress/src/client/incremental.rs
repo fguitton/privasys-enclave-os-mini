@@ -157,15 +157,22 @@ impl IncrementalTlsClient {
         pool: &std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
     ) -> Result<IncrementalTlsOutput, String> {
         if !self.tls_conn.wants_write() {
-            return Ok(IncrementalTlsOutput { bytes: Vec::new(), _allocation: None });
+            return Ok(IncrementalTlsOutput {
+                bytes: Vec::new(),
+                _allocation: None,
+            });
         }
-        let allocation = pool.reserve_unpublished(TLS_OUTPUT_WORKING_BYTES)
+        let allocation = pool
+            .reserve_unpublished(TLS_OUTPUT_WORKING_BYTES)
             .ok_or("incremental TLS output allocation admission refused")?;
         let bytes = self.collect_tls_output()?;
         if !bytes.is_empty() {
             allocation.activate_release_notification();
         }
-        Ok(IncrementalTlsOutput { bytes, _allocation: Some(allocation) })
+        Ok(IncrementalTlsOutput {
+            bytes,
+            _allocation: Some(allocation),
+        })
     }
 
     /// Queue one bounded application request after local handshake validation.
@@ -351,26 +358,37 @@ impl IncrementalTlsClient {
     }
 
     fn append_plaintext(&mut self, bytes: &[u8]) -> Result<(), String> {
-        let length = self.plaintext.len().checked_add(bytes.len())
+        let length = self
+            .plaintext
+            .len()
+            .checked_add(bytes.len())
             .filter(|n| *n <= MAX_INCREMENTAL_PLAINTEXT)
             .ok_or("incremental TLS plaintext exceeds profile bound")?;
         if length > self.plaintext.capacity() {
-            let capacity = enclave_os_common::allocation::bounded_vec_capacity(length, MAX_INCREMENTAL_PLAINTEXT)
-                .ok_or("TLS plaintext allocation geometry refused")?;
+            let capacity = enclave_os_common::allocation::bounded_vec_capacity(
+                length,
+                MAX_INCREMENTAL_PLAINTEXT,
+            )
+            .ok_or("TLS plaintext allocation geometry refused")?;
             // Keep the old lease until the old backing has actually dropped.
             // Both requested layouts coexist during the bounded copy.
             let allocation = match &self.application_pool {
-                Some(pool) => Some(pool.reserve_unpublished(capacity)
-                    .ok_or("TLS plaintext allocation admission refused")?),
+                Some(pool) => Some(
+                    pool.reserve_unpublished(capacity)
+                        .ok_or("TLS plaintext allocation admission refused")?,
+                ),
                 None => None,
             };
             let mut replacement = Vec::new();
-            replacement.try_reserve_exact(capacity)
+            replacement
+                .try_reserve_exact(capacity)
                 .map_err(|_| "TLS plaintext allocation failed")?;
             replacement.extend_from_slice(&self.plaintext);
             let old = core::mem::replace(&mut self.plaintext, replacement);
             drop(old);
-            if let Some(lease) = &allocation { lease.activate_release_notification(); }
+            if let Some(lease) = &allocation {
+                lease.activate_release_notification();
+            }
             self.plaintext_allocation = allocation;
         }
         self.plaintext.extend_from_slice(bytes);
@@ -407,11 +425,15 @@ pub struct IncrementalTlsPlaintext {
     _allocation: Option<enclave_os_common::allocation::AllocationLeaseV1>,
 }
 impl AsRef<[u8]> for IncrementalTlsPlaintext {
-    fn as_ref(&self) -> &[u8] { &self.bytes }
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 impl std::ops::Deref for IncrementalTlsPlaintext {
     type Target = [u8];
-    fn deref(&self) -> &[u8] { &self.bytes }
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 /// Ciphertext and its existing SDK-pool credit move together. No clone or raw
@@ -422,11 +444,15 @@ pub struct IncrementalTlsOutput {
     _allocation: Option<enclave_os_common::allocation::AllocationLeaseV1>,
 }
 impl AsRef<[u8]> for IncrementalTlsOutput {
-    fn as_ref(&self) -> &[u8] { &self.bytes }
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 impl std::ops::Deref for IncrementalTlsOutput {
     type Target = [u8];
-    fn deref(&self) -> &[u8] { &self.bytes }
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 /// A fallible exact Vec growth may overlap its old and replacement buffers.
 /// Both buffers individually obey the actual output bound; no cap is enlarged.
@@ -440,10 +466,14 @@ struct TlsOutputBuffer {
 }
 impl Write for TlsOutputBuffer {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        let next = self.bytes.len().checked_add(bytes.len()).filter(|length| {
-            *length <= MAX_INCREMENTAL_TLS_OUTPUT
-        }).ok_or_else(|| std::io::Error::other("incremental TLS output exceeds profile bound"))?;
-        self.bytes.try_reserve_exact(next - self.bytes.len())
+        let next = self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .filter(|length| *length <= MAX_INCREMENTAL_TLS_OUTPUT)
+            .ok_or_else(|| std::io::Error::other("incremental TLS output exceeds profile bound"))?;
+        self.bytes
+            .try_reserve_exact(next - self.bytes.len())
             .map_err(|_| std::io::Error::other("incremental TLS output allocation refused"))?;
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
@@ -477,20 +507,31 @@ mod tests {
         assert_eq!(pool.used(), 1);
         paid.append_plaintext(&[2]).unwrap();
         assert_eq!(pool.used(), 2, "old backing was released after replacement");
-        assert!(paid.append_plaintext(&[3]).is_err(), "old/new layouts must coexist before growth");
+        assert!(
+            paid.append_plaintext(&[3]).is_err(),
+            "old/new layouts must coexist before growth"
+        );
         assert_eq!(paid.plaintext, [1, 2]);
         let held = paid.take_plaintext();
         assert_eq!(held.as_ref(), &[1, 2]);
-        assert_eq!(pool.used(), 2, "HTTP recipient retains original plaintext credit");
+        assert_eq!(
+            pool.used(),
+            2,
+            "HTTP recipient retains original plaintext credit"
+        );
         assert!(paid.account_application_buffers(pool.clone()).is_err());
         drop(paid);
         assert_eq!(pool.used(), 2);
         drop(held);
         assert_eq!(pool.used(), 0);
         let mut paid = IncrementalTlsClient::new("bounded.invalid", &roots, None).unwrap();
-        let pool = enclave_os_common::allocation::AllocationPoolV1::new(2 * super::MAX_INCREMENTAL_PLAINTEXT).unwrap();
+        let pool = enclave_os_common::allocation::AllocationPoolV1::new(
+            2 * super::MAX_INCREMENTAL_PLAINTEXT,
+        )
+        .unwrap();
         paid.account_application_buffers(pool.clone()).unwrap();
-        paid.append_plaintext(&vec![0; super::MAX_INCREMENTAL_PLAINTEXT - 1]).unwrap();
+        paid.append_plaintext(&vec![0; super::MAX_INCREMENTAL_PLAINTEXT - 1])
+            .unwrap();
         paid.append_plaintext(&[1]).unwrap();
         assert_eq!(pool.used(), super::MAX_INCREMENTAL_PLAINTEXT);
         assert!(paid.append_plaintext(&[2]).is_err());
@@ -500,7 +541,9 @@ mod tests {
         // Exercise the exact write destination used by collect_tls_output.
         // Refused appends must preserve both contents and allocation capacity.
         let mut output = super::TlsOutputBuffer::default();
-        output.write_all(&vec![0x31; super::MAX_INCREMENTAL_TLS_OUTPUT - 1]).unwrap();
+        output
+            .write_all(&vec![0x31; super::MAX_INCREMENTAL_TLS_OUTPUT - 1])
+            .unwrap();
         output.write_all(&[0x32]).unwrap();
         let capacity = output.bytes.capacity();
         assert_eq!(output.bytes.len(), super::MAX_INCREMENTAL_TLS_OUTPUT);
@@ -509,26 +552,37 @@ mod tests {
         assert_eq!(output.bytes.capacity(), capacity);
         assert_eq!(output.bytes.last(), Some(&0x32));
         let mut empty = super::TlsOutputBuffer::default();
-        assert!(empty.write_all(&vec![0; super::MAX_INCREMENTAL_TLS_OUTPUT + 1]).is_err());
+        assert!(empty
+            .write_all(&vec![0; super::MAX_INCREMENTAL_TLS_OUTPUT + 1])
+            .is_err());
         assert_eq!(empty.bytes.capacity(), 0);
         let roots = RootCertStore::empty();
         let mut client =
             IncrementalTlsClient::new("bounded.invalid", &roots, None).expect("incremental client");
         let too_small = enclave_os_common::allocation::AllocationPoolV1::new(
             super::TLS_OUTPUT_WORKING_BYTES - 1,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(client.collect_tls_output_charged(&too_small).is_err());
         assert_eq!(too_small.used(), 0);
-        let pool = enclave_os_common::allocation::AllocationPoolV1::new(
-            super::TLS_OUTPUT_WORKING_BYTES,
-        ).unwrap();
-        let hello = client.collect_tls_output_charged(&pool).expect("bounded ClientHello");
-        assert!(!hello.is_empty(), "failed admission must not drain ClientHello");
+        let pool =
+            enclave_os_common::allocation::AllocationPoolV1::new(super::TLS_OUTPUT_WORKING_BYTES)
+                .unwrap();
+        let hello = client
+            .collect_tls_output_charged(&pool)
+            .expect("bounded ClientHello");
+        assert!(
+            !hello.is_empty(),
+            "failed admission must not drain ClientHello"
+        );
         assert_eq!(pool.used(), super::TLS_OUTPUT_WORKING_BYTES);
         drop(hello);
         assert_eq!(pool.used(), 0);
         let empty = client.collect_tls_output_charged(&too_small).unwrap();
-        assert!(empty.is_empty(), "idle output needs no reservation or release wake");
+        assert!(
+            empty.is_empty(),
+            "idle output needs no reservation or release wake"
+        );
         assert_eq!(too_small.used(), 0);
         client
             .tls_conn
