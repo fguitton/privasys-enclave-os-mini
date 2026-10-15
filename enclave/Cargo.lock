@@ -533,7 +533,6 @@ dependencies = [
  "enclave-os-kvstore",
  "getrandom",
  "honest-wasmtime-profile",
- "p256",
  "ring",
  "serde",
  "serde_json",
