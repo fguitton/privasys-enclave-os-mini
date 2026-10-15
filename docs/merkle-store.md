@@ -26,9 +26,9 @@ Two independent 32-byte keys, never mixed:
 The tree commits to `(path, vh)` pairs only, so the root is a pure
 function of the logical state and `ck`. Two replicas sharing `ck` but
 holding different storage keys produce **identical roots** and compare
-state by comparing `(version, root)` — the property a future BFT-Raft
-layer builds on. Ciphertexts are free to be non-deterministic (random
-GCM nonces) and per-machine.
+state by comparing `(version, root)`. Matching roots establish matching logical
+state; replicated authority requires the consensus layer's own validation.
+Ciphertexts are free to be non-deterministic (random GCM nonces) and per-machine.
 
 Keyed hashing means the host cannot dictionary-attack low-entropy keys
 or values; including `path` in the `vh` preimage hides value equality
