@@ -21,6 +21,8 @@ extern crate std;
 #[cfg(test)]
 extern crate self as enclave_os_common;
 pub mod allocation;
+/// Admitted request parser backing and escaped-text ownership.
+pub mod request_json;
 pub mod channel;
 pub mod core_phase;
 pub mod dependencies;

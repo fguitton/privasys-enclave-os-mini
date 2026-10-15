@@ -79,23 +79,26 @@ impl AttestationMode {
 
 // -- messages ---------------------------------------------------------------
 
+/// Resource-aware inbound visitor for this same message field model.
+pub mod request;
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct AttestRequest {
+pub struct AttestRequest<T = String> {
     pub v: u32,
-    pub mode: String,
+    pub mode: T,
     #[serde(default)]
-    pub leaf: String,
+    pub leaf: T,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context: Option<String>,
+    pub context: Option<T>,
     // present
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tee: Option<String>,
+    pub tee: Option<T>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub quote: Option<String>,
+    pub quote: Option<T>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gpu_evidence: Option<String>,
+    pub gpu_evidence: Option<T>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub quote_time: Option<String>,
+    pub quote_time: Option<T>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
