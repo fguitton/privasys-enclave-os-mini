@@ -2693,17 +2693,16 @@ mod configure_tests {
 
     #[test]
     fn configure_refuses_missing_identity_and_predecessor_authority() {
-        let load: WasmLoad = serde_json::from_value(serde_json::json!({
-            "name": "app.test", "bytes": ""
-        }))
-        .unwrap();
+        let load: WasmLoad = serde_json::from_str(r#"{"name":"app.test","bytes":""}"#).unwrap();
         let mut encoded = serde_json::to_value(&load).unwrap();
-        assert!(serde_json::from_value::<WasmLoad>(encoded.clone()).is_ok());
+        assert!(serde_json::from_slice::<WasmLoad>(&serde_json::to_vec(&encoded).unwrap()).is_ok());
         encoded
             .as_object_mut()
             .unwrap()
             .insert("unknown_setting".into(), true.into());
-        assert!(serde_json::from_value::<WasmLoad>(encoded).is_err());
+        assert!(
+            serde_json::from_slice::<WasmLoad>(&serde_json::to_vec(&encoded).unwrap()).is_err()
+        );
         let id = [1; 16];
         let hexid = enclave_os_common::hex::hex_encode(&id);
         for role in ["owner", "admin"] {
