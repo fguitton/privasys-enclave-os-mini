@@ -2689,6 +2689,7 @@ fn collect_role_strings(val: &serde_json::Value, out: &mut Vec<String>) {
 #[cfg(test)]
 mod configure_tests {
     use super::*;
+    use crate::protocol::WasmLoad;
 
     #[test]
     fn configure_refuses_missing_identity_and_predecessor_authority() {
