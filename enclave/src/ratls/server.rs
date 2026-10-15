@@ -943,8 +943,8 @@ impl IngressServer {
             slot.close,
             false,
         ) {
-            Ok(()) => self.mark_dispatch(id),
-            Err((_, body)) => {
+            std::ops::ControlFlow::Continue(()) => self.mark_dispatch(id),
+            std::ops::ControlFlow::Break((_, body)) => {
                 *response = Some(crate::HonestIngressResponse {
                     status: ready.status,
                     content_type: ready.content_type,

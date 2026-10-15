@@ -14,13 +14,21 @@ pub enum HonestStreamIngressPush {
     Consumed,
     Pending,
 }
+/// The receiver rejected this fragment; the failure carries no allocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HonestStreamIngressError;
+
 pub trait HonestStreamIngressReceiver: Send {
-    fn push(&mut self, bytes: &[u8], context: &RequestContext) -> Result<(), ()>;
+    fn push(
+        &mut self,
+        bytes: &[u8],
+        context: &RequestContext,
+    ) -> Result<(), HonestStreamIngressError>;
     fn push_with_backpressure(
         &mut self,
         bytes: &[u8],
         context: &RequestContext,
-    ) -> Result<HonestStreamIngressPush, ()> {
+    ) -> Result<HonestStreamIngressPush, HonestStreamIngressError> {
         self.push(bytes, context)
             .map(|()| HonestStreamIngressPush::Consumed)
     }
@@ -36,7 +44,7 @@ pub type HonestStreamIngressBegin =
         &HttpRequest,
         usize,
         &RequestContext,
-    ) -> Result<Box<dyn HonestStreamIngressReceiver>, HonestIngressResponse>;
+    ) -> std::ops::ControlFlow<HonestIngressResponse, Box<dyn HonestStreamIngressReceiver>>;
 pub(crate) type Hooks = (HonestStreamIngressEligible, HonestStreamIngressBegin);
 
 pub(crate) struct SlotCharge {
@@ -456,12 +464,12 @@ pub(crate) fn run_work(
     if let Some(context) = work.context.as_ref() {
         if let Some(header) = work.header.take() {
             match begin(&header, work.length, context) {
-                Ok(receiver) => work.receiver = Some(receiver),
-                Err(refused) => response = Some(refused),
+                std::ops::ControlFlow::Continue(receiver) => work.receiver = Some(receiver),
+                std::ops::ControlFlow::Break(refused) => response = Some(refused),
             }
         } else if let Some(mut receiver) = work.receiver.take() {
             match receiver.push_with_backpressure(&work.bytes, context) {
-                Err(()) => {
+                Err(HonestStreamIngressError) => {
                     response = Some(crate::HonestIngressResponse {
                         status: 403,
                         content_type: "application/octet-stream",
@@ -496,7 +504,7 @@ impl Drop for ChargedDropCheck {
 }
 #[cfg(test)]
 impl HonestStreamIngressReceiver for ChargedDropCheck {
-    fn push(&mut self, _: &[u8], _: &RequestContext) -> Result<(), ()> {
+    fn push(&mut self, _: &[u8], _: &RequestContext) -> Result<(), HonestStreamIngressError> {
         unreachable!()
     }
     fn finish(self: Box<Self>, _: &RequestContext) -> HonestIngressResponse {

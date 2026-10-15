@@ -6,6 +6,9 @@
 
 use std::collections::BTreeMap;
 
+type ReferenceModel = BTreeMap<Vec<u8>, Vec<u8>>;
+type SnapshotChanges = Vec<(Vec<u8>, Option<Vec<u8>>)>;
+
 use crate::backend::MemBackend;
 use crate::error::MerkleError;
 use crate::hash::placeholder;
@@ -155,7 +158,7 @@ fn root_is_history_independent() {
         let mut batch = Vec::new();
         for _ in 0..(rng.next() % 8 + 1) {
             let k = key(rng.next() % 50);
-            if rng.next() % 4 == 0 {
+            if rng.next().is_multiple_of(4) {
                 batch.push((k, None));
             } else {
                 let v = val(rng.next() % 1000);
@@ -205,14 +208,14 @@ fn random_ops_match_reference_model() {
     let mut store = new_store();
     let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
     let mut rng = Rng(42);
-    let mut snapshots: Vec<(u64, BTreeMap<Vec<u8>, Vec<u8>>)> = Vec::new();
+    let mut snapshots: Vec<(u64, ReferenceModel)> = Vec::new();
 
     for round in 0..60 {
         let mut batch = Vec::new();
         for _ in 0..(rng.next() % 10 + 1) {
             // Small keyspace so overwrites, deletes and collisions happen.
             let k = key(rng.next() % 30);
-            if rng.next() % 3 == 0 {
+            if rng.next().is_multiple_of(3) {
                 batch.push((k, None));
             } else {
                 batch.push((k, Some(val(rng.next()))));
@@ -538,15 +541,13 @@ fn proof_mutation_fuzz() {
         if mutated == encoded {
             continue;
         }
-        match crate::proof::Proof::decode(&mutated) {
-            Err(_) => {}
-            Ok(p) => match path_free_check(&p) {
-                // A mutated proof may still decode, but it must not
-                // verify the target statement...
-                Ok(true) => panic!("mutated proof still verifies at byte {pos}"),
-                // ...rejecting or proving nothing is fine.
-                Ok(false) | Err(_) => {}
-            },
+        if let Ok(p) = crate::proof::Proof::decode(&mutated) {
+            // A mutated proof may still decode, but it must not verify the
+            // target statement. Rejection or proving nothing is still fine.
+            assert!(
+                !matches!(path_free_check(&p), Ok(true)),
+                "mutated proof still verifies at byte {pos}"
+            );
         }
     }
 }
@@ -583,7 +584,7 @@ fn prune_removes_exactly_the_garbage() {
         let mut batch = Vec::new();
         for _ in 0..(rng.next() % 8 + 1) {
             let k = key(rng.next() % 40);
-            if rng.next() % 4 == 0 {
+            if rng.next().is_multiple_of(4) {
                 batch.push((k, None));
             } else {
                 batch.push((k, Some(val(rng.next() % 500))));
@@ -638,7 +639,7 @@ fn prune_removes_exactly_the_garbage() {
 #[test]
 fn prune_keeps_the_retained_window() {
     let mut store = new_store();
-    let mut snapshots: Vec<(u64, Vec<(Vec<u8>, Option<Vec<u8>>)>)> = Vec::new();
+    let mut snapshots: Vec<(u64, SnapshotChanges)> = Vec::new();
     for round in 0..10u64 {
         store
             .put_batch(&[
@@ -798,7 +799,7 @@ fn checkpoint_reopen_without_external_state() {
 
     // A tampered checkpoint fails closed (GCM tag).
     let backend = reopened.into_backend();
-    assert!(backend.tamper(&[b'c']));
+    assert!(backend.tamper(b"c"));
     assert!(matches!(
         MerkleStore::open_latest(backend, CK, SK),
         Err(MerkleError::Corrupted(_))

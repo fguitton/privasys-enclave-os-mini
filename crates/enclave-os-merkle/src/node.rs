@@ -20,7 +20,7 @@ pub const NIBBLES: usize = 64;
 pub fn nibble(path: &Hash, i: usize) -> u8 {
     debug_assert!(i < NIBBLES);
     let byte = path[i / 2];
-    if i % 2 == 0 {
+    if i.is_multiple_of(2) {
         byte >> 4
     } else {
         byte & 0x0F
@@ -50,6 +50,7 @@ impl NodeKey {
         }
     }
 
+    #[cfg(test)]
     pub fn child(&self, version: u64, nib: u8) -> Self {
         debug_assert!(nib < 16);
         let mut prefix = self.prefix.clone();
@@ -118,6 +119,10 @@ pub struct LeafNode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The inline 16-child fanout preserves allocation-free node construction; boxing would introduce a new heap owner."
+)]
 pub enum Node {
     Internal(InternalNode),
     Leaf(LeafNode),

@@ -93,7 +93,9 @@ pub use enclave_os_common::attest;
 #[cfg(test)]
 pub use enclave_os_common::enclave_log_error;
 #[cfg(test)]
-pub use stream_ingress::{HonestStreamIngressReceiver, MAX_STREAM_INGRESS_FRAGMENT};
+pub use stream_ingress::{
+    HonestStreamIngressError, HonestStreamIngressReceiver, MAX_STREAM_INGRESS_FRAGMENT,
+};
 
 pub mod jwks;
 

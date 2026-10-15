@@ -118,8 +118,8 @@ static HONEST_INGRESS_HOOK: OnceLock<HonestIngressHook> = OnceLock::new();
 mod stream_ingress;
 pub use stream_ingress::{
     notify_honest_stream_ingress, HonestStreamIngressBegin, HonestStreamIngressEligible,
-    HonestStreamIngressPush, HonestStreamIngressReceiver, MAX_STREAM_INGRESS_FRAGMENT,
-    MAX_STREAM_INGRESS_SESSIONS,
+    HonestStreamIngressError, HonestStreamIngressPush, HonestStreamIngressReceiver,
+    MAX_STREAM_INGRESS_FRAGMENT, MAX_STREAM_INGRESS_SESSIONS,
 };
 static HONEST_STREAM_INGRESS_HOOK: OnceLock<stream_ingress::Hooks> = OnceLock::new();
 /// Optional explicit input adoption; defaults retain ordinary whole-body HTTP.

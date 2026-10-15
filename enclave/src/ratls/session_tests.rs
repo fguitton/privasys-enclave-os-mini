@@ -234,6 +234,7 @@ fn owned_body(
 
 #[test]
 fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
+    assert_eq!(core::mem::size_of::<crate::HonestStreamIngressError>(), 0);
     legacy_response_keeps_original_bytes();
     let allocation_pool = enclave_os_common::allocation::AllocationPoolV1::new(1).unwrap();
     let lease = allocation_pool.reserve_unpublished(1).unwrap();
@@ -346,7 +347,7 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
             (false, false),
             Some(&short)
         )
-        .is_err());
+        .is_break());
     assert_eq!(short.used(), 0);
     assert!(!header_session.has_pending_response());
     for capacity in [required, required + 1] {
@@ -360,6 +361,7 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
                 (false, false),
                 Some(&pool),
             )
+            .continue_value()
             .unwrap();
         assert_eq!(pool.used(), required);
         assert_eq!(
@@ -375,7 +377,7 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
                 (false, false),
                 Some(&pool)
             )
-            .is_err());
+            .is_break());
         let (output, _, _) = header_session.progress_http_response().unwrap();
         assert!(!output.is_empty());
         assert_eq!(pool.used(), 0);
@@ -392,7 +394,7 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
             (false, false),
             Some(&pool)
         )
-        .is_err());
+        .is_break());
     assert_eq!(pool.used(), 0);
     header_session
         .queue_http_response_admitted(
@@ -403,6 +405,7 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
             (false, false),
             Some(&pool),
         )
+        .continue_value()
         .unwrap();
     drop(header_session);
     assert_eq!(pool.used(), 0);
@@ -455,7 +458,7 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
             false,
             false,
         )
-        .err()
+        .break_value()
         .unwrap();
     assert_eq!(reason, "response already pending");
     assert_eq!(returned.len(), 7);
@@ -980,9 +983,9 @@ impl crate::HonestStreamIngressReceiver for FixtureReceiver {
         &mut self,
         bytes: &[u8],
         context: &enclave_os_common::modules::RequestContext,
-    ) -> Result<(), ()> {
+    ) -> Result<(), crate::HonestStreamIngressError> {
         if context.channel_binder.as_ref() != Some(&self.binding) {
-            return Err(());
+            return Err(crate::HonestStreamIngressError);
         }
         self.bytes.extend_from_slice(bytes);
         Ok(())
@@ -1003,10 +1006,11 @@ fn fixture_begin(
     request: &enclave_os_common::protocol::HttpRequest,
     length: usize,
     context: &enclave_os_common::modules::RequestContext,
-) -> Result<Box<dyn crate::HonestStreamIngressReceiver>, crate::HonestIngressResponse> {
+) -> std::ops::ControlFlow<crate::HonestIngressResponse, Box<dyn crate::HonestStreamIngressReceiver>>
+{
     assert!(request.body.is_empty());
     assert_eq!(length, 128 * 1024 + 17);
-    Ok(Box::new(FixtureReceiver {
+    std::ops::ControlFlow::Continue(Box::new(FixtureReceiver {
         bytes: Vec::new(),
         binding: context.channel_binder.clone().unwrap(),
     }))
@@ -1112,16 +1116,21 @@ struct PendingReceiver {
     consumed: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl crate::HonestStreamIngressReceiver for PendingReceiver {
-    fn push(&mut self, _: &[u8], _: &enclave_os_common::modules::RequestContext) -> Result<(), ()> {
+    fn push(
+        &mut self,
+        _: &[u8],
+        _: &enclave_os_common::modules::RequestContext,
+    ) -> Result<(), crate::HonestStreamIngressError> {
         unreachable!()
     }
     fn push_with_backpressure(
         &mut self,
         bytes: &[u8],
         context: &enclave_os_common::modules::RequestContext,
-    ) -> Result<crate::stream_ingress::HonestStreamIngressPush, ()> {
+    ) -> Result<crate::stream_ingress::HonestStreamIngressPush, crate::HonestStreamIngressError>
+    {
         if context.channel_binder.as_ref() != Some(&self.binding) {
-            return Err(());
+            return Err(crate::HonestStreamIngressError);
         }
         if !self.credit.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(crate::stream_ingress::HonestStreamIngressPush::Pending);
@@ -1170,7 +1179,7 @@ fn segmented_response_lifecycle() {
         .unwrap();
     let (reason, returned) = session
         .queue_http_response_owned(200, "application/json", &[], payload(), false, false)
-        .err()
+        .break_value()
         .unwrap();
     assert_eq!(reason, "response already pending");
     assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);

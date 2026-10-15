@@ -50,11 +50,11 @@ mod tree;
 #[cfg(test)]
 mod tests;
 
-pub use backend::{KvBackend, MemBackend, OcallBackend};
+pub use backend::{KvBackend, KvScanEntries, MemBackend, OcallBackend};
 pub use error::MerkleError;
 pub use fork::{MerkleFork, SealedFork};
 pub use hash::{Hash, HASH_SIZE};
 pub use module::MerkleModule;
 pub use proof::{verify, Proof, Verified};
 pub use snapshot::SnapshotBuilder;
-pub use tree::{MerkleStore, PruneStats};
+pub use tree::{MerkleStore, PruneStats, SnapshotLeafEntries};

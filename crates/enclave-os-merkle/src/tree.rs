@@ -53,6 +53,9 @@ use crate::cache::NodeCache;
 use crate::error::MerkleError;
 use crate::hash::{placeholder, Hash, HASH_SIZE};
 use crate::node::{nibble, subtree_hash, Child, InternalNode, LeafNode, Node, NodeKey};
+
+/// Path and verified plaintext entries in a snapshot page.
+pub type SnapshotLeafEntries = Vec<(Hash, Vec<u8>)>;
 use crate::proof::{verify, Proof, Verified};
 
 const REC_NODE: u8 = b'n';
@@ -329,7 +332,7 @@ impl<B: KvBackend> MerkleStore<B> {
         version: u64,
         start_after: Option<&Hash>,
         max: usize,
-    ) -> Result<(Vec<(Hash, Vec<u8>)>, bool), MerkleError> {
+    ) -> Result<(SnapshotLeafEntries, bool), MerkleError> {
         let root = self.load_root_record(version)?;
         let root_child = self.load_root_child(root, version)?;
         let mut out = Vec::new();

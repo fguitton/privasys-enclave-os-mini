@@ -29,7 +29,7 @@ fn hex_encode(data: &[u8]) -> String {
 
 /// Hex-decode a string into bytes. Returns `None` on invalid hex.
 fn hex_decode(hex: &str) -> Option<Vec<u8>> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(hex.len() / 2);

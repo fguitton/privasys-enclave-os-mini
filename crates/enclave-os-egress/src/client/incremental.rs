@@ -495,6 +495,7 @@ mod tests {
     use rustls::RootCertStore;
 
     use super::{IncrementalTlsClient, MAX_INCREMENTAL_REQUEST};
+    #[cfg(any(not(feature = "mock"), feature = "sgx-sim-attestation"))]
     use crate::client::{RaTlsPolicy, ReportDataBinding, TeeType};
 
     #[test]

@@ -18,17 +18,15 @@ use enclave_os_common::rpc::KvBatchOp;
 
 use crate::error::MerkleError;
 
+/// Key/value records returned by the original ascending backend scan.
+pub type KvScanEntries = Vec<(Vec<u8>, Vec<u8>)>;
+
 pub trait KvBackend {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, MerkleError>;
     /// Apply all ops atomically: either every op lands or none does.
     fn write_batch(&self, ops: Vec<KvBatchOp>) -> Result<(), MerkleError>;
     /// Ascending scan over `[start, end)`; empty `end` = unbounded.
-    fn scan(
-        &self,
-        start: &[u8],
-        end: &[u8],
-        limit: u32,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, MerkleError>;
+    fn scan(&self, start: &[u8], end: &[u8], limit: u32) -> Result<KvScanEntries, MerkleError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -68,12 +66,7 @@ impl KvBackend for OcallBackend {
             .map_err(MerkleError::Backend)
     }
 
-    fn scan(
-        &self,
-        start: &[u8],
-        end: &[u8],
-        limit: u32,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, MerkleError> {
+    fn scan(&self, start: &[u8], end: &[u8], limit: u32) -> Result<KvScanEntries, MerkleError> {
         enclave_os_common::ocall::kv_store_scan(&self.table, start, end, limit)
             .map_err(MerkleError::Backend)
     }
@@ -162,12 +155,7 @@ impl KvBackend for MemBackend {
         Ok(())
     }
 
-    fn scan(
-        &self,
-        start: &[u8],
-        end: &[u8],
-        limit: u32,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, MerkleError> {
+    fn scan(&self, start: &[u8], end: &[u8], limit: u32) -> Result<KvScanEntries, MerkleError> {
         let limit = if limit == 0 {
             usize::MAX
         } else {

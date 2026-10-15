@@ -718,8 +718,17 @@ impl RaTlsSession {
         close: bool,
         shutdown: bool,
     ) -> Result<(), &'static str> {
-        self.queue_http_response_owned(status, content_type, extra_headers, body, close, shutdown)
-            .map_err(|(error, _body)| error)
+        match self.queue_http_response_owned(
+            status,
+            content_type,
+            extra_headers,
+            body,
+            close,
+            shutdown,
+        ) {
+            std::ops::ControlFlow::Continue(()) => Ok(()),
+            std::ops::ControlFlow::Break((error, _body)) => Err(error),
+        }
     }
 
     /// Keep an unconsumed body available for its owner to drop outside STATE.
@@ -731,12 +740,12 @@ impl RaTlsSession {
         body: impl Into<crate::HttpResponsePayload>,
         close: bool,
         shutdown: bool,
-    ) -> Result<(), (&'static str, crate::HttpResponsePayload)> {
+    ) -> std::ops::ControlFlow<(&'static str, crate::HttpResponsePayload)> {
         let body = body.into();
         #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
         let pool = match crate::local_allocation_pool() {
             Some(pool) => Some(pool),
-            None => return Err(("SDK heap unavailable", body)),
+            None => return std::ops::ControlFlow::Break(("SDK heap unavailable", body)),
         };
         #[cfg(not(any(target_env = "sgx", target_vendor = "teaclave")))]
         let pool = None;
@@ -759,13 +768,13 @@ impl RaTlsSession {
         body: crate::HttpResponsePayload,
         completion: (bool, bool),
         pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
-    ) -> Result<(), (&'static str, crate::HttpResponsePayload)> {
+    ) -> std::ops::ControlFlow<(&'static str, crate::HttpResponsePayload)> {
         let (close, shutdown) = completion;
         if let Err(error) = self.require_current_configuration() {
-            return Err((error, body));
+            return std::ops::ControlFlow::Break((error, body));
         }
         if self.response.is_some() {
-            return Err(("response already pending", body));
+            return std::ops::ControlFlow::Break(("response already pending", body));
         }
         let Some(head_bytes) = protocol::response_head_encoded_len(
             status,
@@ -775,12 +784,17 @@ impl RaTlsSession {
             close,
         )
         .filter(|n| *n <= MAX_RESPONSE_HEADER_BYTES) else {
-            return Err(("response headers too large", body));
+            return std::ops::ControlFlow::Break(("response headers too large", body));
         };
         let allocation = match pool {
             Some(pool) => match pool.reserve_unpublished(head_bytes) {
                 Some(credit) => Some(credit),
-                None => return Err(("response header admission exhausted", body)),
+                None => {
+                    return std::ops::ControlFlow::Break((
+                        "response header admission exhausted",
+                        body,
+                    ))
+                }
             },
             None => None,
         };
@@ -793,7 +807,7 @@ impl RaTlsSession {
             head_bytes,
         ) {
             Ok(head) => head,
-            Err(error) => return Err((error, body)),
+            Err(error) => return std::ops::ControlFlow::Break((error, body)),
         };
         if let Some(credit) = &allocation {
             credit.activate_release_notification();
@@ -814,7 +828,7 @@ impl RaTlsSession {
             close,
             shutdown,
         });
-        Ok(())
+        std::ops::ControlFlow::Continue(())
     }
 
     /// Caller reserves 64 KiB of socket credit before each step. Configuration
