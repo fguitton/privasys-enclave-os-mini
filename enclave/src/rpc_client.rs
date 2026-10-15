@@ -86,11 +86,13 @@ pub struct RpcClient {
 
 // Request encoding and raw response coexist. The decoded payload is borrowed;
 // a callback that retains it must admit its own child before copying.
+#[cfg(all(not(feature = "mock"), not(feature = "sgx-sim-attestation")))]
 struct QeWorking {
     request: Vec<u8>,
     response: Vec<u8>,
     _allocation: enclave_os_common::allocation::AllocationLeaseV1,
 }
+#[cfg(all(not(feature = "mock"), not(feature = "sgx-sim-attestation")))]
 impl QeWorking {
     fn new(
         pool: &std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
@@ -767,6 +769,7 @@ impl RpcClient {
 
     /// Actual simultaneous request/raw-response backing for a QE exchange.
     /// Geometry comes from this client's immutable queue endpoints.
+    #[cfg(all(not(feature = "mock"), not(feature = "sgx-sim-attestation")))]
     pub(crate) fn qe_working_bytes(&self, payload: usize) -> Option<usize> {
         if !rpc::framed_payload_len_valid(
             payload,
@@ -780,6 +783,7 @@ impl RpcClient {
             .checked_add(self.response_rx.max_message_bytes())
     }
 
+    #[cfg(all(not(feature = "mock"), not(feature = "sgx-sim-attestation")))]
     pub(crate) fn with_qe_target_info<T>(
         &self,
         pool: &std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
@@ -788,6 +792,7 @@ impl RpcClient {
         self.qe_call_admitted(pool, RpcMethod::QeGetTargetInfo, &[], accept)
     }
 
+    #[cfg(all(not(feature = "mock"), not(feature = "sgx-sim-attestation")))]
     pub(crate) fn with_qe_quote<T>(
         &self,
         pool: &std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
@@ -797,6 +802,7 @@ impl RpcClient {
         self.qe_call_admitted(pool, RpcMethod::QeGetQuote, report, accept)
     }
 
+    #[cfg(all(not(feature = "mock"), not(feature = "sgx-sim-attestation")))]
     fn qe_call_admitted<T>(
         &self,
         pool: &std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
