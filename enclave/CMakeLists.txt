@@ -29,10 +29,6 @@ option(ENABLE_VAULT   "Include the vault module (implies egress + kvstore)"   OF
 option(ENABLE_WASM    "Include the WASM runtime module (implies egress + kvstore)" OFF)
 option(ENABLE_FIDO2   "Include the FIDO2/WebAuthn authentication module (implies kvstore)" OFF)
 option(ENABLE_MERKLE  "Include the authenticated Merkle KV store module"      OFF)
-if(DEFINED ENABLE_RAFT)
-    message(FATAL_ERROR "ENABLE_RAFT was removed; use the Honest BFT composition")
-endif()
-
 set(CUSTOM_ENCLAVE_DIR "" CACHE PATH
     "Path to an external composition crate with a custom ecall_run. \
      When set, all ENABLE_* flags are ignored and this crate is built instead.")
