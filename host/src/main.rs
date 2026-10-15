@@ -110,7 +110,7 @@ struct Cli {
     /// The enclave, not this host process, terminates the TLS session.
     #[arg(long)]
     local_control_socket: Option<PathBuf>,
-    /// Optional second listen port for cluster peer links (raft).
+    /// Optional second listen port for cluster peer links.
     /// Inbound connections on this port are routed to the enclave's
     /// peer-link layer instead of the HTTPS ingress.
     #[arg(long)]
@@ -153,8 +153,7 @@ struct Cli {
     oidc_audience: Option<String>,
 
     /// Extra enclave config as a JSON object, merged into the config
-    /// passed to ecall_run (e.g. '{"raft_node_id":1,"raft_peers":
-    /// {"2":"10.0.0.2:7400"},"raft_cluster_key":"<hex64>"}').
+    /// passed to ecall_run.
     #[arg(long)]
     extra: Option<String>,
 

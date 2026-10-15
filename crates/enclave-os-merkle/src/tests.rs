@@ -143,7 +143,7 @@ fn empty_value_is_a_value() {
 }
 
 // ---------------------------------------------------------------------------
-//  Root determinism (the BFT-Raft requirement)
+//  Root determinism
 // ---------------------------------------------------------------------------
 
 /// The root must be a pure function of (logical state, ck): independent

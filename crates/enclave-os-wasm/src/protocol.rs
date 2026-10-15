@@ -265,6 +265,7 @@ pub struct WasmFundedRps {
 /// The `bytes` field contains the raw WASM component bytecode.
 /// If an app with the same name is already loaded, it will be replaced.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WasmLoad {
     /// App identifier — used in subsequent `wasm_call` requests.
     pub name: String,
@@ -291,15 +292,6 @@ pub struct WasmLoad {
     /// read across app reloads.
     #[serde(default)]
     pub encryption_key: Option<String>,
-    /// Replay-mode cluster transactions: replicas RE-EXECUTE this
-    /// app's transactions deterministically and verify the write-set
-    /// instead of trusting it. Loading enforces the transaction
-    /// world: imports of https egress or raw sockets are rejected
-    /// (wasi:random stays available, backed by the per-transaction
-    /// DRBG; clocks are frozen to the committed timestamp). The app
-    /// must be loaded IDENTICALLY on every cluster node.
-    #[serde(default)]
-    pub txn_replay: bool,
     /// Optional per-app permission policy.
     ///
     /// When present, the enclave enforces per-function access control on

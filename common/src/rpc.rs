@@ -54,7 +54,6 @@ pub enum RpcMethod {
     KvPutDurable = 0x0207,
     /// Execution-owned private scratch storage, distinct from BFT persistence.
     WorkerStorage = 0x0208,
-    // 0x0240 is retired; never reuse the former Raft persistence method ID.
 
     // -- Utility --
     GetCurrentTime = 0x0300,

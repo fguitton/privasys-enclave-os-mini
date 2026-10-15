@@ -381,45 +381,6 @@ impl WasmModule {
         Ok(reg.set_billing_frozen(name, reason))
     }
 
-    /// Dispatch a parsed `WasmCall` to the appropriate app and record metrics.
-    ///
-    /// If the app is known but not currently compiled in memory, its
-    /// WASM bytes are loaded from the sealed KV store and compiled
-    /// on the fly (AOT deserialization — very fast).
-    /// Whether an app was loaded in replay mode (replicas re-execute
-    /// its transactions deterministically). Unknown apps are `false`.
-    pub fn txn_replay(&self, app: &str) -> bool {
-        self.registry
-            .lock()
-            .ok()
-            .and_then(|r| r.app_meta(app).map(|m| m.txn_replay))
-            .unwrap_or(false)
-    }
-
-    /// The app's per-call fuel budget (recorded in replay envelopes).
-    pub fn app_max_fuel(&self, app: &str) -> Option<u64> {
-        self.registry
-            .lock()
-            .ok()
-            .and_then(|r| r.app_meta(app).map(|m| m.max_fuel))
-    }
-
-    /// Execute one exported function for a CLUSTER TRANSACTION. The
-    /// consensus owner authorises the caller (its own envelope gate) and
-    /// installs the transaction-ledger scope around this call; here it
-    /// is a plain dispatch with no platform auth context (an app-level
-    /// `permissions` policy still applies via `call.app_auth`). The
-    /// serialized return values are handed back to the consensus owner,
-    /// which commits them alongside the write-set proposal.
-    pub fn call_for_transaction(&self, call: &WasmCall) -> Result<serde_json::Value, String> {
-        match self.dispatch_call(call, None) {
-            WasmResult::Ok { returns, .. } => {
-                serde_json::to_value(&returns).map_err(|e| format!("serialize returns: {e}"))
-            }
-            WasmResult::Error { message, .. } => Err(message),
-        }
-    }
-
     fn dispatch_call(&self, call: &WasmCall, auth: Option<AuthResult>) -> WasmResult {
         // Ensure the app is compiled.  This is a no-op when the app
         // is already in the `loaded` map.
@@ -1726,7 +1687,6 @@ impl EnclaveModule for WasmModule {
                 app_id,
                 vault,
                 dependencies,
-                txn_replay: load.txn_replay,
             }) {
                 Ok(()) => {
                     // Return the loaded app's info
@@ -2732,6 +2692,17 @@ mod configure_tests {
 
     #[test]
     fn configure_refuses_missing_identity_and_predecessor_authority() {
+        let load: WasmLoad = serde_json::from_value(serde_json::json!({
+            "name": "app.test", "bytes": ""
+        }))
+        .unwrap();
+        let mut encoded = serde_json::to_value(&load).unwrap();
+        assert!(serde_json::from_value::<WasmLoad>(encoded.clone()).is_ok());
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .insert("unknown_setting".into(), true.into());
+        assert!(serde_json::from_value::<WasmLoad>(encoded).is_err());
         let id = [1; 16];
         let hexid = enclave_os_common::hex::hex_encode(&id);
         for role in ["owner", "admin"] {

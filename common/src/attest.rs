@@ -5,7 +5,7 @@
 //! the evidence exchange that follows the handshake
 //! (`ra-tls-clients/docs/ratls-v2.md`). Shared by the ingress server (which
 //! answers `POST /__privasys/attest`), the egress client (which asks), the
-//! vault and the raft peer link.
+//! vault and the peer link.
 //!
 //! ```text
 //! deterministic: report_data = SHA-512( SHA-256(SPKI_DER) || quote_time )
@@ -43,7 +43,7 @@ pub const PROTOCOL_VERSION: u32 = 2;
 pub const EXPORTER_LABEL_SERVER: &[u8] = b"EXPORTER-privasys-ratls-attest-v2";
 /// Exporter label of the client evidence of a connection (mutual leg).
 pub const EXPORTER_LABEL_CLIENT: &[u8] = b"EXPORTER-privasys-ratls-attest-v2-client";
-/// Exporter labels of the symmetric raft peer link, one per role.
+/// Exporter labels of the symmetric peer link, one per role.
 pub const EXPORTER_LABEL_PEER_CLIENT: &[u8] = b"EXPORTER-privasys-ratls-attest-v2-peer-client";
 pub const EXPORTER_LABEL_PEER_SERVER: &[u8] = b"EXPORTER-privasys-ratls-attest-v2-peer-server";
 /// Length of a challenge context.

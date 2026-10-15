@@ -220,7 +220,7 @@ pub struct TcpProxy {
     local_control_listener: Option<UnixListener>,
     /// Exact socket created by this process, removed on orderly shutdown.
     local_control_path: Option<PathBuf>,
-    /// Optional peer-port listener (raft peer links). Inbound conns from
+    /// Optional peer-port listener. Inbound conns from
     /// this listener get ids from the `CONN_ID_PEER_IN_BASE` range.
     peer_listener: Option<TcpListener>,
     /// Active connections: conn_id → state.

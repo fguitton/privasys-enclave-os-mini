@@ -48,7 +48,7 @@ impl OcallBackend {
     }
 
     /// A backend over an explicit table name (no `merkle:` prefix) —
-    /// for non-merkle consumers of the KV OCALLs (e.g. the raft log).
+    /// for other consumers of the KV OCALLs.
     pub fn with_table(table: &str) -> Self {
         Self {
             table: table.as_bytes().to_vec(),

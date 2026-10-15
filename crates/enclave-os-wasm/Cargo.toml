@@ -31,11 +31,6 @@ enclave-os-app-auth = { path = "../enclave-os-app-auth", optional = true }
 
 # Crypto (SHA-256 for WASM code hashing, RNG for WASI random)
 ring = "0.17"
-# RFC 6979 deterministic ECDSA for replay-mode transactions (same
-# crate/pin as the raft commit certificates; pkcs8 for key loading).
-# PKCS#8 import and deterministic signing use caller-owned keys; no OS RNG API.
-p256 = { version = "=0.14.0", default-features = false, features = ["ecdsa", "alloc", "pkcs8"] }
-
 # Serialization for WasmCall / WasmResult protocol
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

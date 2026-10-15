@@ -16,9 +16,6 @@
 //! boundary for user-owned data. Apps should record the returned code
 //! hash beside anything they seal, so a later version can name which S_N
 //! a blob needs.
-//!
-//! Refused during ledger replay: raw key material must never be able to
-//! leak into a replicated write-set on a replica that should not hold it.
 
 use std::string::String;
 use std::vec::Vec;
@@ -45,9 +42,6 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
         |store: StoreContextMut<'_, AppContext>,
          (): ()|
          -> wasmtime::Result<(Result<SealKeyMaterial, String>,)> {
-            if super::ledger::in_replay() {
-                return Ok((Err("get-seal-key is not available during replay".into()),));
-            }
             let app_name = store.data().app_name.clone();
             let module = match crate::global() {
                 Some(m) => m,

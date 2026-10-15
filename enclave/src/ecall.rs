@@ -1130,12 +1130,6 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
         _module_count += 1;
     }
 
-    // Reject retired consensus configuration rather than starting a partial service.
-    if config.extra.keys().any(|key| key.starts_with("raft_")) {
-        enclave_log_error!("Raft configuration was removed; use the Honest BFT composition");
-        return -36;
-    }
-
     // ── Vault module (policy-gated secrets, JWT + mRA-TLS) ───────────
     #[cfg(feature = "vault")]
     {
