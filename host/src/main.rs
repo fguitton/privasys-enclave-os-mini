@@ -11,7 +11,6 @@
 //! - Provide the CLI entry point
 
 mod build_contract;
-mod c3_endpoints;
 #[cfg(all(target_os = "linux", not(sgx_mode_sim), not(feature = "mock")))]
 mod dcap;
 mod dispatcher;
@@ -27,7 +26,6 @@ mod storage_rpc_profile;
 mod tcp_proxy;
 
 use anyhow::Result;
-use c3_endpoints::validate_c3_development_endpoints;
 use clap::{Parser, ValueEnum};
 use log::{error, info};
 use std::net::IpAddr;
@@ -173,53 +171,6 @@ struct Cli {
     /// Negative selections exist only to prove fail-closed gate propagation.
     #[arg(long, value_enum)]
     enclave_test_selection: Option<EnclaveTestSelection>,
-
-    /// S1.2 test-only synthetic worker budget. Ignored by legacy compositions.
-    #[arg(long)]
-    s1_2_synthetic_work_units: Option<u64>,
-
-    /// S2.0 test-only private executor fixture. Ignored by legacy
-    /// compositions and absent unless explicitly requested.
-    #[arg(long)]
-    s2_0_private_fixture: bool,
-
-    /// Development-only physical-cluster node ID (1..=cluster cardinality).
-    #[arg(long)]
-    c3_development_node_id: Option<u64>,
-
-    /// Development-only node incarnation generation. Generation 1 is the
-    /// clean-install default; a replacement must declare its exact successor.
-    #[arg(long)]
-    c3_development_generation: Option<u64>,
-
-    /// Development-only fixed network ID as 32 hexadecimal characters.
-    #[arg(long)]
-    c3_development_network_id: Option<String>,
-
-    /// Three to sixteen ordered `node-id=IPv4:port` cluster entries.
-    #[arg(long, value_delimiter = ',')]
-    c3_development_peer_endpoints: Option<Vec<String>>,
-
-    /// File containing exactly two P-256 reviewer public keys, one hex key
-    /// per line. Private reviewer keys never enter the host configuration.
-    #[arg(long)]
-    c3_development_reviewer_keys_file: Option<String>,
-
-    /// Optional development supplier identity as 32 hexadecimal characters.
-    /// It is accepted only together with its Ed25519 public key.
-    #[arg(long)]
-    c3_development_component_supplier_id: Option<String>,
-
-    /// Optional development supplier Ed25519 public key as 64 hexadecimal
-    /// characters. Private supplier material remains outside the node.
-    #[arg(long)]
-    c3_development_component_supplier_public_key: Option<String>,
-
-    /// Development-only fault: change this node's post-WASM receipt vector.
-    /// This can only deny progress and is accepted only with the complete C3
-    /// development-cluster profile.
-    #[arg(long)]
-    c3_development_inject_divergent_receipt: bool,
 }
 
 fn spawn_control_ecall(enclave_id: u64, config_bytes: Vec<u8>) -> Result<thread::JoinHandle<i32>> {
@@ -574,118 +525,7 @@ fn main() -> Result<()> {
         anyhow::bail!("--oidc-issuer is required when --oidc-audience is set");
     }
 
-    if let Some(work_units) = cli.s1_2_synthetic_work_units {
-        config["s1_2_synthetic_work_units"] = serde_json::Value::from(work_units);
-    }
-    if cli.s2_0_private_fixture {
-        config["s2_0_private_fixture"] = serde_json::Value::Bool(true);
-    }
-
-    let c3_arguments = [
-        cli.c3_development_node_id.is_some(),
-        cli.c3_development_network_id.is_some(),
-        cli.c3_development_peer_endpoints.is_some(),
-        cli.c3_development_reviewer_keys_file.is_some(),
-    ];
-    if c3_arguments.iter().any(|present| *present) && !c3_arguments.iter().all(|present| *present) {
-        anyhow::bail!("all C3 development-cluster arguments are required together");
-    }
-    if cli.c3_development_inject_divergent_receipt && !c3_arguments.iter().all(|present| *present) {
-        anyhow::bail!("C3 divergent-receipt injection requires the complete development profile");
-    }
-    if cli.c3_development_generation.is_some() && !c3_arguments.iter().all(|present| *present) {
-        anyhow::bail!("C3 generation requires the complete development profile");
-    }
-    if cli.c3_development_component_supplier_id.is_some()
-        != cli.c3_development_component_supplier_public_key.is_some()
-    {
-        anyhow::bail!("component supplier ID and public key must be configured together");
-    }
-    if cli.c3_development_component_supplier_id.is_some()
-        && !c3_arguments.iter().all(|present| *present)
-    {
-        anyhow::bail!("component supplier configuration requires the complete C3 profile");
-    }
-    if let Some(node_id) = cli.c3_development_node_id {
-        let generation = cli.c3_development_generation.unwrap_or(1);
-        if generation == 0 {
-            anyhow::bail!("--c3-development-generation must be nonzero");
-        }
-        let network_id = cli.c3_development_network_id.as_deref().unwrap_or_default();
-        if network_id.len() != 32 || !network_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            anyhow::bail!("--c3-development-network-id must contain 32 hexadecimal characters");
-        }
-        let endpoints = cli
-            .c3_development_peer_endpoints
-            .as_ref()
-            .expect("all C3 arguments checked");
-        validate_c3_development_endpoints(node_id, endpoints).map_err(anyhow::Error::msg)?;
-        let reviewer_path = cli
-            .c3_development_reviewer_keys_file
-            .as_deref()
-            .expect("all C3 arguments checked");
-        let reviewer_keys: Vec<String> = std::fs::read_to_string(reviewer_path)
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "Failed to read reviewer key file '{}': {}",
-                    reviewer_path,
-                    error
-                )
-            })?
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(str::to_owned)
-            .collect();
-        if reviewer_keys.len() != 2
-            || reviewer_keys
-                .iter()
-                .any(|key| key.len() != 130 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        {
-            anyhow::bail!("reviewer key file must contain exactly two 130-character hex keys");
-        }
-        let supplier_id = cli
-            .c3_development_component_supplier_id
-            .as_deref()
-            .map(|value| {
-                if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                    anyhow::bail!(
-                        "--c3-development-component-supplier-id must contain 32 hexadecimal characters"
-                    );
-                }
-                Ok(value)
-            })
-            .transpose()?;
-        let supplier_public_key = cli
-            .c3_development_component_supplier_public_key
-            .as_deref()
-            .map(|value| {
-                if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                    anyhow::bail!(
-                        "--c3-development-component-supplier-public-key must contain 64 hexadecimal characters"
-                    );
-                }
-                Ok(value)
-            })
-            .transpose()?;
-        let mut development = serde_json::json!({
-            "node_id": node_id,
-            "generation": generation,
-            "network_id": network_id,
-            "peer_endpoints": endpoints,
-            "reviewer_public_keys": reviewer_keys,
-            "inject_divergent_receipt": cli.c3_development_inject_divergent_receipt,
-        });
-        if let (Some(supplier_id), Some(supplier_public_key)) = (supplier_id, supplier_public_key) {
-            development["component_supplier_id"] =
-                serde_json::Value::String(supplier_id.to_string());
-            development["component_supplier_public_key"] =
-                serde_json::Value::String(supplier_public_key.to_string());
-        }
-        config["c3_development"] = development;
-    }
-
-    // Merge --extra JSON object into the enclave config (raft_*, ...).
+    // Merge --extra JSON object into the enclave config.
     if let Some(ref extra) = cli.extra {
         match serde_json::from_str::<serde_json::Value>(extra) {
             Ok(serde_json::Value::Object(map)) => {
