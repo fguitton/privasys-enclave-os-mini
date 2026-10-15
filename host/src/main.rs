@@ -183,10 +183,6 @@ struct Cli {
     #[arg(long)]
     s2_0_private_fixture: bool,
 
-    /// Test-only literal IP:port for the incremental appraised peer probe.
-    #[arg(long)]
-    s1_peer_probe_endpoint: Option<String>,
-
     /// Development-only physical-cluster node ID (1..=cluster cardinality).
     #[arg(long)]
     c3_development_node_id: Option<u64>,
@@ -583,9 +579,6 @@ fn main() -> Result<()> {
     }
     if cli.s2_0_private_fixture {
         config["s2_0_private_fixture"] = serde_json::Value::Bool(true);
-    }
-    if let Some(endpoint) = cli.s1_peer_probe_endpoint {
-        config["s1_peer_probe_endpoint"] = serde_json::Value::String(endpoint);
     }
 
     let c3_arguments = [

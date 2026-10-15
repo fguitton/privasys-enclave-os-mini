@@ -1,8 +1,8 @@
 # Repository instructions
 
-## Pre-MVP: one current implementation, no backward compatibility
+## Development policy: one current implementation, no backward compatibility
 
-- Until MVP is explicitly declared, maintain one current representation and one
+- Maintain one current representation and one
   accepted format for each conceptual object, protocol and execution profile.
   A successor replaces its predecessor; it does not add another supported level.
 - Remove superseded objects, implementations, decoders, wire branches, profile
