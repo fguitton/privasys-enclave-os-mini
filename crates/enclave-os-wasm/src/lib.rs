@@ -92,13 +92,13 @@ use enclave_os_common::types::AEAD_KEY_SIZE;
 use ring::digest;
 
 use crate::metrics::WasmMetricsStore;
-use crate::protocol::{
-    AppPermissions, FunctionPolicy, Payer, WasmCall, WasmEnvelope, WasmManagementResult, WasmParam,
-    WasmResult, WasmSchemaRequest,
-};
 #[cfg(feature = "app-auth")]
 use crate::protocol::{AppRolesAction, AppRolesResult, UserRoles};
-use crate::registry::AppRegistry;
+use crate::protocol::{
+    FunctionPolicy, Payer, WasmCall, WasmEnvelope, WasmManagementResult, WasmParam, WasmResult,
+    WasmSchemaRequest,
+};
+use crate::registry::{AppLoad, AppRegistry};
 
 // ---------------------------------------------------------------------------
 //  OID for WASM apps combined code hash — imported from common
@@ -229,45 +229,16 @@ impl WasmModule {
     /// enforced on `wasm_call` using the app developer's own OIDC
     /// provider. The SHA-256 hash of the configuration is included
     /// in the per-app RA-TLS certificate as OID 3.5.
-    pub fn load_app(
-        &self,
-        name: &str,
-        hostname: &str,
-        wasm_bytes: &[u8],
-        encryption_key: Option<[u8; AEAD_KEY_SIZE]>,
-        permissions: Option<AppPermissions>,
-        max_fuel: u64,
-        mcp_enabled: bool,
-        docs: Option<std::collections::BTreeMap<String, String>>,
-        config_api_function: Option<String>,
-        owners: Vec<String>,
-        app_id: Option<[u8; 16]>,
-        vault: Option<crate::registry::VaultBacking>,
-        dependencies: Option<Vec<u8>>,
-        txn_replay: bool,
-    ) -> Result<(), String> {
+    pub fn load_app(&self, load: AppLoad<'_>) -> Result<(), String> {
+        let name = load.name;
+        let wasm_bytes = load.wasm_bytes;
         // Load into the registry (compile + introspect + per-app key)
         let meta = {
             let mut reg = self
                 .registry
                 .lock()
                 .map_err(|_| String::from("registry lock poisoned"))?;
-            reg.load_app(
-                name,
-                hostname,
-                wasm_bytes,
-                encryption_key,
-                permissions,
-                max_fuel,
-                mcp_enabled,
-                docs,
-                config_api_function,
-                owners,
-                app_id,
-                vault,
-                dependencies,
-                txn_replay,
-            )?
+            reg.load_app(load)?
         };
 
         // ── Persist to KV store ────────────────────────────────────
@@ -690,20 +661,9 @@ impl WasmModule {
         // equally privileged). The freeze gate decides WHICH function
         // runs while frozen; this decides WHO may call it.
         if registry.config_api_function(&call.app) == Some(call.function.as_str()) {
-            let owners = registry.app_owners(&call.app);
             let app_id = registry.app_id(&call.app);
-            let permissions = registry.app_permissions(&call.app).cloned();
-            let role_store = build_app_role_store(&registry, &call.app);
             drop(registry);
-            return self
-                .check_configure_authz(
-                    call,
-                    owners,
-                    app_id,
-                    permissions.as_ref(),
-                    role_store.as_ref(),
-                )
-                .map(Some);
+            return Self::check_configure_authz(call, app_id).map(Some);
         }
 
         let permissions = match registry.app_permissions(&call.app) {
@@ -938,124 +898,62 @@ impl WasmModule {
         Ok(Some(auth)) // Permitted with auth context.
     }
 
-    /// Authorize a call to the app's `@config-api` function — the
-    /// configure-authz standard.
-    ///
-    /// Primary: the caller's `app_auth` bearer verifies against the
-    /// PLATFORM issuer and carries the per-app config role
-    /// `<audience>:app:<app-id-hex>:owner|admin` (granted/revoked live by
-    /// the control plane on team changes — no redeploy). Transitional
-    /// fallback: a verified platform `sub` on the owners team. Legacy
-    /// fallback: the pre-standard Owner behaviour (FIDO2/app-OIDC
-    /// verification + owners membership) while clients migrate. Loads
-    /// carrying neither an app id nor an owners team are admitted with a
-    /// log — enforcement becomes possible when the platform redeploys
-    /// them with the new payload. Everything else fails closed.
+    /// Require the platform issuer's per-app owner/admin role on every
+    /// `@config-api` call. Missing app identity or platform authority fails closed.
     fn check_configure_authz(
-        &self,
         call: &WasmCall,
-        owners: Vec<String>,
         app_id: Option<[u8; 16]>,
-        permissions: Option<&AppPermissions>,
-        role_store: Option<&enclave_os_kvstore::SealedKvStore>,
     ) -> Result<AuthResult, Response> {
         let deny =
             |message: String| Response::Data(serialize_or_error(&WasmResult::Error { message }));
-
-        if app_id.is_none() && owners.is_empty() {
+        let id = app_id.ok_or_else(|| {
+            deny(format!(
+                "configure is owner/admin-only: app '{}' has no current app identity",
+                call.app,
+            ))
+        })?;
+        let token = call.app_auth.as_deref().ok_or_else(|| deny(format!(
+            "configure is owner/admin-only: function '{}' on app '{}' requires the caller's platform OIDC bearer in app_auth",
+            call.function, call.app,
+        )))?;
+        let cfg = enclave_os_common::oidc::global_oidc_config()
+            .ok_or_else(|| deny("configure requires platform OIDC configuration".into()))?;
+        let platform = crate::protocol::AppOidcConfig {
+            issuer: cfg.issuer.clone(),
+            jwks_uri: cfg.jwks_uri.clone(),
+            audience: cfg.audience.clone(),
+            roles_claim: cfg.role_claim.clone(),
+        };
+        let (roles, sub) = verify_app_token(token, &platform).map_err(|error| {
+            deny(format!(
+                "configure platform bearer verification failed: {error}"
+            ))
+        })?;
+        if Self::has_configure_role(&id, &cfg.audience, &roles) {
             enclave_os_common::enclave_log_info!(
-                "configure gate: app '{}' has neither app_id nor owners (legacy load) — admitting",
-                call.app
+                "configure gate: app '{}' authorized by config role (sub={})",
+                call.app,
+                sub.as_deref().unwrap_or("?")
             );
             return Ok(AuthResult {
-                roles: Vec::new(),
-                user_id: None,
+                roles,
+                user_id: sub,
             });
         }
-
-        let token = match call.app_auth.as_deref() {
-            Some(t) => t,
-            None => {
-                return Err(deny(format!(
-                    "configure is owner/admin-only: function '{}' on app '{}' requires the caller's platform OIDC bearer in app_auth",
-                    call.function, call.app,
-                )))
-            }
-        };
-
-        // Primary: platform-issuer token + per-app config role.
-        if let Some(cfg) = enclave_os_common::oidc::global_oidc_config() {
-            let platform = crate::protocol::AppOidcConfig {
-                issuer: cfg.issuer.clone(),
-                jwks_uri: cfg.jwks_uri.clone(),
-                audience: cfg.audience.clone(),
-                roles_claim: cfg.role_claim.clone(),
-            };
-            if let Ok((roles, sub)) = verify_app_token(token, &platform) {
-                if let Some(id) = app_id {
-                    let hexid = enclave_os_common::hex::hex_encode(&id);
-                    let owner_role = format!("{}:app:{}:owner", cfg.audience, hexid);
-                    let admin_role = format!("{}:app:{}:admin", cfg.audience, hexid);
-                    if roles.iter().any(|r| r == &owner_role || r == &admin_role) {
-                        enclave_os_common::enclave_log_info!(
-                            "configure gate: app '{}' authorized by config role (sub={})",
-                            call.app,
-                            sub.as_deref().unwrap_or("?")
-                        );
-                        return Ok(AuthResult {
-                            roles,
-                            user_id: sub,
-                        });
-                    }
-                }
-                // Transitional: verified platform sub on the owners team
-                // (token predates the config-role backfill).
-                if let Some(s) = sub.as_deref() {
-                    if owners.iter().any(|o| o == s) {
-                        enclave_os_common::enclave_log_info!(
-                            "configure gate: app '{}' authorized by owners-list fallback (sub={} carries no config role yet — run the config-role backfill)",
-                            call.app,
-                            s
-                        );
-                        return Ok(AuthResult {
-                            roles,
-                            user_id: sub,
-                        });
-                    }
-                }
-                // A VERIFIED platform token without authority is a hard
-                // deny — re-checking it as an app token cannot add
-                // platform authority.
-                return Err(deny(format!(
-                    "configure is owner/admin-only: caller is not an owner/admin of app '{}'",
-                    call.app,
-                )));
-            }
-            // Not a platform token — fall through to the pre-standard path.
-        }
-
-        // Pre-standard fallback: FIDO2 / app-OIDC verification + owners
-        // membership (the original Owner-policy behaviour), kept while
-        // clients migrate to platform bearers on configure.
-        if let Some(p) = permissions {
-            if !owners.is_empty() {
-                let auth = verify_auth_token(token, p, role_store).map_err(|e| {
-                    deny(format!(
-                        "configure is owner/admin-only: app_auth verification failed: {e}"
-                    ))
-                })?;
-                if let Some(s) = auth.user_id.as_deref() {
-                    if owners.iter().any(|o| o == s) {
-                        return Ok(auth);
-                    }
-                }
-            }
-        }
         Err(deny(format!(
-            "configure is owner/admin-only: caller is not an owner/admin of app '{}' (team has {} member(s))",
+            "configure is owner/admin-only: caller is not an owner/admin of app '{}'",
             call.app,
-            owners.len(),
         )))
+    }
+
+    // This predicate is used only after platform bearer verification above.
+    fn has_configure_role(id: &[u8; 16], audience: &str, roles: &[String]) -> bool {
+        let hexid = enclave_os_common::hex::hex_encode(id);
+        let owner_role = format!("{audience}:app:{hexid}:owner");
+        let admin_role = format!("{audience}:app:{hexid}:admin");
+        roles
+            .iter()
+            .any(|role| role == &owner_role || role == &admin_role)
     }
 
     /// Enforce per-app permission policy on a `wasm_schema` request.
@@ -1071,9 +969,9 @@ impl WasmModule {
     ///   - `role` → require a valid token with at least one of `schema_roles`.
     fn check_schema_permissions(&self, req: &WasmSchemaRequest) -> Option<Response> {
         let registry = self.registry.lock().ok()?;
-        let permissions = match registry.app_permissions(&req.app) {
-            Some(p) => p.clone(),
-            None => return None, // No permissions → schema is public.
+        let permissions = {
+            let p = registry.app_permissions(&req.app)?;
+            p.clone()
         };
         let role_store = build_app_role_store(&registry, &req.app);
         drop(registry);
@@ -1139,11 +1037,11 @@ impl WasmModule {
         #[cfg(not(feature = "app-auth"))]
         {
             let _ = req;
-            return WasmManagementResult::Error {
+            WasmManagementResult::Error {
                 message: String::from(
                     "role management requires the enclave to be built with app-auth support",
                 ),
-            };
+            }
         }
 
         #[cfg(feature = "app-auth")]
@@ -1610,11 +1508,7 @@ impl EnclaveModule for WasmModule {
         registry
             .all_code_hashes()
             .iter()
-            .filter_map(|(name, _)| {
-                registry
-                    .get_known(name)
-                    .map(|meta| build_app_identity(meta))
-            })
+            .filter_map(|(name, _)| registry.get_known(name).map(build_app_identity))
             .collect()
     }
 
@@ -1818,22 +1712,22 @@ impl EnclaveModule for WasmModule {
                 }
             };
 
-            let mgmt_result = match self.load_app(
-                &load.name,
-                &hostname,
-                &load.bytes,
+            let mgmt_result = match self.load_app(AppLoad {
+                name: &load.name,
+                hostname: &hostname,
+                wasm_bytes: &load.bytes,
                 encryption_key,
-                load.permissions,
+                permissions: load.permissions,
                 max_fuel,
                 mcp_enabled,
-                load.docs,
-                load.config_api.map(|c| c.function),
-                load.owners,
+                docs: load.docs,
+                config_api_function: load.config_api.map(|c| c.function),
+                owners: load.owners,
                 app_id,
                 vault,
                 dependencies,
-                load.txn_replay,
-            ) {
+                txn_replay: load.txn_replay,
+            }) {
                 Ok(()) => {
                     // Return the loaded app's info
                     let apps = self.list_apps();
@@ -1913,6 +1807,15 @@ impl EnclaveModule for WasmModule {
             // the new KEK is created there instead of the sealed selection.
             let new_cfg = match rot.new_vault_endpoints.as_ref() {
                 Some(eps) => {
+                    let Some(acceptable_tcb_statuses) =
+                        rot.new_vault_acceptable_tcb_statuses.clone()
+                    else {
+                        return Some(Response::Data(serialize_or_error(
+                            &WasmManagementResult::Error {
+                                message: "rotation requires an explicit vault TCB policy".into(),
+                            },
+                        )));
+                    };
                     match crate::vaultkey::VaultConfig::from_parts(
                         eps.clone(),
                         rot.new_vault_mrenclave.as_deref().unwrap_or(""),
@@ -1920,9 +1823,7 @@ impl EnclaveModule for WasmModule {
                         rot.new_vault_ca_roots.as_deref().unwrap_or(&[]),
                         rot.new_vault_threshold.unwrap_or(0),
                         rot.new_vault_oidc_issuer.as_deref().unwrap_or(""),
-                        rot.new_vault_acceptable_tcb_statuses
-                            .clone()
-                            .unwrap_or_default(),
+                        acceptable_tcb_statuses,
                     ) {
                         Ok(c) => Some(c),
                         Err(e) => {
@@ -2228,7 +2129,7 @@ fn parse_app_id(s: Option<&str>) -> Option<[u8; 16]> {
 fn parse_dependencies(b64: Option<&str>) -> Result<Option<Vec<u8>>, String> {
     match b64 {
         None => Ok(None),
-        Some(s) if s.is_empty() => Ok(None),
+        Some("") => Ok(None),
         Some(s) => {
             use base64::{engine::general_purpose::STANDARD, Engine};
             let raw = STANDARD
@@ -2822,5 +2723,45 @@ fn collect_role_strings(val: &serde_json::Value, out: &mut Vec<String>) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod configure_tests {
+    use super::*;
+
+    #[test]
+    fn configure_refuses_missing_identity_and_predecessor_authority() {
+        let id = [1; 16];
+        let hexid = enclave_os_common::hex::hex_encode(&id);
+        for role in ["owner", "admin"] {
+            let roles = vec![format!("platform:app:{hexid}:{role}")];
+            assert!(WasmModule::has_configure_role(&id, "platform", &roles));
+            assert!(!WasmModule::has_configure_role(
+                &[2; 16], "platform", &roles
+            ));
+            assert!(!WasmModule::has_configure_role(
+                &id,
+                "another-platform",
+                &roles
+            ));
+        }
+        assert!(!WasmModule::has_configure_role(
+            &id,
+            "platform",
+            &["owner".into()]
+        ));
+        let mut call = WasmCall {
+            app: "app.test".into(),
+            function: "configure".into(),
+            params: vec![],
+            app_auth: None,
+            billing_approved: None,
+        };
+        assert!(WasmModule::check_configure_authz(&call, None).is_err());
+        assert!(WasmModule::check_configure_authz(&call, Some([1; 16])).is_err());
+        call.app_auth = Some("pre-standard-owner-token".into());
+        assert!(WasmModule::check_configure_authz(&call, None).is_err());
+        assert!(WasmModule::check_configure_authz(&call, Some([1; 16])).is_err());
     }
 }

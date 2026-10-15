@@ -203,7 +203,7 @@ pub struct RequestContext {
 
     /// Verified OIDC claims extracted from the `"auth"` field in the
     /// JSON envelope.  `None` when no bearer token was provided (e.g.
-    /// healthz, or RA-TLS-only vault GetSecret).
+    /// healthz, or RA-TLS-only vault ExportKey).
     pub oidc_claims: Option<crate::oidc::OidcClaims>,
 }
 

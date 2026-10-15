@@ -48,19 +48,17 @@ impl PaidHttpRequest {
         }
     }
     /// The returned header owns its metadata credit through Slot and Work.
-    /// Both selectors and strict validation still use their original parsers.
+    /// Selection and validation share the current strict framing parser.
     pub(super) fn parse_head(
         bytes: &[u8],
         pool: Option<&Arc<AllocationPoolV1>>,
-        strict: bool,
     ) -> Result<Option<(Self, usize, usize)>, &'static str> {
-        // Preserve the original peek's incomplete result for overlong headers.
         if bytes
             .windows(4)
             .position(|w| w == b"\r\n\r\n")
             .is_none_or(|end| end + 4 > protocol::MAX_REQUEST_HEAD_BYTES)
         {
-            return if strict && bytes.len() > protocol::MAX_REQUEST_HEAD_BYTES {
+            return if bytes.len() > protocol::MAX_REQUEST_HEAD_BYTES {
                 Err("malformed streaming HTTP header")
             } else {
                 Ok(None)
@@ -75,11 +73,7 @@ impl PaidHttpRequest {
             ),
             None => None,
         };
-        let parsed = if strict {
-            protocol::parse_http_stream_request_head(bytes)
-        } else {
-            protocol::peek_http_stream_request_head(bytes)
-        };
+        let parsed = protocol::parse_http_stream_request_head(bytes);
         match parsed {
             Ok((request, head, length)) => {
                 if let Some(credit) = &allocation {

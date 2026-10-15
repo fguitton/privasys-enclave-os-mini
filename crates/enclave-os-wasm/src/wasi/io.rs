@@ -150,7 +150,7 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
             match data {
                 Ok(bytes) => {
                     let list: Vec<Val> = bytes.into_iter().map(Val::U8).collect();
-                    results[0] = Val::Result(Ok(Some(Box::new(Val::List(list.into())))));
+                    results[0] = Val::Result(Ok(Some(Box::new(Val::List(list)))));
                 }
                 Err("closed") => {
                     results[0] = Val::Result(Err(Some(Box::new(
@@ -182,7 +182,7 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
             match store.data_mut().read_stream(rep, len) {
                 Ok(bytes) => {
                     let list: Vec<Val> = bytes.into_iter().map(Val::U8).collect();
-                    results[0] = Val::Result(Ok(Some(Box::new(Val::List(list.into())))));
+                    results[0] = Val::Result(Ok(Some(Box::new(Val::List(list)))));
                 }
                 Err(_) => {
                     results[0] = Val::Result(Err(Some(Box::new(Val::Variant(

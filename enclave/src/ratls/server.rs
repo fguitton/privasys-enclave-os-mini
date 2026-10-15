@@ -983,7 +983,7 @@ impl IngressServer {
         close: bool,
     ) -> bool {
         if session
-            .queue_http_response(
+            .queue_http_response_owned(
                 response.status,
                 response.content_type,
                 &[],
@@ -991,7 +991,7 @@ impl IngressServer {
                 close,
                 false,
             )
-            .is_err()
+            .is_break()
         {
             self.send_close(conn_id);
             return false;
@@ -1227,14 +1227,16 @@ impl IngressServer {
                 // either a second HTTP body or a whole-response TLS buffer.
                 let send_close = close || result.shutdown;
                 let ct = result.content_type.as_deref().unwrap_or("application/json");
-                if let Err(error) = session.queue_http_response(
-                    result.status,
-                    ct,
-                    &result.extra_headers,
-                    result.body,
-                    send_close,
-                    result.shutdown,
-                ) {
+                if let std::ops::ControlFlow::Break((error, _body)) = session
+                    .queue_http_response_owned(
+                        result.status,
+                        ct,
+                        &result.extra_headers,
+                        result.body,
+                        send_close,
+                        result.shutdown,
+                    )
+                {
                     enclave_log_error!("queue response failed conn_id={}: {}", conn_id, error);
                     self.send_close(conn_id);
                     return false;
@@ -1325,7 +1327,7 @@ impl IngressServer {
         };
 
         // Capture the exact static leaf and routing identity for this session.
-        let mut session = RaTlsSession::new_paid(
+        let mut session = RaTlsSession::new(
             server_conn,
             tls_result.local_cert_der,
             hello.sni,
@@ -3124,7 +3126,7 @@ impl IngressServer {
                 } else {
                     "challenge"
                 });
-                session.set_local_evidence_paid(evidence);
+                session.set_local_evidence(evidence);
                 let mut response_context = None;
                 // A caller whose client certificate claims a fleet identity (the
                 // workload app-id extension) must prove it: a mutual leg, and the
@@ -3295,7 +3297,7 @@ impl IngressServer {
                 ) else {
                     return HttpHandleResult::err(503, "evidence storage unavailable");
                 };
-                session.set_peer_evidence_paid(evidence);
+                session.set_peer_evidence(evidence);
                 HttpHandleResult {
                     status: 204,
                     body: Vec::new().into(),

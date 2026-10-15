@@ -386,11 +386,11 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
                     let at_end = end >= buf.len();
 
                     // result<tuple<list<u8>, bool>, error-code>
-                    let list_val =
-                        Val::List(data.into_iter().map(Val::U8).collect::<Vec<_>>().into());
-                    results[0] = Val::Result(Ok(Some(Box::new(Val::Tuple(
-                        vec![list_val, Val::Bool(at_end)].into(),
-                    )))));
+                    let list_val = Val::List(data.into_iter().map(Val::U8).collect::<Vec<_>>());
+                    results[0] = Val::Result(Ok(Some(Box::new(Val::Tuple(vec![
+                        list_val,
+                        Val::Bool(at_end),
+                    ])))));
                 }
                 _ => {
                     results[0] = fs_error("bad-descriptor");
@@ -492,13 +492,10 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
             match entry {
                 Some((name, is_dir)) => {
                     let dtype = if is_dir { "directory" } else { "regular-file" };
-                    let record = Val::Record(
-                        vec![
-                            ("type".into(), Val::Enum(dtype.to_string())),
-                            ("name".into(), Val::String(name.into())),
-                        ]
-                        .into(),
-                    );
+                    let record = Val::Record(vec![
+                        ("type".into(), Val::Enum(dtype.to_string())),
+                        ("name".into(), Val::String(name)),
+                    ]);
                     results[0] =
                         Val::Result(Ok(Some(Box::new(Val::Option(Some(Box::new(record)))))));
                 }
@@ -723,12 +720,10 @@ fn add_preopens(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> 
             let any = wasmtime::component::ResourceAny::try_from_resource(res, &mut store)?;
 
             // list<tuple<descriptor, string>>
-            results[0] = Val::List(
-                vec![Val::Tuple(
-                    vec![Val::Resource(any), Val::String("/".into())].into(),
-                )]
-                .into(),
-            );
+            results[0] = Val::List(vec![Val::Tuple(vec![
+                Val::Resource(any),
+                Val::String("/".into()),
+            ])]);
             Ok(())
         },
     )?;
@@ -802,17 +797,14 @@ fn fs_error(name: &str) -> Val {
 
 /// Construct a `descriptor-stat` record.
 fn make_descriptor_stat(dtype: &str, size: u64) -> Val {
-    Val::Record(
-        vec![
-            ("type".into(), Val::Enum(dtype.to_string())),
-            ("link-count".into(), Val::U64(1)),
-            ("size".into(), Val::U64(size)),
-            ("data-access-timestamp".into(), Val::Option(None)),
-            ("data-modification-timestamp".into(), Val::Option(None)),
-            ("status-change-timestamp".into(), Val::Option(None)),
-        ]
-        .into(),
-    )
+    Val::Record(vec![
+        ("type".into(), Val::Enum(dtype.to_string())),
+        ("link-count".into(), Val::U64(1)),
+        ("size".into(), Val::U64(size)),
+        ("data-access-timestamp".into(), Val::Option(None)),
+        ("data-modification-timestamp".into(), Val::Option(None)),
+        ("status-change-timestamp".into(), Val::Option(None)),
+    ])
 }
 
 /// Extract `open-flags` from a Val.

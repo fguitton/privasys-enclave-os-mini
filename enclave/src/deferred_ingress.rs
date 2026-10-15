@@ -25,10 +25,6 @@ pub type HonestDeferredIngressEligible = fn(&HttpRequest, &RequestContext) -> bo
 /// Original wire/body storage remains separately bounded by the HTTP parser.
 pub type HonestDeferredIngressMetadata = fn(&HttpRequest, &RequestContext) -> Option<usize>;
 
-pub(crate) fn legacy_metadata(request: &HttpRequest, _: &RequestContext) -> Option<usize> {
-    Some(request.body.len())
-}
-
 pub(crate) fn metadata_fits(bytes: Option<usize>) -> bool {
     bytes.is_some_and(|bytes| bytes <= MAX_DEFERRED_INGRESS_REQUEST_BYTES)
 }
@@ -154,8 +150,8 @@ pub(crate) fn check_pending_for_native() {
     assert!(metadata_fits(Some(4096)));
     assert!(!metadata_fits(Some(4097)));
     assert!(!metadata_fits(None));
-    // Legacy admission retains its original wire bound; compact metadata can
-    // fit even when the independently bounded original request is 4220 bytes.
+    // Compact metadata must fit even when the independently bounded original
+    // request is 4220 bytes.
     assert!(!metadata_fits(Some(4220)));
 
     let bytes = core::alloc::Layout::array::<(u32, PendingSession)>(MAX_DEFERRED_INGRESS_REQUESTS)

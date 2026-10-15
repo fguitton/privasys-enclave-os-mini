@@ -62,26 +62,9 @@ mod http_request;
 #[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
 #[path = "leaf_key.rs"]
 pub(crate) mod leaf_key;
-#[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
 #[path = "retained_evidence.rs"]
 pub(crate) mod retained_evidence;
 
-// Public legacy setters keep their original value API; target producers use
-// the opaque paid variant and never fall back when admission is refused.
-enum SessionEvidence {
-    Legacy(enclave_os_common::modules::PeerEvidence),
-    #[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
-    Paid(retained_evidence::RetainedEvidence),
-}
-impl SessionEvidence {
-    fn evidence(&self) -> &enclave_os_common::modules::PeerEvidence {
-        match self {
-            Self::Legacy(value) => value,
-            #[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
-            Self::Paid(value) => value.evidence(),
-        }
-    }
-}
 #[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
 #[path = "attest_response.rs"]
 pub(crate) mod attest_response;
@@ -95,7 +78,6 @@ pub(crate) mod pending_client;
 #[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
 #[path = "quote_time.rs"]
 pub(crate) mod quote_time;
-#[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
 #[path = "retained_certificate.rs"]
 pub(crate) mod retained_certificate;
 #[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
@@ -152,7 +134,7 @@ pub struct RaTlsSession {
     stream_allocation: Option<StreamAllocation>,
     response: Option<PendingResponse>,
     /// Exact v2 leaf served on this connection (evidence is exchanged separately).
-    local_cert_der: LocalCertificate,
+    local_cert_der: retained_certificate::RetainedCertificate,
     /// SNI and endpoint identity selected with the served leaf.
     server_name: Option<String>,
     attested_endpoint: Option<enclave_os_common::modules::AttestedEndpointIdentity>,
@@ -164,8 +146,8 @@ pub struct RaTlsSession {
     client_context: Option<[u8; 32]>,
     channel_binder_cache: std::sync::OnceLock<[u8; RaTlsSession::CHANNEL_BINDER_BYTES]>,
     /// The peer's evidence accepted at present time (binding verified).
-    peer_evidence: Option<SessionEvidence>,
-    local_evidence: Option<SessionEvidence>,
+    peer_evidence: Option<retained_evidence::RetainedEvidence>,
+    local_evidence: Option<retained_evidence::RetainedEvidence>,
     attestation_failed: bool,
     configuration: ConfigurationLease,
     /// FIDO2 identity, set after a successful FIDO2 ceremony on this
@@ -272,65 +254,11 @@ pub struct FidoIdentity {
 // is Send. Ready for future multi-threaded worker dispatch.
 unsafe impl Send for RaTlsSession {}
 
-// Public legacy callers retain their original owned Vec contract. Production
-// cache/session construction uses Paid and never selects Legacy on refusal.
-enum LocalCertificate {
-    Legacy(Vec<u8>),
-    #[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
-    Paid(retained_certificate::RetainedCertificate),
-}
-impl LocalCertificate {
-    fn bytes(&self) -> &[u8] {
-        match self {
-            Self::Legacy(bytes) => bytes,
-            #[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
-            Self::Paid(bytes) => bytes.bytes(),
-        }
-    }
-}
-
 impl RaTlsSession {
-    /// Create a session from a `ServerConnection`.
-    ///
-    /// The caller (IngressServer) is responsible for creating the
-    /// ServerConnection from the Acceptor flow.
-    ///
-    pub fn new(
-        tls_conn: rustls::ServerConnection,
-        local_cert_der: Vec<u8>,
-        server_name: Option<String>,
-        attested_endpoint: Option<enclave_os_common::modules::AttestedEndpointIdentity>,
-        configuration: ConfigurationLease,
-    ) -> Self {
-        Self::with_certificate(
-            tls_conn,
-            LocalCertificate::Legacy(local_cert_der),
-            server_name,
-            attested_endpoint,
-            configuration,
-        )
-    }
-
-    #[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
-    pub(crate) fn new_paid(
+    /// Create a session retaining its admitted certificate owner.
+    pub(crate) fn new(
         tls_conn: rustls::ServerConnection,
         local_cert_der: retained_certificate::RetainedCertificate,
-        server_name: Option<String>,
-        attested_endpoint: Option<enclave_os_common::modules::AttestedEndpointIdentity>,
-        configuration: ConfigurationLease,
-    ) -> Self {
-        Self::with_certificate(
-            tls_conn,
-            LocalCertificate::Paid(local_cert_der),
-            server_name,
-            attested_endpoint,
-            configuration,
-        )
-    }
-
-    fn with_certificate(
-        tls_conn: rustls::ServerConnection,
-        local_cert_der: LocalCertificate,
         server_name: Option<String>,
         attested_endpoint: Option<enclave_os_common::modules::AttestedEndpointIdentity>,
         configuration: ConfigurationLease,
@@ -473,7 +401,7 @@ impl RaTlsSession {
         let pool = Some(crate::local_allocation_pool().ok_or("SDK heap unavailable")?);
         #[cfg(not(any(target_env = "sgx", target_vendor = "teaclave")))]
         let pool = None;
-        PaidHttpRequest::parse_head(&self.read_buf[self.read_offset..], pool.as_ref(), false)
+        PaidHttpRequest::parse_head(&self.read_buf[self.read_offset..], pool.as_ref())
     }
     pub(crate) fn validate_stream_head(&self) -> bool {
         #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
@@ -485,7 +413,7 @@ impl RaTlsSession {
         #[cfg(not(any(target_env = "sgx", target_vendor = "teaclave")))]
         let pool = None;
         matches!(
-            PaidHttpRequest::parse_head(&self.read_buf[self.read_offset..], pool.as_ref(), true),
+            PaidHttpRequest::parse_head(&self.read_buf[self.read_offset..], pool.as_ref()),
             Ok(Some(_))
         )
     }
@@ -612,7 +540,7 @@ impl RaTlsSession {
         let Some((mut buffer, offset)) = chunks.pop_front() else {
             return Ok(());
         };
-        // Compact once, at the stream-to-legacy boundary, reusing the inherited
+        // Compact once, at the stream-to-contiguous boundary, reusing the inherited
         // allocation rather than holding two potentially32MiB buffers.
         buffer.drain(..offset);
         let total = buffer.len() + chunks.iter().map(|(b, o)| b.len() - o).sum::<usize>();
@@ -707,28 +635,6 @@ impl RaTlsSession {
 
     pub fn has_pending_response(&self) -> bool {
         self.response.is_some()
-    }
-
-    pub fn queue_http_response(
-        &mut self,
-        status: u16,
-        content_type: &str,
-        extra_headers: &[(String, String)],
-        body: impl Into<crate::HttpResponsePayload>,
-        close: bool,
-        shutdown: bool,
-    ) -> Result<(), &'static str> {
-        match self.queue_http_response_owned(
-            status,
-            content_type,
-            extra_headers,
-            body,
-            close,
-            shutdown,
-        ) {
-            std::ops::ControlFlow::Continue(()) => Ok(()),
-            std::ops::ControlFlow::Break((error, _body)) => Err(error),
-        }
     }
 
     /// Keep an unconsumed body available for its owner to drop outside STATE.
@@ -1168,21 +1074,19 @@ impl RaTlsSession {
 
     pub fn local_evidence(&self) -> Option<&enclave_os_common::modules::PeerEvidence> {
         self.configuration.is_current().then_some(())?;
-        self.local_evidence.as_ref().map(SessionEvidence::evidence)
+        self.local_evidence
+            .as_ref()
+            .map(retained_evidence::RetainedEvidence::evidence)
     }
 
-    pub fn set_local_evidence(&mut self, evidence: enclave_os_common::modules::PeerEvidence) {
-        self.local_evidence = Some(SessionEvidence::Legacy(evidence));
+    pub(crate) fn set_local_evidence(&mut self, value: retained_evidence::RetainedEvidence) {
+        self.local_evidence = Some(value);
     }
 
-    #[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
-    pub(crate) fn set_local_evidence_paid(&mut self, value: retained_evidence::RetainedEvidence) {
-        self.local_evidence = Some(SessionEvidence::Paid(value));
-    }
-
-    #[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
-    pub(crate) fn set_peer_evidence_paid(&mut self, value: retained_evidence::RetainedEvidence) {
-        self.peer_evidence = Some(SessionEvidence::Paid(value));
+    /// Retain evidence whose key/exporter binding was checked. Its quote
+    /// signature and admission policy still require application appraisal.
+    pub(crate) fn set_peer_evidence(&mut self, value: retained_evidence::RetainedEvidence) {
+        self.peer_evidence = Some(value);
     }
 
     /// Requested child allocation lengths of the actual fresh_context copies.
@@ -1305,13 +1209,9 @@ impl RaTlsSession {
     /// The peer's evidence accepted at present time, if any.
     pub fn peer_evidence(&self) -> Option<&enclave_os_common::modules::PeerEvidence> {
         self.configuration.is_current().then_some(())?;
-        self.peer_evidence.as_ref().map(SessionEvidence::evidence)
-    }
-
-    /// Retain evidence whose key/exporter binding was checked. Its quote
-    /// signature and admission policy still require application appraisal.
-    pub fn set_peer_evidence(&mut self, ev: enclave_os_common::modules::PeerEvidence) {
-        self.peer_evidence = Some(SessionEvidence::Legacy(ev));
+        self.peer_evidence
+            .as_ref()
+            .map(retained_evidence::RetainedEvidence::evidence)
     }
 
     /// Existing exporter protocol width, shared by its allocation consumers.

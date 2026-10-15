@@ -151,13 +151,10 @@ fn add_wall_clock(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error
                 None => (get_time_secs(), 0),
             };
             // Return a record { seconds, nanoseconds } — flattened as two vals.
-            results[0] = Val::Record(
-                vec![
-                    ("seconds".into(), Val::U64(secs)),
-                    ("nanoseconds".into(), Val::U32(nanos)),
-                ]
-                .into(),
-            );
+            results[0] = Val::Record(vec![
+                ("seconds".into(), Val::U64(secs)),
+                ("nanoseconds".into(), Val::U32(nanos)),
+            ]);
             Ok(())
         },
     )?;
@@ -170,13 +167,10 @@ fn add_wall_clock(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error
          _params: &[wasmtime::component::Val],
          results: &mut [wasmtime::component::Val]| {
             use wasmtime::component::Val;
-            results[0] = Val::Record(
-                vec![
-                    ("seconds".into(), Val::U64(1)),
-                    ("nanoseconds".into(), Val::U32(0)),
-                ]
-                .into(),
-            );
+            results[0] = Val::Record(vec![
+                ("seconds".into(), Val::U64(1)),
+                ("nanoseconds".into(), Val::U32(0)),
+            ]);
             Ok(())
         },
     )?;

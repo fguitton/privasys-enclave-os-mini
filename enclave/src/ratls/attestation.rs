@@ -303,8 +303,8 @@ pub fn sgx_quote(report_data: &[u8; 64]) -> Result<Vec<u8>, String> {
     generate_sgx_quote(report_data)
 }
 
-/// Paid quote construction for the live server/cache route. Public legacy
-/// Vec-returning APIs below remain separate; this value grants no authority.
+/// Paid quote construction for the live server/cache route. The client-attestation
+/// provider retains an owned quote; this value grants no authority.
 pub(crate) fn sgx_quote_paid(
     report_data: &[u8; 64],
 ) -> Result<super::session::retained_quote::RetainedQuote, String> {

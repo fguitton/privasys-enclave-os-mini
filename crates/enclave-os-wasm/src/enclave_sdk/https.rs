@@ -153,9 +153,8 @@ fn build_ratls_policy(p: wit::RatlsPolicy) -> Result<RaTlsPolicy, String> {
             })
             .collect(),
         attestation_servers: p.attestation_servers,
-        // TCB acceptance stays legacy (Revoked-only) until apps can carry an
-        // acceptable-TCB set in their sealed metadata.
-        acceptable_tcb_statuses: None,
+        // The current SDK policy enforces the secure TCB floor.
+        acceptable_tcb_statuses: Vec::new(),
         // App egress presents no client certificate (server attestation only).
         client_identity: None,
         // Set by the caller from the app's sealed metadata, not the app request.
@@ -210,14 +209,20 @@ impl wit::Host for AppContext {
             None => client::mozilla_root_store(),
         };
 
-        let r = client::https_fetch(
+        let r = client::BoundedHttpsRequest::new(
             method_str,
             &req.url,
-            &req.headers,
-            req.body.as_deref(),
-            root_store,
-            ratls_policy.as_ref(),
-        )?;
+            req.headers.to_vec(),
+            (req.body.as_deref()).map(<[u8]>::to_vec),
+        )
+        .and_then(|request| {
+            client::https_fetch_interruptible(
+                &mut client::GlobalOcallNetIo,
+                &request,
+                root_store,
+                ratls_policy.as_ref(),
+            )
+        })?;
 
         // Record billable HTTPS egress (request + response body bytes),
         // split by transport (plain TLS vs RA-TLS).

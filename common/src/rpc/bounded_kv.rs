@@ -82,7 +82,7 @@ impl KvPutBatchBounds {
     }
 }
 
-/// Encode borrowed puts with the exact legacy KvWriteBatch wire format.
+/// Encode borrowed puts with the same current KvWriteBatch wire format.
 /// Aggregate value bytes and complete framed request bytes have separate bounds.
 pub fn encode_kv_put_batch_req_borrowed(
     table: &[u8],

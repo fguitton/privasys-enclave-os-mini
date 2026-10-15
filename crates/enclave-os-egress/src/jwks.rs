@@ -5,7 +5,7 @@
 //!
 //! Lazily fetches JWKS from an OIDC provider's well-known endpoint (or an
 //! explicit `jwks_uri`), caches the keys in memory, and re-fetches when the TTL
-//! expires. Lives here (not in `common`) because it needs `https_fetch`, and
+//! expires. Lives here (not in `common`) because it needs bounded HTTPS egress, and
 //! `egress` depends on `common` rather than the reverse. Both the WASM runtime
 //! and the vault crate verify JWTs through this module.
 
@@ -15,7 +15,9 @@ use std::sync::Mutex;
 
 use enclave_os_common::jwks::{extract_jwt_kid, JwksCache};
 
-use crate::client::{https_fetch, mozilla_root_store};
+use crate::client::{
+    https_fetch_interruptible, mozilla_root_store, BoundedHttpsRequest, GlobalOcallNetIo,
+};
 
 /// Cache TTL — keys are re-fetched after this many seconds.
 const JWKS_CACHE_TTL_SECS: u64 = 3600; // 1 hour
@@ -43,14 +45,15 @@ fn discover_jwks_uri(issuer: &str) -> Result<String, String> {
         "{}/.well-known/openid-configuration",
         issuer.trim_end_matches('/')
     );
-    let resp = https_fetch(
+    let resp = BoundedHttpsRequest::new(
         "GET",
         &url,
-        &[("Accept".into(), "application/json".into())],
+        vec![("Accept".into(), "application/json".into())],
         None,
-        mozilla_root_store(),
-        None,
-    )?;
+    )
+    .and_then(|request| {
+        https_fetch_interruptible(&mut GlobalOcallNetIo, &request, mozilla_root_store(), None)
+    })?;
 
     if resp.status != 200 {
         return Err(format!(
@@ -70,14 +73,15 @@ fn discover_jwks_uri(issuer: &str) -> Result<String, String> {
 
 /// Fetch JWKS JSON from a URI and parse it into a [`JwksCache`].
 fn fetch_jwks(jwks_uri: &str) -> Result<JwksCache, String> {
-    let resp = https_fetch(
+    let resp = BoundedHttpsRequest::new(
         "GET",
         jwks_uri,
-        &[("Accept".into(), "application/json".into())],
+        vec![("Accept".into(), "application/json".into())],
         None,
-        mozilla_root_store(),
-        None,
-    )?;
+    )
+    .and_then(|request| {
+        https_fetch_interruptible(&mut GlobalOcallNetIo, &request, mozilla_root_store(), None)
+    })?;
 
     if resp.status != 200 {
         return Err(format!(

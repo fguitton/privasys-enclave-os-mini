@@ -31,8 +31,9 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 
 use enclave_os_egress::{
-    enclave_attestation_quote, https_fetch, mozilla_root_store, root_store_from_der,
-    ClientCertIdentity, RaTlsPolicy, ReportDataBinding, RootCertStore, TeeType,
+    enclave_attestation_quote, https_fetch_interruptible, mozilla_root_store, root_store_from_der,
+    BoundedHttpsRequest, ClientCertIdentity, GlobalOcallNetIo, RaTlsPolicy, ReportDataBinding,
+    RootCertStore, TeeType,
 };
 
 use enclave_os_common::hex::{hex_decode, hex_encode};
@@ -77,13 +78,8 @@ pub struct VaultConfig {
     /// e.g. `https://privasys.id`). Only needed to re-author on migration.
     #[serde(default)]
     pub oidc_issuer: String,
-    /// Intel TCB statuses accepted (beyond the secure floor) when verifying the
-    /// VAULTS' quotes on this leg — from the constellation's
-    /// `acceptable_tcb_statuses`. Empty (incl. every pre-existing sealed
-    /// selection) = no TCB acceptance check on the dial, matching the
-    /// constellation-unset case; `Revoked` is rejected by the egress gate
-    /// whenever enforcement is on.
-    #[serde(default)]
+    /// Explicit Intel TCB exceptions for vault quotes. Empty means the secure
+    /// floor only; missing and Revoked reports always fail.
     pub acceptable_tcb_statuses: Vec<String>,
 }
 
@@ -162,9 +158,7 @@ struct DirConstellation {
     /// for the enclave-driven path (inc.4); empty on an older directory.
     #[serde(default)]
     ca_roots: Vec<String>,
-    /// Constellation's acceptable Intel TCB statuses (empty on an older
-    /// directory = no enforcement on the dial).
-    #[serde(default)]
+    /// Explicit exceptions beyond the secure TCB floor.
     acceptable_tcb_statuses: Vec<String>,
 }
 
@@ -202,7 +196,10 @@ fn fetch_directory(
         (String::from("X-Attestation-Timestamp"), format!("{ts}")),
         (String::from("X-Attestation-Quote"), quote_b64),
     ];
-    let resp = https_fetch("GET", &dir_url, &headers, None, roots, None)?;
+    let resp =
+        BoundedHttpsRequest::new("GET", &dir_url, headers.to_vec(), None).and_then(|request| {
+            https_fetch_interruptible(&mut GlobalOcallNetIo, &request, roots, None)
+        })?;
     if resp.status < 200 || resp.status >= 300 {
         return Err(format!("directory HTTP {}", resp.status));
     }
@@ -481,7 +478,15 @@ pub fn read_policy_measurements(
             Err(e) => return Err(format!("marshal GetPolicy: {e}")),
         };
         let url = format!("https://{ep}/data");
-        let resp = match https_fetch("POST", &url, &[], Some(&body), &root_store, Some(&policy)) {
+        let resp = match BoundedHttpsRequest::new("POST", &url, Vec::new(), Some(body.to_vec()))
+            .and_then(|request| {
+                https_fetch_interruptible(
+                    &mut GlobalOcallNetIo,
+                    &request,
+                    &root_store,
+                    Some(&policy),
+                )
+            }) {
             Ok(r) => r,
             Err(e) => {
                 last_err = Some(e);
@@ -623,13 +628,8 @@ fn build_ratls_policy(
         report_data: ReportDataBinding::ChallengeResponse { nonce },
         expected_oids: Vec::new(),
         attestation_servers: cfg.attestation_servers.clone(),
-        // Enforce the constellation's acceptable-TCB set on the vault's quote
-        // (empty set = legacy no-check, matching an unset constellation).
-        acceptable_tcb_statuses: if cfg.acceptable_tcb_statuses.is_empty() {
-            None
-        } else {
-            Some(cfg.acceptable_tcb_statuses.clone())
-        },
+        // Empty is the secure floor, not an enforcement opt-out.
+        acceptable_tcb_statuses: cfg.acceptable_tcb_statuses.clone(),
         // Mutual RA-TLS: present this app's identity (OS signer mints the cert).
         client_identity: Some(ClientCertIdentity {
             code_hash: code_hash.to_vec(),
@@ -655,7 +655,11 @@ fn call_vault(
 ) -> Result<Vec<u8>, String> {
     let body = serde_json::to_vec(req).map_err(|e| format!("marshal request: {e}"))?;
     let url = format!("https://{endpoint}/data");
-    let resp = https_fetch("POST", &url, &[], Some(&body), root_store, Some(policy))?;
+    let resp = BoundedHttpsRequest::new("POST", &url, Vec::new(), Some(body.to_vec())).and_then(
+        |request| {
+            https_fetch_interruptible(&mut GlobalOcallNetIo, &request, root_store, Some(policy))
+        },
+    )?;
     if resp.status < 200 || resp.status >= 300 {
         return Err(format!("vault HTTP {}", resp.status));
     }
@@ -736,14 +740,14 @@ fn gf_tables() -> &'static ([u8; 256], [u8; 256]) {
         let mut exp = [0u8; 256];
         let mut log = [0u8; 256];
         let mut val: u16 = 1;
-        for i in 0..255usize {
-            exp[i] = val as u8;
+        for (i, entry) in exp.iter_mut().take(255).enumerate() {
+            *entry = val as u8;
             log[val as usize] = i as u8;
             let mut doubled = val << 1;
             if doubled & 0x100 != 0 {
                 doubled ^= 0x11b;
             }
-            val = doubled ^ val; // val *= 3
+            val ^= doubled; // val *= 3
         }
         exp[255] = exp[0]; // g^255 = g^0 = 1
         (exp, log)
@@ -879,4 +883,41 @@ fn b64url_nopad_encode(data: &[u8]) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod current_policy_tests {
+    use super::*;
+
+    #[test]
+    fn vault_selection_requires_explicit_current_tcb_policy() {
+        let current = serde_json::json!({
+            "mrenclave": "00", "attestation_server": "https://appraiser.test",
+            "acceptable_tcb_statuses": []
+        });
+        assert!(serde_json::from_value::<DirConstellation>(current.clone()).is_ok());
+        let mut old = current;
+        old.as_object_mut()
+            .unwrap()
+            .remove("acceptable_tcb_statuses");
+        assert!(serde_json::from_value::<DirConstellation>(old.clone()).is_err());
+        old["acceptable_tcb_statuses"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<DirConstellation>(old).is_err());
+        let config = VaultConfig {
+            endpoints: vec!["vault.test:443".into()],
+            threshold: 1,
+            mrenclave: [0; 32],
+            attestation_servers: vec!["https://appraiser.test".into()],
+            ca_roots_der: vec![],
+            oidc_issuer: "https://issuer.test".into(),
+            acceptable_tcb_statuses: vec![],
+        };
+        let mut serialized = serde_json::to_value(config).unwrap();
+        assert!(serde_json::from_value::<VaultConfig>(serialized.clone()).is_ok());
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("acceptable_tcb_statuses");
+        assert!(serde_json::from_value::<VaultConfig>(serialized).is_err());
+    }
 }

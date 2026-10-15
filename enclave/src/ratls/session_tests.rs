@@ -21,19 +21,18 @@ fn register(store: &CertStore, name: &str) {
 }
 
 fn pair(store: &CertStore, name: &str) -> (ClientConnection, RaTlsSession) {
-    let (client, session, pool) = pair_with_certificate(store, name, false);
-    assert!(pool.is_none());
+    let (client, session, pool) = pair_with_certificate(store, name);
+    assert!(pool.used() > 0);
     (client, session)
 }
 
 fn pair_with_certificate(
     store: &CertStore,
     name: &str,
-    paid: bool,
 ) -> (
     ClientConnection,
     RaTlsSession,
-    Option<Arc<enclave_os_common::allocation::AllocationPoolV1>>,
+    Arc<enclave_os_common::allocation::AllocationPoolV1>,
 ) {
     let key = rcgen::KeyPair::generate().unwrap();
     let cert = rcgen::CertificateParams::new(vec![name.into()])
@@ -62,27 +61,17 @@ fn pair_with_certificate(
     let (app, lease) = store.snapshot(Some(name)).unwrap();
     let server = ServerConnection::new(Arc::new(server)).unwrap();
     let endpoint = app.and_then(|app| app.attested_endpoint);
-    let (session, pool) = if paid {
-        use super::retained_certificate::RetainedCertificate;
-        use enclave_os_common::allocation::{AllocationPoolV1, SharedAllocationV1};
-        let required = SharedAllocationV1::<Vec<u8>>::required_bytes(cert.len()).unwrap();
-        let short = AllocationPoolV1::new(required - 1).unwrap();
-        assert!(RetainedCertificate::copy_from(&short, &cert).is_none());
-        assert_eq!(short.used(), 0);
-        let pool = AllocationPoolV1::new(required).unwrap();
-        let retained = RetainedCertificate::copy_from(&pool, &cert).unwrap();
-        assert_eq!(retained.bytes(), cert);
-        assert_eq!(pool.used(), required);
-        (
-            RaTlsSession::new_paid(server, retained, Some(name.into()), endpoint, lease),
-            Some(pool),
-        )
-    } else {
-        (
-            RaTlsSession::new(server, cert, Some(name.into()), endpoint, lease),
-            None,
-        )
-    };
+    use super::retained_certificate::RetainedCertificate;
+    use enclave_os_common::allocation::{AllocationPoolV1, SharedAllocationV1};
+    let required = SharedAllocationV1::<Vec<u8>>::required_bytes(cert.len()).unwrap();
+    let short = AllocationPoolV1::new(required - 1).unwrap();
+    assert!(RetainedCertificate::copy_from(&short, &cert).is_none());
+    assert_eq!(short.used(), 0);
+    let pool = AllocationPoolV1::new(required).unwrap();
+    let retained = RetainedCertificate::copy_from(&pool, &cert).unwrap();
+    assert_eq!(retained.bytes(), cert);
+    assert_eq!(pool.used(), required);
+    let session = RaTlsSession::new(server, retained, Some(name.into()), endpoint, lease);
     (
         ClientConnection::new(
             Arc::new(client),
@@ -190,14 +179,21 @@ fn replacement_rejects_buffered_requests_and_re_attestation() {
         b"GET /first HTTP/1.1\r\nHost: a.test\r\n\r\nGET /second HTTP/1.1\r\nHost: a.test\r\n\r\n",
     );
     assert_eq!(session.recv_http_request().unwrap().unwrap().path, "/first");
-    let evidence = PeerEvidence {
-        tee: "sgx".into(),
-        quote: vec![1],
+    use super::retained_evidence::{EvidenceRef, RetainedEvidence};
+    use enclave_os_common::allocation::{AllocationPoolV1, SharedAllocationV1};
+    let evidence = EvidenceRef {
+        tee: "sgx",
+        quote: &[1],
         gpu_evidence: None,
-        quote_time: "2026-09-08T10:00Z".into(),
+        quote_time: "2026-09-08T10:00Z",
         context: Some([1; 32]),
         hctx: Some([2; 32]),
     };
+    let bytes =
+        SharedAllocationV1::<PeerEvidence>::required_bytes(evidence.children_bytes().unwrap())
+            .unwrap();
+    let pool = AllocationPoolV1::new(bytes).unwrap();
+    let evidence = RetainedEvidence::copy_from(&pool, &evidence).unwrap();
     session.set_peer_evidence(evidence.clone());
     session.set_local_evidence(evidence);
     session.set_fido2_identity(FidoIdentity {
@@ -235,7 +231,7 @@ fn owned_body(
 #[test]
 fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
     assert_eq!(core::mem::size_of::<crate::HonestStreamIngressError>(), 0);
-    legacy_response_keeps_original_bytes();
+    contiguous_response_keeps_original_bytes();
     let allocation_pool = enclave_os_common::allocation::AllocationPoolV1::new(1).unwrap();
     let lease = allocation_pool.reserve_unpublished(1).unwrap();
     let paid_body = crate::HttpResponseBody::with_allocation(vec![7], Some(lease));
@@ -439,7 +435,7 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
     // HTTP oracle while the receiver accepts only bounded flights.
     let body: Vec<u8> = (0..5 * 1024 * 1024).map(|n| (n % 251) as u8).collect();
     let expected = enclave_os_common::protocol::format_http_response(200, &body, false);
-    b.queue_http_response(
+    b.queue_http_response_owned(
         200,
         "application/json",
         &[],
@@ -447,6 +443,7 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
         false,
         false,
     )
+    .continue_value()
     .unwrap();
     let failed_owner = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (reason, returned) = b
@@ -470,7 +467,7 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
     drop(returned);
     assert_eq!(failed_owner.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(b
-        .queue_http_response(
+        .queue_http_response_owned(
             200,
             "application/json",
             &[],
@@ -478,7 +475,7 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
             false,
             false
         )
-        .is_err());
+        .is_break());
     assert_eq!(
         owner_drop_count(),
         1,
@@ -563,7 +560,7 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
         2,
         "successful complete drain releases the body admission"
     );
-    b.queue_http_response(
+    b.queue_http_response_owned(
         200,
         "application/octet-stream",
         &[],
@@ -571,6 +568,7 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
         false,
         false,
     )
+    .continue_value()
     .unwrap();
     assert!(!b.progress_http_response().unwrap().0.is_empty());
     assert!(b.has_pending_response());
@@ -597,7 +595,8 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
     handshake(&mut client, &mut control);
     let body = b"{\"runtime_active\":true}";
     control
-        .queue_http_response(200, "application/json", &[], body.to_vec(), false, false)
+        .queue_http_response_owned(200, "application/json", &[], body.to_vec(), false, false)
+        .continue_value()
         .unwrap();
     let (flight, close, shutdown) = control.progress_http_response().unwrap();
     assert!(!control.has_pending_response());
@@ -612,7 +611,7 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
     );
     register(&store, "control.test");
     assert!(control
-        .queue_http_response(
+        .queue_http_response_owned(
             200,
             "application/json",
             &[],
@@ -620,7 +619,7 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
             false,
             false
         )
-        .is_err());
+        .is_break());
     assert!(control.collect_tls_output().unwrap().is_empty());
     assert_eq!(
         owner_drop_count(),
@@ -631,7 +630,7 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
     let (mut teardown_client, mut teardown) = pair(&store, "teardown.test");
     handshake(&mut teardown_client, &mut teardown);
     teardown
-        .queue_http_response(
+        .queue_http_response_owned(
             200,
             "application/json",
             &[],
@@ -639,6 +638,7 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
             false,
             false,
         )
+        .continue_value()
         .unwrap();
     assert_eq!(owner_drop_count(), 4);
     drop(teardown);
@@ -675,7 +675,7 @@ fn fixed_peer_configuration_boundary() {
     let body: Vec<_> = (0..256 * 1024).map(|n| (n % 251) as u8).collect();
     let expected = enclave_os_common::protocol::format_http_response(200, &body, false);
     session
-        .queue_http_response(
+        .queue_http_response_owned(
             200,
             "application/json",
             &[],
@@ -683,6 +683,7 @@ fn fixed_peer_configuration_boundary() {
             false,
             false,
         )
+        .continue_value()
         .unwrap();
     let mut actual = Vec::new();
     let mut steps = 0;
@@ -719,7 +720,7 @@ fn fixed_peer_configuration_boundary() {
     assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     session
-        .queue_http_response(
+        .queue_http_response_owned(
             200,
             "application/json",
             &[],
@@ -727,6 +728,7 @@ fn fixed_peer_configuration_boundary() {
             false,
             false,
         )
+        .continue_value()
         .unwrap();
     let (bytes, _, _) = session.progress_http_response().unwrap();
     assert!(!bytes.is_empty() && session.has_pending_response());
@@ -774,7 +776,7 @@ fn streamed_request_preserves_tls_and_following_request() {
         enclave_os_common::protocol::http_request_head_allocation_bound(header_bytes).unwrap();
     let header_pool = enclave_os_common::allocation::AllocationPoolV1::new(header_charge).unwrap();
     let (header, paid_head, paid_length) =
-        super::PaidHttpRequest::parse_head(header_bytes, Some(&header_pool), false)
+        super::PaidHttpRequest::parse_head(header_bytes, Some(&header_pool))
             .unwrap()
             .unwrap();
     assert_eq!((paid_head, paid_length), (head_bytes, length));
@@ -958,7 +960,7 @@ fn streamed_request_preserves_tls_and_following_request() {
     let head =
         b"POST /honest/v1/proposal HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n";
     write_requests(&mut client, &mut session, head);
-    assert!(session.stream_head().unwrap().is_some());
+    assert!(session.stream_head().is_err());
     assert!(!session.validate_stream_head());
     assert!(store.unregister("stream.test"));
     assert!(session.stream_head().is_err());
@@ -1175,7 +1177,8 @@ fn segmented_response_lifecycle() {
         .unwrap()
     };
     session
-        .queue_http_response(200, "application/json", &[], payload(), false, false)
+        .queue_http_response_owned(200, "application/json", &[], payload(), false, false)
+        .continue_value()
         .unwrap();
     let (reason, returned) = session
         .queue_http_response_owned(200, "application/json", &[], payload(), false, false)
@@ -1215,7 +1218,8 @@ fn segmented_response_lifecycle() {
     assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 2);
     assert_eq!(Arc::strong_count(&bytes), 1);
     session
-        .queue_http_response(200, "application/json", &[], payload(), false, false)
+        .queue_http_response_owned(200, "application/json", &[], payload(), false, false)
+        .continue_value()
         .unwrap();
     assert!(!session.progress_http_response().unwrap().0.is_empty());
     assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 2);
@@ -1299,10 +1303,10 @@ fn checked_tls_output_backing() {
     assert_eq!(short.used(), 0);
 }
 
-fn legacy_response_keeps_original_bytes() {
+fn contiguous_response_keeps_original_bytes() {
     let store = CertStore::new();
-    register(&store, "legacy-response.test");
-    let (mut client, mut session) = pair(&store, "legacy-response.test");
+    register(&store, "contiguous-response.test");
+    let (mut client, mut session) = pair(&store, "contiguous-response.test");
     handshake(&mut client, &mut session);
     let body = vec![0x5a; 70 * 1024 + 17];
     let expected = enclave_os_common::protocol::format_http_response(200, &body, false);
@@ -1318,7 +1322,7 @@ fn legacy_response_keeps_original_bytes() {
                 Ok(0) => break,
                 Ok(n) => received.extend_from_slice(&bytes[..n]),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(error) => panic!("legacy response: {error}"),
+                Err(error) => panic!("contiguous response: {error}"),
             }
         }
     }
@@ -1370,11 +1374,11 @@ fn checked_stream_header_admission() {
         protocol::http_request_head_allocation_bound(&raw[..head]).unwrap()
     );
     let small = AllocationPoolV1::new(needed - 1).unwrap();
-    assert!(super::PaidHttpRequest::parse_head(raw, Some(&small), false).is_err());
+    assert!(super::PaidHttpRequest::parse_head(raw, Some(&small)).is_err());
     assert_eq!(small.used(), 0);
     for limit in [needed, needed + 1] {
         let pool = AllocationPoolV1::new(limit).unwrap();
-        let (header, consumed, body) = super::PaidHttpRequest::parse_head(raw, Some(&pool), true)
+        let (header, consumed, body) = super::PaidHttpRequest::parse_head(raw, Some(&pool))
             .unwrap()
             .unwrap();
         assert_eq!((consumed, body), (head, 4));
@@ -1388,16 +1392,10 @@ fn checked_stream_header_admission() {
     let pool =
         AllocationPoolV1::new(protocol::http_request_head_allocation_bound(duplicate).unwrap())
             .unwrap();
-    assert!(
-        super::PaidHttpRequest::parse_head(duplicate, Some(&pool), false)
-            .unwrap()
-            .is_some()
-    );
-    assert_eq!(pool.used(), 0);
-    assert!(super::PaidHttpRequest::parse_head(duplicate, Some(&pool), true).is_err());
+    assert!(super::PaidHttpRequest::parse_head(duplicate, Some(&pool)).is_err());
     assert_eq!(pool.used(), 0);
     assert!(
-        super::PaidHttpRequest::parse_head(&raw[..head - 1], Some(&pool), true)
+        super::PaidHttpRequest::parse_head(&raw[..head - 1], Some(&pool))
             .unwrap()
             .is_none()
     );
@@ -1590,12 +1588,8 @@ fn checked_fixed_channel_binder() {
 fn checked_retained_certificate() {
     let store = CertStore::new();
     register(&store, "paid.test");
-    let (mut client, mut session, pool) = pair_with_certificate(&store, "paid.test", true);
-    let pool = pool.unwrap();
-    let super::LocalCertificate::Paid(retained) = &session.local_cert_der else {
-        panic!("paid constructor lost owner")
-    };
-    let alias = retained.clone();
+    let (mut client, mut session, pool) = pair_with_certificate(&store, "paid.test");
+    let alias = session.local_cert_der.clone();
     let charged = pool.used();
     assert!(charged > alias.bytes().len());
     handshake(&mut client, &mut session);
@@ -1644,8 +1638,8 @@ fn checked_retained_evidence() {
         register(&store, "a.test");
         let (mut client, mut session) = pair(&store, "a.test");
         handshake(&mut client, &mut session);
-        session.set_local_evidence_paid(held.clone());
-        session.set_peer_evidence_paid(held.clone());
+        session.set_local_evidence(held.clone());
+        session.set_peer_evidence(held.clone());
         assert_eq!(pool.used(), required);
         assert_eq!(session.local_evidence().unwrap().quote, value.quote);
         assert_eq!(session.peer_evidence().unwrap().quote, value.quote);
@@ -1726,7 +1720,8 @@ fn checked_response_step_policy() {
     let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let body = owned_body(vec![9; super::TLS_RESPONSE_PLAINTEXT_STEP_BYTES], &drops);
     session
-        .queue_http_response(200, "application/json", &[], body, false, false)
+        .queue_http_response_owned(200, "application/json", &[], body, false, false)
+        .continue_value()
         .unwrap();
     assert!(session.progress_http_response().is_err());
     assert!(!session.has_pending_response());

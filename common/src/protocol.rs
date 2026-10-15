@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 /// Maximum HTTP request body: 16 MiB.
 pub const MAX_BODY_SIZE: usize = 16 * 1024 * 1024;
 /// Optional header-only streamed ceiling: eight canonical8MiB frames plus
-/// bounded AEAD/header/page/group overhead. Never used by the legacy parser.
+/// bounded AEAD/header/page/group overhead. Not used by the ordinary body parser.
 // Opaque HTTP policy ceiling; source codecs and signed admission are independent.
 pub const MAX_STREAM_BODY_SIZE: usize = 67_371_916;
 /// Optional peer outer authority/manifest prefix; still one canonical frame at
@@ -385,7 +385,7 @@ fn http_request_header_len(buf: &[u8]) -> Result<usize, HttpParseError> {
 }
 
 pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseError> {
-    let (mut request, header_len, body_len) = parse_http_metadata(buf, false, MAX_BODY_SIZE)?;
+    let (mut request, header_len, body_len) = parse_http_request_head(buf)?;
     let total = header_len + body_len;
     if buf.len() < total {
         return Err(HttpParseError::Incomplete);
@@ -395,8 +395,7 @@ pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseE
 }
 /// Header-only framing for an optional charged input adopter. Returns no body
 /// and allocates only bounded header metadata. No application authority follows.
-/// Unlike the legacy parser, this route rejects duplicate length or transfer
-/// encoding rather than allowing ambiguous streaming ownership.
+/// Duplicate lengths and transfer encoding are rejected so framing has one owner.
 pub fn parse_http_request_head(buf: &[u8]) -> Result<(HttpRequest, usize, usize), HttpParseError> {
     if buf
         .windows(4)
@@ -409,18 +408,7 @@ pub fn parse_http_request_head(buf: &[u8]) -> Result<(HttpRequest, usize, usize)
             Err(HttpParseError::Incomplete)
         };
     }
-    parse_http_metadata(buf, true, MAX_BODY_SIZE)
-}
-/// Inert bounded header peek; preserves legacy framing semantics for selectors.
-pub fn peek_http_request_head(buf: &[u8]) -> Result<(HttpRequest, usize, usize), HttpParseError> {
-    if buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .is_none_or(|n| n + 4 > MAX_REQUEST_HEAD_BYTES)
-    {
-        return Err(HttpParseError::Incomplete);
-    }
-    parse_http_metadata(buf, false, MAX_BODY_SIZE)
+    parse_http_metadata(buf, MAX_BODY_SIZE)
 }
 /// Optional header-only route. Its inert maximum grants no admission or body
 /// allocation; the adopter independently validates negotiated geometry/authority.
@@ -438,27 +426,10 @@ pub fn parse_http_stream_request_head(
             Err(HttpParseError::Incomplete)
         };
     }
-    parse_http_stream_metadata(buf, true)
+    parse_http_stream_metadata(buf)
 }
-/// Header selector peek with the optional stream ceiling; ordinary parsing
-/// still applies its original16MiB body limit if no adopter claims this request.
-pub fn peek_http_stream_request_head(
-    buf: &[u8],
-) -> Result<(HttpRequest, usize, usize), HttpParseError> {
-    if buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .is_none_or(|n| n + 4 > MAX_REQUEST_HEAD_BYTES)
-    {
-        return Err(HttpParseError::Incomplete);
-    }
-    parse_http_stream_metadata(buf, false)
-}
-fn parse_http_stream_metadata(
-    buf: &[u8],
-    strict: bool,
-) -> Result<(HttpRequest, usize, usize), HttpParseError> {
-    let result = parse_http_metadata(buf, strict, MAX_STREAM_PEER_BODY_SIZE)?;
+fn parse_http_stream_metadata(buf: &[u8]) -> Result<(HttpRequest, usize, usize), HttpParseError> {
+    let result = parse_http_metadata(buf, MAX_STREAM_PEER_BODY_SIZE)?;
     let maximum = if result.0.content_type.as_deref() == Some(STREAM_PEER_MEDIA) {
         MAX_STREAM_PEER_BODY_SIZE
     } else {
@@ -471,7 +442,6 @@ fn parse_http_stream_metadata(
 }
 fn parse_http_metadata(
     buf: &[u8],
-    strict: bool,
     maximum_body: usize,
 ) -> Result<(HttpRequest, usize, usize), HttpParseError> {
     let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
@@ -504,11 +474,11 @@ fn parse_http_metadata(
     let mut edge_terminated = false;
 
     for h in req.headers.iter() {
-        if strict && h.name.eq_ignore_ascii_case("transfer-encoding") {
+        if h.name.eq_ignore_ascii_case("transfer-encoding") {
             return Err(HttpParseError::Malformed);
         }
         if h.name.eq_ignore_ascii_case("content-length") {
-            if strict && content_length.is_some() {
+            if content_length.is_some() {
                 return Err(HttpParseError::InvalidContentLength);
             }
             let val =
@@ -1083,11 +1053,10 @@ mod tests {
                 .as_slice(),
             b"POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice(),
         ] {
-            assert!(peek_http_request_head(raw).is_ok());
             assert!(parse_http_request_head(raw).is_err());
             assert!(
-                parse_http_request(raw).is_ok(),
-                "legacy fallback framing remains unchanged"
+                parse_http_request(raw).is_err(),
+                "owned parsing rejects ambiguous framing"
             );
         }
         let oversized = b"POST /upload HTTP/1.1\r\nContent-Length: 999999999\r\n\r\n";

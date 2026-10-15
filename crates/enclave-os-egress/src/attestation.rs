@@ -32,7 +32,8 @@
 //!   "status": "OK",
 //!   "teeType": "SGX",
 //!   "mrenclave": "aabbccdd...",
-//!   "mrsigner": "11223344..."
+//!   "mrsigner": "11223344...",
+//!   "tcbStatus": "UpToDate"
 //! }
 //! ```
 //!
@@ -102,9 +103,9 @@ pub struct VerifyResponse {
 
     /// Intel platform TCB status derived by the server from PCS collateral
     /// (e.g. `"UpToDate"`, `"SWHardeningNeeded"`,
-    /// `"ConfigurationAndSWHardeningNeeded"`, `"Revoked"`). Empty when the
-    /// server did not run the TCB check (older server, or TCB reporting off).
-    #[serde(default, rename = "tcbStatus")]
+    /// `"ConfigurationAndSWHardeningNeeded"`, `"Revoked"`). Required in the
+    /// current response; an empty report cannot pass TCB appraisal.
+    #[serde(rename = "tcbStatus")]
     pub tcb_status: String,
 
     /// Error description when `success` is `false`.
@@ -116,33 +117,16 @@ pub struct VerifyResponse {
 //  Public API
 // ---------------------------------------------------------------------------
 
-/// Decide whether a reported Intel platform TCB status is acceptable under an
-/// optional acceptable-status policy.
-///
-///   - empty status (the server did not derive one — older server, or TCB
-///     reporting off) → accepted, for compatibility;
-///   - `"Revoked"` → NEVER accepted, policy or not (a revoked TCB is
-///     known-broken, not merely behind — nothing legitimate runs on it);
-///   - `acceptable` is `None` (policy predates TCB enforcement / opted out)
-///     → accepted: enforcement is opt-in so that rolling this build out does
-///     not reject fleets whose policies have not yet been updated;
-///   - `acceptable` is `Some`: the secure floor (`"UpToDate"`,
-///     `"SWHardeningNeeded"`) always passes, anything else must be listed
-///     (`Some(&[])` = strict floor-only).
-pub fn tcb_status_acceptable(status: &str, acceptable: Option<&[String]>) -> bool {
-    if status.is_empty() {
-        return true;
-    }
-    if status == "Revoked" {
+/// Require a reported Intel platform TCB status under the explicit current
+/// policy. The secure floor always passes; other statuses must be listed.
+/// Missing status and Revoked are never accepted.
+pub fn tcb_status_acceptable(status: &str, acceptable: &[String]) -> bool {
+    if status.is_empty() || status == "Revoked" {
         return false;
     }
-    let Some(set) = acceptable else {
-        return true;
-    };
-    if status == "UpToDate" || status == "SWHardeningNeeded" {
-        return true;
-    }
-    set.iter().any(|s| s == status)
+    status == "UpToDate"
+        || status == "SWHardeningNeeded"
+        || acceptable.iter().any(|candidate| candidate == status)
 }
 
 /// Verify a raw attestation quote against one or more attestation servers.
@@ -233,14 +217,15 @@ pub fn verify_quote_statuses(
             headers.push(("Authorization".to_string(), auth.to_string()));
         }
 
-        let resp = client::https_fetch(
+        let resp = client::BoundedHttpsRequest::new(
             "POST",
             server_url,
-            &headers,
-            Some(body.as_bytes()),
-            store,
-            None, // Standard HTTPS — the attestation server is not behind RA-TLS.
+            headers.to_vec(),
+            Some(body.as_bytes().to_vec()),
         )
+        .and_then(|request| {
+            client::https_fetch_interruptible(&mut client::GlobalOcallNetIo, &request, store, None)
+        })
         .map_err(|e| format!("attestation server request to {} failed: {}", server_url, e))?;
 
         let result: VerifyResponse = serde_json::from_slice(&resp.body).map_err(|e| {

@@ -603,7 +603,7 @@ mod tests {
             report_data: ReportDataBinding::ChallengeResponse { nonce: vec![9; 32] },
             expected_oids: Vec::new(),
             attestation_servers: Vec::new(),
-            acceptable_tcb_statuses: None,
+            acceptable_tcb_statuses: Vec::new(),
             client_identity: None,
             dependencies: None,
         };
@@ -626,7 +626,7 @@ mod tests {
             report_data: ReportDataBinding::ChallengeResponse { nonce: vec![9; 32] },
             expected_oids: Vec::new(),
             attestation_servers: Vec::new(),
-            acceptable_tcb_statuses: None,
+            acceptable_tcb_statuses: Vec::new(),
             client_identity: None,
             dependencies: None,
         };

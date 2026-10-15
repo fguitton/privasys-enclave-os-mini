@@ -6,7 +6,7 @@ types, usage flags and per-key access policies — not opaque "secrets".
 
 A vault enclave has **no policy of its own**: it is a verifiable,
 tamper-proof SGX binary that faithfully enforces the per-key policy the
-secret owner attached at `CreateKey` / `PutShare` time. Trust comes from
+secret owner attached at `CreateKey` time. Trust comes from
 the attested enclave measurement; trust does not come from any role the
 vault plays in a quorum, and there is no cross-vault coordination.
 
@@ -50,7 +50,7 @@ sealing round-trip.
 
 | `KeyType` | Operations | Notes |
 |---|---|---|
-| `RawShare` | `ExportKey` | A Shamir share of an external secret. The client reconstructs after retrieving K-of-N shares. Default for legacy `PutShare`/`GetShare`. |
+| `RawShare` | `ExportKey` | A Shamir share of an external secret. The client reconstructs after retrieving K-of-N shares. |
 | `Aes256GcmKey` | `Wrap`, `Unwrap`, optional `ExportKey` | 32-byte AES-256 KEK / DEK. |
 | `P256SigningKey` | `Sign`, optional `ExportKey` | PKCS#8 v1 ECDSA-P256 private key. Returns IEEE-P1363 fixed-length 64-byte signatures. |
 | `HmacSha256Key` | `Mac`, optional `ExportKey` | 32-64 byte HMAC key. |
@@ -184,7 +184,10 @@ principal AND every condition in `requires` evaluates true.
 
 `AttestationProfile` carries `name`, `measurements: Vec<Measurement>`
 (`Mrenclave(hex)` or `Mrtd(hex)`), `attestation_servers` (URLs with
-optional pinned-SPKI hash), and `required_oids`.
+optional pinned-SPKI hash), `required_oids`, and an explicit
+`acceptable_tcb_statuses` array. The array adds exceptions to the secure floor
+(`UpToDate`, `SWHardeningNeeded`); an empty array permits only that floor.
+Missing policy fields, missing/empty status reports and `Revoked` are rejected.
 
 ### 3.4 `Mutability` — who can change what on `UpdatePolicy`
 
@@ -364,21 +367,3 @@ Default OIDC role names (Privasys IdP; configurable per deployment):
 `oidc_issuer_url` and `vault_*_role` at any OIDC provider.
 
 ---
-
-## 9. Migration from the legacy `SecretRecord` API
-
-The previous wire protocol (`StoreSecret` / `GetSecret` / etc.) is gone.
-Adopters using the old shape need to:
-
-1. Replace `StoreSecret` with `CreateKey { key_type: RawShare, exportable: true, ... }`.
-2. Replace `GetSecret` (OIDC owner path) with `ExportKey`.
-3. Replace `GetSecret` (RA-TLS path) with `ExportKey` carrying
-   appropriate `principals.tees` + `OperationRule { ops: [ExportKey],
-   principals: [AnyTee] }`.
-4. Replace `manager_sub` with `principals.managers[i]` plus a
-   `Condition::ManagerApproval` on the relevant operation rule (and use
-   `IssueApprovalToken` to mint approvals at the call site).
-
-This is a breaking change — there is no compatibility shim. Keeping the
-TCB minimal is more important than a deprecation window for an API with
-no production deployments.

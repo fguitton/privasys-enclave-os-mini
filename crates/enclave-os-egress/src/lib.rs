@@ -10,7 +10,7 @@
 //!
 //! When connecting to a server that serves RA-TLS certificates (e.g. another
 //! enclave-os instance or a Caddy RA-TLS reverse proxy), callers can pass an
-//! [`RaTlsPolicy`] to [`client::https_fetch`]. The policy specifies the expected TEE type and
+//! [`RaTlsPolicy`] to [`client::https_fetch_interruptible`]. The policy specifies the expected TEE type and
 //! measurement registers; the egress client will verify the attestation
 //! quote in the RA-TLS v2 exchange after TLS completes. Application traffic
 //! remains blocked until the evidence and required appraisal checks succeed.
@@ -101,15 +101,15 @@ pub mod jwks;
 
 // Re-export RA-TLS verification types for convenience.
 pub use client::{
-    enclave_attestation_quote, enclave_self_mrenclave, https_fetch,
+    enclave_attestation_quote, enclave_self_mrenclave,
     https_fetch_authorized_interruptible_detailed, https_fetch_interruptible,
     https_fetch_interruptible_detailed, https_fetch_resource_authorized_interruptible_detailed,
     locally_verify_sgx_peer_certificate, mozilla_root_store, register_enclave_attestation_provider,
     register_enclave_client_cert_signer, root_store_from_der,
     verify_webpki_client_certificate_chain_at, verify_webpki_server_certificate_chain_at,
     BoundedHttpsRequest, ClientCertIdentity, EnclaveAttestationProvider, EnclaveClientCertSigner,
-    ExpectedOid, HttpResponse, HttpsBodyLimitsV1, HttpsFetchError, HttpsFetchFailurePhase,
-    IncrementalTlsClient, IncrementalTlsOutput, IncrementalTlsPlaintext,
+    ExpectedOid, GlobalOcallNetIo, HttpResponse, HttpsBodyLimitsV1, HttpsFetchError,
+    HttpsFetchFailurePhase, IncrementalTlsClient, IncrementalTlsOutput, IncrementalTlsPlaintext,
     InterruptibleBlockingNetIo, RaTlsPolicy, ReportDataBinding, ResourceBoundHttpsRequest,
     SgxPeerCertificateEvidence, TeeType, TlsPeerCertificateChain, TlsPeerCertificateEvidence,
     MAX_INCREMENTAL_PLAINTEXT, MAX_INCREMENTAL_REQUEST, MAX_INCREMENTAL_TLS_FRAGMENT,

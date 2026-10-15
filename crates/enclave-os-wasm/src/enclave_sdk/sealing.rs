@@ -29,6 +29,9 @@ use wasmtime::StoreContextMut;
 use super::AppContext;
 use crate::sovereign_seal;
 
+/// Derived sealing key and the component code hash to which it is bound.
+type SealKeyMaterial = (Vec<u8>, Vec<u8>);
+
 // =========================================================================
 //  privasys:enclave-os/sealing@0.1.0
 // =========================================================================
@@ -41,7 +44,7 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
         "get-seal-key",
         |store: StoreContextMut<'_, AppContext>,
          (): ()|
-         -> wasmtime::Result<(Result<(Vec<u8>, Vec<u8>), String>,)> {
+         -> wasmtime::Result<(Result<SealKeyMaterial, String>,)> {
             if super::ledger::in_replay() {
                 return Ok((Err("get-seal-key is not available during replay".into()),));
             }

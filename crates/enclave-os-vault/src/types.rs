@@ -36,6 +36,10 @@ pub const DEFAULT_APPROVAL_TOKEN_TTL_SECONDS: u64 = 5 * 60;
 
 /// A vault RPC request, JSON-encoded inside `Request::Data`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Inline current request policies avoid adding an unadmitted heap owner during JSON decoding"
+)]
 pub enum VaultRequest {
     // --- Key management ---------------------------------------------------
     /// Create a key with caller-supplied material, authorised by a `grant`.
@@ -208,6 +212,10 @@ pub enum VaultRequest {
 
 /// A vault RPC response, JSON-encoded inside `Response::Data`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Inline current policy and key-info replies preserve their existing allocation and ownership behavior"
+)]
 pub enum VaultResponse {
     KeyCreated {
         handle: String,
@@ -438,17 +446,9 @@ pub struct AttestationProfile {
     #[serde(default)]
     pub required_oids: Vec<OidRequirement>,
 
-    /// Opt-in Intel TCB-status enforcement. `None` (the default, and what
-    /// every pre-existing stored policy deserialises to) = no TCB acceptance
-    /// check — deliberately, so rolling out this enclave build does not
-    /// reject peers on fleets whose policies have not been updated (the
-    /// production hosts report `ConfigurationAndSWHardeningNeeded`).
-    /// `Some(set)` = enforce: the secure floor (`UpToDate`,
-    /// `SWHardeningNeeded`) always passes, other statuses must be listed in
-    /// `set` (`Some([])` = strict floor-only). `"Revoked"` is never accepted,
-    /// even with `None` — a revoked platform TCB always fails.
-    #[serde(default)]
-    pub acceptable_tcb_statuses: Option<Vec<String>>,
+    /// Explicit Intel TCB exceptions in addition to the secure floor.
+    /// Empty means floor-only; missing and Revoked statuses always fail.
+    pub acceptable_tcb_statuses: Vec<String>,
 }
 
 /// A measurement value that identifies a specific enclave build.

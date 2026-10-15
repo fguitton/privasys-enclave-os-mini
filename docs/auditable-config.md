@@ -235,5 +235,6 @@ let policy = RaTlsPolicy {
     report_data: ReportDataBinding::Deterministic,
     expected_oids: vec![],
     attestation_servers: servers,
+    acceptable_tcb_statuses: Vec::new(), // secure TCB floor only
 };
 ```

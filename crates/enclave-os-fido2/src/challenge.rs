@@ -23,7 +23,7 @@ use crate::types::*;
 #[derive(Debug, Clone)]
 struct ChallengeEntry {
     /// The raw 32-byte challenge.
-    challenge: Vec<u8>,
+    _challenge: Vec<u8>,
     /// Unix timestamp when this challenge expires.
     expires_at: u64,
     /// Browser session ID (for token binding after completion).
@@ -71,7 +71,7 @@ pub fn create_challenge(
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
 
     let entry = ChallengeEntry {
-        challenge: bytes.to_vec(),
+        _challenge: bytes.to_vec(),
         expires_at: now + CHALLENGE_TTL_SECS,
         browser_session_id,
         ceremony,

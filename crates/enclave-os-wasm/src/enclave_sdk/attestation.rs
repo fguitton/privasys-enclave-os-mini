@@ -16,12 +16,12 @@
 //!    accepts only calls to `configure`; everything else returns an
 //!    error.
 //! 2. The deployer calls `configure(api_key)` over RA-TLS. The app:
-//!    a. Stores the secret to its sealed KV store.
-//!    b. Computes a SHA-256 of the secret.
-//!    c. Calls `set-attestation-extension(1, hash)` so the per-app
-//!       leaf advertises the configured-secret hash on its next
-//!       handshake.
-//!    d. Calls `set-config-complete()` to unfreeze.
+//!    - Stores the secret to its sealed KV store.
+//!    - Computes a SHA-256 of the secret.
+//!    - Calls `set-attestation-extension(1, hash)` so the per-app
+//!      leaf advertises the configured-secret hash on its next
+//!      handshake.
+//!    - Calls `set-config-complete()` to unfreeze.
 //! 3. Subsequent client connections see the new extension in the
 //!    leaf certificate and can prove they're talking to an enclave
 //!    that saw exactly the secret they delivered.

@@ -255,13 +255,13 @@ impl WasmEngine {
             // field carries the `ComponentItem` (was yielded directly in 46).
             match item.ty {
                 ComponentItem::ComponentFunc(func_ty) => {
-                    functions.push(func_type_to_schema(&name, &func_ty, &docs));
+                    functions.push(func_type_to_schema(name, &func_ty, &docs));
                 }
                 ComponentItem::ComponentInstance(inst_ty) => {
                     let mut iface_fns = Vec::new();
                     for (func_name, nested) in inst_ty.exports(&self.engine) {
                         if let ComponentItem::ComponentFunc(func_ty) = nested.ty {
-                            iface_fns.push(func_type_to_schema(&func_name, &func_ty, &docs));
+                            iface_fns.push(func_type_to_schema(func_name, &func_ty, &docs));
                         }
                     }
                     if !iface_fns.is_empty() {

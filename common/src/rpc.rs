@@ -1169,7 +1169,7 @@ mod tests {
         assert_eq!(table, b"merkle:t:nodes");
         assert_eq!(decoded, ops);
 
-        // Legacy encoder and unchanged host decoder are independent wire oracles.
+        // Mixed-operation encoder and host decoder are independent wire oracles.
         let bounds = KvPutBatchBounds::new(
             MAX_BOUNDED_KV_ITEMS,
             crate::types::KV_MAX_VALUE_SIZE,
@@ -1179,7 +1179,7 @@ mod tests {
         assert!(KvPutBatchBounds::new(0, 1, 1).is_none());
         assert!(KvPutBatchBounds::new(1, 0, 1).is_none());
         assert!(KvPutBatchBounds::new(1, 1, 0).is_none());
-        let same_as_legacy = |table: &[u8], records: &[(&[u8], &[u8])]| {
+        let same_as_mixed = |table: &[u8], records: &[(&[u8], &[u8])]| {
             let owned = records
                 .iter()
                 .map(|(key, value)| KvBatchOp::Put {
@@ -1187,29 +1187,29 @@ mod tests {
                     value: value.to_vec(),
                 })
                 .collect::<Vec<_>>();
-            let legacy = encode_kv_write_batch_req(table, &owned);
+            let mixed = encode_kv_write_batch_req(table, &owned);
             let borrowed = encode_kv_put_batch_req_borrowed(table, records, bounds).unwrap();
-            assert_eq!(borrowed, legacy);
+            assert_eq!(borrowed, mixed);
             assert_eq!(decode_kv_write_batch_req(&borrowed), Some((table, owned)));
             assert!(borrowed.len() + REQ_HEADER_SIZE <= crate::queue::MAX_MSG_SIZE as usize);
             borrowed
         };
         // Unsorted duplicate keys retain original put order, including last-write order.
         let ordered: &[(&[u8], &[u8])] = &[(b"z", b"first"), (b"a", b"second"), (b"z", b"last")];
-        let wire = same_as_legacy(b"honest.source-cache-v1", ordered);
+        let wire = same_as_mixed(b"honest.source-cache-v1", ordered);
         for cut in 0..wire.len() {
             assert!(decode_kv_write_batch_req(&wire[..cut]).is_none());
         }
         let table_limit = vec![b't'; u16::MAX as usize];
         let key_limit = vec![b'k'; crate::types::KV_MAX_KEY_SIZE];
-        same_as_legacy(&table_limit, &[(key_limit.as_slice(), b"value")]);
-        same_as_legacy(
+        same_as_mixed(&table_limit, &[(key_limit.as_slice(), b"value")]);
+        same_as_mixed(
             b"t",
             &[(b"k".as_slice(), b"v".as_slice()); MAX_BOUNDED_KV_ITEMS],
         );
         let individual = vec![1u8; crate::types::KV_MAX_VALUE_SIZE];
         let remaining = vec![2u8; MAX_BOUNDED_KV_BYTES - individual.len()];
-        same_as_legacy(
+        same_as_mixed(
             b"t",
             &[(b"a", individual.as_slice()), (b"b", remaining.as_slice())],
         );
@@ -1268,7 +1268,7 @@ mod tests {
         ];
         assert_eq!(
             encode_kv_put_batch_req_borrowed(b"t", accepted, tighter).unwrap(),
-            same_as_legacy(b"t", accepted)
+            same_as_mixed(b"t", accepted)
         );
         let intersected = KvPutBatchBounds::new(usize::MAX, usize::MAX, usize::MAX).unwrap();
         assert!(encode_kv_put_batch_req_borrowed(
@@ -1293,8 +1293,8 @@ mod tests {
             intersected
         )
         .is_none());
-        // The original mixed/delete and empty-value API remains compatible above;
-        // empty legacy batches keep their original wire representation as well.
+        // The distinct mixed/delete and empty-value API remains supported above;
+        // empty mixed-operation batches keep their original wire representation as well.
         assert_eq!(
             decode_kv_write_batch_req(&encode_kv_write_batch_req(b"t", &[])),
             Some((b"t".as_slice(), Vec::new()))
@@ -1501,7 +1501,9 @@ mod tests {
         let req_id = 1u64;
         let payload = encode_net_tcp_listen_req(443, 128);
         let msg = encode_request(req_id, RpcMethod::NetTcpListen, &payload);
-        enc_tx.send(&msg);
+        enc_tx
+            .send_bounded(&msg)
+            .expect("fixture response fits queue");
 
         // Host: read, decode, respond
         let raw = host_rx.recv();
@@ -1514,7 +1516,9 @@ mod tests {
 
         // Host responds with fd=100
         let resp = encode_response(rid, 0, &encode_fd(100));
-        host_tx.send(&resp);
+        host_tx
+            .send_bounded(&resp)
+            .expect("fixture response fits queue");
 
         // Enclave: read response
         let resp_raw = enc_rx.recv();

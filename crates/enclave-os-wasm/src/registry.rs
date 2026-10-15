@@ -615,12 +615,27 @@ pub struct AppRegistry {
     /// top-up. In-memory only — the feed re-applies it after a restart.
     /// Independent of the `configured` config-gate.
     billing_frozen: BTreeMap<String, String>,
-    /// Host-pushed funded sponsor rp_ids (`x-privasys.price`
-    /// payer:"sponsor"). `None` = never pushed → no refusal (pre-rollout
-    /// compatibility); `Some(set)` → a sponsored call whose rp_id is not
-    /// in the set is refused before dispatch. In-memory only — the usage
-    /// feed re-asserts it each sweep, like the billing freeze.
-    funded_rps: Option<BTreeSet<String>>,
+    /// Host-pushed funded sponsor rp_ids. Until funding is explicitly supplied,
+    /// the empty set refuses every sponsored call before dispatch.
+    funded_rps: BTreeSet<String>,
+}
+
+/// Current inputs for one app load; owned configuration moves once into the registry.
+pub struct AppLoad<'a> {
+    pub name: &'a str,
+    pub hostname: &'a str,
+    pub wasm_bytes: &'a [u8],
+    pub encryption_key: Option<[u8; AEAD_KEY_SIZE]>,
+    pub permissions: Option<AppPermissions>,
+    pub max_fuel: u64,
+    pub mcp_enabled: bool,
+    pub docs: Option<std::collections::BTreeMap<String, String>>,
+    pub config_api_function: Option<String>,
+    pub owners: Vec<String>,
+    pub app_id: Option<[u8; 16]>,
+    pub vault: Option<VaultBacking>,
+    pub dependencies: Option<Vec<u8>>,
+    pub txn_replay: bool,
 }
 
 impl AppRegistry {
@@ -635,7 +650,7 @@ impl AppRegistry {
             config_api: BTreeMap::new(),
             configured: BTreeMap::new(),
             billing_frozen: BTreeMap::new(),
-            funded_rps: None,
+            funded_rps: BTreeSet::new(),
         }
     }
 
@@ -657,23 +672,23 @@ impl AppRegistry {
     /// attestation and the policy is stored for per-function enforcement.
     ///
     /// Returns an error if `name` is already taken or deserialization fails.
-    pub fn load_app(
-        &mut self,
-        name: &str,
-        hostname: &str,
-        wasm_bytes: &[u8],
-        encryption_key: Option<[u8; AEAD_KEY_SIZE]>,
-        permissions: Option<AppPermissions>,
-        max_fuel: u64,
-        mcp_enabled: bool,
-        docs: Option<std::collections::BTreeMap<String, String>>,
-        config_api_function: Option<String>,
-        owners: Vec<String>,
-        app_id: Option<[u8; 16]>,
-        vault: Option<VaultBacking>,
-        dependencies: Option<Vec<u8>>,
-        txn_replay: bool,
-    ) -> Result<AppMeta, String> {
+    pub fn load_app(&mut self, load: AppLoad<'_>) -> Result<AppMeta, String> {
+        let AppLoad {
+            name,
+            hostname,
+            wasm_bytes,
+            encryption_key,
+            permissions,
+            max_fuel,
+            mcp_enabled,
+            docs,
+            config_api_function,
+            owners,
+            app_id,
+            vault,
+            dependencies,
+            txn_replay,
+        } = load;
         if self.known.contains_key(name) {
             return Err(format!("app '{}' is already loaded", name));
         }
@@ -1196,18 +1211,13 @@ impl AppRegistry {
     pub fn set_funded_rps(&mut self, rp_ids: Vec<String>) -> usize {
         let set: BTreeSet<String> = rp_ids.into_iter().collect();
         let n = set.len();
-        self.funded_rps = Some(set);
+        self.funded_rps = set;
         n
     }
 
-    /// Whether a sponsored call for `rp_id` may proceed. `true` until the
-    /// host has pushed a funded set (pre-rollout compatibility); once
-    /// pushed, only listed rp_ids are allowed.
+    /// Only explicitly funded relying parties may receive sponsored calls.
     pub fn funded_rp_allowed(&self, rp_id: &str) -> bool {
-        match &self.funded_rps {
-            None => true,
-            Some(set) => set.contains(rp_id),
-        }
+        self.funded_rps.contains(rp_id)
     }
 
     /// Resolve the effective API-fee context for a call: the price rule
@@ -1484,12 +1494,12 @@ impl AppRegistry {
                     });
                 }
             };
-            match instance.get_func(&mut store, &iface_idx) {
+            match instance.get_func(&mut store, iface_idx) {
                 Some(_) => {
                     // The index resolved the instance; now get the function within it.
                     // We need to look up the function export under the interface.
                     match app.component.get_export_index(Some(&iface_idx), func_name) {
-                        Some(func_idx) => match instance.get_func(&mut store, &func_idx) {
+                        Some(func_idx) => match instance.get_func(&mut store, func_idx) {
                             Some(f) => f,
                             None => {
                                 return Err(WasmResult::Error {
@@ -1513,7 +1523,7 @@ impl AppRegistry {
                 None => {
                     // Try the nested lookup approach
                     match app.component.get_export_index(Some(&iface_idx), func_name) {
-                        Some(func_idx) => match instance.get_func(&mut store, &func_idx) {
+                        Some(func_idx) => match instance.get_func(&mut store, func_idx) {
                             Some(f) => f,
                             None => {
                                 return Err(WasmResult::Error {
@@ -1611,21 +1621,18 @@ fn param_to_val(p: &WasmParam) -> Val {
         WasmParam::U64(v) => Val::U64(*v),
         WasmParam::F32(v) => Val::Float32(*v),
         WasmParam::F64(v) => Val::Float64(*v),
-        WasmParam::String(v) => Val::String(v.clone().into()),
+        WasmParam::String(v) => Val::String(v.clone()),
         WasmParam::Bytes(v) => {
             // Component model doesn't have a native "bytes" type;
             // map to list<u8>.
-            Val::List(v.iter().map(|&b| Val::U8(b)).collect::<Vec<_>>().into())
+            Val::List(v.iter().map(|&b| Val::U8(b)).collect::<Vec<_>>())
         }
-        WasmParam::List(items) => {
-            Val::List(items.iter().map(param_to_val).collect::<Vec<_>>().into())
-        }
+        WasmParam::List(items) => Val::List(items.iter().map(param_to_val).collect::<Vec<_>>()),
         WasmParam::Record(fields) => Val::Record(
             fields
                 .iter()
                 .map(|(n, v)| (n.clone(), param_to_val(v)))
-                .collect::<Vec<_>>()
-                .into(),
+                .collect::<Vec<_>>(),
         ),
         WasmParam::Enum(name) => Val::Enum(name.clone()),
         WasmParam::Option(inner) => Val::Option(inner.as_ref().map(|v| Box::new(param_to_val(v)))),
@@ -1633,9 +1640,7 @@ fn param_to_val(p: &WasmParam) -> Val {
             name.clone(),
             payload.as_ref().map(|v| Box::new(param_to_val(v))),
         ),
-        WasmParam::Tuple(items) => {
-            Val::Tuple(items.iter().map(param_to_val).collect::<Vec<_>>().into())
-        }
+        WasmParam::Tuple(items) => Val::Tuple(items.iter().map(param_to_val).collect::<Vec<_>>()),
         WasmParam::Flags(names) => Val::Flags(names.clone()),
     }
 }
@@ -1753,5 +1758,21 @@ fn val_to_json(v: &Val) -> serde_json::Value {
         }
         // Resources and any unhandled variants — emit Debug as a string fallback.
         other => Value::String(format!("{:?}", other)),
+    }
+}
+
+#[cfg(test)]
+mod funding_tests {
+    use super::*;
+
+    #[test]
+    fn sponsored_calls_require_explicit_current_funding() {
+        let mut registry = AppRegistry::new(WasmEngine::new().unwrap());
+        assert!(!registry.funded_rp_allowed("rp.test"));
+        assert_eq!(registry.set_funded_rps(vec!["rp.test".into()]), 1);
+        assert!(registry.funded_rp_allowed("rp.test"));
+        assert!(!registry.funded_rp_allowed("other.test"));
+        assert_eq!(registry.set_funded_rps(vec![]), 0);
+        assert!(!registry.funded_rp_allowed("rp.test"));
     }
 }

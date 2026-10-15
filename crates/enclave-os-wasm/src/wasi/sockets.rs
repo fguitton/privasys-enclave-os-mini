@@ -245,9 +245,10 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
             let out_any = wasmtime::component::ResourceAny::try_from_resource(out_res, &mut store)?;
 
             // result<tuple<input-stream, output-stream>, error-code>
-            results[0] = Val::Result(Ok(Some(Box::new(Val::Tuple(
-                vec![Val::Resource(in_any), Val::Resource(out_any)].into(),
-            )))));
+            results[0] = Val::Result(Ok(Some(Box::new(Val::Tuple(vec![
+                Val::Resource(in_any),
+                Val::Resource(out_any),
+            ])))));
             Ok(())
         },
     )?;
@@ -339,14 +340,11 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
             let out_res = Resource::<OutputStreamRes>::new_own(out_rep);
             let out_any = wasmtime::component::ResourceAny::try_from_resource(out_res, &mut store)?;
 
-            results[0] = Val::Result(Ok(Some(Box::new(Val::Tuple(
-                vec![
-                    Val::Resource(sock_any),
-                    Val::Resource(in_any),
-                    Val::Resource(out_any),
-                ]
-                .into(),
-            )))));
+            results[0] = Val::Result(Ok(Some(Box::new(Val::Tuple(vec![
+                Val::Resource(sock_any),
+                Val::Resource(in_any),
+                Val::Resource(out_any),
+            ])))));
             Ok(())
         },
     )?;
@@ -537,27 +535,23 @@ fn extract_host_port_from_address(val: &Val) -> (String, u16) {
                         port = *p;
                     }
                 }
-                if name.as_str() == "address" {
-                    if disc == "ipv4" {
-                        // ipv4 — tuple<u8,u8,u8,u8>
-                        if let Val::Tuple(parts) = field_val {
-                            let octets: Vec<u8> = parts
-                                .iter()
-                                .filter_map(|v| match v {
-                                    Val::U8(b) => Some(*b),
-                                    _ => None,
-                                })
-                                .collect();
-                            if octets.len() == 4 {
-                                host = format!(
-                                    "{}.{}.{}.{}",
-                                    octets[0], octets[1], octets[2], octets[3]
-                                );
-                            }
+                if name.as_str() == "address" && disc == "ipv4" {
+                    // ipv4 — tuple<u8,u8,u8,u8>
+                    if let Val::Tuple(parts) = field_val {
+                        let octets: Vec<u8> = parts
+                            .iter()
+                            .filter_map(|v| match v {
+                                Val::U8(b) => Some(*b),
+                                _ => None,
+                            })
+                            .collect();
+                        if octets.len() == 4 {
+                            host =
+                                format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3]);
                         }
                     }
-                    // ipv6 — not fully implemented yet
                 }
+                // ipv6 — not fully implemented yet
             }
         }
     }
@@ -569,15 +563,12 @@ fn make_ipv4_address(a: u8, b: u8, c: u8, d: u8, port: u16) -> Val {
     // variant case "ipv4"
     Val::Variant(
         "ipv4".to_string(),
-        Some(Box::new(Val::Record(
-            vec![
-                ("port".into(), Val::U16(port)),
-                (
-                    "address".into(),
-                    Val::Tuple(vec![Val::U8(a), Val::U8(b), Val::U8(c), Val::U8(d)].into()),
-                ),
-            ]
-            .into(),
-        ))),
+        Some(Box::new(Val::Record(vec![
+            ("port".into(), Val::U16(port)),
+            (
+                "address".into(),
+                Val::Tuple(vec![Val::U8(a), Val::U8(b), Val::U8(c), Val::U8(d)]),
+            ),
+        ]))),
     )
 }

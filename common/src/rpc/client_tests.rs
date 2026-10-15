@@ -125,13 +125,17 @@ fn check_synchronous_pair(durable_first: bool) {
         } else {
             encode_u64(123)
         };
-        host_tx.send(&encode_response(id, 0, &payload));
+        host_tx
+            .send_bounded(&encode_response(id, 0, &payload))
+            .expect("fixture response fits queue");
         for (expected, status) in [(RpcMethod::KvGet, 1), (RpcMethod::KvPutDurable, 0)] {
             let request = receive(&host_rx);
             let (next, method, _) = decode_request(&request).unwrap();
             assert!(next > id);
             assert_eq!(method, expected);
-            host_tx.send(&encode_response(next, status, &[]));
+            host_tx
+                .send_bounded(&encode_response(next, status, &[]))
+                .expect("fixture response fits queue");
         }
         assert!(host_rx.try_recv().is_none());
     });
@@ -176,7 +180,9 @@ fn check_polled_owner() {
     assert_eq!(rpc.kv_put_durable(b"journal", b"key", b"sealed"), Err(-16));
     let request = receive(&host_rx);
     let request = decode_honest_request(&request).unwrap();
-    host_tx.send(&encode_honest_response(request.identity, 0, &[]).unwrap());
+    host_tx
+        .send_bounded(&encode_honest_response(request.identity, 0, &[]).unwrap())
+        .expect("fixture response fits queue");
     assert_eq!(
         rpc.poll_execution_rpc(&pending).unwrap().unwrap().status(),
         0
@@ -193,7 +199,9 @@ fn check_failed_acknowledgement() {
             let request = receive(&host_rx);
             let (id, method, _) = decode_request(&request).unwrap();
             assert_eq!(method, RpcMethod::KvPutDurable);
-            host_tx.send(&encode_response(id + u64::from(corrupt_id), -5, &[]));
+            host_tx
+                .send_bounded(&encode_response(id + u64::from(corrupt_id), -5, &[]))
+                .expect("fixture response fits queue");
             assert!(host_rx.try_recv().is_none());
         });
         assert_eq!(
@@ -219,7 +227,9 @@ fn check_completion_wait() {
             rpc.poll_execution_rpc(&pending).unwrap().is_none(),
             "host hint creates no response"
         );
-        host_tx.send(&encode_honest_response(identity, 0, b"exact frame").unwrap());
+        host_tx
+            .send_bounded(&encode_honest_response(identity, 0, b"exact frame").unwrap())
+            .expect("fixture response fits queue");
         let result = rpc.poll_execution_rpc(&pending).unwrap().unwrap();
         assert_eq!(result.status(), 0);
         assert_eq!(result.payload(), b"exact frame");
@@ -235,7 +245,9 @@ fn check_completion_wait() {
     let request = receive(&host_rx);
     let mut identity = decode_honest_request(&request).unwrap().identity;
     identity.operation_id += 1;
-    host_tx.send(&encode_honest_response(identity, 0, &[]).unwrap());
+    host_tx
+        .send_bounded(&encode_honest_response(identity, 0, &[]).unwrap())
+        .expect("fixture response fits queue");
     assert!(matches!(
         rpc.poll_execution_rpc(&pending),
         Err(client::PolledExecutionRpcError::UnexpectedResponse)
@@ -305,7 +317,9 @@ fn check_worker_storage_reservation() {
         decode_worker_storage_request(request.payload),
         Some((WorkerStorageOperation::Get, payload.as_slice()))
     );
-    host_tx.send(&encode_honest_response(request.identity, 0, b"sealed value").unwrap());
+    host_tx
+        .send_bounded(&encode_honest_response(request.identity, 0, b"sealed value").unwrap())
+        .expect("fixture response fits queue");
     assert_eq!(
         rpc.poll_execution_rpc(&pending).unwrap().unwrap().payload(),
         b"sealed value"
@@ -313,7 +327,9 @@ fn check_worker_storage_reservation() {
     let network = rpc.try_execution_net_close(3, 8, 7).unwrap();
     let message = receive(&host_rx);
     let request = decode_honest_request(&message).unwrap();
-    host_tx.send(&encode_honest_response(request.identity, 0, &[]).unwrap());
+    host_tx
+        .send_bounded(&encode_honest_response(request.identity, 0, &[]).unwrap())
+        .expect("fixture response fits queue");
     rpc.poll_execution_rpc(&network).unwrap().unwrap();
     assert!(decode_worker_storage_request(&[255]).is_none());
     assert!(encode_worker_storage_request(
@@ -373,7 +389,11 @@ fn check_ready_recheck() {
         .recheck_execution_rpc_with(&pending, 64, || {
             empty += 1;
             if empty == 3 {
-                host_tx.send(&encode_honest_response(identity, 0, b"ready sealed value").unwrap());
+                host_tx
+                    .send_bounded(
+                        &encode_honest_response(identity, 0, b"ready sealed value").unwrap(),
+                    )
+                    .expect("fixture response fits queue");
             }
         })
         .unwrap();
@@ -401,7 +421,9 @@ fn check_ready_recheck() {
     );
     rpc.wait_execution_rpc(&pending, 1000).unwrap();
     assert_eq!(WAIT_CALLS.with(std::cell::Cell::get), 1);
-    host_tx.send(&encode_honest_response(identity, 0, b"event completed").unwrap());
+    host_tx
+        .send_bounded(&encode_honest_response(identity, 0, b"event completed").unwrap())
+        .expect("fixture response fits queue");
     assert_eq!(
         rpc.recheck_execution_rpc(&pending, 64)
             .unwrap()
@@ -596,9 +618,15 @@ fn check_paid_qe_exchange() {
     assert_eq!(payload, report);
     assert_eq!(request, encode_request(id, method, report));
     // Original malformed/wrong-ID wait behavior remains; no fresh operation.
-    host_tx.send(&[0]);
-    host_tx.send(&encode_response(id + 1, 0, quote));
-    host_tx.send(&encode_response(id, 0, quote));
+    host_tx
+        .send_bounded(&[0])
+        .expect("fixture response fits queue");
+    host_tx
+        .send_bounded(&encode_response(id + 1, 0, quote))
+        .expect("fixture response fits queue");
+    host_tx
+        .send_bounded(&encode_response(id, 0, quote))
+        .expect("fixture response fits queue");
     let held = job.join().unwrap().unwrap();
     assert_eq!(held.bytes(), quote);
     assert_eq!(pool.used(), retained);
@@ -622,7 +650,9 @@ fn check_paid_qe_exchange() {
         let (id, method, payload) = decode_request(&request).unwrap();
         assert_eq!(method, RpcMethod::QeGetTargetInfo);
         assert!(payload.is_empty());
-        host_tx.send(&encode_response(id, 0, b"fixed-target"));
+        host_tx
+            .send_bounded(&encode_response(id, 0, b"fixed-target"))
+            .expect("fixture response fits queue");
         assert_eq!(job.join().unwrap(), Ok(b"fixed-target".len()));
         assert_eq!(pool.used(), 0);
     }
@@ -654,14 +684,18 @@ fn check_paid_qe_exchange() {
     let (outer_id, method, payload) = decode_request(&outer_request).unwrap();
     assert_eq!(method, RpcMethod::QeGetTargetInfo);
     assert!(payload.is_empty());
-    host_tx.send(&encode_response(outer_id, 0, b"outer-target"));
+    host_tx
+        .send_bounded(&encode_response(outer_id, 0, b"outer-target"))
+        .expect("fixture response fits queue");
     let nested_request = receive(&host_rx);
     let (nested_id, method, payload) = decode_request(&nested_request).unwrap();
     assert_ne!(nested_id, outer_id);
     assert_eq!(method, RpcMethod::QeGetQuote);
     assert_eq!(payload, report);
     assert_eq!(nested_request, encode_request(nested_id, method, report));
-    host_tx.send(&encode_response(nested_id, 0, quote));
+    host_tx
+        .send_bounded(&encode_response(nested_id, 0, quote))
+        .expect("fixture response fits queue");
     let held = job.join().unwrap().unwrap();
     assert_eq!(held.bytes(), quote);
     assert_eq!(pool.used(), retained);
@@ -670,7 +704,8 @@ fn check_paid_qe_exchange() {
     // The real queue refuses short output before copying/consuming the frame.
     let mut short = [42; 8];
     let (send, receive) = queue();
-    send.send(b"unchanged");
+    send.send_bounded(b"unchanged")
+        .expect("fixture response fits queue");
     let positions = send.diagnostic_positions();
     assert_eq!(receive.try_recv_into(&mut short), Err(9));
     assert_eq!(short, [42; 8]);

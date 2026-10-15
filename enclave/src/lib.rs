@@ -104,7 +104,7 @@ static EXECUTION_RPC_CLIENT: OnceLock<RpcClient> = OnceLock::new();
 /// Enclave-owned lifecycle barrier shared by the control and worker TCS.
 static CORE_PHASE: CorePhaseCell = CorePhaseCell::new();
 /// Default-false ingress selector. The custom Honest composition sets this
-/// exactly during initialisation; legacy compositions retain their existing
+/// exactly during initialisation; generic Mini compositions retain their own
 /// routes.
 static HONEST_INGRESS_PROFILE: AtomicBool = AtomicBool::new(false);
 
@@ -149,22 +149,6 @@ static HONEST_DEFERRED_INGRESS_HOOK: OnceLock<(
     HonestDeferredIngressPoll,
     HonestDeferredIngressCancel,
 )> = OnceLock::new();
-
-/// Install the optional data-request continuation during initialisation.
-pub fn register_honest_deferred_ingress_hook(
-    eligible: HonestDeferredIngressEligible,
-    hook: HonestDeferredIngressHook,
-    poll: HonestDeferredIngressPoll,
-    cancel: HonestDeferredIngressCancel,
-) -> Result<(), i32> {
-    register_honest_deferred_ingress_hook_with_metadata(
-        eligible,
-        deferred_ingress::legacy_metadata,
-        hook,
-        poll,
-        cancel,
-    )
-}
 
 /// Register an adopter that retains compact, bounded operation metadata.
 pub fn register_honest_deferred_ingress_hook_with_metadata(

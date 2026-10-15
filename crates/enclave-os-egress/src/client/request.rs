@@ -305,7 +305,8 @@ impl BoundedHttpsRequest {
     }
 }
 
-struct GlobalOcallNetIo;
+/// Network I/O using the process-global OCALL vtable.
+pub struct GlobalOcallNetIo;
 
 impl InterruptibleBlockingNetIo for GlobalOcallNetIo {
     fn tcp_connect(&mut self, host: &str, port: u16) -> Result<i32, i32> {
@@ -323,20 +324,6 @@ impl InterruptibleBlockingNetIo for GlobalOcallNetIo {
     fn close(&mut self, fd: i32) {
         ocall::net_close(fd);
     }
-}
-
-/// Compatibility wrapper using the process-global OCALL vtable.
-pub fn https_fetch(
-    method: &str,
-    url: &str,
-    headers: &[(String, String)],
-    body: Option<&[u8]>,
-    root_store: &RootCertStore,
-    ratls: Option<&RaTlsPolicy>,
-) -> Result<HttpResponse, String> {
-    let request =
-        BoundedHttpsRequest::new(method, url, headers.to_vec(), body.map(<[u8]>::to_vec))?;
-    https_fetch_interruptible(&mut GlobalOcallNetIo, &request, root_store, ratls)
 }
 
 /// Perform a bounded HTTPS request using only caller-injected network I/O.

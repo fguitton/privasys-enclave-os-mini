@@ -129,7 +129,7 @@ fn pair(
         report_data: ReportDataBinding::ChallengeResponse { nonce: vec![9; 32] },
         expected_oids: vec![],
         attestation_servers: vec![],
-        acceptable_tcb_statuses: None,
+        acceptable_tcb_statuses: Vec::new(),
         client_identity: client_identity.map(|_| ClientCertIdentity {
             code_hash: vec![1; 32],
             app_id: None,

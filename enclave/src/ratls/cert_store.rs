@@ -149,7 +149,7 @@ impl CertStore {
         Self::with_fixed_peer(false)
     }
 
-    /// Select only at Honest bootstrap, where legacy security configuration
+    /// Select only at Honest bootstrap, where generic Mini security configuration
     /// mutation routes are disabled. This changes lease dependencies, never
     /// the platform certificate generator or live peer admission checks.
     pub(crate) fn new_honest_profile() -> Self {

@@ -174,7 +174,7 @@ pub fn b64_decoded_capacity(value: &str) -> usize {
 }
 
 /// Decode using the original padding acceptance into existing admitted bytes.
-/// Failure returns no allocated diagnostic; legacy `b64_decode` keeps its API.
+/// Failure returns no allocated diagnostic; owned decoding retains its diagnostic API.
 #[must_use]
 pub fn b64_decode_into(value: &str, output: &mut [u8]) -> Option<usize> {
     BASE64_URL
@@ -276,8 +276,8 @@ pub fn client_report_data(
 /// Formats seconds since the epoch as `YYYY-MM-DDTHH:MMZ` (minute precision).
 pub fn format_quote_time(unix: i64) -> String {
     let mut output = String::new();
-    // String's formatting writer cannot refuse. This preserves the legacy
-    // allocating API; paid callers use the measured writer below.
+    // String's formatting writer cannot refuse. This is the current
+    // owned string API; paid callers use the measured writer below.
     let _ = write_quote_time(unix, &mut output);
     output
 }

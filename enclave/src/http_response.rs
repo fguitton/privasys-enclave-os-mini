@@ -200,7 +200,7 @@ impl HttpResponsePayload {
             }
         }
     }
-    /// Only receive-side/legacy contiguous bodies can be borrowed as one slice.
+    /// Only receive-side contiguous bodies can be borrowed as one slice.
     pub fn contiguous(&self) -> Option<&[u8]> {
         match self {
             Self::Contiguous(body) => Some(body),

@@ -376,7 +376,7 @@ mod tests {
 
     #[test]
     fn object_map_format() {
-        // role_claim default is "roles"; map shape (legacy compatibility)
+        // role_claim default is "roles"; standard object-map claim shape
         // is still accepted by collect_role_strings.
         let mut config = test_config();
         config.role_claim = "app_roles".into();

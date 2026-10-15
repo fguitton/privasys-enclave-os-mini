@@ -284,12 +284,6 @@ impl SpscProducer {
         }
     }
 
-    /// Legacy convenience API; invalid geometry fails instead of spinning forever.
-    pub fn send(&self, msg: &[u8]) {
-        self.send_bounded(msg)
-            .expect("message exceeds actual queue capacity");
-    }
-
     /// Write bytes into the ring buffer at the given offset, handling wrap-around.
     fn write_bytes(&self, offset: u64, data: &[u8]) {
         let cap = self.capacity as usize;
@@ -696,7 +690,9 @@ mod tests {
         let producer_handle = std::thread::spawn(move || {
             for i in 0u64..num_messages {
                 let msg = i.to_le_bytes();
-                producer.send(&msg);
+                producer
+                    .send_bounded(&msg)
+                    .expect("fixture message fits queue");
             }
         });
 
@@ -838,7 +834,9 @@ mod tests {
                 let mut msg = Vec::with_capacity(16);
                 msg.extend_from_slice(&i.to_le_bytes());
                 msg.extend_from_slice(&(i.wrapping_mul(0xDEAD)).to_le_bytes());
-                producer.send(&msg);
+                producer
+                    .send_bounded(&msg)
+                    .expect("fixture message fits queue");
             }
         });
 
@@ -931,7 +929,9 @@ mod tests {
 
         let enclave = std::thread::spawn(move || {
             // Send a request
-            enc_tx.send(b"PING");
+            enc_tx
+                .send_bounded(b"PING")
+                .expect("fixture message fits queue");
             // Wait for response
             let resp = enc_rx.recv();
             assert_eq!(resp, b"PONG");
@@ -942,7 +942,9 @@ mod tests {
             let req = host_rx.recv();
             assert_eq!(req, b"PING");
             // Send response
-            host_tx.send(b"PONG");
+            host_tx
+                .send_bounded(b"PONG")
+                .expect("fixture message fits queue");
         });
 
         enclave.join().unwrap();

@@ -1,18 +1,9 @@
 # API Reference
 
-The enclave-os-mini API is exposed over RA-TLS using a binary
-length-delimited frame protocol.  Every request and response is a JSON
-payload wrapped in a 4-byte big-endian length prefix:
-
-```
-[4 bytes: payload length (BE u32)] [JSON payload]
-```
-
-Maximum frame size: 16 MiB.
-
-All operations except `Healthz` require an OIDC bearer token when OIDC is
-configured.  The token is passed inside the JSON envelope as an `"auth"`
-field (not an HTTP header — enclave-os-mini does not use HTTP).
+The enclave-os-mini ingress uses HTTP/1.1 over TLS 1.3. Requests use the
+current bounded HTTP parser; duplicate Content-Length and Transfer-Encoding
+are rejected. Application payloads are JSON. OIDC credentials travel in the
+HTTP Authorization bearer header and are verified before module dispatch.
 
 See [vault.md](vault.md) for vault-specific details and
 [wasm-runtime.md](wasm-runtime.md) for WASM runtime details.
@@ -52,13 +43,9 @@ is handled at the core level (see `SetAttestationServers` above).
 
 ### Vault
 
-| Operation | Auth | Role | Description |
-|-----------|------|------|-------------|
-| `StoreSecret` | Bearer | Secret Owner | Store a named secret |
-| `GetSecret` | Bearer **or** mutual RA-TLS | — | Retrieve a secret (dual-path) |
-| `DeleteSecret` | Bearer | Secret Owner | Delete a secret |
-| `UpdateSecretPolicy` | Bearer | Secret Owner | Update a secret's access policy |
-| `ListSecrets` | Bearer | Secret Owner | List caller's secrets (metadata only) |
+Current requests use typed keys and per-key policies. See the complete
+[Vault operations](vault.md#2-operations-rpcs) for CreateKey, ExportKey,
+DeleteKey, UpdatePolicy, GetKeyInfo, ListKeys and cryptographic operations.
 
 "Monitoring+" means the `privasys-platform:monitoring` role or any higher
 role (manager implies monitoring).
@@ -736,203 +723,11 @@ which configuration is active — without trusting the host.
 
 ## Vault Operations
 
-Vault operations are carried inside `Data` frames.  The JSON payload is a
-`VaultRequest` enum variant.  See [vault.md](vault.md) for the full access
-policy model and dual-path authentication details.
-
-### StoreSecret
-
-Store a named secret with an access policy.  Requires **Secret Owner**
-role.
-
-**Request**
-
-```json
-{
-  "auth": "<token>",
-  "StoreSecret": {
-    "name": "customer-123-dek",
-    "secret": "base64url-encoded-bytes",
-    "policy": {
-      "allowed_mrenclave": ["abcd1234..."],
-      "allowed_mrtd": [],
-      "manager_sub": "manager-oidc-subject",
-      "required_oids": [],
-      "ttl_seconds": 604800
-    }
-  }
-}
-```
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `name` | string | yes | Human-readable secret name |
-| `secret` | string | yes | Base64url-encoded secret bytes |
-| `policy` | SecretPolicy | yes | Access policy (see below) |
-
-**SecretPolicy fields**
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `allowed_mrenclave` | string[] | `[]` | SGX MRENCLAVE values (hex) permitted to retrieve |
-| `allowed_mrtd` | string[] | `[]` | TDX MRTD values (hex) permitted to retrieve |
-| `manager_sub` | string? | `null` | OIDC `sub` of the secret manager (defence-in-depth) |
-| `required_oids` | OidRequirement[] | `[]` | OID/value pairs the caller's RA-TLS cert must contain |
-| `ttl_seconds` | u64 | 30 days | Time-to-live (capped at 90 days) |
-
-**Response**
-
-```json
-{ "SecretStored": { "name": "customer-123-dek", "expires_at": 1741564800 } }
-```
-
----
-
-### GetSecret
-
-Retrieve a secret.  Supports two authentication paths:
-
-**Path 1 — OIDC owner**: the caller's OIDC `sub` matches the stored
-`owner_sub`.  No RA-TLS required.
-
-**Path 2 — Mutual RA-TLS TEE**: the caller presents an RA-TLS client
-certificate.  The vault extracts attestation from the peer cert and
-evaluates it against the secret's policy.  Optionally requires a bearer
-token from the secret manager.
-
-**Request** (OIDC owner path)
-
-```json
-{
-  "auth": "<owner-oidc-token>",
-  "GetSecret": { "name": "customer-123-dek" }
-}
-```
-
-**Request** (RA-TLS TEE path, with manager bearer token)
-
-```json
-{
-  "GetSecret": {
-    "name": "customer-123-dek",
-    "bearer_token": [101, 121, 74, ...]
-  }
-}
-```
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `name` | string | yes | Secret name |
-| `bearer_token` | byte[] | no | OIDC bearer token from the secret manager (required if policy has `manager_sub`) |
-
-**Response**
-
-```json
-{
-  "SecretValue": {
-    "secret": [72, 101, 108, 108, 111],
-    "expires_at": 1741564800
-  }
-}
-```
-
-**Error responses**
-
-| Condition | Error message |
-|-----------|---------------|
-| No auth provided | `"authentication required: provide OIDC token or mutual RA-TLS client certificate"` |
-| Secret not found | `"secret not found"` |
-| Secret expired | `"secret has expired"` |
-| Measurement mismatch | `"measurement not permitted by policy"` |
-| Missing bearer token | `"bearer token required (manager_sub set in policy)"` |
-| Bearer sub mismatch | `"bearer token sub '...' != policy manager_sub"` |
-| OID not satisfied | `"required OID ... not satisfied"` |
-
----
-
-### DeleteSecret
-
-Delete a secret.  Only the original OIDC owner can delete.  Requires
-**Secret Owner** role.
-
-**Request**
-
-```json
-{
-  "auth": "<token>",
-  "DeleteSecret": { "name": "customer-123-dek" }
-}
-```
-
-**Response**
-
-```json
-"SecretDeleted"
-```
-
----
-
-### UpdateSecretPolicy
-
-Update the access policy for an existing secret.  Only the original OIDC
-owner can update.  Requires **Secret Owner** role.
-
-**Request**
-
-```json
-{
-  "auth": "<token>",
-  "UpdateSecretPolicy": {
-    "name": "customer-123-dek",
-    "policy": {
-      "allowed_mrenclave": ["abcd1234...", "ef567890..."],
-      "allowed_mrtd": [],
-      "manager_sub": null,
-      "required_oids": [
-        { "oid": "1.3.6.1.4.1.65230.2.1", "value": "a1b2c3..." }
-      ],
-      "ttl_seconds": 2592000
-    }
-  }
-}
-```
-
-**Response**
-
-```json
-"PolicyUpdated"
-```
-
----
-
-### ListSecrets
-
-List all secrets owned by the caller (metadata only, never the secret
-values).  Requires **Secret Owner** role.
-
-**Request**
-
-```json
-{
-  "auth": "<token>",
-  "ListSecrets": null
-}
-```
-
-**Response**
-
-```json
-{
-  "SecretList": {
-    "secrets": [
-      { "name": "customer-123-dek", "expires_at": 1741564800 },
-      { "name": "signing-key", "expires_at": 1742169600 }
-    ]
-  }
-}
-```
-
----
+The current key protocol is defined by `VaultRequest` and `VaultResponse` in
+`crates/enclave-os-vault/src/types.rs`. See [vault.md](vault.md) for the
+current request fields, authorization and policy rules. Every attestation
+profile requires an explicit `acceptable_tcb_statuses` array; `[]` enforces
+the secure floor. Missing policy fields and missing TCB reports are rejected.
 
 ## Error Format
 

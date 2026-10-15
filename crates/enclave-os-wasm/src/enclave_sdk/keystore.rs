@@ -56,7 +56,7 @@ pub enum KeyMaterial {
 ///
 /// All key material remains in enclave memory and is never exposed
 /// to the untrusted host.  Keys are referenced by name from WASM apps.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct KeyStore {
     keys: BTreeMap<String, KeyMaterial>,
 }
@@ -121,6 +121,11 @@ impl KeyStore {
     /// Get a clone of the raw key material (for persistence).
     pub fn get_raw(&self, name: &str) -> Option<KeyMaterial> {
         self.keys.get(name).cloned()
+    }
+
+    /// Whether the store holds no keys.
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
     }
 
     /// Number of keys held.

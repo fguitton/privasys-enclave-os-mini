@@ -27,6 +27,9 @@ use wasmtime::StoreContextMut;
 
 use super::AppContext;
 
+/// User identities and their registered roles returned by the auth interface.
+type UsersWithRoles = Vec<(String, Vec<String>)>;
+
 // =========================================================================
 //  privasys:enclave-os/auth@0.1.0
 // =========================================================================
@@ -67,7 +70,7 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
         "list-users",
         |store: StoreContextMut<'_, AppContext>,
          (): ()|
-         -> wasmtime::Result<(Result<Vec<(String, Vec<String>)>, String>,)> {
+         -> wasmtime::Result<(Result<UsersWithRoles, String>,)> {
             let ctx = store.data();
 
             // Require admin or user-management role.

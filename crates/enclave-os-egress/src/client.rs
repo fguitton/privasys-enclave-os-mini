@@ -7,7 +7,7 @@
 //! flows through OCALLs to the host, but the TLS termination happens inside
 //! the enclave, so the host never sees plaintext.
 //!
-//! The single public entry point is [`https_fetch`], which returns an
+//! The bounded request entry point is [`https_fetch_interruptible`], which returns an
 //! [`HttpResponse`] (status + headers + body) and supports all HTTP methods,
 //! custom headers, and optional RA-TLS verification.
 
@@ -53,13 +53,13 @@ pub use incremental::{
 };
 pub use renewal::{AttestationRenewalBudget, AttestationRenewalPolicy};
 pub use request::{
-    https_fetch, https_fetch_authorized_interruptible_detailed, https_fetch_interruptible,
+    https_fetch_authorized_interruptible_detailed, https_fetch_interruptible,
     https_fetch_interruptible_detailed, https_fetch_resource_authorized_interruptible_detailed,
-    BoundedHttpsRequest, HttpResponse, HttpsBodyLimitsV1, HttpsFetchError, HttpsFetchFailurePhase,
-    InterruptibleBlockingNetIo, ResourceBoundHttpsRequest, TlsPeerCertificateChain,
-    TlsPeerCertificateEvidence, MAX_REQUEST_BODY, MAX_REQUEST_HEADERS, MAX_REQUEST_HEADER_BYTES,
-    MAX_RESPONSE_BODY, MAX_RESPONSE_HEADERS, MAX_RESPONSE_HEADER_BYTES, MAX_TLS_PEER_CERTIFICATES,
-    MAX_TLS_PEER_CERTIFICATE_BYTES, MAX_TLS_PEER_CHAIN_BYTES,
+    BoundedHttpsRequest, GlobalOcallNetIo, HttpResponse, HttpsBodyLimitsV1, HttpsFetchError,
+    HttpsFetchFailurePhase, InterruptibleBlockingNetIo, ResourceBoundHttpsRequest,
+    TlsPeerCertificateChain, TlsPeerCertificateEvidence, MAX_REQUEST_BODY, MAX_REQUEST_HEADERS,
+    MAX_REQUEST_HEADER_BYTES, MAX_RESPONSE_BODY, MAX_RESPONSE_HEADERS, MAX_RESPONSE_HEADER_BYTES,
+    MAX_TLS_PEER_CERTIFICATES, MAX_TLS_PEER_CERTIFICATE_BYTES, MAX_TLS_PEER_CHAIN_BYTES,
 };
 
 // Re-export shared quote primitives for callers building `RaTlsPolicy` values.
@@ -280,7 +280,7 @@ pub struct ExpectedOid {
 
 /// RA-TLS verification policy.
 ///
-/// Pass to [`https_fetch`] to verify the
+/// Pass to [`https_fetch_interruptible`] to verify the
 /// remote server's RA-TLS certificate after standard chain validation.
 ///
 /// ## What is verified
@@ -361,14 +361,10 @@ pub struct RaTlsPolicy {
     /// ```
     pub attestation_servers: Vec<String>,
 
-    /// Opt-in Intel TCB-status enforcement on the attestation servers'
-    /// reported `tcbStatus`. `None` (the default) = no acceptance check
-    /// beyond the always-on rejection of `"Revoked"`. `Some(set)` = the
-    /// secure floor (`UpToDate`, `SWHardeningNeeded`) always passes and any
-    /// other reported status must be listed in `set` (`Some(vec![])` =
-    /// strict floor-only). Opt-in so existing callers keep their behaviour
-    /// on fleets that report `ConfigurationAndSWHardeningNeeded`.
-    pub acceptable_tcb_statuses: Option<Vec<String>>,
+    /// Explicit acceptable Intel TCB statuses in addition to the secure floor
+    /// (`UpToDate`, `SWHardeningNeeded`). Empty means floor-only. Missing and
+    /// Revoked statuses are always rejected.
+    pub acceptable_tcb_statuses: Vec<String>,
 
     /// Mutual RA-TLS: when `Some`, the connection presents a client
     /// certificate carrying this (OS-derived) app identity, minted by the
@@ -428,7 +424,7 @@ pub fn locally_verify_sgx_peer_certificate(
         },
         expected_oids: Vec::new(),
         attestation_servers: Vec::new(),
-        acceptable_tcb_statuses: None,
+        acceptable_tcb_statuses: Vec::new(),
         client_identity: None,
         dependencies: None,
     };
@@ -972,7 +968,7 @@ fn appraise_evidence(ev: &crate::attest::Evidence, policy: &RaTlsPolicy) -> Resu
     for v in &verdicts {
         if !crate::attestation::tcb_status_acceptable(
             &v.tcb_status,
-            policy.acceptable_tcb_statuses.as_deref(),
+            &policy.acceptable_tcb_statuses,
         ) {
             return Err(format!(
                 "peer platform TCB status {:?} not acceptable under policy",

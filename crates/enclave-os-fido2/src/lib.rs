@@ -76,7 +76,7 @@ impl Fido2Module {
         if let Err(e) = credentials::init_aaguid_allowlist(aaguid_allowlist) {
             // Log but don't fail — the module is usable, registration will
             // reject all AAGUIDs if the allowlist couldn't be initialised.
-            #[cfg(feature = "sgx")]
+            #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
             enclave_os_common::enclave_log_error!("FIDO2: init AAGUID allowlist failed: {e}");
             let _ = e;
         }

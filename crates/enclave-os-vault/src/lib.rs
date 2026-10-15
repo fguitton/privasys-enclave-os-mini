@@ -220,22 +220,20 @@ fn remove_from_owner_index(
 //  KV access helpers
 // ---------------------------------------------------------------------------
 
-fn kv() -> Result<&'static std::sync::Mutex<SealedKvStore>, VaultResponse> {
-    enclave_os_kvstore::kv_store()
-        .ok_or_else(|| VaultResponse::Error("kv store not initialised".into()))
+fn kv() -> Result<&'static std::sync::Mutex<SealedKvStore>, String> {
+    enclave_os_kvstore::kv_store().ok_or_else(|| "kv store not initialised".into())
 }
 
-fn load_record(handle: &str) -> Result<KeyRecord, VaultResponse> {
+fn load_record(handle: &str) -> Result<KeyRecord, String> {
     let kv = kv()?;
     let store = kv
         .lock()
-        .map_err(|_| VaultResponse::Error("kv store lock poisoned".into()))?;
+        .map_err(|_| String::from("kv store lock poisoned"))?;
     let bytes = store
         .get(&record_key(handle))
-        .map_err(|e| VaultResponse::Error(format!("kv get failed: {e}")))?
-        .ok_or_else(|| VaultResponse::Error("key not found".into()))?;
-    serde_json::from_slice::<KeyRecord>(&bytes)
-        .map_err(|e| VaultResponse::Error(format!("corrupt record: {e}")))
+        .map_err(|e| format!("kv get failed: {e}"))?
+        .ok_or_else(|| String::from("key not found"))?;
+    serde_json::from_slice::<KeyRecord>(&bytes).map_err(|e| format!("corrupt record: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -258,18 +256,17 @@ fn audit_and_save(
     caller: &str,
     decision: AuditDecision,
     reason: &str,
-) -> Result<(), VaultResponse> {
+) -> Result<(), String> {
     let kv = kv()?;
     let store = kv
         .lock()
-        .map_err(|_| VaultResponse::Error("kv store lock poisoned".into()))?;
+        .map_err(|_| String::from("kv store lock poisoned"))?;
     audit::append(&store, record, op, caller, decision, reason)
-        .map_err(|e| VaultResponse::Error(format!("audit append: {e}")))?;
-    let bytes = serde_json::to_vec(record)
-        .map_err(|e| VaultResponse::Error(format!("serialise record: {e}")))?;
+        .map_err(|e| format!("audit append: {e}"))?;
+    let bytes = serde_json::to_vec(record).map_err(|e| format!("serialise record: {e}"))?;
     store
         .put(&record_key(&record.handle), &bytes)
-        .map_err(|e| VaultResponse::Error(format!("kv put failed: {e}")))
+        .map_err(|e| format!("kv put failed: {e}"))
 }
 
 fn caller_str(ctx: &RequestContext) -> String {
@@ -383,7 +380,7 @@ fn handle_create(
 
     let kv = match kv() {
         Ok(k) => k,
-        Err(e) => return e,
+        Err(e) => return VaultResponse::Error(e),
     };
     {
         let store = match kv.lock() {
@@ -419,7 +416,7 @@ fn handle_create(
         AuditDecision::Allowed,
         &format!("owner={owner_sub}"),
     ) {
-        return e;
+        return VaultResponse::Error(e);
     }
 
     {
@@ -441,7 +438,7 @@ fn handle_create(
 fn handle_export(handle: &str, approvals: &[ApprovalToken], ctx: &RequestContext) -> VaultResponse {
     let mut record = match load_record(handle) {
         Ok(r) => r,
-        Err(e) => return e,
+        Err(e) => return VaultResponse::Error(e),
     };
     if expired(&record) {
         return VaultResponse::Error("key has expired".into());
@@ -491,7 +488,7 @@ fn handle_export(handle: &str, approvals: &[ApprovalToken], ctx: &RequestContext
 fn handle_delete(handle: &str, approvals: &[ApprovalToken], ctx: &RequestContext) -> VaultResponse {
     let mut record = match load_record(handle) {
         Ok(r) => r,
-        Err(e) => return e,
+        Err(e) => return VaultResponse::Error(e),
     };
     let caller = caller_str(ctx);
     if let Err(e) = evaluate_op(
@@ -525,7 +522,7 @@ fn handle_delete(handle: &str, approvals: &[ApprovalToken], ctx: &RequestContext
 
     let kv = match kv() {
         Ok(k) => k,
-        Err(e) => return e,
+        Err(e) => return VaultResponse::Error(e),
     };
     let mut store = match kv.lock() {
         Ok(s) => s,
@@ -546,7 +543,7 @@ fn handle_update_policy(
 ) -> VaultResponse {
     let mut record = match load_record(handle) {
         Ok(r) => r,
-        Err(e) => return e,
+        Err(e) => return VaultResponse::Error(e),
     };
     if expired(&record) {
         return VaultResponse::Error("key has expired".into());
@@ -596,7 +593,7 @@ fn handle_update_policy(
         AuditDecision::Allowed,
         "",
     ) {
-        return e;
+        return VaultResponse::Error(e);
     }
     VaultResponse::PolicyUpdated {
         policy_version: record.policy_version,
@@ -606,7 +603,7 @@ fn handle_update_policy(
 fn handle_get_policy(handle: &str, ctx: &RequestContext) -> VaultResponse {
     let record = match load_record(handle) {
         Ok(r) => r,
-        Err(e) => return e,
+        Err(e) => return VaultResponse::Error(e),
     };
     if resolve_caller(&record.policy, ctx).is_none() {
         return VaultResponse::Error("caller is not in policy.principals".into());
@@ -620,7 +617,7 @@ fn handle_get_policy(handle: &str, ctx: &RequestContext) -> VaultResponse {
 fn handle_get_info(handle: &str, ctx: &RequestContext) -> VaultResponse {
     let record = match load_record(handle) {
         Ok(r) => r,
-        Err(e) => return e,
+        Err(e) => return VaultResponse::Error(e),
     };
     if resolve_caller(&record.policy, ctx).is_none() {
         return VaultResponse::Error("caller is not in policy.principals".into());
@@ -645,7 +642,7 @@ fn handle_list(ctx: &RequestContext) -> VaultResponse {
 
     let kv = match kv() {
         Ok(k) => k,
-        Err(e) => return e,
+        Err(e) => return VaultResponse::Error(e),
     };
     let store = match kv.lock() {
         Ok(s) => s,
@@ -684,7 +681,7 @@ fn require_op(
     expect_type: KeyType,
     approvals: &[ApprovalToken],
     ctx: &RequestContext,
-) -> Result<KeyRecord, VaultResponse> {
+) -> Result<KeyRecord, String> {
     let mut record = load_record(handle)?;
     if expired(&record) {
         let _ = audit_and_save(
@@ -694,7 +691,7 @@ fn require_op(
             AuditDecision::Denied,
             "key has expired",
         );
-        return Err(VaultResponse::Error("key has expired".into()));
+        return Err("key has expired".into());
     }
     if record.key_type != expect_type {
         let msg = format!(
@@ -708,22 +705,20 @@ fn require_op(
             AuditDecision::Denied,
             &msg,
         );
-        return Err(VaultResponse::Error(msg));
+        return Err(msg);
     }
     let caller = caller_str(ctx);
     if let Err(e) = evaluate_op(&record.policy, op, handle, approvals, ctx, None) {
         let _ = audit_and_save(&mut record, op_name(op), &caller, AuditDecision::Denied, &e);
-        return Err(VaultResponse::Error(e));
+        return Err(e);
     }
-    if let Err(e) = audit_and_save(
+    audit_and_save(
         &mut record,
         op_name(op),
         &caller,
         AuditDecision::Allowed,
         "",
-    ) {
-        return Err(e);
-    }
+    )?;
     Ok(record)
 }
 
@@ -756,7 +751,7 @@ fn handle_wrap(
         ctx,
     ) {
         Ok(r) => r,
-        Err(e) => return e,
+        Err(e) => return VaultResponse::Error(e),
     };
     let plaintext = match URL_SAFE_NO_PAD.decode(plaintext_b64) {
         Ok(b) => b,
@@ -798,7 +793,7 @@ fn handle_unwrap(
         ctx,
     ) {
         Ok(r) => r,
-        Err(e) => return e,
+        Err(e) => return VaultResponse::Error(e),
     };
     let ciphertext = match URL_SAFE_NO_PAD.decode(ciphertext_b64) {
         Ok(b) => b,
@@ -836,7 +831,7 @@ fn handle_sign(
         ctx,
     ) {
         Ok(r) => r,
-        Err(e) => return e,
+        Err(e) => return VaultResponse::Error(e),
     };
     let message = match URL_SAFE_NO_PAD.decode(message_b64) {
         Ok(b) => b,
@@ -872,7 +867,7 @@ fn handle_mac(
         ctx,
     ) {
         Ok(r) => r,
-        Err(e) => return e,
+        Err(e) => return VaultResponse::Error(e),
     };
     let message = match URL_SAFE_NO_PAD.decode(message_b64) {
         Ok(b) => b,
@@ -897,7 +892,7 @@ fn handle_issue_approval(
 ) -> VaultResponse {
     let mut record = match load_record(handle) {
         Ok(r) => r,
-        Err(e) => return e,
+        Err(e) => return VaultResponse::Error(e),
     };
 
     // Caller must be an OIDC manager of this key.
@@ -953,7 +948,7 @@ fn handle_issue_approval(
     let token = {
         let kv = match kv() {
             Ok(k) => k,
-            Err(e) => return e,
+            Err(e) => return VaultResponse::Error(e),
         };
         let mut store = match kv.lock() {
             Ok(s) => s,
@@ -989,7 +984,7 @@ fn handle_read_audit(
 ) -> VaultResponse {
     let record = match load_record(handle) {
         Ok(r) => r,
-        Err(e) => return e,
+        Err(e) => return VaultResponse::Error(e),
     };
     if resolve_caller(&record.policy, ctx).is_none() {
         return VaultResponse::Error("caller is not in policy.principals".into());
@@ -998,7 +993,7 @@ fn handle_read_audit(
 
     let kv = match kv() {
         Ok(k) => k,
-        Err(e) => return e,
+        Err(e) => return VaultResponse::Error(e),
     };
     let store = match kv.lock() {
         Ok(s) => s,
@@ -1052,7 +1047,7 @@ fn check_pending_mutability(
 /// Who is staging a pending profile.
 enum StagerIdentity {
     /// A key principal (owner, or a manager the Mutability rules permit).
-    Principal(CallerRole),
+    Principal,
     /// The PLATFORM: a verified manager-role bearer that matches no key
     /// principal. This is the staging-only capability from the
     /// enclave-upgrade design (item 2): after a runtime roll the platform
@@ -1073,7 +1068,7 @@ fn check_stage_authority(
     ctx: &RequestContext,
 ) -> Result<StagerIdentity, String> {
     if resolve_caller(&record.policy, ctx).is_some() {
-        return check_pending_mutability(record, ctx).map(StagerIdentity::Principal);
+        return check_pending_mutability(record, ctx).map(|_| StagerIdentity::Principal);
     }
     let is_platform = ctx
         .oidc_claims
@@ -1104,7 +1099,7 @@ fn handle_stage_pending(
 ) -> VaultResponse {
     let mut record = match load_record(handle) {
         Ok(r) => r,
-        Err(e) => return e,
+        Err(e) => return VaultResponse::Error(e),
     };
     let caller = caller_str(ctx);
     let stager = match check_stage_authority(&record, ctx) {
@@ -1182,7 +1177,7 @@ fn handle_stage_pending(
             AuditDecision::Allowed,
             &format!("runtime-only delta -> tees[{}]", new_tee_idx),
         ) {
-            return e;
+            return VaultResponse::Error(e);
         }
         return VaultResponse::PendingProfileStaged {
             pending_id: 0,
@@ -1235,7 +1230,7 @@ fn handle_stage_pending(
         AuditDecision::Allowed,
         &format!("id={}", pending_id),
     ) {
-        return e;
+        return VaultResponse::Error(e);
     }
     let policy_version = record.policy_version;
     VaultResponse::PendingProfileStaged {
@@ -1248,7 +1243,7 @@ fn handle_stage_pending(
 fn handle_list_pending(handle: &str, ctx: &RequestContext) -> VaultResponse {
     let record = match load_record(handle) {
         Ok(r) => r,
-        Err(e) => return e,
+        Err(e) => return VaultResponse::Error(e),
     };
     if resolve_caller(&record.policy, ctx).is_none() {
         return VaultResponse::Error("caller is not in policy.principals".into());
@@ -1266,7 +1261,7 @@ fn handle_promote_pending(
 ) -> VaultResponse {
     let mut record = match load_record(handle) {
         Ok(r) => r,
-        Err(e) => return e,
+        Err(e) => return VaultResponse::Error(e),
     };
     let caller = caller_str(ctx);
 
@@ -1358,7 +1353,7 @@ fn handle_promote_pending(
         AuditDecision::Allowed,
         &format!("id={} -> tees[{}]", pending_id, new_tee_idx),
     ) {
-        return e;
+        return VaultResponse::Error(e);
     }
     VaultResponse::PendingProfilePromoted {
         policy_version: record.policy_version,
@@ -1368,7 +1363,7 @@ fn handle_promote_pending(
 fn handle_revoke_pending(handle: &str, pending_id: u32, ctx: &RequestContext) -> VaultResponse {
     let mut record = match load_record(handle) {
         Ok(r) => r,
-        Err(e) => return e,
+        Err(e) => return VaultResponse::Error(e),
     };
     let caller = caller_str(ctx);
     if let Err(e) = check_pending_mutability(&record, ctx) {
@@ -1401,7 +1396,7 @@ fn handle_revoke_pending(handle: &str, pending_id: u32, ctx: &RequestContext) ->
         AuditDecision::Allowed,
         &format!("id={}", pending_id),
     ) {
-        return e;
+        return VaultResponse::Error(e);
     }
     VaultResponse::PendingProfileRevoked
 }

@@ -20,7 +20,8 @@ use base64::Engine;
 use enclave_os_common::modules::AppIdentity;
 use enclave_os_common::ocall::{self, OcallVtable};
 use enclave_os_egress::{
-    https_fetch, root_store, EgressModule, ExpectedOid, RaTlsPolicy, ReportDataBinding, TeeType,
+    https_fetch_interruptible, root_store, BoundedHttpsRequest, EgressModule, ExpectedOid,
+    GlobalOcallNetIo, RaTlsPolicy, ReportDataBinding, TeeType,
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{json, Value};
@@ -517,7 +518,7 @@ fn request_with_status(
             Vec::new()
         },
         attestation_servers: vec![args.appraiser_url.clone()],
-        acceptable_tcb_statuses: None,
+        acceptable_tcb_statuses: Vec::new(),
         client_identity: None,
         dependencies: None,
     };
@@ -527,7 +528,11 @@ fn request_with_status(
     }
     let url = format!("https://{}:{}{}", args.host, args.port, path);
     let roots = root_store().ok_or_else(|| "RA-TLS root store is unavailable".to_string())?;
-    let response = https_fetch(method, &url, &headers, body, roots, Some(&policy))?;
+    let response =
+        BoundedHttpsRequest::new(method, &url, headers.to_vec(), (body).map(<[u8]>::to_vec))
+            .and_then(|request| {
+                https_fetch_interruptible(&mut GlobalOcallNetIo, &request, roots, Some(&policy))
+            })?;
     Ok((response.status, response.body))
 }
 

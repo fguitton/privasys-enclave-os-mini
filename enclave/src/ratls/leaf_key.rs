@@ -205,10 +205,10 @@ pub(super) fn check() {
     assert_eq!(pool.used(), required);
     drop(fresh);
     assert_eq!(pool.used(), 0);
-    // Exercise the unchanged legacy producer, not a made-up cache payload.
-    let legacy = new_leaf_key(23).unwrap();
-    assert_eq!(legacy.created, 23);
-    assert!(EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &legacy.pkcs8, &rng).is_ok());
+    // Exercise the current client-identity producer, not a made-up cache payload.
+    let client = new_leaf_key(23).unwrap();
+    assert_eq!(client.created, 23);
+    assert!(EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &client.pkcs8, &rng).is_ok());
     assert!(enclave_os_common::quote::p256_spki_der_len(usize::MAX).is_none());
     let mut short = vec![0; spki_len - 1];
     assert!(enclave_os_common::quote::write_p256_spki_der(point, &mut short).is_none());

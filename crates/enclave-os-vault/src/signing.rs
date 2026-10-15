@@ -15,7 +15,7 @@
 use std::string::String;
 use std::vec::Vec;
 
-use enclave_os_common::jwt::{decode_payload_unverified, encode_jwt, JwtVerifier};
+use enclave_os_common::jwt::{encode_jwt, JwtVerifier};
 use enclave_os_kvstore::SealedKvStore;
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};

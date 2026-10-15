@@ -105,7 +105,7 @@ pub struct WasmEnvelope {
     /// linked accounts can cover sponsored calls; a sponsored call whose
     /// rp_id is not in the set is refused before dispatch ("relying party
     /// has not funded verification") instead of silently shifting cost to
-    /// the owner. Never pushed → no refusal (pre-rollout compatibility).
+    /// the owner. Before a set is supplied, every sponsored call is refused.
     /// Requires the **manager** role.
     #[serde(default)]
     pub wasm_funded_rps: Option<WasmFundedRps>,
@@ -206,8 +206,8 @@ pub struct WasmRotateKey {
     /// selection for a later re-author).
     #[serde(default)]
     pub new_vault_oidc_issuer: Option<String>,
-    /// TARGET constellation acceptable Intel TCB statuses (empty/absent =
-    /// no TCB acceptance check on the dial).
+    /// TARGET constellation explicit TCB exceptions. Required when selecting
+    /// new endpoints; an empty set enforces the secure floor.
     #[serde(default)]
     pub new_vault_acceptable_tcb_statuses: Option<Vec<String>>,
 }
@@ -996,7 +996,7 @@ pub enum FunctionPolicy {
     /// this annotation (the configure-authz standard): it always
     /// requires the per-app config role
     /// `<audience>:app:<app-id-hex>:owner|admin` on a platform bearer,
-    /// with owners-team membership as the transitional fallback.
+    /// without a predecessor owner-membership fallback.
     Owner,
 }
 

@@ -4,7 +4,7 @@
 //! JWKS-based JWT verification.
 //!
 //! The fetch+cache implementation lives in `enclave-os-egress` (it needs
-//! `https_fetch`, and both this crate and the vault crate depend on egress).
+//! bounded HTTPS requests, and both this crate and the vault crate depend on egress).
 //! Re-exported here so existing `crate::jwks_fetcher::…` call-sites keep working.
 
 pub use enclave_os_egress::jwks::{idp_ec_p256_keys, verify_jwt_signature, verify_jwt_with_jwks};

@@ -92,6 +92,7 @@ pub enum InputStreamKind {
 }
 
 /// Per-socket state.
+#[derive(Default)]
 pub struct TcpSocketState {
     pub fd: Option<i32>,
     pub bound: bool,
@@ -219,6 +220,12 @@ pub struct AppContext {
     next_rep: u32,
 }
 
+impl Default for AppContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AppContext {
     /// Create a new empty app context.
     pub fn new() -> Self {
@@ -335,7 +342,7 @@ impl AppContext {
                 Self::forward_to_log(&mut self.stderr_buf, &self.app_name, data, true);
             }
             OutputStreamKind::TcpSocket(fd) => {
-                if let Err(_) = enclave_os_common::ocall::net_send(fd, data) {
+                if enclave_os_common::ocall::net_send(fd, data).is_err() {
                     return Err("last-operation-failed");
                 }
             }

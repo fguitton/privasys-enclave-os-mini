@@ -226,16 +226,11 @@ pub(crate) fn tee_matches(
             Ok(v) => v,
             Err(_) => return false,
         };
-    // Enforce the Intel platform TCB status reported by each server against
-    // the profile's acceptable set (opt-in: `None` = legacy policy, no check;
-    // `Some` = secure floor + explicit relaxations; `Revoked` always fails,
-    // opt-in or not). A server that reports no status is accepted for
-    // compatibility — the sgx.fail downgrade gate only tightens when the
-    // hardened attestation server actually derives a status.
+    // Require each server to report a status accepted by the explicit policy.
     for v in &verdicts {
         if !enclave_os_egress::attestation::tcb_status_acceptable(
             &v.tcb_status,
-            profile.acceptable_tcb_statuses.as_deref(),
+            &profile.acceptable_tcb_statuses,
         ) {
             return false;
         }
@@ -617,6 +612,7 @@ pub fn evaluate_policy_update(
 ///     (all-SGX or all-TDX — a runtime roll never changes the TEE type),
 ///   - actually different measurements (an identical profile is a re-stage,
 ///     not a migration — the caller dedupes that separately).
+///
 /// `name` is advisory display text and deliberately ignored.
 pub(crate) fn runtime_only_delta(staged: &AttestationProfile, active: &AttestationProfile) -> bool {
     if !same_elements(&staged.required_oids, &active.required_oids) {
@@ -625,16 +621,12 @@ pub(crate) fn runtime_only_delta(staged: &AttestationProfile, active: &Attestati
     if !same_elements(&staged.attestation_servers, &active.attestation_servers) {
         return false;
     }
-    // A migration must not smuggle a TCB-policy change past the owner: the
-    // acceptable-TCB set has to be the same policy on both sides (None==None,
-    // or Some sets equal as unordered element sets).
-    match (
+    // Runtime rotation cannot change the explicit TCB policy.
+    if !same_elements(
         &staged.acceptable_tcb_statuses,
         &active.acceptable_tcb_statuses,
     ) {
-        (None, None) => {}
-        (Some(a), Some(b)) if same_elements(a, b) => {}
-        _ => return false,
+        return false;
     }
     let family = |ms: &[Measurement]| -> Option<bool> {
         // Some(true) = all SGX, Some(false) = all TDX, None = empty or mixed.
@@ -901,7 +893,7 @@ mod auto_migrate_tests {
                     value: app_id.into(),
                 },
             ],
-            acceptable_tcb_statuses: None,
+            acceptable_tcb_statuses: Vec::new(),
         }
     }
 
@@ -929,15 +921,13 @@ mod auto_migrate_tests {
         // Opting a profile into TCB enforcement (or relaxing/tightening the
         // set) is a policy change, never an auto-acceptable runtime roll.
         let mut opted = profile("bbbb", "code1", "aid1");
-        opted.acceptable_tcb_statuses = Some(vec!["ConfigurationAndSWHardeningNeeded".into()]);
+        opted.acceptable_tcb_statuses = vec!["ConfigurationAndSWHardeningNeeded".into()];
         assert!(!runtime_only_delta(&opted, &active));
         // Same set (order-insensitive) still qualifies.
         let mut active2 = profile("aaaa", "code1", "aid1");
-        active2.acceptable_tcb_statuses =
-            Some(vec!["OutOfDate".into(), "ConfigurationNeeded".into()]);
+        active2.acceptable_tcb_statuses = vec!["OutOfDate".into(), "ConfigurationNeeded".into()];
         let mut staged2 = profile("bbbb", "code1", "aid1");
-        staged2.acceptable_tcb_statuses =
-            Some(vec!["ConfigurationNeeded".into(), "OutOfDate".into()]);
+        staged2.acceptable_tcb_statuses = vec!["ConfigurationNeeded".into(), "OutOfDate".into()];
         assert!(runtime_only_delta(&staged2, &active2));
     }
 
@@ -945,36 +935,55 @@ mod auto_migrate_tests {
     fn tcb_status_gate() {
         use enclave_os_egress::attestation::tcb_status_acceptable;
         let strict: Vec<String> = vec![];
+        let mut current = serde_json::to_value(profile("aaaa", "code1", "aid1")).unwrap();
+        assert!(serde_json::from_value::<AttestationProfile>(current.clone()).is_ok());
+        current
+            .as_object_mut()
+            .unwrap()
+            .remove("acceptable_tcb_statuses");
+        assert!(serde_json::from_value::<AttestationProfile>(current.clone()).is_err());
+        current["acceptable_tcb_statuses"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<AttestationProfile>(current).is_err());
+        let mut report = serde_json::json!({"success": true, "tcbStatus": "UpToDate"});
+        assert!(
+            serde_json::from_value::<enclave_os_egress::attestation::VerifyResponse>(
+                report.clone()
+            )
+            .is_ok()
+        );
+        report.as_object_mut().unwrap().remove("tcbStatus");
+        assert!(
+            serde_json::from_value::<enclave_os_egress::attestation::VerifyResponse>(report)
+                .is_err()
+        );
+
         let relax = vec!["ConfigurationAndSWHardeningNeeded".to_string()];
-        // Legacy policy (None): no enforcement — anything but Revoked passes.
-        assert!(tcb_status_acceptable(
+        assert!(!tcb_status_acceptable(
             "ConfigurationAndSWHardeningNeeded",
-            None
+            &strict
         ));
-        assert!(tcb_status_acceptable("OutOfDate", None));
-        // …but Revoked always fails, opt-in or not.
-        assert!(!tcb_status_acceptable("Revoked", None));
-        // Empty status (server did not derive one) is accepted for compat.
-        assert!(tcb_status_acceptable("", Some(&strict)));
+        assert!(!tcb_status_acceptable("OutOfDate", &strict));
+        assert!(!tcb_status_acceptable("Revoked", &strict));
+        assert!(!tcb_status_acceptable("", &strict));
         // Secure floor always passes under enforcement.
-        assert!(tcb_status_acceptable("UpToDate", Some(&strict)));
-        assert!(tcb_status_acceptable("SWHardeningNeeded", Some(&strict)));
+        assert!(tcb_status_acceptable("UpToDate", &strict));
+        assert!(tcb_status_acceptable("SWHardeningNeeded", &strict));
         // Outside the floor: rejected under strict floor-only…
         assert!(!tcb_status_acceptable(
             "ConfigurationAndSWHardeningNeeded",
-            Some(&strict)
+            &strict
         ));
-        assert!(!tcb_status_acceptable("OutOfDate", Some(&strict)));
+        assert!(!tcb_status_acceptable("OutOfDate", &strict));
         // …accepted only when explicitly listed…
         assert!(tcb_status_acceptable(
             "ConfigurationAndSWHardeningNeeded",
-            Some(&relax)
+            &relax
         ));
         // …and one relaxation never implies another.
-        assert!(!tcb_status_acceptable("OutOfDate", Some(&relax)));
+        assert!(!tcb_status_acceptable("OutOfDate", &relax));
         // Revoked is non-overridable, even if a policy lists it.
         let evil = vec!["Revoked".to_string()];
-        assert!(!tcb_status_acceptable("Revoked", Some(&evil)));
+        assert!(!tcb_status_acceptable("Revoked", &evil));
     }
 
     #[test]
