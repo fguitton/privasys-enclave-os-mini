@@ -109,6 +109,8 @@ pub(super) fn check() {
     drop(alias);
     assert_eq!(pool.used(), 0);
     check_erased();
+    check_extensions();
+    check_extension_parser_precedence();
 }
 fn erased(
     allocator: rustls::RetainedAllocator,
@@ -200,6 +202,97 @@ fn check_erased() {
             continue;
         }
         drop(allocator);
+        drop(origin);
+        assert_eq!(pool.used(), 0);
+    }
+}
+
+// Native generic factory ownership is distinct from the selected SDK parser's
+// original connection allocator. Both use the production concrete helper.
+fn check_extensions() {
+    use rustls::internal::msgs::handshake::{
+        server_extensions_layout, server_extensions_owner_probe,
+    };
+    let metadata = metadata_bytes();
+    let backend = backend_bytes(server_extensions_layout());
+    for (slots, delta) in [(1_usize, -1_isize), (2, -1), (2, 0), (2, 1)] {
+        let capacity = metadata.checked_add(backend.checked_mul(slots).unwrap())
+            .unwrap().checked_add_signed(delta).unwrap();
+        let pool = AllocationPoolV1::new(capacity).unwrap();
+        let origin = Original::new(&pool);
+        origin.arm(None);
+        let mut observed = false;
+        let result = without_global(|| server_extensions_owner_probe(origin.clone(), || {
+            observed = true;
+            assert_eq!(pool.used(), metadata + backend);
+            assert_eq!(origin.backend_bytes(), backend);
+        }));
+        assert_eq!(observed, slots == 2);
+        if delta < 0 {
+            assert!(matches!(result, Err(rustls::InvalidMessage::AllocationFailed)));
+        } else {
+            result.unwrap();
+        }
+        assert_eq!(origin.requests(), slots);
+        assert_eq!(origin.backend_bytes(), 0);
+        assert_eq!(pool.used(), metadata);
+        drop(origin);
+        assert_eq!(pool.used(), 0);
+    }
+    for failed_request in [0, 1] {
+        let pool = AllocationPoolV1::new(metadata + backend * 2).unwrap();
+        let origin = Original::new(&pool);
+        origin.arm(Some(failed_request));
+        let mut observed = false;
+        let result = without_global(|| server_extensions_owner_probe(origin.clone(), || {
+            observed = true;
+            assert_eq!(pool.used(), metadata + backend);
+        }));
+        assert!(matches!(result, Err(rustls::InvalidMessage::AllocationFailed)));
+        assert_eq!(observed, failed_request == 1);
+        assert_eq!(origin.requests(), failed_request + 1);
+        assert_eq!(origin.backend_bytes(), 0);
+        assert_eq!(pool.used(), metadata);
+        origin.arm(None);
+        without_global(|| server_extensions_owner_probe(origin.clone(), || {})).unwrap();
+        assert_eq!(origin.requests(), 2);
+        assert_eq!(pool.used(), metadata);
+        drop(origin);
+        assert_eq!(pool.used(), 0);
+    }
+}
+
+fn check_extension_parser_precedence() {
+    use rustls::internal::msgs::handshake::{
+        server_extensions_layout, server_extensions_parser_probe,
+    };
+    let metadata = metadata_bytes();
+    let backend = backend_bytes(server_extensions_layout());
+    for server_hello in [true, false] {
+        let pool = AllocationPoolV1::new(metadata + backend).unwrap();
+        let origin = Original::new(&pool);
+        origin.arm(Some(0));
+        let error = without_global(|| {
+            server_extensions_parser_probe(origin.clone(), server_hello, true)
+        }).unwrap_err();
+        let label = if server_hello { "ServerHelloPayload" } else { "HandshakeMessagePayload" };
+        assert_eq!(error, rustls::InvalidMessage::TrailingData(label));
+        assert_eq!(origin.requests(), 0);
+        assert_eq!(pool.used(), metadata);
+        assert_eq!(origin.backend_bytes(), 0);
+        let error = without_global(|| {
+            server_extensions_parser_probe(origin.clone(), server_hello, false)
+        }).unwrap_err();
+        assert_eq!(error, rustls::InvalidMessage::AllocationFailed);
+        assert_eq!(origin.requests(), 1);
+        assert_eq!(pool.used(), metadata);
+        origin.arm(None);
+        without_global(|| {
+            server_extensions_parser_probe(origin.clone(), server_hello, false)
+        }).unwrap();
+        assert_eq!(origin.requests(), 1);
+        assert_eq!(origin.backend_bytes(), 0);
+        assert_eq!(pool.used(), metadata);
         drop(origin);
         assert_eq!(pool.used(), 0);
     }

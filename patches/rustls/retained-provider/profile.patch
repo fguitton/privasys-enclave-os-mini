@@ -305,7 +305,12 @@
 -        let enc = match retry_req.is_some() {
 -            true => Vec::default(),
 -            false => self.enc.0.clone(),
--        };
++        let allocator = outer_hello.extensions.allocator.clone();
++        let enc: &[u8] = if retry_req.is_some() {
++            &[]
++        } else {
++            &self.enc.0
+         };
 -
 -        fn outer_hello_ext(ctx: &EchState, enc: Vec<u8>, payload: Vec<u8>) -> EncryptedClientHello {
 -            EncryptedClientHello::Outer(EncryptedClientHelloOuter {
@@ -315,12 +320,6 @@
 -                payload: PayloadU16::new(payload),
 -            })
 -        }
-+        let allocator = outer_hello.extensions.allocator.clone();
-+        let enc: &[u8] = if retry_req.is_some() {
-+            &[]
-+        } else {
-+            &self.enc.0
-+        };
 +        let enc = PayloadU16::from_vec_in(
 +            crate::msgs::retained::copy_bytes_in(enc, allocator.clone())
 +                .map_err(|_| crate::InvalidMessage::AllocationFailed)?,
@@ -383,7 +382,7 @@
          // encoding rather than reencoding it.
          confirmation_transcript
 -            .add_message(&Self::server_hello_conf(server_hello, server_hello_encoded));
-+            .add_message(&Self::server_hello_conf(server_hello, server_hello_encoded))?;
++            .add(Self::server_hello_conf(server_hello_encoded).bytes())?;
  
          // Derive a confirmation secret from the inner hello random and the confirmation transcript.
          let derived = ks.server_ech_confirmation_secret(
@@ -523,7 +522,7 @@
  
              // fill_in_psk_binder works on an owned HandshakeMessagePayload, so we need to
              // extract our inner hello back out of it to retain ownership.
-@@ -728,41 +769,32 @@
+@@ -728,48 +769,38 @@
          };
  
          // Update the inner transcript buffer with the inner hello message.
@@ -577,6 +576,91 @@
          Ok(())
      }
  
+     fn server_hello_conf(
+-        server_hello: &ServerHelloPayload,
+         server_hello_encoded: &Payload<'_>,
+-    ) -> Message<'static> {
++    ) -> Payload<'static> {
+         // The confirmation is computed over the server hello, which has had
+         // its `random` field altered to zero the final 8 bytes.
+         //
+@@ -780,15 +811,7 @@
+         let mut encoded = server_hello_encoded.clone().into_vec();
+         encoded[SERVER_HELLO_ECH_CONFIRMATION_SPAN].fill(0x00);
+ 
+-        Message {
+-            version: ProtocolVersion::TLSv1_3,
+-            payload: MessagePayload::Handshake {
+-                encoded: Payload::Owned(encoded),
+-                parsed: HandshakeMessagePayload(HandshakePayload::ServerHello(
+-                    server_hello.clone(),
+-                )),
+-            },
+-        }
++        Payload::Owned(encoded)
+     }
+ 
+     fn hello_retry_request_conf(retry_req: &HelloRetryRequest) -> Message<'_> {
+@@ -856,12 +879,12 @@
+             session_id: SessionId::empty(),
+             cipher_suite: CipherSuite::TLS13_AES_256_GCM_SHA384,
+             compression_method: Compression::Null,
+-            extensions: Box::new(ServerExtensions::default()),
++            extensions: crate::retained_box::try_box_in(ServerExtensions::default(), crate::limited_cache::default_allocator()).unwrap(),
+         };
+         let message = Message {
+             version: ProtocolVersion::TLSv1_3,
+             payload: MessagePayload::handshake(HandshakeMessagePayload(
+-                HandshakePayload::ServerHello(server_hello.clone()),
++                HandshakePayload::ServerHello(server_hello),
+             )),
+         };
+         let Message {
+@@ -876,19 +899,7 @@
+             unreachable!("ServerHello is a handshake message");
+         };
+ 
+-        let message = EchState::server_hello_conf(&server_hello, server_hello_encoded_before);
+-
+-        let Message {
+-            payload:
+-                MessagePayload::Handshake {
+-                    encoded: server_hello_encoded_after,
+-                    ..
+-                },
+-            ..
+-        } = &message
+-        else {
+-            unreachable!("ServerHello is a handshake message");
+-        };
++        let server_hello_encoded_after = EchState::server_hello_conf(server_hello_encoded_before);
+ 
+         assert_eq!(
+             std::format!("{server_hello_encoded_before:x?}"),
+@@ -966,6 +977,7 @@
+             false,
+             &FixedRandom,
+             enable_sni,
++            alloc::alloc::Global,
+         )
+         .unwrap()
+         .encode_inner_hello(
+@@ -976,13 +988,13 @@
+                 cipher_suites: vec![],
+                 compression_methods: vec![Compression::Null],
+                 extensions: Box::new(ClientExtensions {
+-                    server_name: Some(ServerNamePayload::from(&name)),
++                    server_name: Some(ServerNamePayload::try_from_dns_in(&name, alloc::alloc::Global).unwrap()),
+                     ..Default::default()
+                 }),
+             },
+             None,
+             &None,
+-        )
++        ).unwrap()
+     }
+ 
+     fn dns_name_of_len(mut len: usize) -> DnsName<'static> {
 --- a/src/client/hs.rs
 +++ b/src/client/hs.rs
 @@ -1,6 +1,6 @@
@@ -1676,13 +1760,14 @@
      fn common(&self) -> &persist::ClientSessionCommon {
 --- a/src/client/test.rs
 +++ b/src/client/test.rs
-@@ -1,4 +1,5 @@
+@@ -1,5 +1,5 @@
  #![cfg(any(feature = "ring", feature = "aws_lc_rs"))]
+-use alloc::boxed::Box;
 +use crate::crypto::cipher::{SelectedDecrypter, SelectedEncrypter};
- use alloc::boxed::Box;
  use alloc::vec;
  use alloc::vec::Vec;
-@@ -42,7 +43,7 @@
+ use core::sync::atomic::{AtomicBool, Ordering};
+@@ -42,7 +42,7 @@
      use crate::sign::CertifiedKey;
      use crate::tls13::key_schedule::{derive_traffic_iv, derive_traffic_key};
      use crate::verify::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -1691,7 +1776,7 @@
  
      /// Tests that session_ticket(35) extension
      /// is not sent if the client does not support TLS 1.2.
-@@ -70,10 +71,9 @@
+@@ -70,10 +70,9 @@
                  .with_no_client_auth(),
          )
          .unwrap();
@@ -1705,7 +1790,12 @@
      }
  
      #[test]
-@@ -170,8 +170,7 @@
+@@ -166,12 +165,11 @@
+                     cipher_suite: CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+                     legacy_version: ProtocolVersion::TLSv1_2,
+                     session_id: SessionId::empty(),
+-                    extensions: Box::new(ServerExtensions::default()),
++                    extensions: crate::retained_box::try_box_in(ServerExtensions::default(), crate::limited_cache::default_allocator()).unwrap(),
                  }),
              )),
          };
@@ -1715,7 +1805,16 @@
  
          assert_eq!(
              conn.process_new_packets(),
-@@ -240,8 +239,7 @@
+@@ -233,15 +231,14 @@
+                     cipher_suite: CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+                     legacy_version: ProtocolVersion::TLSv1_2,
+                     session_id: SessionId::empty(),
+-                    extensions: Box::new(ServerExtensions {
++                    extensions: crate::retained_box::try_box_in(ServerExtensions {
+                         extended_master_secret_ack: Some(()),
+                         ..ServerExtensions::default()
+-                    }),
++                    }, crate::limited_cache::default_allocator()).unwrap(),
                  }),
              )),
          };
@@ -1725,7 +1824,7 @@
          conn.process_new_packets().unwrap();
  
          let cert = Message {
-@@ -290,11 +288,7 @@
+@@ -290,11 +287,7 @@
              .unwrap();
          conn.process_new_packets().unwrap();
  
@@ -1738,7 +1837,7 @@
      }
  
      #[derive(Debug, Default)]
-@@ -321,8 +315,7 @@
+@@ -321,8 +314,7 @@
              dss: &DigitallySignedStruct,
          ) -> Result<HandshakeSignatureValid, Error> {
              assert_eq!(dss.scheme, SignatureScheme::ECDSA_SHA1_Legacy);
@@ -1748,7 +1847,19 @@
              Ok(HandshakeSignatureValid::assertion())
          }
  
-@@ -426,8 +419,7 @@
+@@ -416,24 +408,23 @@
+                     cipher_suite: CipherSuite::TLS13_AES_128_GCM_SHA256,
+                     legacy_version: ProtocolVersion::TLSv1_3,
+                     session_id: SessionId::empty(),
+-                    extensions: Box::new(ServerExtensions {
++                    extensions: crate::retained_box::try_box_in(ServerExtensions {
+                         key_share: Some(KeyShareEntry {
+                             group: NamedGroup::X25519,
+                             payload: PayloadU16::new(vec![0xaa; 32]),
+                         }),
+                         ..ServerExtensions::default()
+-                    }),
++                    }, crate::limited_cache::default_allocator()).unwrap(),
                  }),
              )),
          };
@@ -1758,7 +1869,14 @@
          conn.process_new_packets().unwrap();
  
          let ee = Message {
-@@ -441,8 +433,7 @@
+             version: ProtocolVersion::TLSv1_3,
+             payload: MessagePayload::handshake(HandshakeMessagePayload(
+-                HandshakePayload::EncryptedExtensions(Box::new(encrypted_extensions)),
++                HandshakePayload::EncryptedExtensions(crate::retained_box::try_box_in(encrypted_extensions, crate::limited_cache::default_allocator()).unwrap()),
+             )),
+         };
+ 
+@@ -441,8 +432,7 @@
          let enc_ee = encrypter
              .encrypt(PlainMessage::from(ee).borrow_outbound(), 0)
              .unwrap();
@@ -1768,7 +1886,7 @@
          conn.process_new_packets().map(|_| ())
      }
  
-@@ -465,10 +456,7 @@
+@@ -465,10 +455,7 @@
              .load_private_key(client_key())
              .unwrap();
          let public_key_as_cert = vec![CertificateDer::from(
@@ -1780,7 +1898,7 @@
          )];
          CertifiedKey::new(public_key_as_cert, key)
      }
-@@ -591,15 +579,12 @@
+@@ -591,15 +578,12 @@
              }
          }
  
@@ -1798,7 +1916,7 @@
  
              let expander = cipher_suite
                  .hkdf_provider
-@@ -619,9 +604,7 @@
+@@ -619,9 +603,7 @@
  
          fn log(&self, label: &str, _client_random: &[u8], secret: &[u8]) {
              if label == "SERVER_HANDSHAKE_TRAFFIC_SECRET" {
@@ -1809,7 +1927,7 @@
              }
          }
      }
-@@ -644,11 +627,7 @@
+@@ -644,11 +626,7 @@
      )
      .unwrap();
  
@@ -1822,7 +1940,7 @@
      assert_eq!(key_shares.len(), 2);
      assert_eq!(key_shares[0].group, NamedGroup::X25519MLKEM768);
      assert_eq!(key_shares[1].group, NamedGroup::X25519);
-@@ -671,11 +650,7 @@
+@@ -671,11 +649,7 @@
      )
      .unwrap();
  
@@ -6492,75 +6610,6 @@
 +        Self::try_new_in(DEFAULT_CACHE_SIZE, allocator)
 +    }
 +}
---- a/src/conn/kernel.rs
-+++ b/src/conn/kernel.rs
-@@ -53,7 +53,6 @@
- //! [`CipherSuiteCommon::confidentiality_limit`]: crate::CipherSuiteCommon::confidentiality_limit
- //! [`KernelConnection`]: crate::kernel::KernelConnection
- 
--use alloc::boxed::Box;
- use core::marker::PhantomData;
- 
- use crate::client::ClientConnectionData;
-@@ -71,7 +70,7 @@
- ///
- /// See the [`crate::kernel`] module docs for more details.
- pub struct KernelConnection<Data> {
--    state: Box<dyn KernelState>,
-+    state: crate::common_state::StateBox<Data>,
- 
-     peer_certificates: Option<CertificateChain<'static>>,
-     quic: Quic,
-@@ -84,7 +83,10 @@
- }
- 
- impl<Data> KernelConnection<Data> {
--    pub(crate) fn new(state: Box<dyn KernelState>, common: CommonState) -> Result<Self, Error> {
-+    pub(crate) fn new(
-+        state: crate::common_state::StateBox<Data>,
-+        common: CommonState,
-+    ) -> Result<Self, Error> {
-         Ok(Self {
-             state,
- 
-@@ -94,9 +96,7 @@
-                 .negotiated_version
-                 .ok_or(Error::HandshakeNotComplete)?,
-             protocol: common.protocol,
--            suite: common
--                .suite
--                .ok_or(Error::HandshakeNotComplete)?,
-+            suite: common.suite.ok_or(Error::HandshakeNotComplete)?,
- 
-             _data: PhantomData,
-         })
-@@ -126,6 +126,8 @@
-     pub fn update_tx_secret(&mut self) -> Result<(u64, ConnectionTrafficSecrets), Error> {
-         // The sequence number always starts at 0 after a key update.
-         self.state
-+            .kernel_state()
-+            .ok_or(Error::HandshakeNotComplete)?
-             .update_secrets(Direction::Transmit)
-             .map(|secret| (0, secret))
-     }
-@@ -144,6 +146,8 @@
-     pub fn update_rx_secret(&mut self) -> Result<(u64, ConnectionTrafficSecrets), Error> {
-         // The sequence number always starts at 0 after a key update.
-         self.state
-+            .kernel_state()
-+            .ok_or(Error::HandshakeNotComplete)?
-             .update_secrets(Direction::Receive)
-             .map(|secret| (0, secret))
-     }
-@@ -230,6 +234,8 @@
-             quic: &self.quic,
-         };
-         self.state
-+            .kernel_state()
-+            .ok_or(Error::HandshakeNotComplete)?
-             .handle_new_session_ticket(&mut cx, &nst)
-     }
- }
 --- a/src/conn.rs
 +++ b/src/conn.rs
 @@ -1,4 +1,3 @@
@@ -6680,13 +6729,13 @@
  
          let res = self
              .core
-@@ -718,12 +718,13 @@
+@@ -718,20 +718,28 @@
                  self.deframer_buffer.filled_mut(),
                  &mut buffer_progress,
              )
 -            .map(|opt| opt.map(|pm| Message::try_from(pm).map(|m| m.into_owned())));
 +            .map(|opt| {
-+                opt.map(|pm| Message::from_inbound_in(pm, allocator).map(|m| m.into_owned()))
++                opt.map(|pm| Message::from_inbound_in(pm, allocator).and_then(Message::try_into_owned))
 +            });
  
          match res? {
@@ -6696,8 +6745,16 @@
 +                self.deframer_buffer.discard(buffer_progress.take_discard());
                  Ok(Some(msg))
              }
-             Some(Err(err)) => Err(self.send_fatal_alert(AlertDescription::DecodeError, err)),
-@@ -731,7 +732,7 @@
+-            Some(Err(err)) => Err(self.send_fatal_alert(AlertDescription::DecodeError, err)),
++            Some(Err(err)) => {
++                let alert = if matches!(err, crate::InvalidMessage::AllocationFailed) {
++                    AlertDescription::InternalError
++                } else {
++                    AlertDescription::DecodeError
++                };
++                Err(self.send_fatal_alert(alert, err))
++            },
+             None => Ok(None),
          }
      }
  
@@ -6706,7 +6763,7 @@
          self.core.state = Ok(new);
      }
  
-@@ -858,7 +859,7 @@
+@@ -858,7 +866,7 @@
  }
  
  pub(crate) struct ConnectionCore<Data> {
@@ -6715,7 +6772,7 @@
      pub(crate) data: Data,
      pub(crate) common_state: CommonState,
      pub(crate) hs_deframer: HandshakeDeframer,
-@@ -869,7 +870,11 @@
+@@ -869,7 +877,11 @@
  }
  
  impl<Data> ConnectionCore<Data> {
@@ -6728,7 +6785,7 @@
          Self {
              state: Ok(state),
              data,
-@@ -896,7 +901,7 @@
+@@ -896,7 +908,7 @@
  
          loop {
              let res = self.deframe(
@@ -6737,7 +6794,7 @@
                  deframer_buffer.filled_mut(),
                  &mut buffer_progress,
              );
-@@ -923,10 +928,7 @@
+@@ -923,10 +935,7 @@
                  }
              }
  
@@ -6749,7 +6806,7 @@
                  // "Any data received after a closure alert has been received MUST be ignored."
                  // -- <https://datatracker.ietf.org/doc/html/rfc8446#section-6.1>
                  // This is data that has already been accepted in `read_tls`.
-@@ -945,7 +947,7 @@
+@@ -945,7 +954,7 @@
      /// Pull a message out of the deframer and send any messages that need to be sent as a result.
      fn deframe<'b>(
          &mut self,
@@ -6758,7 +6815,7 @@
          buffer: &'b mut [u8],
          buffer_progress: &mut BufferProgress,
      ) -> Result<Option<InboundPlainMessage<'b>>, Error> {
-@@ -976,7 +978,7 @@
+@@ -976,7 +985,7 @@
  
      fn process_more_input<'b>(
          &mut self,
@@ -6767,7 +6824,7 @@
          buffer: &'b mut [u8],
          buffer_progress: &mut BufferProgress,
      ) -> Result<Option<InboundPlainMessage<'b>>, Error> {
-@@ -1008,10 +1010,7 @@
+@@ -1008,10 +1017,7 @@
                      // * The payload size is indicative of a plaintext alert message.
                      ContentType::Alert
                          if version_is_tls13
@@ -6779,7 +6836,7 @@
                              && message.payload.len() <= 2 =>
                      {
                          true
-@@ -1024,11 +1023,7 @@
+@@ -1024,11 +1030,7 @@
                      break (message.into_plain_message(), iter.bytes_consumed());
                  }
  
@@ -6792,7 +6849,7 @@
                      // failed decryption during trial decryption is not allowed to be
                      // interleaved with partial handshake data.
                      Ok(None) if !self.hs_deframer.is_aligned() => {
-@@ -1105,16 +1100,18 @@
+@@ -1105,16 +1107,18 @@
  
              if self.hs_deframer.has_message_ready() {
                  // trial decryption finishes with the first handshake message after it started.
@@ -6815,7 +6872,7 @@
          match error {
              error @ Error::InvalidMessage(_) => {
                  if self.common_state.is_quic() {
-@@ -1143,14 +1140,12 @@
+@@ -1143,14 +1147,12 @@
      fn process_msg(
          &mut self,
          msg: InboundPlainMessage<'_>,
@@ -6833,7 +6890,7 @@
              && self.common_state.is_tls13()
          {
              if !msg.is_valid_ccs() {
-@@ -1163,14 +1158,13 @@
+@@ -1163,14 +1165,13 @@
                  ));
              }
  
@@ -6850,7 +6907,7 @@
              Ok(msg) => msg,
              Err(err) => {
                  return Err(self
-@@ -1190,18 +1184,13 @@
+@@ -1190,18 +1191,13 @@
      }
  
      pub(crate) fn dangerous_extract_secrets(self) -> Result<ExtractedSecrets, Error> {
@@ -6871,7 +6928,7 @@
              return Err(Error::General("Secret extraction is disabled".into()));
          }
  
-@@ -1209,11 +1198,7 @@
+@@ -1209,11 +1205,7 @@
              return Err(Error::HandshakeNotComplete);
          }
  
@@ -6884,7 +6941,7 @@
              return Err(Error::General(
                  "cannot convert into an KernelConnection while there are still buffered TLS records to send"
                      .into()
-@@ -1257,11 +1242,7 @@
+@@ -1257,11 +1249,7 @@
  
      /// Trigger a `refresh_traffic_keys` if required by `CommonState`.
      fn maybe_refresh_traffic_keys(&mut self) {
@@ -6897,6 +6954,75 @@
              let _ = self.refresh_traffic_keys();
          }
      }
+--- a/src/conn/kernel.rs
++++ b/src/conn/kernel.rs
+@@ -53,7 +53,6 @@
+ //! [`CipherSuiteCommon::confidentiality_limit`]: crate::CipherSuiteCommon::confidentiality_limit
+ //! [`KernelConnection`]: crate::kernel::KernelConnection
+ 
+-use alloc::boxed::Box;
+ use core::marker::PhantomData;
+ 
+ use crate::client::ClientConnectionData;
+@@ -71,7 +70,7 @@
+ ///
+ /// See the [`crate::kernel`] module docs for more details.
+ pub struct KernelConnection<Data> {
+-    state: Box<dyn KernelState>,
++    state: crate::common_state::StateBox<Data>,
+ 
+     peer_certificates: Option<CertificateChain<'static>>,
+     quic: Quic,
+@@ -84,7 +83,10 @@
+ }
+ 
+ impl<Data> KernelConnection<Data> {
+-    pub(crate) fn new(state: Box<dyn KernelState>, common: CommonState) -> Result<Self, Error> {
++    pub(crate) fn new(
++        state: crate::common_state::StateBox<Data>,
++        common: CommonState,
++    ) -> Result<Self, Error> {
+         Ok(Self {
+             state,
+ 
+@@ -94,9 +96,7 @@
+                 .negotiated_version
+                 .ok_or(Error::HandshakeNotComplete)?,
+             protocol: common.protocol,
+-            suite: common
+-                .suite
+-                .ok_or(Error::HandshakeNotComplete)?,
++            suite: common.suite.ok_or(Error::HandshakeNotComplete)?,
+ 
+             _data: PhantomData,
+         })
+@@ -126,6 +126,8 @@
+     pub fn update_tx_secret(&mut self) -> Result<(u64, ConnectionTrafficSecrets), Error> {
+         // The sequence number always starts at 0 after a key update.
+         self.state
++            .kernel_state()
++            .ok_or(Error::HandshakeNotComplete)?
+             .update_secrets(Direction::Transmit)
+             .map(|secret| (0, secret))
+     }
+@@ -144,6 +146,8 @@
+     pub fn update_rx_secret(&mut self) -> Result<(u64, ConnectionTrafficSecrets), Error> {
+         // The sequence number always starts at 0 after a key update.
+         self.state
++            .kernel_state()
++            .ok_or(Error::HandshakeNotComplete)?
+             .update_secrets(Direction::Receive)
+             .map(|secret| (0, secret))
+     }
+@@ -230,6 +234,8 @@
+             quic: &self.quic,
+         };
+         self.state
++            .kernel_state()
++            .ok_or(Error::HandshakeNotComplete)?
+             .handle_new_session_ticket(&mut cx, &nst)
+     }
+ }
 --- a/src/crypto/aws_lc_rs/sign.rs
 +++ b/src/crypto/aws_lc_rs/sign.rs
 @@ -8,12 +8,12 @@
@@ -9260,18 +9386,19 @@
      /// Low-level TLS message parsing and encoding functions.
      pub mod msgs {
          pub mod base {
-@@ -485,8 +494,10 @@
+@@ -485,8 +494,11 @@
              pub use crate::msgs::fragmenter::MessageFragmenter;
          }
          pub mod handshake {
 +            pub use crate::hash_hs::{RetainedHandshakeBuffer, RetainedHandshakeHash};
              pub use crate::msgs::handshake::{
                  EchConfigContents, EchConfigPayload, HpkeKeyConfig, HpkeSymmetricCipherSuite,
-+                RetainedClientHello,
++                RetainedClientHello, server_extensions_layout, server_extensions_owner_probe,
++                server_extensions_parser_probe,
              };
          }
          pub mod message {
-@@ -533,20 +544,20 @@
+@@ -533,20 +545,20 @@
  /// [`unbuffered-client`]: https://github.com/rustls/rustls/blob/main/examples/src/bin/unbuffered-client.rs
  /// [`unbuffered-server`]: https://github.com/rustls/rustls/blob/main/examples/src/bin/unbuffered-server.rs
  pub mod unbuffered {
@@ -9294,7 +9421,7 @@
  pub use crate::enums::{
      AlertDescription, CertificateCompressionAlgorithm, CipherSuite, ContentType, HandshakeType,
      ProtocolVersion, SignatureAlgorithm, SignatureScheme,
-@@ -575,7 +586,7 @@
+@@ -575,7 +587,7 @@
  pub use crate::tls12::Tls12CipherSuite;
  pub use crate::tls13::Tls13CipherSuite;
  pub use crate::verify::DigitallySignedStruct;
@@ -9303,7 +9430,7 @@
  pub use crate::webpki::RootCertStore;
  
  /// Items for use in a client.
-@@ -613,8 +624,8 @@
+@@ -613,8 +625,8 @@
  
      pub use crate::msgs::persist::{Tls12ClientSessionValue, Tls13ClientSessionValue};
      pub use crate::webpki::{
@@ -9314,7 +9441,7 @@
      };
  }
  
-@@ -635,7 +646,11 @@
+@@ -635,7 +647,11 @@
      mod tls12;
      mod tls13;
  
@@ -9327,7 +9454,7 @@
      #[cfg(any(feature = "std", feature = "hashbrown"))]
      pub use handy::ResolvesServerCertUsingSni;
      #[cfg(any(feature = "std", feature = "hashbrown"))]
-@@ -682,7 +697,8 @@
+@@ -682,7 +698,8 @@
  /// Message signing interfaces.
  pub mod sign {
      pub use crate::crypto::signer::{
@@ -9337,7 +9464,7 @@
      };
  }
  
-@@ -706,13 +722,13 @@
+@@ -706,13 +723,13 @@
  
  #[cfg(any(feature = "std", feature = "hashbrown"))]
  mod hash_map {
@@ -11108,7 +11235,89 @@
  }
  
  impl<'a> Codec<'a> for ClientSessionTicket {
-@@ -1321,17 +1523,16 @@
+@@ -1296,6 +1498,81 @@
+     }
+ }
+ 
++/// Admit the actual final box with its original allocator before normalization.
++/// Both boxes remain charged while their lifetimes overlap.
++pub(super) fn try_own_server_extensions<A: core::alloc::Allocator + Clone>(
++    value: Box<ServerExtensions<'_>, A>,
++) -> Result<Box<ServerExtensions<'static>, A>, InvalidMessage> {
++    let storage = Box::<ServerExtensions<'static>, A>::try_new_uninit_in(
++        Box::allocator(&value).clone(),
++    ).map_err(|_| InvalidMessage::AllocationFailed)?;
++    Ok(Box::write(storage, (*value).into_owned()))
++}
++
++// The borrowed wire parse and its original trailing-data check precede the
++// fallible fixed owner. Normalization follows admission of that final owner.
++fn read_server_extensions_in<'a, 'owned, A: core::alloc::Allocator>(
++    input: &mut Reader<'a>,
++    allocator: A,
++    allow_absent: bool,
++    label: &'static str,
++    normalize: impl FnOnce(ServerExtensions<'a>) -> ServerExtensions<'owned>,
++) -> Result<Box<ServerExtensions<'owned>, A>, InvalidMessage> {
++    let parsed = if allow_absent && !input.any_left() {
++        ServerExtensions::default()
++    } else {
++        ServerExtensions::read(input)?
++    };
++    input.expect_empty(label)?;
++    let storage = Box::<ServerExtensions<'owned>, A>::try_new_uninit_in(allocator)
++        .map_err(|_| InvalidMessage::AllocationFailed)?;
++    Ok(Box::write(storage, normalize(parsed)))
++}
++
++/// Exercise the current parser finish on empty extensions with optional trailing
++/// data. No nested extension is present; only the supplied fixed-owner allocator
++/// can be called. Whole SDK connection/parser ownership is a separate check.
++#[doc(hidden)]
++pub fn server_extensions_parser_probe<A: core::alloc::Allocator>(
++    allocator: A,
++    server_hello: bool,
++    trailing: bool,
++) -> Result<(), InvalidMessage> {
++    let bytes = [0, 0, 0];
++    let mut input = Reader::init(if trailing { &bytes } else { &bytes[..2] });
++    if server_hello {
++        drop(read_server_extensions_in(
++            &mut input, allocator, true, "ServerHelloPayload", ServerExtensions::into_owned,
++        )?);
++    } else {
++        drop(read_server_extensions_in(
++            &mut input, allocator, false, "HandshakeMessagePayload", |parsed| parsed,
++        )?);
++    }
++    Ok(())
++}
++
++/// Concrete fixed extension owner layout, for original allocator controls.
++#[doc(hidden)]
++pub fn server_extensions_layout() -> core::alloc::Layout {
++    core::alloc::Layout::new::<ServerExtensions<'static>>()
++}
++
++/// Exercise the same concrete factory and owning conversion with an observer.
++/// The observer receives neither the value nor its allocation capability.
++/// Nested extension storage is deliberately absent from this fixed-owner probe.
++#[doc(hidden)]
++pub fn server_extensions_owner_probe<A: core::alloc::Allocator + Clone>(
++    allocator: A,
++    after_first: impl FnOnce(),
++) -> Result<(), InvalidMessage> {
++    let value = crate::retained_box::try_box_in(ServerExtensions::default(), allocator)
++        .map_err(|_| InvalidMessage::AllocationFailed)?;
++    after_first();
++    drop(try_own_server_extensions(value)?);
++    Ok(())
++}
++
+ impl<'a> Codec<'a> for ServerExtensions<'a> {
+     fn encode(&self, bytes: &mut Vec<u8>) {
+         let extensions = LengthPrefixedBuffer::new(ListLength::U16, bytes);
+@@ -1321,17 +1598,16 @@
      }
  }
  
@@ -11133,7 +11342,7 @@
      pub(crate) fn ech_inner_encoding(&self, to_compress: Vec<ExtensionType>) -> Vec<u8> {
          let mut bytes = Vec::new();
          self.payload_encode(&mut bytes, Encoding::EchInnerHello { to_compress });
-@@ -1348,29 +1549,18 @@
+@@ -1348,29 +1624,18 @@
              _ => self.session_id.encode(bytes),
          }
  
@@ -11167,7 +11376,7 @@
      }
  
      pub(crate) fn has_keyshare_extension_with_duplicates(&self) -> bool {
-@@ -1395,38 +1585,46 @@
+@@ -1395,38 +1660,46 @@
      }
  }
  
@@ -11244,7 +11453,53 @@
      }
  }
  
-@@ -2248,7 +2446,7 @@
+@@ -1602,14 +1875,14 @@
+     }
+ }
+ 
+-#[derive(Clone, Debug)]
++#[derive(Debug)]
+ pub(crate) struct ServerHelloPayload {
+     pub(crate) legacy_version: ProtocolVersion,
+     pub(crate) random: Random,
+     pub(crate) session_id: SessionId,
+     pub(crate) cipher_suite: CipherSuite,
+     pub(crate) compression_method: Compression,
+-    pub(crate) extensions: Box<ServerExtensions<'static>>,
++    pub(crate) extensions: crate::retained_box::RetainedBox<ServerExtensions<'static>>,
+ }
+ 
+ impl Codec<'_> for ServerHelloPayload {
+@@ -1627,14 +1900,10 @@
+         // "The presence of extensions can be detected by determining whether
+         //  there are bytes following the compression_method field at the end of
+         //  the ServerHello."
+-        let extensions = Box::new(
+-            if r.any_left() {
+-                ServerExtensions::read(r)?
+-            } else {
+-                ServerExtensions::default()
+-            }
+-            .into_owned(),
+-        );
++        let allocator = r.allocator();
++        let extensions = read_server_extensions_in(
++            r, allocator, true, "ServerHelloPayload", ServerExtensions::into_owned,
++        )?;
+ 
+         let ret = Self {
+             legacy_version: ProtocolVersion::Unknown(0),
+@@ -1645,8 +1914,7 @@
+             extensions,
+         };
+ 
+-        r.expect_empty("ServerHelloPayload")
+-            .map(|_| ret)
++        Ok(ret)
+     }
+ }
+ 
+@@ -2248,7 +2516,7 @@
  
  /// RFC8446: `DistinguishedName authorities<3..2^16-1>;` however,
  /// RFC5246: `DistinguishedName certificate_authorities<0..2^16-1>;`
@@ -11253,7 +11508,57 @@
      const SIZE_LEN: ListLength = ListLength::U16;
  }
  
-@@ -2807,7 +3005,7 @@
+@@ -2582,7 +2850,7 @@
+     ClientKeyExchange(Payload<'a>),
+     NewSessionTicket(NewSessionTicketPayload),
+     NewSessionTicketTls13(NewSessionTicketPayloadTls13),
+-    EncryptedExtensions(Box<ServerExtensions<'a>>),
++    EncryptedExtensions(crate::retained_box::RetainedBox<ServerExtensions<'a>>),
+     KeyUpdate(KeyUpdateRequest),
+     Finished(Payload<'a>),
+     CertificateStatus(CertificateStatus<'a>),
+@@ -2650,10 +2918,10 @@
+         }
+     }
+ 
+-    fn into_owned(self) -> HandshakePayload<'static> {
++    fn try_into_owned(self) -> Result<HandshakePayload<'static>, InvalidMessage> {
+         use HandshakePayload::*;
+ 
+-        match self {
++        Ok(match self {
+             HelloRequest => HelloRequest,
+             ClientHello(x) => ClientHello(x),
+             ServerHello(x) => ServerHello(x),
+@@ -2670,13 +2938,13 @@
+             ClientKeyExchange(x) => ClientKeyExchange(x.into_owned()),
+             NewSessionTicket(x) => NewSessionTicket(x),
+             NewSessionTicketTls13(x) => NewSessionTicketTls13(x),
+-            EncryptedExtensions(x) => EncryptedExtensions(Box::new(x.into_owned())),
++            EncryptedExtensions(x) => EncryptedExtensions(try_own_server_extensions(x)?),
+             KeyUpdate(x) => KeyUpdate(x),
+             Finished(x) => Finished(x.into_owned()),
+             CertificateStatus(x) => CertificateStatus(x.into_owned()),
+             MessageHash(x) => MessageHash(x.into_owned()),
+             Unknown((t, x)) => Unknown((t, x.into_owned())),
+-        }
++        })
+     }
+ }
+ 
+@@ -2763,7 +3031,10 @@
+                 HandshakePayload::NewSessionTicket(p)
+             }
+             HandshakeType::EncryptedExtensions => {
+-                HandshakePayload::EncryptedExtensions(Box::new(ServerExtensions::read(&mut sub)?))
++                let allocator = sub.allocator();
++                HandshakePayload::EncryptedExtensions(read_server_extensions_in(
++                    &mut sub, allocator, false, "HandshakeMessagePayload", |parsed| parsed,
++                )?)
+             }
+             HandshakeType::KeyUpdate => {
+                 HandshakePayload::KeyUpdate(KeyUpdateRequest::read(&mut sub)?)
+@@ -2807,7 +3078,7 @@
                      let mut binders_encoding = Vec::new();
                      offer
                          .binders
@@ -11262,12 +11567,16 @@
                      binders_encoding.len()
                  }
                  _ => 0,
-@@ -2843,8 +3041,23 @@
+@@ -2843,12 +3114,27 @@
          }
      }
  
 -    pub(crate) fn build_handshake_hash(hash: &[u8]) -> Self {
 -        Self(HandshakePayload::MessageHash(Payload::new(hash.to_vec())))
+-    }
+-
+-    pub(crate) fn into_owned(self) -> HandshakeMessagePayload<'static> {
+-        HandshakeMessagePayload(self.0.into_owned())
 +    /// The current synthetic HRR message borrows the already fixed hash output.
 +    pub(crate) fn build_handshake_hash(hash: &'a [u8]) -> Self {
 +        Self(HandshakePayload::MessageHash(Payload::Borrowed(hash)))
@@ -11285,10 +11594,14 @@
 +        let mut header = u32::try_from(bytes.len()).expect("bounded hash::Output").to_be_bytes();
 +        header[0] = u8::from(self.0.handshake_type());
 +        (header, bytes)
++    }
++
++    pub(crate) fn try_into_owned(self) -> Result<HandshakeMessagePayload<'static>, InvalidMessage> {
++        Ok(HandshakeMessagePayload(self.0.try_into_owned()?))
      }
+ }
  
-     pub(crate) fn into_owned(self) -> HandshakeMessagePayload<'static> {
-@@ -3063,10 +3276,9 @@
+@@ -3063,10 +3349,9 @@
  /// [draft-ietf-tls-esni Section 5].
  ///
  /// [draft-ietf-tls-esni Section 5]: <https://www.ietf.org/archive/id/draft-ietf-tls-esni-18.html#section-5>
@@ -11301,7 +11614,7 @@
      /// An empty `ECHClientHello` with type [EchClientHelloType::ClientHelloInner].
      ///
      /// This variant has no payload.
-@@ -3102,8 +3314,7 @@
+@@ -3102,8 +3387,7 @@
  /// [draft-ietf-tls-esni Section 5].
  ///
  /// [draft-ietf-tls-esni Section 5]: <https://www.ietf.org/archive/id/draft-ietf-tls-esni-18.html#section-5>
@@ -11311,7 +11624,7 @@
      /// The cipher suite used to encrypt ClientHelloInner. Must match a value from
      /// ECHConfigContents.cipher_suites list.
      pub cipher_suite: HpkeSymmetricCipherSuite,
-@@ -3111,9 +3322,9 @@
+@@ -3111,9 +3395,9 @@
      pub config_id: u8,
      /// The HPKE encapsulated key, used by servers to decrypt the corresponding payload field.
      /// This field is empty in a ClientHelloOuter sent in response to a HelloRetryRequest.
@@ -11323,7 +11636,7 @@
  }
  
  impl Codec<'_> for EncryptedClientHelloOuter {
-@@ -3264,3 +3475,300 @@
+@@ -3264,3 +3548,300 @@
          }
      }
  }
@@ -11624,6 +11937,214 @@
 +        Self::Ocsp(OcspCertificateStatusRequest { responder_ids: Vec::new_in(allocator.clone()), extensions: PayloadU16::from_vec_in(Vec::new_in(allocator)) })
 +    }
 +}
+--- a/src/msgs/handshake_test.rs
++++ b/src/msgs/handshake_test.rs
+@@ -5,6 +5,8 @@
+ 
+ use super::base::{Payload, PayloadU8, PayloadU16, PayloadU24};
+ use super::codec::{Codec, Reader, put_u16};
++use super::retained::{RetainedCodec, RetainedEncode, TryCloneIn};
++use alloc::alloc::Global;
+ use super::enums::{
+     ClientCertificateType, Compression, ECCurveType, ExtensionType, KeyUpdateRequest, NamedGroup,
+ };
+@@ -120,7 +122,7 @@
+ fn refuses_client_exts_with_unparsed_bytes() {
+     let bytes = [0x00u8, 0x08, 0x00, 0x0b, 0x00, 0x04, 0x02, 0xf8, 0x01, 0x02];
+     assert_eq!(
+-        ClientExtensions::read_bytes(&bytes).unwrap_err(),
++        { let mut reader = Reader::init(&bytes); ClientExtensions::read_in(&mut reader, Global).and_then(|value| { reader.expect_empty("read_bytes")?; Ok(value) }) }.unwrap_err(),
+         InvalidMessage::TrailingData("ClientExtensions")
+     );
+ }
+@@ -221,7 +223,7 @@
+ #[test]
+ fn rejects_empty_sni_extension() {
+     assert_eq!(
+-        ClientExtensions::read_bytes(&[0, 6, 0, 0, 0, 2, 0, 0]).unwrap_err(),
++        { let mut reader = Reader::init(&[0, 6, 0, 0, 0, 2, 0, 0]); ClientExtensions::read_in(&mut reader, Global).and_then(|value| { reader.expect_empty("read_bytes")?; Ok(value) }) }.unwrap_err(),
+         InvalidMessage::IllegalEmptyList("ServerNames")
+     );
+ }
+@@ -229,7 +231,7 @@
+ #[test]
+ fn rejects_duplicate_names_in_sni_extension() {
+     assert_eq!(
+-        ClientExtensions::read_bytes(&[0, 14, 0, 0, 0, 10, 0, 8, 0, 0, 1, b'a', 0, 0, 1, b'b',])
++        { let mut reader = Reader::init(&[0, 14, 0, 0, 0, 10, 0, 8, 0, 0, 1, b'a', 0, 0, 1, b'b',]); ClientExtensions::read_in(&mut reader, Global).and_then(|value| { reader.expect_empty("read_bytes")?; Ok(value) }) }
+             .unwrap_err(),
+         InvalidMessage::InvalidServerName
+     );
+@@ -302,7 +304,7 @@
+ #[test]
+ fn can_clone_all_client_extensions() {
+     let exts = sample_client_hello_payload().extensions;
+-    let exts2 = exts.clone();
++    let exts2 = exts.try_clone_in(Global).unwrap();
+     println!("{exts:?}, {exts2:?}");
+ }
+ 
+@@ -317,16 +319,16 @@
+     assert_eq!(src.collect_used(), vec![ExtensionType::EarlyData]);
+     assert_eq!(target.collect_used(), vec![]);
+ 
+-    target.clone_one(&src, ExtensionType::EarlyData);
++    target.try_clone_one(&src, ExtensionType::EarlyData).unwrap();
+     assert_eq!(target.collect_used(), vec![ExtensionType::EarlyData]);
+ }
+ 
+ #[test]
+ fn client_extensions_empty() {
+     // both sides of empty-encoding branch
+-    assert_eq!(ClientExtensions::default().get_encoding(), Vec::<u8>::new());
+-    assert_eq!(
+-        ClientExtensions::read_bytes(&[])
++    assert_eq!({ let mut bytes = Vec::new(); ClientExtensions::default().encode_retained(&mut bytes); bytes }, Vec::<u8>::new());
++    assert_eq!(
++        { let mut reader = Reader::init(&[]); ClientExtensions::read_in(&mut reader, Global).and_then(|value| { reader.expect_empty("read_bytes")?; Ok(value) }) }
+             .unwrap()
+             .collect_used(),
+         vec![]
+@@ -334,15 +336,14 @@
+ 
+     let early_data = b"\x00\x04\x00\x2a\x00\x00";
+     assert_eq!(
+-        ClientExtensions {
++        { let mut bytes = Vec::new(); ClientExtensions {
+             early_data_request: Some(()),
+             ..Default::default()
+-        }
+-        .get_encoding(),
++        }.encode_retained(&mut bytes); bytes },
+         early_data
+     );
+     assert_eq!(
+-        ClientExtensions::read_bytes(early_data)
++        { let mut reader = Reader::init(early_data); ClientExtensions::read_in(&mut reader, Global).and_then(|value| { reader.expect_empty("read_bytes")?; Ok(value) }) }
+             .unwrap()
+             .collect_used(),
+         vec![ExtensionType::EarlyData]
+@@ -352,17 +353,17 @@
+ #[test]
+ fn client_extensions_decode_checks_duplicates() {
+     // base
+-    ClientExtensions::read_bytes(b"\x00\x04\x00\x2a\x00\x00").unwrap();
++    { let mut reader = Reader::init(b"\x00\x04\x00\x2a\x00\x00"); ClientExtensions::read_in(&mut reader, Global).and_then(|value| { reader.expect_empty("read_bytes")?; Ok(value) }) }.unwrap();
+ 
+     // duplicate known
+     assert_eq!(
+-        ClientExtensions::read_bytes(b"\x00\x08\x00\x2a\x00\x00\x00\x2a\x00\x00").unwrap_err(),
++        { let mut reader = Reader::init(b"\x00\x08\x00\x2a\x00\x00\x00\x2a\x00\x00"); ClientExtensions::read_in(&mut reader, Global).and_then(|value| { reader.expect_empty("read_bytes")?; Ok(value) }) }.unwrap_err(),
+         InvalidMessage::DuplicateExtension(0x002a)
+     );
+ 
+     // duplicate unknown
+     assert_eq!(
+-        ClientExtensions::read_bytes(b"\x00\x08\xff\xff\x00\x00\xff\xff\x00\x00").unwrap_err(),
++        { let mut reader = Reader::init(b"\x00\x08\xff\xff\x00\x00\xff\xff\x00\x00"); ClientExtensions::read_in(&mut reader, Global).and_then(|value| { reader.expect_empty("read_bytes")?; Ok(value) }) }.unwrap_err(),
+         InvalidMessage::DuplicateExtension(0xffff)
+     );
+ }
+@@ -388,7 +389,7 @@
+ 
+     let psk_and_ech_with_contiguous = ClientExtensions {
+         contiguous_extensions: vec![ExtensionType::ExtendedMasterSecret],
+-        ..psk_and_ech.clone()
++        ..psk_and_ech.try_clone_in(Global).unwrap()
+     };
+ 
+     let ech = ClientExtensions {
+@@ -412,9 +413,9 @@
+     };
+ 
+     fn encoding_with_order(order_seed: u16, exts: &ClientExtensions<'_>) -> Vec<u8> {
+-        let mut e = exts.clone();
++        let mut e = exts.try_clone_in(Global).unwrap();
+         e.order_seed = order_seed;
+-        e.get_encoding()
++        { let mut bytes = Vec::new(); e.encode_retained(&mut bytes); bytes }
+     }
+ 
+     assert_ne!(
+@@ -495,13 +496,13 @@
+ fn test_truncated_client_extension_is_detected() {
+     let chp = sample_client_hello_payload();
+ 
+-    let enc = chp.extensions.get_encoding();
++    let mut enc = Vec::new(); chp.extensions.encode_retained(&mut enc);
+     println!("testing enc {enc:?}");
+ 
+     // "outer" truncation, i.e., where the extension-level length is longer than
+     // the input
+     for l in 1..enc.len() {
+-        assert!(ClientExtensions::read_bytes(&enc[..l]).is_err());
++        assert!({ let mut reader = Reader::init(&enc[..l]); ClientExtensions::read_in(&mut reader, Global).and_then(|value| { reader.expect_empty("read_bytes")?; Ok(value) }) }.is_err());
+     }
+ }
+ 
+@@ -581,7 +582,7 @@
+     for hm in all_tls12_handshake_payloads().drain(..) {
+         let enc = hm.get_encoding();
+         let debug = format!("{hm:?}");
+-        let other = hm.into_owned();
++        let other = hm.try_into_owned().unwrap();
+         assert_eq!(enc, other.get_encoding());
+         assert_eq!(debug, format!("{other:?}"));
+     }
+@@ -647,7 +648,7 @@
+     for hm in all_tls13_handshake_payloads().drain(..) {
+         let enc = hm.get_encoding();
+         let debug = format!("{hm:?}");
+-        let other = hm.into_owned();
++        let other = hm.try_into_owned().unwrap();
+         assert_eq!(enc, other.get_encoding());
+         assert_eq!(debug, format!("{other:?}"));
+     }
+@@ -773,9 +774,9 @@
+         cipher_suites: vec![CipherSuite::TLS_NULL_WITH_NULL_NULL],
+         compression_methods: vec![Compression::Null],
+         extensions: Box::new(ClientExtensions {
+-            server_name: Some(ServerNamePayload::from(
+-                &DnsName::try_from("hello").unwrap(),
+-            )),
++            server_name: Some(ServerNamePayload::try_from_dns_in(
++                &DnsName::try_from("hello").unwrap(), Global,
++            ).unwrap()),
+             cookie: Some(PayloadU16::new(vec![1, 2, 3])),
+             signature_schemes: Some(vec![SignatureScheme::ECDSA_NISTP256_SHA256]),
+             session_ticket: Some(ClientSessionTicket::Request),
+@@ -822,7 +823,7 @@
+         session_id: SessionId::empty(),
+         cipher_suite: CipherSuite::TLS_NULL_WITH_NULL_NULL,
+         compression_method: Compression::Null,
+-        extensions: Box::new(ServerExtensions {
++        extensions: crate::retained_box::try_box_in(ServerExtensions {
+             ec_point_formats: Some(SupportedEcPointFormats::default()),
+             server_name_ack: Some(()),
+             session_ticket_ack: Some(()),
+@@ -843,7 +844,7 @@
+             client_certificate_type: Some(CertificateType::RawPublicKey),
+             server_certificate_type: Some(CertificateType::RawPublicKey),
+             unknown_extensions: Default::default(),
+-        }),
++        }, crate::limited_cache::default_allocator()).unwrap(),
+     }
+ }
+ 
+@@ -1041,7 +1042,7 @@
+     }
+ }
+ 
+-fn sample_encrypted_extensions() -> Box<ServerExtensions<'static>> {
++fn sample_encrypted_extensions() -> crate::retained_box::RetainedBox<ServerExtensions<'static>> {
+     sample_server_hello_payload().extensions
+ }
+ 
+@@ -1050,3 +1051,4 @@
+         ocsp_response: PayloadU24::from(Payload::new(vec![1, 2, 3])),
+     }
+ }
++
 --- a/src/msgs/message/mod.rs
 +++ b/src/msgs/message/mod.rs
 @@ -53,7 +53,11 @@
@@ -11639,6 +12160,55 @@
          match typ {
              ContentType::ApplicationData => Ok(Self::ApplicationData(Payload::Borrowed(payload))),
              ContentType::Alert => AlertMessagePayload::read(&mut r).map(MessagePayload::Alert),
+@@ -79,18 +83,18 @@
+         }
+     }
+ 
+-    pub(crate) fn into_owned(self) -> MessagePayload<'static> {
++    pub(crate) fn try_into_owned(self) -> Result<MessagePayload<'static>, InvalidMessage> {
+         use MessagePayload::*;
+-        match self {
++        Ok(match self {
+             Alert(x) => Alert(x),
+             Handshake { parsed, encoded } => Handshake {
+-                parsed: parsed.into_owned(),
++                parsed: parsed.try_into_owned()?,
+                 encoded: encoded.into_owned(),
+             },
+             HandshakeFlight(x) => HandshakeFlight(x.into_owned()),
+             ChangeCipherSpec(x) => ChangeCipherSpec(x),
+             ApplicationData(x) => ApplicationData(x.into_owned()),
+-        }
++        })
+     }
+ }
+ 
+@@ -197,12 +201,12 @@
+     }
+ 
+     #[cfg(feature = "std")]
+-    pub(crate) fn into_owned(self) -> Message<'static> {
++    pub(crate) fn try_into_owned(self) -> Result<Message<'static>, InvalidMessage> {
+         let Self { version, payload } = self;
+-        Message {
++        Ok(Message {
+             version,
+-            payload: payload.into_owned(),
+-        }
++            payload: payload.try_into_owned()?,
++        })
+     }
+ 
+     #[cfg(test)]
+@@ -220,7 +224,7 @@
+         Ok(Self {
+             version: plain.version,
+             payload: MessagePayload::new(plain.typ, plain.version, plain.payload.bytes())?
+-                .into_owned(),
++                .try_into_owned()?,
+         })
+     }
+ }
 @@ -233,10 +237,13 @@
      type Error = InvalidMessage;
  
@@ -12460,12 +13030,14 @@
  }
 --- a/src/server/hs.rs
 +++ b/src/server/hs.rs
-@@ -1,3 +1,4 @@
+@@ -1,5 +1,5 @@
 +use crate::msgs::retained::TryCloneIn;
  use alloc::borrow::ToOwned;
- use alloc::boxed::Box;
+-use alloc::boxed::Box;
  use alloc::vec::Vec;
-@@ -28,12 +29,12 @@
+ 
+ use pki_types::DnsName;
+@@ -28,12 +28,12 @@
  use crate::msgs::message::{Message, MessagePayload};
  use crate::msgs::persist;
  use crate::server::common::ActiveCertifiedKey;
@@ -12483,7 +13055,47 @@
  pub(super) type ServerContext<'a> = crate::common_state::Context<'a, ServerConnectionData>;
  
  pub(super) fn can_resume(
-@@ -139,11 +140,17 @@
+@@ -57,21 +57,21 @@
+         && &resumedata.sni == sni
+ }
+ 
+-#[derive(Default)]
+ pub(super) struct ExtensionProcessing {
+     // extensions to reply with
+-    pub(super) extensions: Box<ServerExtensions<'static>>,
++    pub(super) extensions: crate::retained_box::RetainedBox<ServerExtensions<'static>>,
+     #[cfg(feature = "tls12")]
+     pub(super) send_ticket: bool,
+ }
+ 
+ impl ExtensionProcessing {
+-    pub(super) fn new(extra_exts: ServerExtensionsInput<'static>) -> Self {
++    pub(super) fn new(extra_exts: ServerExtensionsInput<'static>, allocator: crate::RetainedAllocator) -> Result<Self, Error> {
+         let ServerExtensionsInput {
+             transport_parameters,
+         } = extra_exts;
+ 
+-        let mut extensions = Box::new(ServerExtensions::default());
++        let mut extensions = crate::retained_box::try_box_in(ServerExtensions::default(), allocator)
++            .map_err(|_| Error::AllocationFailed)?;
+         match transport_parameters {
+             Some(TransportParameters::Quic(v)) => extensions.transport_parameters = Some(v),
+             Some(TransportParameters::QuicDraft(v)) => {
+@@ -80,11 +80,11 @@
+             None => {}
+         }
+ 
+-        Self {
++        Ok(Self {
+             extensions,
+             #[cfg(feature = "tls12")]
+             send_ticket: false,
+-        }
++        })
+     }
+ 
+     pub(super) fn process_common(
+@@ -139,11 +139,17 @@
              let transport_params = hello
                  .transport_parameters
                  .as_ref()
@@ -12505,7 +13117,7 @@
                  None => {
                      return Err(cx
                          .common
-@@ -162,15 +169,10 @@
+@@ -162,15 +168,10 @@
          // Send status_request response if we have one.  This is not allowed
          // if we're resuming, and is only triggered if we have an OCSP response
          // to send.
@@ -12523,7 +13135,7 @@
              }
          } else {
              // Throw away any OCSP response so we don't try to send it later.
-@@ -213,8 +215,7 @@
+@@ -213,8 +214,7 @@
  
          // Confirm use of EMS if offered.
          if using_ems {
@@ -12533,7 +13145,7 @@
          }
      }
  
-@@ -231,9 +232,7 @@
+@@ -231,9 +231,7 @@
  
          self.process_cert_type_extension(
              client_supports,
@@ -12544,7 +13156,7 @@
              ExtensionType::ServerCertificateType,
              cx,
          )
-@@ -252,9 +251,7 @@
+@@ -252,9 +250,7 @@
  
          self.process_cert_type_extension(
              client_supports,
@@ -12555,7 +13167,7 @@
              ExtensionType::ClientCertificateType,
              cx,
          )
-@@ -321,8 +318,9 @@
+@@ -321,8 +317,9 @@
      pub(super) fn new(
          config: Arc<ServerConfig>,
          extra_exts: ServerExtensionsInput<'static>,
@@ -12566,7 +13178,7 @@
  
          if config.verifier.offer_client_auth() {
              transcript_buffer.set_client_auth_enabled();
-@@ -348,7 +346,7 @@
+@@ -348,7 +345,7 @@
          client_hello: &ClientHelloPayload,
          m: &Message<'_>,
          cx: &mut ServerContext<'_>,
@@ -12575,7 +13187,7 @@
          let tls13_enabled = self
              .config
              .supports_version(ProtocolVersion::TLSv1_3, cx.common.protocol);
-@@ -406,11 +404,7 @@
+@@ -406,11 +403,7 @@
              .cipher_suites
              .iter()
              .copied()
@@ -12588,7 +13200,7 @@
              .collect::<Vec<_>>();
  
          sig_schemes
-@@ -419,32 +413,23 @@
+@@ -419,32 +412,23 @@
          // We adhere to the TLS 1.2 RFC by not exposing this to the cert resolver if TLS version is 1.2
          let certificate_authorities = match version {
              ProtocolVersion::TLSv1_2 => None,
@@ -12626,7 +13238,7 @@
  
              certkey.ok_or_else(|| {
                  cx.common.send_fatal_alert(
-@@ -460,10 +445,7 @@
+@@ -460,10 +444,7 @@
                  version,
                  certkey.get_key().algorithm(),
                  cx.common.protocol,
@@ -12638,7 +13250,7 @@
                  &client_hello.cipher_suites,
              )
              .map_err(|incompat| {
-@@ -493,7 +475,7 @@
+@@ -493,7 +474,7 @@
          // Start handshake hash.
          let starting_hash = suite.hash_provider();
          let transcript = match self.transcript {
@@ -12647,7 +13259,7 @@
              HandshakeHashOrBuffer::Hash(inner)
                  if inner.algorithm() == starting_hash.algorithm() =>
              {
-@@ -562,14 +544,9 @@
+@@ -562,14 +543,9 @@
          let mut supported_groups = Vec::with_capacity(client_groups.len());
  
          for offered_group in client_groups {
@@ -12665,7 +13277,7 @@
  
              match offered_group.key_exchange_algorithm() {
                  KeyExchangeAlgorithm::DHE => {
-@@ -584,33 +561,27 @@
+@@ -584,33 +560,27 @@
              supported_groups.push(supported);
          }
  
@@ -12715,7 +13327,7 @@
                  // And version
                  && suite.version().version == selected_version
                  // And protocol
-@@ -618,7 +589,7 @@
+@@ -618,7 +588,7 @@
                  // And support one of key exchange groups
                  && (ecdhe_possible && suite.usable_for_kx_algorithm(KeyExchangeAlgorithm::ECDHE)
                  || ffdhe_possible && suite.usable_for_kx_algorithm(KeyExchangeAlgorithm::DHE))
@@ -12724,7 +13336,7 @@
  
          // RFC 7919 (https://datatracker.ietf.org/doc/html/rfc7919#section-4) requires us to send
          // the InsufficientSecurity alert in case we don't recognize client's FFDHE groups (i.e.,
-@@ -633,9 +604,7 @@
+@@ -633,9 +603,7 @@
              client_suites
                  .iter()
                  .find_map(|client_suite| {
@@ -12735,7 +13347,7 @@
                  })
                  .copied()
          }
-@@ -681,20 +650,25 @@
+@@ -681,20 +649,25 @@
  }
  
  impl State<ServerConnectionData> for ExpectClientHello {
@@ -12769,7 +13381,7 @@
          self
      }
  }
-@@ -745,7 +719,9 @@
+@@ -745,7 +718,9 @@
      //
      // [RFC6066]: https://datatracker.ietf.org/doc/html/rfc6066#section-3
      let sni = match &client_hello.server_name {
@@ -12780,7 +13392,7 @@
          Some(ServerNamePayload::IpAddress) => None,
          Some(ServerNamePayload::Invalid) => {
              return Err(cx.common.send_fatal_alert(
-@@ -766,17 +742,19 @@
+@@ -766,17 +741,19 @@
          return Err(PeerMisbehaved::ServerNameDifferedOnRetry.into());
      }
  
@@ -13274,6 +13886,15 @@
 +            )?)
          }
      }
+ 
+@@ -332,7 +328,7 @@
+         randoms: &ConnectionRandoms,
+         extra_exts: ServerExtensionsInput<'static>,
+     ) -> Result<bool, Error> {
+-        let mut ep = hs::ExtensionProcessing::new(extra_exts);
++        let mut ep = hs::ExtensionProcessing::new(extra_exts, cx.common.message_allocator.clone())?;
+         ep.process_common(config, cx, ocsp_response, hello, resumedata)?;
+         ep.process_tls12(config, hello, using_ems);
  
 @@ -345,7 +341,7 @@
              extensions: ep.extensions,
@@ -14131,7 +14752,12 @@
  }
 --- a/src/server/tls13.rs
 +++ b/src/server/tls13.rs
-@@ -12,8 +12,8 @@
+@@ -1,4 +1,3 @@
+-use alloc::boxed::Box;
+ use alloc::vec;
+ use alloc::vec::Vec;
+ 
+@@ -12,8 +11,8 @@
  use crate::common_state::{
      CommonState, HandshakeFlightTls13, HandshakeKind, Protocol, Side, State,
  };
@@ -14141,7 +14767,7 @@
  use crate::enums::{AlertDescription, ContentType, HandshakeType, ProtocolVersion};
  use crate::error::{Error, InvalidMessage, PeerIncompatible, PeerMisbehaved};
  use crate::hash_hs::HandshakeHash;
-@@ -21,8 +21,8 @@
+@@ -21,8 +20,8 @@
  use crate::msgs::codec::{Codec, Reader};
  use crate::msgs::enums::KeyUpdateRequest;
  use crate::msgs::handshake::{
@@ -14152,7 +14778,7 @@
  };
  use crate::msgs::message::{Message, MessagePayload};
  use crate::msgs::persist;
-@@ -33,9 +33,9 @@
+@@ -33,9 +32,9 @@
      KeyScheduleResumption, KeyScheduleTraffic, KeyScheduleTrafficWithClientFinishedPending,
  };
  use crate::tls13::{
@@ -14164,7 +14790,7 @@
  
  mod client_hello {
      use super::*;
-@@ -98,7 +98,7 @@
+@@ -98,7 +97,7 @@
              client_hello: &Message<'_>,
              psk: &[u8],
              binder: &[u8],
@@ -14173,7 +14799,7 @@
              let binder_plaintext = match &client_hello.payload {
                  MessagePayload::Handshake { parsed, encoded } => &encoded.bytes()[..encoded
                      .bytes()
-@@ -107,15 +107,13 @@
+@@ -107,15 +106,13 @@
                  _ => unreachable!(),
              };
  
@@ -14191,7 +14817,7 @@
          }
  
          fn attempt_tls13_ticket_decryption(
-@@ -131,7 +129,7 @@
+@@ -131,7 +128,7 @@
                  self.config
                      .session_storage
                      .take(ticket)
@@ -14200,7 +14826,7 @@
              }
          }
  
-@@ -143,7 +141,7 @@
+@@ -143,7 +140,7 @@
              client_hello: &ClientHelloPayload,
              selected_kxg: &'static dyn SupportedKxGroup,
              mut sigschemes_ext: Vec<SignatureScheme>,
@@ -14209,7 +14835,7 @@
              if client_hello.compression_methods.len() != 1 {
                  return Err(cx.common.send_fatal_alert(
                      AlertDescription::IllegalParameter,
-@@ -153,15 +151,12 @@
+@@ -153,15 +150,12 @@
  
              sigschemes_ext.retain(SignatureScheme::supported_in_tls13);
  
@@ -14231,7 +14857,7 @@
  
              if client_hello.has_keyshare_extension_with_duplicates() {
                  return Err(cx.common.send_fatal_alert(
-@@ -189,9 +184,7 @@
+@@ -189,9 +183,7 @@
                          .find(|compressor| offered.contains(&compressor.algorithm()))
                          .cloned());
  
@@ -14242,7 +14868,7 @@
  
              if let Some(prior) = &self.previous_hello {
                  // EarlyData extension is illegal in second ClientHello
-@@ -206,11 +199,7 @@
+@@ -206,11 +198,7 @@
  
                  // RFC 9846 section 4.2.2 allows the second ClientHello to update a PreSharedKey
                  // offer (binders, incompatible PSKs), but not to withdraw it altogether
@@ -14255,7 +14881,7 @@
                      return Err(cx.common.send_fatal_alert(
                          AlertDescription::MissingExtension,
                          PeerMisbehaved::MissingPskExtensionInSecondClientHello,
-@@ -226,7 +215,7 @@
+@@ -226,7 +214,7 @@
              let Some(chosen_share_and_kxg) = chosen_share_and_kxg else {
                  // We don't have a suitable key share.  Send a HelloRetryRequest
                  // for the mutually_preferred_group.
@@ -14264,7 +14890,7 @@
  
                  if self.previous_hello.is_some() {
                      return Err(cx.common.send_fatal_alert(
-@@ -241,12 +230,12 @@
+@@ -241,12 +229,12 @@
                      client_hello.session_id,
                      cx.common,
                      selected_kxg.name(),
@@ -14279,7 +14905,7 @@
                      config: self.config,
                      transcript: HandshakeHashOrBuffer::Hash(self.transcript),
                      #[cfg(feature = "tls12")]
-@@ -254,22 +243,23 @@
+@@ -254,22 +242,23 @@
                      #[cfg(feature = "tls12")]
                      using_ems: false,
                      previous_hello: Some(PreviousClientHello {
@@ -14312,7 +14938,7 @@
                  };
              };
  
-@@ -281,10 +271,7 @@
+@@ -281,10 +270,7 @@
                  //  offers a "pre_shared_key" extension. If clients offer
                  //  "pre_shared_key" without a "psk_key_exchange_modes" extension,
                  //  servers MUST abort the handshake." - RFC8446 4.2.9
@@ -14324,7 +14950,7 @@
                      return Err(cx.common.send_fatal_alert(
                          AlertDescription::MissingExtension,
                          PeerMisbehaved::MissingPskModesExtension,
-@@ -326,7 +313,7 @@
+@@ -326,7 +312,7 @@
                          chm,
                          &resume.master_secret.0,
                          psk_offer.binders[i].as_ref(),
@@ -14333,7 +14959,7 @@
                          return Err(cx.common.send_fatal_alert(
                              AlertDescription::DecryptError,
                              PeerMisbehaved::IncorrectBinder,
-@@ -376,7 +363,7 @@
+@@ -376,7 +362,7 @@
              }
  
              let full_handshake = resumedata.is_none();
@@ -14342,7 +14968,7 @@
              let key_schedule = emit_server_hello(
                  &mut self.transcript,
                  &self.randoms,
-@@ -385,9 +372,7 @@
+@@ -385,9 +371,7 @@
                  &client_hello.session_id,
                  chosen_share_and_kxg,
                  chosen_psk_index,
@@ -14353,7 +14979,7 @@
                  &self.config,
              )?;
              if !self.previous_hello.is_some() {
-@@ -395,9 +380,7 @@
+@@ -395,9 +379,7 @@
              }
  
              if full_handshake {
@@ -14364,7 +14990,7 @@
              } else {
                  cx.common.handshake_kind = Some(HandshakeKind::Resumed);
              }
-@@ -426,9 +409,9 @@
+@@ -426,9 +408,9 @@
                          server_key.get_cert(),
                          ocsp_response,
                          compressor,
@@ -14376,7 +15002,7 @@
                  }
                  emit_certificate_verify_tls13(
                      &mut flight,
-@@ -467,58 +450,65 @@
+@@ -467,58 +449,65 @@
  
              cx.common.check_aligned_handshake()?;
              let key_schedule_traffic =
@@ -14476,7 +15102,7 @@
              }
          }
      }
-@@ -529,7 +519,10 @@
+@@ -529,7 +518,10 @@
          suite: &'static Tls13CipherSuite,
          cx: &mut ServerContext<'_>,
          session_id: &SessionId,
@@ -14488,7 +15114,22 @@
          chosen_psk_idx: Option<usize>,
          resuming_psk: Option<&[u8]>,
          config: &ServerConfig,
-@@ -568,10 +561,10 @@
+@@ -545,12 +537,12 @@
+             })?;
+         cx.common.kx_state.complete();
+ 
+-        let extensions = Box::new(ServerExtensions {
++        let extensions = crate::retained_box::try_box_in(ServerExtensions {
+             key_share: Some(KeyShareEntry::new(ckx.group, ckx.pub_key)),
+             selected_version: Some(ProtocolVersion::TLSv1_3),
+             preshared_key: chosen_psk_idx.map(|idx| idx as u16),
+             ..Default::default()
+-        });
++        }, cx.common.message_allocator.clone()).map_err(|_| Error::AllocationFailed)?;
+ 
+         let sh = Message {
+             version: ProtocolVersion::TLSv1_2,
+@@ -568,10 +560,10 @@
  
          cx.common.check_aligned_handshake()?;
  
@@ -14501,7 +15142,7 @@
          cx.common.send_msg(sh, false);
  
          // Start key schedule
-@@ -620,7 +613,7 @@
+@@ -620,7 +612,7 @@
          session_id: SessionId,
          common: &mut CommonState,
          group: NamedGroup,
@@ -14510,7 +15151,7 @@
          let req = HelloRetryRequest {
              legacy_version: ProtocolVersion::TLSv1_2,
              session_id,
-@@ -640,10 +633,12 @@
+@@ -640,10 +632,12 @@
          };
  
          trace!("Requesting retry {m:?}");
@@ -14525,7 +15166,7 @@
      }
  
      fn decide_if_early_data_allowed(
-@@ -653,9 +648,7 @@
+@@ -653,9 +647,7 @@
          suite: &'static Tls13CipherSuite,
          config: &ServerConfig,
      ) -> EarlyDataDecision {
@@ -14536,7 +15177,16 @@
          let rejected_or_disabled = match early_data_requested {
              true => EarlyDataDecision::RequestedButRejected,
              false => EarlyDataDecision::Disabled,
-@@ -733,7 +726,7 @@
+@@ -715,7 +707,7 @@
+         config: &ServerConfig,
+         send_tickets: usize,
+     ) -> Result<EarlyDataDecision, Error> {
+-        let mut ep = hs::ExtensionProcessing::new(extra_exts);
++        let mut ep = hs::ExtensionProcessing::new(extra_exts, cx.common.message_allocator.clone())?;
+         ep.process_common(config, cx, ocsp_response, hello, resumedata)?;
+ 
+         // RFC 9149: echo the expected ticket count if the client sent the extension.
+@@ -733,7 +725,7 @@
          let ee = HandshakeMessagePayload(HandshakePayload::EncryptedExtensions(ep.extensions));
  
          trace!("sending encrypted extensions {ee:?}");
@@ -14545,7 +15195,7 @@
          Ok(early_data)
      }
  
-@@ -748,19 +741,10 @@
+@@ -748,19 +740,10 @@
          let cr = CertificateRequestPayloadTls13 {
              context: PayloadU8::empty(),
              extensions: CertificateRequestExtensions {
@@ -14567,7 +15217,7 @@
                  },
                  authority_names: match config.verifier.root_hint_subjects() {
                      &[] => None,
-@@ -772,7 +756,7 @@
+@@ -772,7 +755,7 @@
          let creq = HandshakeMessagePayload(HandshakePayload::CertificateRequestTls13(cr));
  
          trace!("Sending CertificateRequest {creq:?}");
@@ -14576,7 +15226,7 @@
          Ok(true)
      }
  
-@@ -780,13 +764,15 @@
+@@ -780,13 +763,15 @@
          flight: &mut HandshakeFlightTls13<'_>,
          cert_chain: &[CertificateDer<'static>],
          ocsp_response: Option<&[u8]>,
@@ -14594,7 +15244,7 @@
      }
  
      fn emit_compressed_certificate_tls13(
-@@ -795,7 +781,7 @@
+@@ -795,7 +780,7 @@
          cert_chain: &[CertificateDer<'static>],
          ocsp_response: Option<&[u8]>,
          cert_compressor: &'static dyn CertCompressor,
@@ -14603,7 +15253,7 @@
          let payload = CertificatePayloadTls13::new(cert_chain.iter(), ocsp_response);
  
          let Ok(entry) = config
-@@ -810,7 +796,9 @@
+@@ -810,7 +795,9 @@
          ));
  
          trace!("sending compressed certificate {c:?}");
@@ -14614,7 +15264,7 @@
      }
  
      fn emit_certificate_verify_tls13(
-@@ -821,14 +809,12 @@
+@@ -821,14 +808,12 @@
      ) -> Result<(), Error> {
          let message = construct_server_verify_message(&flight.transcript.current_hash());
  
@@ -14635,7 +15285,7 @@
  
          let scheme = signer.scheme();
          let sig = signer.sign(message.as_ref())?;
-@@ -838,7 +824,7 @@
+@@ -838,7 +823,7 @@
          let cv = HandshakeMessagePayload(HandshakePayload::CertificateVerify(cv));
  
          trace!("sending certificate-verify {cv:?}");
@@ -14644,7 +15294,7 @@
          Ok(())
      }
  
-@@ -848,7 +834,7 @@
+@@ -848,7 +833,7 @@
          cx: &mut ServerContext<'_>,
          key_schedule: KeyScheduleHandshake,
          config: &ServerConfig,
@@ -14653,7 +15303,7 @@
          let handshake_hash = flight.transcript.current_hash();
          let verify_data = key_schedule.sign_server_finish(&handshake_hash);
          let verify_data_payload = Payload::new(verify_data.as_ref());
-@@ -856,32 +842,33 @@
+@@ -856,32 +841,33 @@
          let fin = HandshakeMessagePayload(HandshakePayload::Finished(verify_data_payload));
  
          trace!("sending finished {fin:?}");
@@ -14693,7 +15343,7 @@
      where
          Self: 'm,
      {
-@@ -892,14 +879,16 @@
+@@ -892,14 +878,16 @@
          if let MessagePayload::ApplicationData(skip_data) = &m.payload {
              if skip_data.bytes().len() <= self.skip_data_left {
                  self.skip_data_left -= skip_data.bytes().len();
@@ -14715,7 +15365,7 @@
          self
      }
  }
-@@ -913,52 +902,55 @@
+@@ -913,52 +901,55 @@
  }
  
  impl State<ServerConnectionData> for ExpectCertificateOrCompressedCertificate {
@@ -14811,7 +15461,7 @@
          self
      }
  }
-@@ -972,90 +964,91 @@
+@@ -972,90 +963,91 @@
  }
  
  impl State<ServerConnectionData> for ExpectCompressedCertificate {
@@ -14981,7 +15631,7 @@
          self
      }
  }
-@@ -1070,80 +1063,85 @@
+@@ -1070,80 +1062,85 @@
  }
  
  impl State<ServerConnectionData> for ExpectCertificate {
@@ -15135,7 +15785,7 @@
          self
      }
  }
-@@ -1158,50 +1156,56 @@
+@@ -1158,50 +1155,56 @@
  }
  
  impl State<ServerConnectionData> for ExpectCertificateVerify {
@@ -15230,7 +15880,7 @@
          self
      }
  }
-@@ -1218,22 +1222,19 @@
+@@ -1218,22 +1221,19 @@
  }
  
  impl State<ServerConnectionData> for ExpectEarlyData {
@@ -15258,7 +15908,7 @@
                      false => Err(cx.common.send_fatal_alert(
                          AlertDescription::UnexpectedMessage,
                          PeerMisbehaved::TooMuchEarlyDataReceived,
-@@ -1244,16 +1245,20 @@
+@@ -1244,16 +1244,20 @@
                  parsed: HandshakeMessagePayload(HandshakePayload::EndOfEarlyData),
                  ..
              } => {
@@ -15289,7 +15939,7 @@
              }
              payload => Err(inappropriate_handshake_message(
                  &payload,
-@@ -1263,7 +1268,7 @@
+@@ -1263,7 +1267,7 @@
          }
      }
  
@@ -15298,7 +15948,7 @@
          self
      }
  }
-@@ -1327,9 +1332,7 @@
+@@ -1327,9 +1331,7 @@
              (ticket, config.ticketer.lifetime())
          } else {
              let id = rand::random_vec(secure_random, 32)?;
@@ -15309,7 +15959,7 @@
              if !stored {
                  trace!("resumption not available; not issuing ticket");
                  return Ok(());
-@@ -1352,71 +1355,83 @@
+@@ -1352,71 +1354,83 @@
  
          let t = HandshakeMessagePayload(HandshakePayload::NewSessionTicketTls13(payload));
          trace!("sending new ticket {t:?} (stateless: {stateless})");
@@ -15446,7 +16096,7 @@
          self
      }
  }
-@@ -1443,44 +1458,46 @@
+@@ -1443,44 +1457,46 @@
          common.check_aligned_handshake()?;
  
          if common.should_update_key(key_update_request)? {
@@ -15517,7 +16167,7 @@
      }
  
      fn export_keying_material(
-@@ -1494,8 +1511,7 @@
+@@ -1494,8 +1510,7 @@
      }
  
      fn extract_secrets(&self) -> Result<PartiallyExtractedSecrets, Error> {
@@ -15527,7 +16177,7 @@
      }
  
      fn send_key_update_request(&mut self, common: &mut CommonState) -> Result<(), Error> {
-@@ -1503,22 +1519,21 @@
+@@ -1503,22 +1518,21 @@
              .request_key_update_and_update_encrypter(common)
      }
  
@@ -15559,7 +16209,7 @@
      }
  
      fn handle_new_session_ticket(
-@@ -1538,16 +1553,21 @@
+@@ -1538,16 +1552,21 @@
  }
  
  impl State<ServerConnectionData> for ExpectQuicTraffic {
@@ -15585,7 +16235,7 @@
      }
  
      fn export_keying_material(
-@@ -1560,7 +1580,7 @@
+@@ -1560,7 +1579,7 @@
              .export_keying_material(output, label, context)
      }
  
