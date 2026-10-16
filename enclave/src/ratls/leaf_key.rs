@@ -64,8 +64,10 @@ impl core::ops::Deref for RetainedLeafKey {
 impl RetainedLeafKey {
     pub(crate) fn new(pool: &Arc<AllocationPoolV1>, now: u64) -> Result<Self, String> {
         let rng = SystemRandom::new();
-        // ring's returned Document is inline. Its bytes supply the actual child
-        // length; this does not claim payment of ring's internal crypto work.
+        // Pinned ring's P-256 Document/keypair use fixed arrays and borrowed
+        // DER; the current SGX RNG writes caller-owned bytes. Only the PKCS8
+        // and SPKI Vec children below are retained. Rcgen/rustls factory
+        // allocations are separate owners.
         let document = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)
             .map_err(|_| String::from("Key generation failed"))?;
         let pair =

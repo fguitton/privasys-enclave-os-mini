@@ -86,6 +86,8 @@ pub(crate) mod retained_name;
 #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
 #[path = "retained_quote.rs"]
 pub(crate) mod retained_quote;
+#[path = "retained_tls_config.rs"]
+pub(crate) mod retained_tls_config;
 pub use http_request::PaidHttpRequest;
 
 #[cfg(test)]
@@ -123,7 +125,7 @@ impl StreamOwner {
 /// must be sent to the peer (via the data channel → TCP proxy).
 pub struct RaTlsSession {
     /// TLS connection state (rustls ServerConnection).
-    tls_conn: rustls::ServerConnection,
+    tls_conn: retained_tls_config::RetainedConnection,
     /// Accumulation buffer for incomplete application-level frames.
     read_buf: Vec<u8>,
     read_allocation: Option<enclave_os_common::allocation::AllocationLeaseV1>,
@@ -257,7 +259,7 @@ unsafe impl Send for RaTlsSession {}
 impl RaTlsSession {
     /// Create a session retaining its admitted certificate owner.
     pub(crate) fn new(
-        tls_conn: rustls::ServerConnection,
+        tls_conn: retained_tls_config::RetainedConnection,
         local_cert_der: retained_certificate::RetainedCertificate,
         server_name: Option<String>,
         attested_endpoint: Option<enclave_os_common::modules::AttestedEndpointIdentity>,

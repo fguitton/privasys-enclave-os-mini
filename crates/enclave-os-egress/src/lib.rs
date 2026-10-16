@@ -51,6 +51,8 @@
 //! finalize_and_run(&config, &sealed_cfg);
 //! ```
 
+#![cfg_attr(all(test, feature = "fallible-allocation-v1"), feature(allocator_api))]
+
 pub mod attestation;
 pub mod client;
 

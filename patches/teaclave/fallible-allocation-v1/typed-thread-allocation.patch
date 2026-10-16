@@ -147,7 +147,7 @@
 +mod allocator;
 --- a/sgx_trts/src/thread/native.rs
 +++ b/sgx_trts/src/thread/native.rs
-@@ -28,15 +28,16 @@
+@@ -28,23 +28,22 @@
  use core::ptr;
  use core::sync::atomic::Ordering;
  use sgx_types::error::{SgxResult, SgxStatus};
@@ -168,7 +168,15 @@
  
  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
  enum State {
-@@ -61,6 +62,12 @@
+     Preparing,
+     Execution,
+     WakedUp,
+-    OutOfTcs,
+-    Unexpected,
+ }
+ 
+ struct Inner {
+@@ -61,6 +60,12 @@
      where
          F: FnOnce(*mut c_void) -> *mut c_void + Send + 'static,
      {
@@ -181,7 +189,7 @@
          extern "C" {
              fn pthread_create_ocall(ret: *mut SgxStatus, tcs: usize) -> SgxStatus;
          }
-@@ -71,52 +78,43 @@
+@@ -71,52 +76,43 @@
  
          let tcs_id = tcs::current().id();
          let thread = Thread {
@@ -257,7 +265,7 @@
              }
          }
  
-@@ -163,12 +161,15 @@
+@@ -163,12 +159,15 @@
      }
  
      pub fn into_raw(self) -> *const Native {
@@ -307,7 +315,7 @@
          let tail = &mut *node as *mut Node;
          if self.tail.is_null() {
              self.head = Some(node);
-@@ -52,26 +53,45 @@
+@@ -52,34 +53,60 @@
          self.tail = tail;
      }
  
@@ -342,23 +350,42 @@
 +
  }
  
- static mut TASK_QUEUE: SpinMutex<Queue> = SpinMutex::new(Queue::new());
+-static mut TASK_QUEUE: SpinMutex<Queue> = SpinMutex::new(Queue::new());
++// SAFETY: each queued node is exclusively owned by head's Box chain, and its
++// callback is Send. Moving Queue never moves those stable Box allocations.
++// The raw tail is a non-owning link accessed only through the same SpinMutex;
++// no raw pointer is dereferenced after detaching a node. Task's C argument is
++// inert address bits; its callback owns the unsafe dereference contract.
++unsafe impl Send for Queue {}
++
++static TASK_QUEUE: SpinMutex<Queue> = SpinMutex::new(Queue::new());
  
  pub struct Task {
 -    p: Box<dyn FnOnce(*mut c_void) -> *mut c_void>,
-+    p: Box<dyn FnOnce(*mut c_void) -> *mut c_void, AllocationCapability>,
-     arg: *mut c_void,
+-    arg: *mut c_void,
++    p: Box<dyn FnOnce(*mut c_void) -> *mut c_void + Send, AllocationCapability>,
++    arg: usize,
      thread: Thread,
  }
  
  impl Task {
      pub fn new(
 -        p: Box<dyn FnOnce(*mut c_void) -> *mut c_void>,
-+        p: Box<dyn FnOnce(*mut c_void) -> *mut c_void, AllocationCapability>,
++        p: Box<dyn FnOnce(*mut c_void) -> *mut c_void + Send, AllocationCapability>,
          arg: *mut c_void,
          thread: Thread,
      ) -> Task {
-@@ -88,13 +108,25 @@
+-        Task { p, arg, thread }
++        Task { p, arg: arg as usize, thread }
+     }
+ 
+     pub fn run(self) {
+-        let retval = (self.p)(self.arg);
++        let retval = (self.p)(self.arg as *mut c_void);
+         self.thread.set_retval(retval);
+     }
+ 
+@@ -88,13 +115,25 @@
      }
  }
  
@@ -367,7 +394,8 @@
 +pub fn push_in(task: Task, allocator: AllocationCapability) -> SgxResult {
 +    let node = Box::try_new_in(Node { task, next: None }, allocator)
          .map_err(|_| SgxStatus::OutOfMemory)?;
-     unsafe { TASK_QUEUE.lock().push(node); }
+-    unsafe { TASK_QUEUE.lock().push(node); }
++    TASK_QUEUE.lock().push(node);
      Ok(())
  }
  
@@ -378,13 +406,13 @@
 +
  pub fn pop() -> Option<Task> {
 -    unsafe { TASK_QUEUE.lock().pop() }
-+    let node = unsafe { TASK_QUEUE.lock().pop_node() };
++    let node = TASK_QUEUE.lock().pop_node();
 +    // Free the node and run allocator callbacks after releasing TASK_QUEUE.
 +    node.map(take_task)
  }
 +
 +pub fn withdraw(thread: &Thread) -> Option<Task> {
-+    let node = unsafe { TASK_QUEUE.lock().withdraw(thread) };
++    let node = TASK_QUEUE.lock().withdraw(thread);
 +    node.map(take_task)
 +}
 --- a/sgx_tstd/src/alloc.rs

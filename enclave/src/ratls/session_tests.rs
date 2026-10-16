@@ -8,7 +8,7 @@ use super::super::cert_store::CertStore;
 use super::{FidoIdentity, RaTlsSession, TlsOutput};
 use enclave_os_common::modules::{AppIdentity, PeerEvidence};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
-use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection};
+use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig};
 use std::io::{Cursor, Write};
 use std::sync::Arc;
 
@@ -32,6 +32,20 @@ fn pair_with_certificate(
 ) -> (
     ClientConnection,
     RaTlsSession,
+    Arc<enclave_os_common::allocation::AllocationPoolV1>,
+) {
+    let (client, session, certificate, _) = pair_with_all_pools(store, name, 0);
+    (client, session, certificate)
+}
+
+fn pair_with_all_pools(
+    store: &CertStore,
+    name: &str,
+    extra_config_bytes: usize,
+) -> (
+    ClientConnection,
+    RaTlsSession,
+    Arc<enclave_os_common::allocation::AllocationPoolV1>,
     Arc<enclave_os_common::allocation::AllocationPoolV1>,
 ) {
     let key = rcgen::KeyPair::generate().unwrap();
@@ -59,7 +73,26 @@ fn pair_with_certificate(
         .with_root_certificates(roots)
         .with_no_client_auth();
     let (app, lease) = store.snapshot(Some(name)).unwrap();
-    let server = ServerConnection::new(Arc::new(server)).unwrap();
+    use super::retained_tls_config::RetainedTlsConfig;
+    let config_bytes = RetainedTlsConfig::required_bytes().unwrap();
+    let config_short =
+        enclave_os_common::allocation::AllocationPoolV1::new(config_bytes - 1).unwrap();
+    assert!(RetainedTlsConfig::reserve(&config_short).is_none());
+    assert_eq!(config_short.used(), 0);
+    let config_pool = enclave_os_common::allocation::AllocationPoolV1::new(
+        config_bytes.checked_add(extra_config_bytes).unwrap(),
+    )
+    .unwrap();
+    let retained_config = RetainedTlsConfig::reserve(&config_pool)
+        .unwrap()
+        .finish(server)
+        .unwrap();
+    assert_eq!(config_pool.used(), config_bytes);
+    let config_alias = retained_config.clone();
+    let server = retained_config.connect().unwrap();
+    assert_eq!(config_pool.used(), config_bytes);
+    drop(config_alias);
+
     let endpoint = app.and_then(|app| app.attested_endpoint);
     use super::retained_certificate::RetainedCertificate;
     use enclave_os_common::allocation::{AllocationPoolV1, SharedAllocationV1};
@@ -80,6 +113,7 @@ fn pair_with_certificate(
         .unwrap(),
         session,
         pool,
+        config_pool,
     )
 }
 
@@ -149,6 +183,7 @@ fn replacement_rejects_buffered_requests_and_re_attestation() {
     checked_connection_metadata_tables();
     checked_fixed_channel_binder();
     checked_retained_certificate();
+    checked_retained_tls_config();
     checked_retained_evidence();
     checked_paid_quote_time();
     super::attest_response::check();
@@ -1726,4 +1761,38 @@ fn checked_response_step_policy() {
     assert!(session.progress_http_response().is_err());
     assert!(!session.has_pending_response());
     assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+// The same genuine TLS fixture exercises the opaque top-level config owner.
+fn checked_retained_tls_config() {
+    use super::retained_tls_config::RetainedTlsConfig;
+    let needed = RetainedTlsConfig::required_bytes().unwrap();
+    for extra in [-1_isize, 0, 1] {
+        let pool = enclave_os_common::allocation::AllocationPoolV1::new(
+            needed.checked_add_signed(extra).unwrap(),
+        )
+        .unwrap();
+        let reserved = RetainedTlsConfig::reserve(&pool);
+        assert_eq!(reserved.is_some(), extra >= 0);
+        drop(reserved);
+        assert_eq!(pool.used(), 0);
+    }
+    for extra in [0, 1] {
+        let store = CertStore::new();
+        register(&store, "config-paid.test");
+        let (mut client, mut session, cert_pool, config_pool) =
+            pair_with_all_pools(&store, "config-paid.test", extra);
+        assert_eq!(config_pool.used(), needed);
+        // A real Session and a cached-style alias share one original payer.
+        let alias = session.tls_conn.alias();
+        handshake(&mut client, &mut session);
+        assert_eq!(config_pool.used(), needed);
+        register(&store, "config-paid.test");
+        assert!(session.feed_tls_bytes(&[]).is_err());
+        drop(session);
+        assert_eq!(cert_pool.used(), 0);
+        assert_eq!(config_pool.used(), needed);
+        drop(alias);
+        assert_eq!(config_pool.used(), 0);
+    }
 }

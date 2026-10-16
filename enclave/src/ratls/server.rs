@@ -131,7 +131,7 @@ pub struct IngressServer {
 
 /// A cached ServerConfig for deterministic (non-challenge) connections.
 struct CachedConfig {
-    config: Arc<ServerConfig>,
+    config: super::session::retained_tls_config::RetainedTlsConfig,
     local_cert_der: super::session::retained_certificate::RetainedCertificate,
     expires_at: u64,
     configuration: cert_store::ConfigurationLease,
@@ -1316,7 +1316,7 @@ impl IngressServer {
         let tls_result = self.tls_config_for(&hello.sni)?;
 
         // Create the ServerConnection
-        let server_conn = match accepted.into_connection(tls_result.config) {
+        let server_conn = match tls_result.config.accept(accepted) {
             Ok(conn) => conn,
             Err(e) => {
                 return Err(format!(
@@ -1487,7 +1487,7 @@ impl Drop for IngressServer {
 
 /// Result of building a TLS config for a single connection.
 struct TlsConfigResult {
-    config: Arc<ServerConfig>,
+    config: super::session::retained_tls_config::RetainedTlsConfig,
     local_cert_der: super::session::retained_certificate::RetainedCertificate,
     attested_endpoint: Option<enclave_os_common::modules::AttestedEndpointIdentity>,
     configuration: cert_store::ConfigurationLease,
@@ -1504,6 +1504,9 @@ fn build_tls_config(
     now: u64,
     configuration: cert_store::ConfigurationLease,
 ) -> Result<TlsConfigResult, String> {
+    let pool = crate::local_allocation_pool().ok_or_else(String::new)?;
+    let config_reservation = super::session::retained_tls_config::RetainedTlsConfig::reserve(&pool)
+        .ok_or_else(String::new)?;
     let result = match app {
         Some(a) => attestation::generate_app_certificate(ca, key, a, now)?,
         None => attestation::generate_ratls_certificate(ca, key, now)?,
@@ -1536,7 +1539,7 @@ fn build_tls_config(
         .map_err(|e| format!("cert chain error: {:?}", e))?;
 
     Ok(TlsConfigResult {
-        config: Arc::new(config),
+        config: config_reservation.finish(config).ok_or_else(String::new)?,
         local_cert_der,
         attested_endpoint: app.and_then(|app| app.attested_endpoint),
         configuration,

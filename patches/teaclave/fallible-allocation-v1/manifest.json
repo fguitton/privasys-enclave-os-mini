@@ -22,7 +22,7 @@
     },
     {
       "path": "typed-thread-allocation.patch",
-      "sha256": "ba970c543bcf80aeadee91ee4745a5f39de39646c0c4c0c94201f0aaee6103d2"
+      "sha256": "04b37f5b104638aa298a0c04e58e02dcc3e124d27bd76a3d30f74f748961b755"
     }
   ],
   "files": [
@@ -59,12 +59,12 @@
     {
       "path": "sgx_trts/src/thread/native.rs",
       "before_sha256": "fa870ae91aab49b6d5d228e4621377fdabb5433585c14edcda1a096f1f2c86e9",
-      "after_sha256": "997fbbe0e7a41add4b9f68e6603485639f50469c38009ee9069602935849d317"
+      "after_sha256": "778141dfee8cfc18e62ee38f84f4e7f4360299c3a6af1e34d706bbbaf8502786"
     },
     {
       "path": "sgx_trts/src/thread/task.rs",
       "before_sha256": "4bdb8e5b813c1a165f4cfdd2844e31020e9f15cacfc8bf32eb9b2f6920c587f5",
-      "after_sha256": "fd2dcf64bbb55a800ff17aabe6125bdeecd948d2d782aaf3f12f3eda8d15b877"
+      "after_sha256": "5b5475a5eaaf9151c344c29f0b51678eeda1e9bd8042f8c44d15045b903effdf"
     },
     {
       "path": "sgx_sync/src/lib.rs",
