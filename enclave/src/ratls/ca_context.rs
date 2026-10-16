@@ -106,7 +106,8 @@ impl RetainedCaContext {
         Ok(Self(owner))
     }
 
-    pub(crate) fn context(&self) -> &CaContext {
+    /// Borrow the current CA while its original retained owner remains alive.
+    pub fn context(&self) -> &CaContext {
         &self.0
     }
 }

@@ -55,6 +55,12 @@ pub use super::session::leaf_key::{generate_keypair, new_leaf_key, LeafKey};
 pub struct CertGenerationResult {
     pub(crate) leaf: super::session::certificate_wire::PaidDer,
 }
+impl CertGenerationResult {
+    /// Borrow the current admitted leaf without copying or transferring its owner.
+    pub fn certificate_der(&self) -> &[u8] {
+        self.leaf.as_slice()
+    }
+}
 
 // ---------------------------------------------------------------------------
 //  Public API
@@ -82,7 +88,7 @@ pub fn generate_ratls_certificate(
     let mut extensions = super::session::certificate_wire::Extensions::new();
     if let Some(root) = crate::config_merkle_root() {
         extensions
-            .push(pool, CONFIG_MERKLE_ROOT_OID, &root)
+            .push(pool, CONFIG_MERKLE_ROOT_OID, root.as_slice())
             .map_err(String::from)?;
     }
     if let Some(h) = enclave_os_common::attestation_servers::hash() {
