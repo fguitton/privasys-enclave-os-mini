@@ -11,6 +11,7 @@ import sys
 
 GENERATOR = Path(__file__).with_name('prepare-retained-provider.py')
 JSON_RUNNER = Path(__file__).with_name('run-request-json-cargo.py')
+SDK_RUNNER = Path(__file__).with_name('fallible-sdk-app-source.py')
 
 
 def digest(path):
@@ -18,10 +19,12 @@ def digest(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
-def metadata(cargo, manifest, selectors):
+def metadata(cargo, manifest, selectors, target=None):
     return json.loads(subprocess.check_output(
         [str(cargo), 'metadata', '--offline', '--locked', '--format-version', '1',
-         '--manifest-path', str(manifest), *selectors], text=True))
+         '--manifest-path', str(manifest), *selectors,
+         *(['-Zjson-target-spec', '--filter-platform', str(target)] if target else [])],
+        text=True))
 
 
 def graph(value):
@@ -89,7 +92,11 @@ def run(cargo, manifest, build_root, arguments):
     cargo_input = json_runner['cargo_identity'](cargo)
     manifest = manifest.resolve(strict=True)
     selectors = json_runner['feature_selectors'](arguments)
-    original = metadata(cargo, manifest, selectors)
+    sdk_functions = runpy.run_path(str(SDK_RUNNER))
+    target_path = sdk_functions['target'](arguments)
+    original = metadata(cargo, manifest, selectors, target_path)
+    sdk_route = (sdk_functions['verify'](original, os.environ.get(
+        'HONEST_TEACLAVE_FALLIBLE_SOURCE'), target_path) if target_path else None)
     matches = [row for row in original['packages'] if row['name'] == 'rustls']
     if len(matches) != 1:
         raise ValueError('trusted build needs exactly one current rustls supplier')
@@ -117,7 +124,7 @@ def run(cargo, manifest, build_root, arguments):
 import json,os,sys,tomllib
 from pathlib import Path
 arguments=sys.argv[1:]
-paths=[{destination}]
+paths={paths}
 forward=[]
 index=0
 while index<len(arguments):
@@ -139,14 +146,25 @@ config=Path({combined})
 config.write_text('paths = '+json.dumps(list(dict.fromkeys(paths)))+'\\n')
 forward[command+1:command+1]=['--config',str(config)]
 os.execv({cargo},[{cargo},*forward])
-""".format(python=sys.executable, destination=repr(str(destination)),
+""".format(python=sys.executable, paths=repr([str(destination),
+              *(sdk_route['paths'] if sdk_route else [])]),
            combined=repr(str(build_root / 'combined-source.toml')), cargo=repr(str(cargo)))
     wrapper.write_text(wrapper_code)
     wrapper.chmod(0o700)
-    consumed = metadata(wrapper, manifest, selectors)
+    consumed = metadata(wrapper, manifest, selectors, target_path)
+    if sdk_route:
+        sdk_functions['adopted'](consumed, sdk_route)
+        (build_root / 'sdk-app-graph-before.json').write_text(
+            json.dumps(original, indent=2) + '\n')
+        (build_root / 'sdk-app-graph-after.json').write_text(
+            json.dumps(consumed, indent=2) + '\n')
+    original_graph = (sdk_functions['graph'](original, sdk_route['names'])
+                      if sdk_route else graph(original))
+    consumed_graph = (sdk_functions['graph'](consumed, sdk_route['names'])
+                      if sdk_route else graph(consumed))
     adopted = [row for row in consumed['packages'] if row['name'] == 'rustls']
     if (len(adopted) != 1 or Path(adopted[0]['manifest_path']).resolve() != destination / 'Cargo.toml'
-            or adopted[0]['version'] != matches[0]['version'] or graph(original) != graph(consumed)):
+            or adopted[0]['version'] != matches[0]['version'] or original_graph != consumed_graph):
         raise ValueError('trusted rustls source/dependency graph adoption failed')
     if digest(lock) != lock_before:
         raise ValueError('rustls preparation changed the locked workspace')
@@ -157,12 +175,21 @@ os.execv({cargo},[{cargo},*forward])
                   'generated_receipt_sha256': digest(destination / 'retained-provider-source-receipt.json'),
                   'generator_sha256': digest(GENERATOR), 'runner_sha256': digest(Path(__file__)),
                   'workspace_lock_sha256': lock_before, 'resolved_graph_unchanged': True,
-                  'rustup_toolchain': os.environ.get('RUSTUP_TOOLCHAIN')}
+                  'rustup_toolchain': os.environ.get('RUSTUP_TOOLCHAIN'),
+                  'sdk_application_route': sdk_route,
+                  'sdk_runner_sha256': digest(SDK_RUNNER),
+                  'sdk_graph_before_sha256': (digest(build_root / 'sdk-app-graph-before.json')
+                                               if sdk_route else None),
+                  'sdk_graph_after_sha256': (digest(build_root / 'sdk-app-graph-after.json')
+                                              if sdk_route else None)}
     record = build_root / 'retained-provider-build.json'
     record.write_text(json.dumps(provenance, indent=2) + '\n')
     print('RETAINED-PROVIDER-BUILD', receipt['version'], profile_hash, flush=True)
     result = json_runner['run'](wrapper, manifest, build_root / 'request-json', arguments)
     verify(source, destination, functions)
+    if sdk_route:
+        if sdk_functions['verify'](original, sdk_route['mirror'], target_path) != sdk_route:
+            raise ValueError('SDK application source changed during compilation')
     if digest(lock) != lock_before:
         raise ValueError('trusted build changed the locked workspace')
     provenance.update(exit_code=result, status='PASS' if result == 0 else 'FAIL')

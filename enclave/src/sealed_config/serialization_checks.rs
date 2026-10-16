@@ -85,7 +85,13 @@ pub(crate) fn check_in(pool: &Arc<AllocationPoolV1>) -> Result<(), &'static str>
     let certificate = [10, 20, 30];
     let key = [40, 50];
     let entries = BTreeMap::from([(String::from("z"), vec![]), (String::from("a"), vec![60])]);
-    let length = encoded_length(&certificate, &key, &entries)?;
+    let length = encoded_length(
+        &certificate,
+        &key,
+        entries
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_slice())),
+    )?;
     if length != WIRE.len()
         || super::length_header(usize::MAX).is_ok()
         || super::add_field(usize::MAX, 1).is_ok()
@@ -94,7 +100,15 @@ pub(crate) fn check_in(pool: &Arc<AllocationPoolV1>) -> Result<(), &'static str>
     }
     let demand = required_bytes(length)?;
     let before = pool.used();
-    let output = serialize(pool, &master, &certificate, &key, &entries)?;
+    let output = serialize(
+        pool,
+        &master,
+        &certificate,
+        &key,
+        entries
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_slice())),
+    )?;
     if output.as_slice() != WIRE
         || pool.used()
             != before
@@ -115,7 +129,15 @@ pub(crate) fn check_in(pool: &Arc<AllocationPoolV1>) -> Result<(), &'static str>
             .checked_add_signed(extra)
             .ok_or("sealed output exact bound")?;
         let isolated = isolated(limit)?;
-        let result = serialize(&isolated, &master, &certificate, &key, &entries);
+        let result = serialize(
+            &isolated,
+            &master,
+            &certificate,
+            &key,
+            entries
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_slice())),
+        );
         if extra < 0 {
             if result.is_ok() || RELEASED.load(Ordering::Acquire) != 0 {
                 return Err("sealed output one-byte-short published or notified");
@@ -139,7 +161,15 @@ pub(crate) fn check_in(pool: &Arc<AllocationPoolV1>) -> Result<(), &'static str>
     }
     let retained = isolated(demand)?;
     let weak = Arc::downgrade(&retained);
-    let output = serialize(&retained, &master, &certificate, &key, &entries)?;
+    let output = serialize(
+        &retained,
+        &master,
+        &certificate,
+        &key,
+        entries
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_slice())),
+    )?;
     drop(retained);
     if weak
         .upgrade()

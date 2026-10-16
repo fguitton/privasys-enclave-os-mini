@@ -44,7 +44,8 @@
 //! (including third-party deps like rustls) resolve `std` to `sgx_tstd`.
 //! No `#![no_std]` or `extern crate sgx_tstd as std` is needed.
 
-#![cfg_attr(feature = "fallible-allocation-v1", feature(allocator_api))]
+#![feature(allocator_api)]
+#![cfg_attr(feature = "fallible-allocation-v1", feature(btreemap_alloc))]
 
 #[cfg(all(feature = "mock", feature = "sgx-sim-attestation"))]
 compile_error!("mock and sgx-sim-attestation are mutually exclusive");

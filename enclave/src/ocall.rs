@@ -143,6 +143,24 @@ pub fn kv_store_put_durable(table: &[u8], key: &[u8], value: &[u8]) -> Result<()
     rpc().kv_put_durable(table, key, value)
 }
 
+/// Current sealed configuration uses explicitly admitted persistence buffers.
+pub(crate) fn config_store_get(
+    pool: &std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
+    table: &[u8],
+    key: &[u8],
+) -> Result<Option<crate::rpc_client::ConfigResponse>, i32> {
+    rpc().config_kv_get(pool, table, key)
+}
+
+pub(crate) fn config_store_put(
+    pool: &std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
+    table: &[u8],
+    key: &[u8],
+    value: &[u8],
+) -> Result<(), i32> {
+    rpc().config_kv_put(pool, table, key, value)
+}
+
 /// Get an encrypted value from the host. Returns None if not found.
 pub fn kv_store_get(
     table: &[u8],

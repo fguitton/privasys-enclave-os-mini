@@ -51,7 +51,8 @@
 //! finalize_and_run(&config, &sealed_cfg, ca);
 //! ```
 
-#![cfg_attr(all(test, feature = "fallible-allocation-v1"), feature(allocator_api))]
+#![cfg_attr(test, feature(allocator_api))]
+#![cfg_attr(all(test, feature = "fallible-allocation-v1"), feature(btreemap_alloc))]
 
 pub mod attestation;
 pub mod client;

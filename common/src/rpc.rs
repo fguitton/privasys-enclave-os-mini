@@ -147,10 +147,49 @@ pub fn encode_request(req_id: u64, method: RpcMethod, payload: &[u8]) -> Vec<u8>
 }
 
 fn append_request(buf: &mut Vec<u8>, req_id: u64, method: RpcMethod, payload: &[u8]) {
-    buf.extend_from_slice(&req_id.to_le_bytes());
-    buf.extend_from_slice(&(method as u16).to_le_bytes());
-    buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    let mut header = [0; REQ_HEADER_SIZE];
+    write_request_header(&mut header, req_id, method, payload.len() as u32);
+    buf.extend_from_slice(&header);
     buf.extend_from_slice(payload);
+}
+
+fn write_request_header(header: &mut [u8], req_id: u64, method: RpcMethod, payload_len: u32) {
+    let id_end = core::mem::size_of::<u64>();
+    let method_end = id_end + core::mem::size_of::<u16>();
+    header[..id_end].copy_from_slice(&req_id.to_le_bytes());
+    header[id_end..method_end].copy_from_slice(&(method as u16).to_le_bytes());
+    header[method_end..REQ_HEADER_SIZE].copy_from_slice(&payload_len.to_le_bytes());
+}
+
+/// Encode the current frame directly into admitted storage. Each part is an
+/// existing borrowed payload segment; no intermediate payload or frame grows.
+/// All bounds are checked before the destination is mutated.
+pub fn encode_request_parts_into_bounded(
+    req_id: u64,
+    method: RpcMethod,
+    parts: &[&[u8]],
+    maximum: usize,
+    output: &mut [u8],
+) -> Option<usize> {
+    let payload_len = parts
+        .iter()
+        .try_fold(0_usize, |total, part| total.checked_add(part.len()))?;
+    if !framed_payload_len_valid(payload_len, REQ_HEADER_SIZE, maximum) {
+        return None;
+    }
+    let length = REQ_HEADER_SIZE.checked_add(payload_len)?;
+    if output.len() < length {
+        return None;
+    }
+    let payload_len = u32::try_from(payload_len).ok()?;
+    write_request_header(&mut output[..REQ_HEADER_SIZE], req_id, method, payload_len);
+    let mut position = REQ_HEADER_SIZE;
+    for part in parts {
+        let end = position.checked_add(part.len())?;
+        output[position..end].copy_from_slice(part);
+        position = end;
+    }
+    Some(length)
 }
 
 /// Encode using the original request writer into already admitted storage.
@@ -170,8 +209,8 @@ pub fn encode_request_into_bounded(
     if buffer.capacity() < length {
         return None;
     }
-    buffer.clear();
-    append_request(buffer, req_id, method, payload);
+    buffer.resize(length, 0);
+    encode_request_parts_into_bounded(req_id, method, &[payload], maximum, buffer)?;
     Some(())
 }
 
@@ -792,6 +831,34 @@ mod tests {
         assert_eq!(req_id, 42);
         assert_eq!(method, RpcMethod::NetTcpListen);
         assert_eq!(decoded_payload, payload);
+        let mut supplied = vec![0; encoded.len()];
+        assert_eq!(
+            encode_request_parts_into_bounded(
+                42,
+                RpcMethod::NetTcpListen,
+                &[b"he", b"l", b"lo"],
+                encoded.len(),
+                &mut supplied
+            ),
+            Some(encoded.len())
+        );
+        assert_eq!(supplied, encoded);
+        let unchanged = vec![0xa5; encoded.len()];
+        for (maximum, length) in [
+            (encoded.len() - 1, encoded.len()),
+            (encoded.len(), encoded.len() - 1),
+        ] {
+            let mut refused = unchanged.clone();
+            assert!(encode_request_parts_into_bounded(
+                42,
+                RpcMethod::NetTcpListen,
+                &[b"hello"],
+                maximum,
+                &mut refused[..length]
+            )
+            .is_none());
+            assert_eq!(refused, unchanged);
+        }
         let maximum = crate::queue::max_message_bytes(crate::queue::DEFAULT_QUEUE_CAPACITY);
         let exact = vec![19; maximum - REQ_HEADER_SIZE];
         assert_eq!(

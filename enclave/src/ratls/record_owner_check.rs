@@ -4,9 +4,11 @@ pub(super) fn check_record_wire(
     independent: &'static ring::aead::Algorithm,
 ) {
     use rustls::crypto::cipher::{
-        make_tls13_aad, AeadKey, InboundOpaqueMessage, Iv, MessageDecrypter, MessageEncrypter,
-        Nonce, OutboundChunks, OutboundPlainMessage,
+        make_tls13_aad, AeadKey, InboundOpaqueMessage, Iv, Nonce, OutboundChunks,
+        OutboundPlainMessage,
     };
+    #[cfg(feature = "fallible-allocation-v1")]
+    use rustls::crypto::cipher::{MessageDecrypter, MessageEncrypter};
     use rustls::{ContentType, ProtocolVersion};
     let cipher = suite.tls13().unwrap().aead_alg;
     let plaintext = b"retained original record bytes";

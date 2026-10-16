@@ -8,6 +8,7 @@ from pathlib import Path
 import runpy
 import subprocess
 import sys
+import tomllib
 
 GENERATOR = Path(__file__).with_name('prepare-request-json.py')
 
@@ -195,7 +196,28 @@ def native_run(cargo, build_root, arguments):
     paid_tree = any(packages[node['id']]['name'] == 'honest-layer-1-core'
                     and 'fallible-state-allocation-v1' in node['features']
                     for node in resolved['resolve']['nodes'])
-    if paid_tree:
+    front = arguments[:arguments.index('--')] if '--' in arguments else arguments
+    test_targets = (arguments[0] == 'test' and '--doc' not in front
+                    or '--all-targets' in front or '--tests' in front)
+    selected_packages = [front[index + 1] for index, value in enumerate(front[:-1])
+                         if value in ('-p', '--package')]
+    selected_packages += [value.partition('=')[2] for value in front
+                          if value.startswith('--package=')]
+    manifest_package = tomllib.loads(manifest.read_text()).get('package', {}).get('name')
+    def selected(name):
+        return ('--workspace' in front
+                or any(value.split('@', 1)[0] == name for value in selected_packages)
+                or not selected_packages and manifest_package == name)
+    egress_selected = selected('enclave-os-egress')
+    paid_config_tests = (test_targets and egress_selected
+                         and any(packages[node['id']]['name'] == 'enclave-os-egress'
+                                 and 'fallible-allocation-v1' in node['features']
+                                 for node in resolved['resolve']['nodes']))
+    paid_config_product = (selected('enclave-os-enclave')
+                           and any(packages[node['id']]['name'] == 'enclave-os-enclave'
+                                   and 'fallible-allocation-v1' in node['features']
+                                   for node in resolved['resolve']['nodes']))
+    if paid_tree or paid_config_tests or paid_config_product:
         source = runpy.run_path(str(Path(__file__).with_name('run-fallible-btree-cargo.py')))
         output = (build_root if build_root is not None else Path(resolved['target_directory'])) / 'fallible-btree-source'
         with source['source_context'](manifest, output.absolute(), arguments) as admitted:

@@ -19,8 +19,24 @@ use std::vec::Vec;
 use enclave_os_common::queue::{SpscConsumer, SpscProducer};
 use enclave_os_common::rpc::{self, HonestRpcFrameError, HonestRpcIdentity, RpcMethod, RpcRole};
 
+// One backing primitive shared by this transport boundary and sealed configuration.
+#[path = "sealed_config/backing.rs"]
+pub(crate) mod config_buffer;
+
 /// Opaque host-stored key/value pairs returned by a bounded scan.
 pub type KvEntries = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// Move-only response retaining its actual original-pool frame backing.
+/// The payload is a read-only range; no Global payload copy is returned.
+pub(crate) struct ConfigResponse {
+    frame: config_buffer::ConfigBytes,
+    payload: core::ops::Range<usize>,
+}
+impl ConfigResponse {
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.frame[self.payload.clone()]
+    }
+}
 
 // ---------------------------------------------------------------------------
 //  External: queue notification and bounded completion hints
@@ -512,6 +528,135 @@ impl RpcClient {
         }
     }
 
+    /// The config persistence exchange uses the existing synchronous request
+    /// reservation/queue/ID codec with caller-admitted request/response backing.
+    fn call_config(
+        &self,
+        pool: &std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
+        method: RpcMethod,
+        parts: &[&[u8]],
+    ) -> Result<(i32, ConfigResponse), i32> {
+        let payload_len = parts
+            .iter()
+            .try_fold(0_usize, |length, part| length.checked_add(part.len()))
+            .ok_or(-22)?;
+        let request_maximum = self.request_tx.max_message_bytes();
+        if !rpc::framed_payload_len_valid(payload_len, rpc::REQ_HEADER_SIZE, request_maximum) {
+            return Err(-22);
+        }
+        let frame_len = rpc::REQ_HEADER_SIZE.checked_add(payload_len).ok_or(-22)?;
+        let _exchange = self.synchronous_exchange.lock().map_err(|_| -1)?;
+        let request_id = self.try_reserve_request().map_err(|error| match error {
+            RequestReserveError::Busy => -16,
+            RequestReserveError::OperationIdExhausted => -75,
+        })?;
+        let result =
+            self.exchange_config(pool, request_id, method, parts, frame_len, request_maximum);
+        self.release_request(request_id);
+        result
+    }
+
+    // One current supplied-buffer exchange, shared by the real reservation
+    // owner and its existing signed fixture. It neither creates IDs nor grants
+    // any host persistence or application authority.
+    fn exchange_config(
+        &self,
+        pool: &std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
+        request_id: u64,
+        method: RpcMethod,
+        parts: &[&[u8]],
+        frame_len: usize,
+        request_maximum: usize,
+    ) -> Result<(i32, ConfigResponse), i32> {
+        (|| {
+            let origin = config_buffer::ConfigAllocator::try_new(pool).map_err(|_| -12)?;
+            let mut request = origin.try_zeroed(frame_len).map_err(|_| -12)?;
+            // This response queue's actual usable maximum owns the complete
+            // receive storage admitted before a request can be published.
+            let mut response = origin
+                .try_zeroed(self.response_rx.max_message_bytes())
+                .map_err(|_| -12)?;
+            let length = rpc::encode_request_parts_into_bounded(
+                request_id,
+                method,
+                parts,
+                request_maximum,
+                request.as_mut_slice(),
+            )
+            .ok_or(-22)?;
+            if self.request_tx.send_bounded(&request[..length]).is_err() {
+                return Err(-22);
+            }
+            notify_host();
+            loop {
+                let Some(length) = self
+                    .response_rx
+                    .try_recv_into(response.as_mut_slice())
+                    .map_err(|_| -22)?
+                else {
+                    std::thread::yield_now();
+                    continue;
+                };
+                if let Some((response_id, status, payload)) =
+                    rpc::decode_response(&response[..length])
+                {
+                    if response_id == request_id {
+                        let end = rpc::RESP_HEADER_SIZE
+                            .checked_add(payload.len())
+                            .ok_or(-22)?;
+                        response.activate_release_notification();
+                        return Ok((
+                            status,
+                            ConfigResponse {
+                                frame: response,
+                                payload: rpc::RESP_HEADER_SIZE..end,
+                            },
+                        ));
+                    }
+                }
+                // Preserve the current malformed/mismatched reply discard and
+                // retry behavior, reusing the same admitted response backing.
+            }
+        })()
+    }
+
+    pub(crate) fn config_kv_get(
+        &self,
+        pool: &std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
+        table: &[u8],
+        key: &[u8],
+    ) -> Result<Option<ConfigResponse>, i32> {
+        let table_len = u16::try_from(table.len()).map_err(|_| -22)?.to_le_bytes();
+        let (status, response) =
+            self.call_config(pool, RpcMethod::KvGet, &[&table_len, table, key])?;
+        match status {
+            0 => Ok(Some(response)),
+            1 => Ok(None),
+            other => Err(other),
+        }
+    }
+
+    pub(crate) fn config_kv_put(
+        &self,
+        pool: &std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
+        table: &[u8],
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), i32> {
+        let table_len = u16::try_from(table.len()).map_err(|_| -22)?.to_le_bytes();
+        let key_len = u32::try_from(key.len()).map_err(|_| -22)?.to_le_bytes();
+        let (status, _) = self.call_config(
+            pool,
+            RpcMethod::KvPut,
+            &[&table_len, table, &key_len, key, value],
+        )?;
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(status)
+        }
+    }
+
     // ====================================================================
     //  Network calls
     // ====================================================================
@@ -895,4 +1040,153 @@ impl RpcClient {
             Err(status)
         }
     }
+}
+
+#[cfg(all(
+    feature = "sgx-sim-attestation",
+    feature = "fallible-allocation-v1",
+    target_vendor = "teaclave"
+))]
+pub(crate) fn check_config_buffers(
+    pool: &std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
+) -> Result<(), &'static str> {
+    use config_buffer::ConfigAllocator;
+    use enclave_os_common::queue::{SpscQueueHeader, MIN_SHARED_QUEUE_CAPACITY};
+    let capacity =
+        usize::try_from(MIN_SHARED_QUEUE_CAPACITY).map_err(|_| "config queue fixture size")?;
+    let request_header = SpscQueueHeader::new(MIN_SHARED_QUEUE_CAPACITY);
+    let response_header = SpscQueueHeader::new(MIN_SHARED_QUEUE_CAPACITY);
+    let mut request_backing = vec![0_u8; capacity];
+    let mut response_backing = vec![0_u8; capacity];
+    // SAFETY: these actual fixture allocations and immutable headers remain at
+    // stable addresses until every handle/client below is dropped. Endpoints
+    // have one producer/consumer and use the original validated capacity. They
+    // are private protocol buffers, never registered as a trusted host/store.
+    let (request_tx, request_rx, response_tx, response_rx) = unsafe {
+        (
+            SpscProducer::from_raw_with_capacity(
+                &request_header,
+                request_backing.as_mut_ptr(),
+                MIN_SHARED_QUEUE_CAPACITY,
+            ),
+            SpscConsumer::from_raw_with_capacity(
+                &request_header,
+                request_backing.as_ptr(),
+                MIN_SHARED_QUEUE_CAPACITY,
+            ),
+            SpscProducer::from_raw_with_capacity(
+                &response_header,
+                response_backing.as_mut_ptr(),
+                MIN_SHARED_QUEUE_CAPACITY,
+            ),
+            SpscConsumer::from_raw_with_capacity(
+                &response_header,
+                response_backing.as_ptr(),
+                MIN_SHARED_QUEUE_CAPACITY,
+            ),
+        )
+    };
+    let client = RpcClient::new(request_tx, response_rx);
+    let id = client
+        .try_reserve_request()
+        .map_err(|_| "config test request reservation")?;
+    let table = b"system";
+    let key = [7_u8; ring::digest::SHA256_OUTPUT_LEN];
+    let table_len = u16::try_from(table.len())
+        .map_err(|_| "config test table width")?
+        .to_le_bytes();
+    let parts: &[&[u8]] = &[&table_len, table, &key];
+    let frame_len = rpc::REQ_HEADER_SIZE + table_len.len() + table.len() + key.len();
+    let response_maximum = client.response_rx.max_message_bytes();
+    let demand = ConfigAllocator::metadata_bytes()?
+        .checked_add(ConfigAllocator::backing_bytes(frame_len)?)
+        .and_then(|n| n.checked_add(ConfigAllocator::backing_bytes(response_maximum).ok()?))
+        .ok_or("config working geometry")?;
+    let before = pool.used();
+    if !matches!(client.call_config(pool, RpcMethod::KvGet, parts), Err(-16))
+        || pool.used() != before
+        || request_rx.try_recv().is_some()
+    {
+        return Err("config busy changed request or admitted backing");
+    }
+    let short = enclave_os_common::allocation::AllocationPoolV1::new(demand - 1)
+        .ok_or("config short working pool")?;
+    if client
+        .exchange_config(
+            &short,
+            id,
+            RpcMethod::KvGet,
+            parts,
+            frame_len,
+            client.request_tx.max_message_bytes(),
+        )
+        .is_ok()
+        || short.used() != 0
+        || request_rx.try_recv().is_some()
+    {
+        return Err("config prepublication working refusal changed queue or leaked");
+    }
+    // Drive the production exchange with existing raw response codec. Queued
+    // malformed and mismatched IDs must be discarded before the matching frame.
+    response_tx
+        .send_bounded(b"bad")
+        .map_err(|_| "config malformed fixture queue")?;
+    let wrong = rpc::encode_response(
+        id.checked_add(1).ok_or("config fixture ID overflow")?,
+        0,
+        b"wrong",
+    );
+    response_tx
+        .send_bounded(&wrong)
+        .map_err(|_| "config wrong-ID fixture queue")?;
+    let response = rpc::encode_response(id, 0, b"current-sealed-input");
+    response_tx
+        .send_bounded(&response)
+        .map_err(|_| "config matching fixture queue")?;
+    let (status, output) = client
+        .exchange_config(
+            pool,
+            id,
+            RpcMethod::KvGet,
+            parts,
+            frame_len,
+            client.request_tx.max_message_bytes(),
+        )
+        .map_err(|_| "config actual exchange")?;
+    if status != 0
+        || output.as_slice() != b"current-sealed-input"
+        || output.as_slice().as_ptr() != output.frame.as_slice()[rpc::RESP_HEADER_SIZE..].as_ptr()
+        || pool.used()
+            != before
+                + ConfigAllocator::metadata_bytes()?
+                + ConfigAllocator::backing_bytes(response_maximum)?
+    {
+        return Err("config response detached or wrong original backing");
+    }
+    let request = request_rx
+        .try_recv()
+        .ok_or("config original request missing")?;
+    let (observed_id, method, payload) =
+        rpc::decode_request(&request).ok_or("config original request codec")?;
+    if observed_id != id
+        || method != RpcMethod::KvGet
+        || rpc::decode_kv_get_req(payload) != Some((table.as_slice(), key.as_slice()))
+    {
+        return Err("config actual request wire changed");
+    }
+    drop(output);
+    if pool.used() != before {
+        return Err("config working/response final refund");
+    }
+    client.release_request(id);
+    let next = client
+        .try_reserve_request()
+        .map_err(|_| "config reservation not released")?;
+    client.release_request(next);
+    drop(client);
+    drop(request_rx);
+    drop(response_tx);
+    drop(request_backing);
+    drop(response_backing);
+    Ok(())
 }

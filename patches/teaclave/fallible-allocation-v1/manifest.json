@@ -27,23 +27,22 @@
     {
       "path": "owned-collections.patch",
       "sha256": "e68636f6e9bb38034752aafa3bffa3d9430101c7cbda7011216defb6a4f573c9"
+    },
+    {
+      "path": "sealed-buffers.patch",
+      "sha256": "306e27d4e4cc13f9845ac7c0e5682e88652b19a79053c0b1fc4c99353ec149f5"
     }
   ],
   "files": [
     {
-      "path": "sgx_alloc/src/lib.rs",
-      "before_sha256": "7893e8e98a9d8248a7da0f3555bd3dca69ff4527daeba881e51af01f5525fe21",
-      "after_sha256": "4c29cab00bf5f53f355cfd71d1fbdfa747906b3548f871a69c253f249697c9f6"
+      "path": "rustlib/std/Cargo.lock",
+      "before_sha256": "e5f79c0fa641c519795bc43c4b204aa0351a94b4f9ee599f8c642be58ac54e99",
+      "after_sha256": "d36e7a755bfc34dc89fa9e7d64af7ba6e351d40ba303357fef9b70acaa772632"
     },
     {
-      "path": "sgx_alloc/src/system.rs",
-      "before_sha256": "50dbb71de2150643f52fbf48e077d615994553cf59591b3b17a892fd11637830",
-      "after_sha256": "50dbb71de2150643f52fbf48e077d615994553cf59591b3b17a892fd11637830"
-    },
-    {
-      "path": "sgx_tstd/src/alloc.rs",
-      "before_sha256": "77bd807108ac94bc83ce38652003f4ff8814b52d77c18111a3ecd90911916b24",
-      "after_sha256": "28588d8aecfb319dda5d329f8551c1b1b7d5024ffbbf4cd91e2b732b42917d93"
+      "path": "sgx_alloc/Cargo.toml",
+      "before_sha256": "0b430576210f0c3c19c8c54ff2ac675035b072dede5496d5f68c4cadbf6224ac",
+      "after_sha256": "aaae7b3ab6ac73e746ce82398de8ce7538581f2d59b5b732f99e2ba6d3018d52"
     },
     {
       "path": "sgx_alloc/src/fallible.rs",
@@ -51,24 +50,24 @@
       "after_sha256": "de99e8a932c380b7e9b9086935bbb53d75da1f132bfee72ca9d811829c934c2f"
     },
     {
-      "path": "sgx_tstd/src/thread/mod.rs",
-      "before_sha256": "9f312f6d393c2eb3f2a5ae88f0464e94b111ea82f0bd7ab58daf2e6f06ca6a3d",
-      "after_sha256": "69a4b7eef99ca188745878dad86e201b4fd7fa1e40ae6ed9cffb173cdfa52d06"
+      "path": "sgx_alloc/src/fallible_c.rs",
+      "before_sha256": null,
+      "after_sha256": "3220d2d1c7da435e8ada8c428d4dbe2b4d952453d9701a7e19e4c3c4db0fde01"
     },
     {
-      "path": "sgx_tstd/src/sys/thread.rs",
-      "before_sha256": "b7a511afc64e5c722d32b3fca056c7ca8b242f96fde821b816b0af912756a8da",
-      "after_sha256": "6f0d68c6908c8ac105a4fc262c3a69df74945c9831fc50e8ea83e43c4e4471e7"
+      "path": "sgx_alloc/src/lib.rs",
+      "before_sha256": "7893e8e98a9d8248a7da0f3555bd3dca69ff4527daeba881e51af01f5525fe21",
+      "after_sha256": "4c29cab00bf5f53f355cfd71d1fbdfa747906b3548f871a69c253f249697c9f6"
     },
     {
-      "path": "sgx_trts/src/thread/native.rs",
-      "before_sha256": "fa870ae91aab49b6d5d228e4621377fdabb5433585c14edcda1a096f1f2c86e9",
-      "after_sha256": "778141dfee8cfc18e62ee38f84f4e7f4360299c3a6af1e34d706bbbaf8502786"
+      "path": "sgx_alloc/src/owned.rs",
+      "before_sha256": null,
+      "after_sha256": "7ba96a4e1a673d2f89ea123825902a0e90e7273c66dc8a2f8447da044977dfed"
     },
     {
-      "path": "sgx_trts/src/thread/task.rs",
-      "before_sha256": "4bdb8e5b813c1a165f4cfdd2844e31020e9f15cacfc8bf32eb9b2f6920c587f5",
-      "after_sha256": "5b5475a5eaaf9151c344c29f0b51678eeda1e9bd8042f8c44d15045b903effdf"
+      "path": "sgx_alloc/src/system.rs",
+      "before_sha256": "50dbb71de2150643f52fbf48e077d615994553cf59591b3b17a892fd11637830",
+      "after_sha256": "50dbb71de2150643f52fbf48e077d615994553cf59591b3b17a892fd11637830"
     },
     {
       "path": "sgx_sync/src/lib.rs",
@@ -96,31 +95,6 @@
       "after_sha256": "c17c891e1a8331824d3edd7a034f04427446769442288ad247706bbba6725443"
     },
     {
-      "path": "sgx_tstd/src/sync/mod.rs",
-      "before_sha256": "b7771e76d506aa276f6dfb530f3786acd9d93d69e6ce2473ab9759053643e8e7",
-      "after_sha256": "e59daabe3d88f1b05e09efd308cf885ecdf3e6450e1407b58f68ef8d7c1cbaad"
-    },
-    {
-      "path": "sgx_alloc/src/fallible_c.rs",
-      "before_sha256": null,
-      "after_sha256": "3220d2d1c7da435e8ada8c428d4dbe2b4d952453d9701a7e19e4c3c4db0fde01"
-    },
-    {
-      "path": "rustlib/std/Cargo.lock",
-      "before_sha256": "e5f79c0fa641c519795bc43c4b204aa0351a94b4f9ee599f8c642be58ac54e99",
-      "after_sha256": "d36e7a755bfc34dc89fa9e7d64af7ba6e351d40ba303357fef9b70acaa772632"
-    },
-    {
-      "path": "sgx_alloc/Cargo.toml",
-      "before_sha256": "0b430576210f0c3c19c8c54ff2ac675035b072dede5496d5f68c4cadbf6224ac",
-      "after_sha256": "aaae7b3ab6ac73e746ce82398de8ce7538581f2d59b5b732f99e2ba6d3018d52"
-    },
-    {
-      "path": "sgx_alloc/src/owned.rs",
-      "before_sha256": null,
-      "after_sha256": "7ba96a4e1a673d2f89ea123825902a0e90e7273c66dc8a2f8447da044977dfed"
-    },
-    {
       "path": "sgx_trts/src/thread/allocator.rs",
       "before_sha256": null,
       "after_sha256": "a041b71ff70ca4d96c6901c70953233d0dab8297e675819df8a0c6b957d88c4f"
@@ -131,6 +105,51 @@
       "after_sha256": "cfe4161374f272fb25dd2b6c5dbec2d614e981a12a4213a6c3226c79274e4a10"
     },
     {
+      "path": "sgx_trts/src/thread/native.rs",
+      "before_sha256": "fa870ae91aab49b6d5d228e4621377fdabb5433585c14edcda1a096f1f2c86e9",
+      "after_sha256": "778141dfee8cfc18e62ee38f84f4e7f4360299c3a6af1e34d706bbbaf8502786"
+    },
+    {
+      "path": "sgx_trts/src/thread/task.rs",
+      "before_sha256": "4bdb8e5b813c1a165f4cfdd2844e31020e9f15cacfc8bf32eb9b2f6920c587f5",
+      "after_sha256": "5b5475a5eaaf9151c344c29f0b51678eeda1e9bd8042f8c44d15045b903effdf"
+    },
+    {
+      "path": "sgx_tseal/src/internal.rs",
+      "before_sha256": "3d02ddc2128c12440cca8a74dbe9e8a55e80ac665a25b1328bdcb7928217dc99",
+      "after_sha256": "461e499a86a653e293d857b9ab43fffbc5ac1d139f1310d9718eedd820baf4d0"
+    },
+    {
+      "path": "sgx_tseal/src/seal.rs",
+      "before_sha256": "a17063840f77e016552959e159234b4afc5287ae8d164c7e9e033e497dab2c8e",
+      "after_sha256": "7d539dd3b2a7f796b1b7f7acf510bb8f93b7aaa1551de9e1d39db69b6d95b47f"
+    },
+    {
+      "path": "sgx_tstd/src/alloc.rs",
+      "before_sha256": "77bd807108ac94bc83ce38652003f4ff8814b52d77c18111a3ecd90911916b24",
+      "after_sha256": "28588d8aecfb319dda5d329f8551c1b1b7d5024ffbbf4cd91e2b732b42917d93"
+    },
+    {
+      "path": "sgx_tstd/src/collections/mod.rs",
+      "before_sha256": "5cf68d7af16f40415be5345e326fe14ab940ab92322e7964a9a094e7f9846650",
+      "after_sha256": "de5632ab2005869532317874193e0c042254cb1023e3621fd0f0d988b3adcb82"
+    },
+    {
+      "path": "sgx_tstd/src/sync/mod.rs",
+      "before_sha256": "b7771e76d506aa276f6dfb530f3786acd9d93d69e6ce2473ab9759053643e8e7",
+      "after_sha256": "e59daabe3d88f1b05e09efd308cf885ecdf3e6450e1407b58f68ef8d7c1cbaad"
+    },
+    {
+      "path": "sgx_tstd/src/sys/thread.rs",
+      "before_sha256": "b7a511afc64e5c722d32b3fca056c7ca8b242f96fde821b816b0af912756a8da",
+      "after_sha256": "6f0d68c6908c8ac105a4fc262c3a69df74945c9831fc50e8ea83e43c4e4471e7"
+    },
+    {
+      "path": "sgx_tstd/src/thread/mod.rs",
+      "before_sha256": "9f312f6d393c2eb3f2a5ae88f0464e94b111ea82f0bd7ab58daf2e6f06ca6a3d",
+      "after_sha256": "69a4b7eef99ca188745878dad86e201b4fd7fa1e40ae6ed9cffb173cdfa52d06"
+    },
+    {
       "path": "sgx_types/src/lib.rs",
       "before_sha256": "30abb3cb23f937fd7eea2dc6ba9b114202ac45641411789736a6e08c915ead37",
       "after_sha256": "c7bbc14a714cc08f17cbea06517348da409a52a7253f2d0227922ba9dd9af231"
@@ -139,11 +158,6 @@
       "path": "sgx_types/src/memory.rs",
       "before_sha256": null,
       "after_sha256": "fd2535930f345e187213bb13b055d4363ee1af9c2e99cf2b832f6656cefa2e6e"
-    },
-    {
-      "path": "sgx_tstd/src/collections/mod.rs",
-      "before_sha256": "5cf68d7af16f40415be5345e326fe14ab940ab92322e7964a9a094e7f9846650",
-      "after_sha256": "de5632ab2005869532317874193e0c042254cb1023e3621fd0f0d988b3adcb82"
     }
   ],
   "preserved": [
@@ -166,15 +180,18 @@
   "build_inputs": [
     {
       "path": "prepare-inputs.sh",
-      "sha256": "e3369bd791f31ff6980b8e712b29acf22076118856c23ae49d23bb186f794bca"
+      "sha256": "445996213105d231d6f8c72dabb956994fb76ba8c5622a663108f947be205eab",
+      "mode": 420
     },
     {
       "path": "approved-functions.sh",
-      "sha256": "24acd61c83e3ed9155cf479a92f0fe864476f4be9ac5642aa41d6433ae77ab1c"
+      "sha256": "24acd61c83e3ed9155cf479a92f0fe864476f4be9ac5642aa41d6433ae77ab1c",
+      "mode": 420
     }
   ],
   "autotools_owner": {
     "path": "scripts/ci/test-teaclave-sim.sh",
-    "sha256": "902e09180c6faacf7b158b09e189b94fae0bbc2137a8c8b79eebcb4da237407b"
+    "sha256": "ac1f2de829482b230f4cb4bf7a85c20c915925df8633e09c639064ab185a210b",
+    "mode": 493
   }
 }

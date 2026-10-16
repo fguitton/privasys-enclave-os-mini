@@ -109,6 +109,10 @@ pub fn check_paid_session_cache(pool: &Arc<AllocationPoolV1>) -> Result<(), &'st
     std::println!("TLS-STATE-CARRIER-SIM: actual-slot original-pool refusal-before-normalization Stay-same-backing Next consumed-once kernel-move error-drop final-alias-refund PASS");
 
     crate::sealed_config::serialization::check_in(pool)?;
+    crate::sealed_config::data::check_in(pool)?;
+    crate::crypto::sealing::check_in(pool)?;
+    crate::rpc_client::check_config_buffers(pool)?;
+    std::println!("SEALED-CONFIG-INPUT-SIM: current-v3 raw-wire malformed duplicate trailing original-pool exact-backing provided-SGX cross-wire corruption unaligned wipe refusal final-refund PASS");
     std::println!("SEALED-CONFIG-OUTPUT-SIM: current-v3-wire original-pool minus-one exact plus-one allocator-refusal unpublished-no-wake final-refund PASS");
     #[cfg(feature = "egress")]
     {

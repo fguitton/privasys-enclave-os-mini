@@ -17,6 +17,11 @@ mod state_owner_check;
 
 #[path = "../sealed_config/serialization.rs"]
 mod sealed_config_serialization;
+use sealed_config_serialization as serialization;
+#[path = "../sealed_config/backing.rs"]
+mod backing;
+#[path = "../sealed_config/data.rs"]
+mod sealed_config_data;
 
 use super::super::cert_store::CertStore;
 use super::{FidoIdentity, RaTlsSession, TlsOutput};
@@ -181,6 +186,14 @@ fn replacement_rejects_buffered_requests_and_re_attestation() {
     }
 
     sealed_config_serialization::check();
+    let raw_pool = enclave_os_common::allocation::AllocationPoolV1::new(
+        sealed_config_serialization::test_raw_overlap_bytes(
+            sealed_config_data::test_demand().unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    sealed_config_data::check_in(&raw_pool).unwrap();
     #[cfg(feature = "fallible-allocation-v1")]
     client_hello_owner_check::check();
     #[cfg(feature = "fallible-allocation-v1")]

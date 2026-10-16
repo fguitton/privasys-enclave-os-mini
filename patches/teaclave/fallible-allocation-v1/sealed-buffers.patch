@@ -1,0 +1,434 @@
+--- a/sgx_tseal/src/internal.rs
++++ b/sgx_tseal/src/internal.rs
+@@ -101,11 +101,13 @@
+             raw[(header_len + ciphertext_len)..].copy_from_slice(&self.payload.aad);
+         }
+ 
+-        let raw_data = unsafe { &mut *(raw.as_mut_ptr() as *mut CSealedData) };
+-        raw_data.key_request = self.key_request;
+-        raw_data.plaintext_offset = ciphertext_len as u32;
+-        raw_data.aes_data.payload_size = self.payload.len;
+-        raw_data.aes_data.payload_tag = self.payload.tag;
++        Self::write_header(
++            &mut raw,
++            &self.key_request,
++            ciphertext_len as u32,
++            self.payload.len,
++            self.payload.tag,
++        );
+ 
+         Ok(raw)
+     }
+@@ -120,41 +122,14 @@
+     }
+ 
+     pub fn from_slice(raw: &[u8]) -> SgxResult<InnerSealedData> {
+-        ensure!(raw.is_enclave_range(), SgxStatus::InvalidParameter);
+-        ensure!(
+-            raw.len() >= mem::size_of::<CSealedData>(),
+-            SgxStatus::InvalidParameter
+-        );
+-
+-        let raw_data = unsafe { &*(raw.as_ptr() as *const CSealedData) };
+-
+-        ensure!(
+-            raw_data.plaintext_offset <= raw_data.aes_data.payload_size,
+-            SgxStatus::InvalidParameter
+-        );
+-        let aad_len = raw_data.aes_data.payload_size - raw_data.plaintext_offset;
+-        let ciphertext_len = raw_data.plaintext_offset;
+-        ensure!(
+-            ciphertext_len + aad_len == raw_data.aes_data.payload_size,
+-            SgxStatus::InvalidParameter
+-        );
+-
+-        let raw_len = Self::raw_sealed_data_size(aad_len, ciphertext_len)
+-            .ok_or(SgxStatus::InvalidParameter)?;
+-        ensure!(raw.len() == raw_len as usize, SgxStatus::InvalidParameter);
+-
+-        let header_len = mem::size_of::<CSealedData>();
+-        let ciphertext: Box<[u8]> =
+-            Box::from(&raw[header_len..header_len + ciphertext_len as usize]);
+-        let aad: Box<[u8]> = Box::from(&raw[header_len + ciphertext_len as usize..]);
+-
++        let (header, ciphertext, aad) = Self::borrowed(raw)?;
+         Ok(InnerSealedData {
+-            key_request: raw_data.key_request,
++            key_request: header.key_request,
+             payload: Payload {
+-                len: raw_data.aes_data.payload_size,
+-                tag: raw_data.aes_data.payload_tag,
+-                ciphertext,
+-                aad,
++                len: header.aes_data.payload_size,
++                tag: header.aes_data.payload_tag,
++                ciphertext: Box::from(ciphertext),
++                aad: Box::from(aad),
+             },
+         })
+     }
+@@ -210,6 +185,24 @@
+         plaintext: &[u8],
+         aad: Option<&[u8]>,
+     ) -> SgxResult<InnerSealedData> {
++        Self::with_seal_key_request(
++            key_policy,
++            attribute_mask,
++            misc_mask,
++            plaintext,
++            aad,
++            |key_request, aad| Self::seal_data_helper(plaintext, aad, key_request),
++        )
++    }
++
++    fn with_seal_key_request<R>(
++        key_policy: KeyPolicy,
++        attribute_mask: Attributes,
++        misc_mask: u32,
++        plaintext: &[u8],
++        aad: Option<&[u8]>,
++        seal: impl FnOnce(&KeyRequest, &[u8]) -> SgxResult<R>,
++    ) -> SgxResult<R> {
+         let aad_len = aad.map(|aad| aad.len()).unwrap_or(0);
+         let plaintext_len = plaintext.len();
+ 
+@@ -264,7 +257,7 @@
+             ..Default::default()
+         };
+ 
+-        let result = Self::seal_data_helper(plaintext, aad, &key_request);
++        let result = seal(&key_request, aad);
+         key_id.as_mut().fill(0);
+         result
+     }
+@@ -360,13 +353,11 @@
+         aad: &[u8],
+         key_request: &KeyRequest,
+     ) -> SgxResult<InnerSealedData> {
+-        let mut key = key_request.get_align_key()?;
+-        let mut aes = AesGcm::new(&key.key, Nonce::zeroed(), Aad::from(aad))?;
+-
+-        let mut ciphertext = vec![0_u8; plaintext.len()].into_boxed_slice();
+-        let result = aes.encrypt(plaintext, &mut ciphertext);
+-        key.as_mut().fill(0);
+-        let tag = result?;
++        let (ciphertext, tag) = Self::with_seal_aes(key_request, aad, |aes| {
++            let mut ciphertext = vec![0_u8; plaintext.len()].into_boxed_slice();
++            let tag = aes.encrypt(plaintext, &mut ciphertext)?;
++            Ok((ciphertext, tag))
++        })?;
+ 
+         Ok(InnerSealedData {
+             key_request: *key_request,
+@@ -380,30 +371,241 @@
+     }
+ 
+     fn unseal_data_helper(&self) -> SgxResult<InnerUnsealedData> {
+-        let mut key = self.key_request.get_align_key().map_err(|e| {
+-            if e == SgxStatus::InvalidCpusvn
+-                || e == SgxStatus::InvalidIsvsvn
+-                || e == SgxStatus::OutOfMemory
+-            {
+-                e
+-            } else {
+-                SgxStatus::MacMismatch
+-            }
++        let plaintext = Self::with_unseal_key(&self.key_request, |key| {
++            let mut plaintext = vec![0_u8; self.payload.ciphertext.len()].into_boxed_slice();
++            Self::decrypt_with_key(
++                &self.payload.ciphertext,
++                &self.payload.aad,
++                &self.payload.tag,
++                &mut plaintext,
++                key,
++            )?;
++            Ok(plaintext)
+         })?;
+-
+-        lfence();
+-
+-        let mut plaintext = vec![0_u8; self.payload.ciphertext.len()].into_boxed_slice();
+-        let mut aes = AesGcm::new(&key.key, Nonce::zeroed(), Aad::from(&self.payload.aad))?;
+-        let result = aes.decrypt(&self.payload.ciphertext, &mut plaintext, &self.payload.tag);
+-        key.as_mut().fill(0);
+-        result?;
+ 
+         Ok(InnerUnsealedData {
+             payload_len: self.payload.len,
+             plaintext,
+             aad: self.payload.aad.clone(),
+         })
++    }
++
++    fn with_seal_aes<'a, R>(
++        key_request: &KeyRequest,
++        aad: &'a [u8],
++        encrypt: impl FnOnce(&mut AesGcm<&'a [u8]>) -> SgxResult<R>,
++    ) -> SgxResult<R> {
++        let mut key = key_request.get_align_key()?;
++        let result = (|| {
++            let mut aes = AesGcm::new(&key.key, Nonce::zeroed(), Aad::from(aad))?;
++            encrypt(&mut aes)
++        })();
++        key.as_mut().fill(0);
++        result
++    }
++
++    fn encrypt_into(
++        plaintext: &[u8],
++        aad: &[u8],
++        key_request: &KeyRequest,
++        ciphertext: &mut [u8],
++    ) -> SgxResult<[u8; SEAL_TAG_SIZE]> {
++        Self::with_seal_aes(key_request, aad, |aes| aes.encrypt(plaintext, ciphertext))
++    }
++
++    fn with_unseal_key<R>(
++        key_request: &KeyRequest,
++        decrypt: impl FnOnce(&sgx_types::types::Key128bit) -> SgxResult<R>,
++    ) -> SgxResult<R> {
++        let mut key = key_request.get_align_key().map_err(|e| match e {
++            SgxStatus::InvalidCpusvn | SgxStatus::InvalidIsvsvn | SgxStatus::OutOfMemory => e,
++            _ => SgxStatus::MacMismatch,
++        })?;
++        lfence();
++        let result = decrypt(&key.key);
++        key.as_mut().fill(0);
++        result
++    }
++
++    fn decrypt_with_key(
++        ciphertext: &[u8],
++        aad: &[u8],
++        tag: &[u8; SEAL_TAG_SIZE],
++        plaintext: &mut [u8],
++        key: &sgx_types::types::Key128bit,
++    ) -> SgxResult<()> {
++        let result = (|| {
++            let mut aes = AesGcm::new(key, Nonce::zeroed(), Aad::from(aad))?;
++            aes.decrypt(ciphertext, plaintext, tag)
++        })();
++        if result.is_err() {
++            plaintext.fill(0);
++        }
++        result
++    }
++
++    fn decrypt_into(
++        ciphertext: &[u8],
++        aad: &[u8],
++        key_request: &KeyRequest,
++        tag: &[u8; SEAL_TAG_SIZE],
++        plaintext: &mut [u8],
++    ) -> SgxResult<()> {
++        Self::with_unseal_key(key_request, |key| {
++            Self::decrypt_with_key(ciphertext, aad, tag, plaintext, key)
++        })
++    }
++
++    /// Seal directly into an already allocated exact raw-format buffer.
++    /// No Rust-owned ciphertext or AAD intermediate is constructed.
++    pub fn seal_with_key_policy_into(
++        key_policy: KeyPolicy,
++        attribute_mask: Attributes,
++        misc_mask: u32,
++        plaintext: &[u8],
++        aad: Option<&[u8]>,
++        output: &mut [u8],
++    ) -> SgxResult<()> {
++        let aad_len =
++            u32::try_from(aad.map_or(0, <[u8]>::len)).map_err(|_| SgxStatus::InvalidParameter)?;
++        let plaintext_len =
++            u32::try_from(plaintext.len()).map_err(|_| SgxStatus::InvalidParameter)?;
++        let raw_len = Self::raw_sealed_data_size(aad_len, plaintext_len)
++            .ok_or(SgxStatus::InvalidParameter)?;
++        ensure!(
++            output.len() == raw_len as usize,
++            SgxStatus::InvalidParameter
++        );
++        ensure!(output.is_enclave_range(), SgxStatus::InvalidParameter);
++        output.fill(0);
++        let result = Self::with_seal_key_request(
++            key_policy,
++            attribute_mask,
++            misc_mask,
++            plaintext,
++            aad,
++            |key_request, aad| {
++                let header_len = mem::size_of::<CSealedData>();
++                let ciphertext_end = header_len + plaintext.len();
++                let tag = Self::encrypt_into(
++                    plaintext,
++                    aad,
++                    key_request,
++                    &mut output[header_len..ciphertext_end],
++                )?;
++                output[ciphertext_end..].copy_from_slice(aad);
++                Self::write_header(
++                    output,
++                    key_request,
++                    plaintext_len,
++                    plaintext_len + aad_len,
++                    tag,
++                );
++                Ok(())
++            },
++        );
++        if result.is_err() {
++            output.fill(0);
++        }
++        result
++    }
++
++    fn write_header(
++        output: &mut [u8],
++        key_request: &KeyRequest,
++        plaintext_len: u32,
++        payload_len: u32,
++        tag: [u8; SEAL_TAG_SIZE],
++    ) {
++        let mut header = CSealedData::default();
++        header.key_request = *key_request;
++        header.plaintext_offset = plaintext_len;
++        header.aes_data.payload_size = payload_len;
++        header.aes_data.payload_tag = tag;
++        // The C format's explicit reserved fields account for every
++        // header byte; no implicit padding is copied into the wire.
++        const _: () = assert!(
++            mem::size_of::<KeyRequest>()
++                == mem::size_of::<KeyName>()
++                    + mem::size_of::<KeyPolicy>()
++                    + mem::size_of::<u16>() * 3
++                    + mem::size_of::<u32>()
++                    + mem::size_of::<sgx_types::types::CpuSvn>()
++                    + mem::size_of::<Attributes>()
++                    + mem::size_of::<KeyId>()
++                    + sgx_types::types::KEY_REQUEST_RESERVED2_BYTES
++        );
++        const _: () = assert!(
++            mem::offset_of!(KeyRequest, reserved2) + sgx_types::types::KEY_REQUEST_RESERVED2_BYTES
++                == mem::size_of::<KeyRequest>()
++        );
++        const _: () = assert!(
++            mem::size_of::<CSealedData>()
++                == mem::size_of::<KeyRequest>()
++                    + mem::size_of::<u32>()
++                    + mem::size_of::<[u8; 12]>()
++                    + mem::size_of::<sgx_types::types::CAesGcmData>()
++        );
++        // SAFETY: output is fully initialized, enclaved, and checked
++        // for the complete C header. Supplied storage need not align.
++        unsafe { core::ptr::write_unaligned(output.as_mut_ptr().cast(), header) };
++    }
++
++    /// Validate a borrowed raw buffer without constructing owned children.
++    fn borrowed(raw: &[u8]) -> SgxResult<(CSealedData, &[u8], &[u8])> {
++        ensure!(raw.is_enclave_range(), SgxStatus::InvalidParameter);
++        let header_len = mem::size_of::<CSealedData>();
++        ensure!(raw.len() >= header_len, SgxStatus::InvalidParameter);
++        // Validate the only enum discriminant before reading the C struct.
++        let key_name_offset =
++            mem::offset_of!(CSealedData, key_request) + mem::offset_of!(KeyRequest, key_name);
++        let key_name = u16::from_ne_bytes(
++            raw[key_name_offset..key_name_offset + mem::size_of::<u16>()]
++                .try_into()
++                .map_err(|_| SgxStatus::InvalidParameter)?,
++        );
++        KeyName::try_from(key_name).map_err(|_| SgxStatus::InvalidParameter)?;
++        // SAFETY: the full initialized header is present, its only enum tag is
++        // valid, and unaligned input is read without creating a typed reference.
++        let header: CSealedData = unsafe { core::ptr::read_unaligned(raw.as_ptr().cast()) };
++        ensure!(
++            header.plaintext_offset <= header.aes_data.payload_size,
++            SgxStatus::InvalidParameter
++        );
++        let aad_len = header.aes_data.payload_size - header.plaintext_offset;
++        let raw_len = Self::raw_sealed_data_size(aad_len, header.plaintext_offset)
++            .ok_or(SgxStatus::InvalidParameter)?;
++        ensure!(raw.len() == raw_len as usize, SgxStatus::InvalidParameter);
++        let ciphertext_end = header_len + header.plaintext_offset as usize;
++        Ok((
++            header,
++            &raw[header_len..ciphertext_end],
++            &raw[ciphertext_end..],
++        ))
++    }
++
++    pub fn plaintext_size(raw: &[u8]) -> SgxResult<usize> {
++        Self::borrowed(raw).map(|(_, ciphertext, _)| ciphertext.len())
++    }
++
++    /// Authenticate/decrypt into caller-owned exact storage. AAD remains a
++    /// borrowed authenticated view of the original raw input on success only.
++    pub fn unseal_into<'a>(raw: &'a [u8], plaintext: &mut [u8]) -> SgxResult<&'a [u8]> {
++        let (header, ciphertext, aad) = Self::borrowed(raw)?;
++        ensure!(
++            plaintext.len() == ciphertext.len(),
++            SgxStatus::InvalidParameter
++        );
++        ensure!(plaintext.is_enclave_range(), SgxStatus::InvalidParameter);
++        plaintext.fill(0);
++        Self::decrypt_into(
++            ciphertext,
++            aad,
++            &header.key_request,
++            &header.aes_data.payload_tag,
++            plaintext,
++        )?;
++        Ok(aad)
+     }
+ 
+     fn mac_data_helper(aad: &[u8], key_request: &KeyRequest) -> SgxResult<InnerSealedData> {
+--- a/sgx_tseal/src/seal.rs
++++ b/sgx_tseal/src/seal.rs
+@@ -116,6 +116,50 @@
+     }
+ }
+ 
++impl SealedData<[u8]> {
++    /// Exact current C-format size. This is a geometry query, not authority.
++    pub fn sealed_size(plaintext_len: usize, aad_len: usize) -> SgxResult<usize> {
++        ensure!(
++            (1..u32::MAX as usize).contains(&plaintext_len),
++            SgxStatus::InvalidParameter
++        );
++        let aad_len = u32::try_from(aad_len).map_err(|_| SgxStatus::InvalidParameter)?;
++        let plaintext_len =
++            u32::try_from(plaintext_len).map_err(|_| SgxStatus::InvalidParameter)?;
++        InnerSealedData::raw_sealed_data_size(aad_len, plaintext_len)
++            .map(|length| length as usize)
++            .ok_or(SgxStatus::InvalidParameter)
++    }
++
++    pub fn seal_with_key_policy_into(
++        key_policy: KeyPolicy,
++        attribute_mask: Attributes,
++        misc_mask: u32,
++        data: &[u8],
++        aad: Option<&[u8]>,
++        output: &mut [u8],
++    ) -> SgxResult<()> {
++        InnerSealedData::seal_with_key_policy_into(
++            key_policy,
++            attribute_mask,
++            misc_mask,
++            data,
++            aad,
++            output,
++        )
++    }
++
++    /// Unauthenticated geometry only; successful authentication is still
++    /// required before the supplied plaintext may be published or consumed.
++    pub fn plaintext_size(raw: &[u8]) -> SgxResult<usize> {
++        InnerSealedData::plaintext_size(raw)
++    }
++
++    pub fn unseal_into<'a>(raw: &'a [u8], plaintext: &mut [u8]) -> SgxResult<&'a [u8]> {
++        InnerSealedData::unseal_into(raw, plaintext)
++    }
++}
++
+ impl<T: ContiguousMemory> SealedData<T> {
+     pub fn unseal(self) -> SgxResult<UnsealedData<T>> {
+         self.inner.unseal().map(|inner| {

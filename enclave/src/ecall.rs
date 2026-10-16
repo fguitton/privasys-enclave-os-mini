@@ -38,8 +38,6 @@
 //! 5. Call [`finalize_and_run()`] to build the Merkle tree, start the
 //!    RA-TLS server, and enter the event loop.
 
-use std::collections::BTreeMap;
-
 use crate::ratls::attestation::{CaContext, RetainedCaContext};
 use crate::ratls::server::IngressServer;
 use crate::rpc_client::RpcClient;
@@ -328,7 +326,7 @@ pub fn init_enclave(
     enclave_log_info!("Crypto self-tests passed");
 
     // ── Resolve unified sealed config ──────────────────────────────
-    let sealed_cfg = match resolve_sealed_config(&config) {
+    let sealed_cfg = match resolve_sealed_config(&config, &pool) {
         Ok(cfg) => cfg,
         Err(e) => {
             enclave_log_error!("Sealed config resolution failed: {}", e);
@@ -1271,10 +1269,13 @@ pub use enclave_os_common::request_json::configuration::EnclaveConfig;
 /// - First run generates the local CA inside the enclave.
 /// - Subsequent restarts unseal everything automatically.
 /// - Passing new config params on restart updates the sealed blob.
-fn resolve_sealed_config(_config: &EnclaveConfig) -> Result<SealedConfig, String> {
+fn resolve_sealed_config(
+    _config: &EnclaveConfig,
+    pool: &std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
+) -> Result<SealedConfig, String> {
     // Preserve the original unseal-or-fresh branch. Reuse its actual owned
     // value instead of allocating duplicate CA/key/module-data backings.
-    if let Some(existing) = SealedConfig::unseal_from_disk().ok() {
+    if let Some(existing) = SealedConfig::unseal_from_disk(pool).ok() {
         enclave_log_info!("CA loaded from sealed config");
         enclave_log_info!(
             "Loaded {} module data entries from sealed config",
@@ -1292,12 +1293,8 @@ fn resolve_sealed_config(_config: &EnclaveConfig) -> Result<SealedConfig, String
     ring::rand::SecureRandom::fill(&rng, &mut master_key)
         .map_err(|_| String::from("Failed to generate master key"))?;
     enclave_log_info!("Generated fresh master encryption key");
-    let cfg = SealedConfig {
-        master_key,
-        ca_cert_der: ca.ca_cert_der,
-        ca_key_pkcs8: ca.ca_key_pkcs8,
-        module_data: BTreeMap::new(),
-    };
+    let cfg = SealedConfig::from_parts(pool, master_key, &ca.ca_cert_der, &ca.ca_key_pkcs8)
+        .map_err(String::from)?;
     enclave_log_info!("First run: sealed config created");
     Ok(cfg)
 }

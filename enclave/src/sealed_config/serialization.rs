@@ -1,6 +1,14 @@
 //! Current sealed-config encoding with an admitted, move-only output buffer.
 use enclave_os_common::allocation::{AllocationLeaseV1, AllocationPoolV1};
 use enclave_os_common::types::AEAD_KEY_SIZE;
+#[cfg(any(
+    test,
+    all(
+        feature = "sgx-sim-attestation",
+        feature = "fallible-allocation-v1",
+        target_vendor = "teaclave"
+    )
+))]
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -62,11 +70,10 @@ fn add_field(total: usize, length: usize) -> Result<usize, &'static str> {
         .ok_or("SealedConfig encoded length overflow")
 }
 
-fn encoded_length(
-    certificate: &[u8],
-    key: &[u8],
-    entries: &BTreeMap<String, Vec<u8>>,
-) -> Result<usize, &'static str> {
+fn encoded_length<'a, I>(certificate: &[u8], key: &[u8], entries: I) -> Result<usize, &'static str>
+where
+    I: Clone + ExactSizeIterator<Item = (&'a str, &'a [u8])>,
+{
     length_header(entries.len())?;
     let mut total = LENGTH_BYTES
         .checked_add(AEAD_KEY_SIZE)
@@ -104,27 +111,28 @@ fn required_bytes(length: usize) -> Result<usize, &'static str> {
     }
 }
 
-#[cfg(feature = "fallible-allocation-v1")]
-fn allocate_buffer<A: core::alloc::Allocator>(
-    allocator: A,
-    length: usize,
-) -> Result<Vec<u8, A>, &'static str> {
-    let mut bytes = Vec::new_in(allocator);
-    bytes
-        .try_reserve_exact(length)
-        .map_err(|_| "SealedConfig output backing refused")?;
-    Ok(bytes)
+#[cfg(test)]
+pub(super) fn test_raw_overlap_bytes(raw_bytes: usize) -> Result<usize, &'static str> {
+    raw_bytes
+        .checked_add(required_bytes(checks::WIRE.len())?)
+        .ok_or("raw and serialized fixture overlap overflow")
 }
 
+#[cfg(feature = "fallible-allocation-v1")]
+use super::backing::allocate_buffer;
+
 /// Admit the complete current encoding before creating its output backing.
-pub(crate) fn serialize(
+pub(crate) fn serialize<'a, I>(
     pool: &Arc<AllocationPoolV1>,
     master_key: &[u8; AEAD_KEY_SIZE],
     certificate: &[u8],
     key: &[u8],
-    entries: &BTreeMap<String, Vec<u8>>,
-) -> Result<SerializedConfig, &'static str> {
-    let length = encoded_length(certificate, key, entries)?;
+    entries: I,
+) -> Result<SerializedConfig, &'static str>
+where
+    I: Clone + ExactSizeIterator<Item = (&'a str, &'a [u8])>,
+{
+    let length = encoded_length(certificate, key, entries.clone())?;
     // Resolve the complete actual allocator geometry before its first request.
     let demand = required_bytes(length)?;
     #[cfg(not(feature = "fallible-allocation-v1"))]

@@ -177,6 +177,7 @@ function(rust_build_enclave CRATE_DIR OUTPUT_NAME FEATURES)
         set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
             "${RUST_RETAINED_PROVIDER_CARGO_SCRIPT}"
             "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../scripts/prepare-retained-provider.py"
+            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../scripts/fallible-sdk-app-source.py"
             "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../patches/rustls/retained-provider/manifest.json"
             "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../patches/rustls/retained-provider/profile.patch")
     endif()
@@ -186,6 +187,10 @@ function(rust_build_enclave CRATE_DIR OUTPUT_NAME FEATURES)
         message(FATAL_ERROR "TEACLAVE_CHECKOUT not set. Run resolve_teaclave() first.")
     endif()
 
+    set(_FALLIBLE_SDK_APP_SOURCE "")
+    if(HONEST_TEACLAVE_FALLIBLE_ALLOCATION_V1)
+        set(_FALLIBLE_SDK_APP_SOURCE "${TEACLAVE_CHECKOUT}")
+    endif()
     set(TARGET_JSON "${TEACLAVE_CHECKOUT}/rustlib/${RUST_ENCLAVE_TARGET}.json")
 
     # Build the --features flag if modules were requested
@@ -226,6 +231,7 @@ function(rust_build_enclave CRATE_DIR OUTPUT_NAME FEATURES)
     add_custom_target(${OUTPUT_NAME} ALL
         COMMAND ${CMAKE_COMMAND} -E env
             "HONEST_BTREE_SOURCE_RECEIPT=${HONEST_BTREE_SOURCE_RECEIPT}"
+            "HONEST_TEACLAVE_FALLIBLE_SOURCE=${_FALLIBLE_SDK_APP_SOURCE}"
             "SGX_SDK_PATH=${SGX_SDK_PATH}"
             "SGX_MODE=${SGX_MODE}"
             "SGX_CRYPTO_BACKEND=${SGX_CRYPTO_BACKEND}"
