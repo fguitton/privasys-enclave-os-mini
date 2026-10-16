@@ -9,6 +9,7 @@ use enclave_os_common::allocation::{AllocationLeaseV1, AllocationPoolV1};
 #[cfg(feature = "fallible-allocation-v1")]
 use enclave_os_common::allocation::{shared_allocation_bytes, shared_allocation_bytes_for_layout};
 type Pool = Arc<AllocationPoolV1>;
+const ATTESTED_PROTOCOLS: &[&[u8]] = &[b"honest-local-control/1"];
 #[cfg(feature = "fallible-allocation-v1")]
 const REFUSED: &str = "TLS config allocation refused";
 
@@ -265,9 +266,14 @@ fn required_bytes(
         )?;
     }
     if attested {
-        bytes = bytes
-            .checked_add(Layout::array::<Vec<u8>>(1).ok()?.size())?
-            .checked_add(b"honest-local-control/1".len())?;
+        bytes = bytes.checked_add(
+            Layout::array::<Vec<u8>>(ATTESTED_PROTOCOLS.len())
+                .ok()?
+                .size(),
+        )?;
+        for protocol in ATTESTED_PROTOCOLS {
+            bytes = bytes.checked_add(protocol.len())?;
+        }
     }
     Some(bytes)
 }
@@ -390,12 +396,14 @@ pub(super) fn build(
     if attested {
         config
             .alpn_protocols
-            .try_reserve_exact(1)
+            .try_reserve_exact(ATTESTED_PROTOCOLS.len())
             .map_err(|_| REFUSED)?;
-        if config.alpn_protocols.capacity() != 1 {
+        if config.alpn_protocols.capacity() != ATTESTED_PROTOCOLS.len() {
             return Err(REFUSED);
         }
-        config.alpn_protocols.push(copy(b"honest-local-control/1")?);
+        for protocol in ATTESTED_PROTOCOLS {
+            config.alpn_protocols.push(copy(protocol)?);
+        }
     }
     let config = try_arc(config)?;
     Ok(RetainedClientConfig {
@@ -485,7 +493,10 @@ pub(super) fn build(
         builder.with_no_client_auth()
     };
     if attested {
-        config.alpn_protocols = vec![b"honest-local-control/1".to_vec()];
+        config.alpn_protocols = ATTESTED_PROTOCOLS
+            .iter()
+            .map(|protocol| protocol.to_vec())
+            .collect();
     }
     Ok(RetainedClientConfig {
         config: Arc::new(config),
@@ -639,8 +650,10 @@ pub(crate) fn check(roots: &RootCertStore) {
             );
             if attested {
                 layouts.push(arc_layout(Layout::new::<AttestedRaTlsVerifier>()));
-                layouts.push(Layout::array::<Vec<u8>>(1).unwrap());
-                layouts.push(Layout::array::<u8>(b"honest-local-control/1".len()).unwrap());
+                layouts.push(Layout::array::<Vec<u8>>(ATTESTED_PROTOCOLS.len()).unwrap());
+                for protocol in ATTESTED_PROTOCOLS {
+                    layouts.push(Layout::array::<u8>(protocol.len()).unwrap());
+                }
             } else {
                 #[cfg(not(feature = "sgx-sim-attestation"))]
                 layouts.push(arc_layout(Layout::new::<RaTlsVerifier>()));

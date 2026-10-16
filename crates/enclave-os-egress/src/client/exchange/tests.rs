@@ -74,7 +74,8 @@ impl EnclaveClientCertSigner for Identity {
             native_pool = enclave_os_common::allocation::AllocationPoolV1::new(
                 crate::client::ClientCredential::required_pool_bytes(&[&self.cert], &self.key)
                     .ok_or(crate::client::ClientCredentialError::Allocation)?,
-            );
+            )
+            .ok_or(crate::client::ClientCredentialError::Allocation)?;
             &native_pool
         };
         crate::client::ClientCredential::new(pool, &[&self.cert], &self.key).map(Some)

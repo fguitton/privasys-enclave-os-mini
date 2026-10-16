@@ -30,7 +30,7 @@ mod sealed_config_data;
 use super::super::cert_store::CertStore;
 use super::{FidoIdentity, RaTlsSession, TlsOutput};
 use enclave_os_common::modules::{AppIdentity, PeerEvidence};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 #[cfg(not(feature = "fallible-allocation-v1"))]
 use rustls::ClientConfig;
 use rustls::{ClientConnection, RootCertStore};
