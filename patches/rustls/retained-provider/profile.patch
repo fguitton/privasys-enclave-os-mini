@@ -518,7 +518,7 @@
  
  impl ConfigBuilder<ServerConfig, WantsVerifier> {
      /// Choose how to verify client certificates.
-@@ -100,6 +100,42 @@
+@@ -100,6 +100,46 @@
  
      /// Sets a custom [`ResolvesServerCert`].
      pub fn with_cert_resolver(self, cert_resolver: Arc<dyn ResolvesServerCert>) -> ServerConfig {
@@ -527,15 +527,19 @@
 +
 +    /// Construct identical server defaults with fallible retained cache backing.
 +    /// Private-key parsing and the caller's certificate buffers remain separate owners.
-+    pub fn try_with_single_cert_in(
++    pub fn try_with_p256_single_cert_in(
 +        self,
 +        cert_chain: Vec<CertificateDer<'static>>,
 +        key_der: PrivateKeyDer<'static>,
 +        allocator: crate::RetainedAllocator,
 +    ) -> Result<ServerConfig, ServerConfigAllocationError> {
-+        let defaults = ServerConfigDefaults::try_new_in(allocator)?;
-+        let certified_key = CertifiedKey::from_der(cert_chain, key_der, self.crypto_provider())
-+            .map_err(ServerConfigAllocationError::Certificate)?;
++        let defaults = ServerConfigDefaults::try_new_in(allocator.clone())?;
++        let signing_key = crate::crypto::ring::sign::try_p256_signing_key_in(&key_der, allocator)?;
++        let certified_key = CertifiedKey::new(cert_chain, signing_key);
++        match certified_key.keys_match() {
++            Ok(()) | Err(Error::InconsistentKeys(crate::error::InconsistentKeys::Unknown)) => {}
++            Err(error) => return Err(ServerConfigAllocationError::Certificate(error)),
++        }
 +        let certified_key =
 +            Arc::try_new(certified_key).map_err(|_| ServerConfigAllocationError::Allocation)?;
 +        let resolver = Arc::try_new(SingleCertAndKey::from(certified_key))
@@ -561,7 +565,7 @@
          #[cfg(feature = "tls12")]
          let require_ems = self.provider.fips();
  
-@@ -110,13 +146,11 @@
+@@ -110,13 +150,11 @@
              ignore_client_order: false,
              max_fragment_size: None,
              #[cfg(feature = "std")]
@@ -578,7 +582,7 @@
              enable_secret_extraction: false,
              max_early_data_size: 0,
              send_half_rtt_data: false,
-@@ -125,9 +159,119 @@
+@@ -125,9 +163,124 @@
              #[cfg(feature = "tls12")]
              require_ems,
              time_provider: self.time_provider,
@@ -596,6 +600,8 @@
 +    Allocation,
 +    /// The original certificate/key consistency checks rejected the input.
 +    Certificate(Error),
++    /// The selected current PKCS8/P256 key failed the original ring validation.
++    PrivateKey,
 +}
 +
 +/// Actual concrete payload layouts of the separately retained default Arc objects.
@@ -611,10 +617,13 @@
 +}
 +
 +/// Actual single-certificate resolver Arc payload layouts, independently of key internals.
-+pub fn server_config_certificate_payload_layouts() -> [core::alloc::Layout; 2] {
++pub fn server_config_certificate_payload_layouts() -> [core::alloc::Layout; 4] {
++    let [pair, signing_key] = crate::crypto::ring::sign::retained_p256_payload_layouts();
 +    [
 +        core::alloc::Layout::new::<CertifiedKey>(),
 +        core::alloc::Layout::new::<SingleCertAndKey>(),
++        pair,
++        signing_key,
 +    ]
 +}
 +
@@ -1691,3 +1700,370 @@
          signature_verification_algorithms: SUPPORTED_SIG_ALGS,
          secure_random: &Ring,
          key_provider: &Ring,
+--- a/src/crypto/ring/sign.rs
++++ b/src/crypto/ring/sign.rs
+@@ -6,15 +6,108 @@
+ use alloc::{format, vec};
+ use core::fmt::{self, Debug, Formatter};
+ 
+-use pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, SubjectPublicKeyInfoDer, alg_id};
++use pki_types::{alg_id, PrivateKeyDer, PrivatePkcs8KeyDer, SubjectPublicKeyInfoDer};
+ 
+ use super::ring_like::rand::{SecureRandom, SystemRandom};
+ use super::ring_like::signature::{self, EcdsaKeyPair, Ed25519KeyPair, KeyPair, RsaKeyPair};
+-use crate::crypto::signer::{Signer, SigningKey, public_key_to_spki};
++use crate::crypto::signer::{public_key_to_spki, Signer, SigningKey};
+ use crate::enums::{SignatureAlgorithm, SignatureScheme};
+ use crate::error::Error;
+ use crate::sync::Arc;
+ use crate::x509::{wrap_concat_in_sequence, wrap_in_octet_string};
++
++/// Concrete shared payloads in the selected PKCS8/P256 constructor. Arc header
++/// and padding are added by the config owner before either request executes.
++pub(crate) fn retained_p256_payload_layouts() -> [core::alloc::Layout; 2] {
++    [
++        core::alloc::Layout::new::<EcdsaKeyPair>(),
++        core::alloc::Layout::new::<RetainedP256SigningKey<crate::RetainedAllocator>>(),
++    ]
++}
++
++/// Parse the actual retained server leaf key with fallible metadata and SPKI.
++/// This explicitly selected constructor has no generic-key/provider fallback.
++pub fn try_p256_signing_key_in<A>(
++    der: &PrivateKeyDer<'_>,
++    allocator: A,
++) -> Result<Arc<dyn SigningKey>, crate::server::ServerConfigAllocationError>
++where
++    A: core::alloc::Allocator + Clone + Send + Sync + 'static,
++{
++    use crate::server::ServerConfigAllocationError as Refusal;
++    let PrivateKeyDer::Pkcs8(pkcs8) = der else {
++        return Err(Refusal::PrivateKey);
++    };
++    let key = EcdsaKeyPair::from_pkcs8(
++        &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
++        pkcs8.secret_pkcs8_der(),
++        &SystemRandom::new(),
++    )
++    .map_err(|_| Refusal::PrivateKey)?;
++    let key = Arc::try_new(key).map_err(|_| Refusal::Allocation)?;
++    let public_spki = retained_p256_spki(key.public_key().as_ref(), allocator)
++        .map_err(|_| Refusal::Allocation)?;
++    let retained = Arc::try_new(RetainedP256SigningKey { key, public_spki })
++        .map_err(|_| Refusal::Allocation)?;
++    Ok(retained)
++}
++
++fn retained_p256_spki<A: core::alloc::Allocator + Clone>(
++    public_key: &[u8],
++    allocator: A,
++) -> Result<Vec<u8, A>, core::alloc::AllocError> {
++    // Same three DER wrappers as public_key_to_spki. Temporary and retained
++    // buffers each own the original allocator; no infallible Vec conversion.
++    let algorithm = crate::x509::try_asn1_wrap_in(
++        crate::x509::DER_SEQUENCE_TAG,
++        alg_id::ECDSA_P256.as_ref(),
++        &[],
++        allocator.clone(),
++    )?;
++    let bit_string = crate::x509::try_asn1_wrap_in(
++        crate::x509::DER_BIT_STRING_TAG,
++        &[0],
++        public_key,
++        allocator.clone(),
++    )?;
++    crate::x509::try_asn1_wrap_in(
++        crate::x509::DER_SEQUENCE_TAG,
++        &algorithm,
++        &bit_string,
++        allocator,
++    )
++}
++
++struct RetainedP256SigningKey<A: core::alloc::Allocator> {
++    key: Arc<EcdsaKeyPair>,
++    public_spki: Vec<u8, A>,
++}
++impl<A: core::alloc::Allocator + Send + Sync> SigningKey for RetainedP256SigningKey<A> {
++    fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
++        if offered.contains(&SignatureScheme::ECDSA_NISTP256_SHA256) {
++            Some(Box::new(EcdsaSigner {
++                key: self.key.clone(),
++                scheme: SignatureScheme::ECDSA_NISTP256_SHA256,
++            }))
++        } else {
++            None
++        }
++    }
++    fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>> {
++        Some(SubjectPublicKeyInfoDer::from(self.public_spki.as_slice()))
++    }
++    fn algorithm(&self) -> SignatureAlgorithm {
++        SignatureAlgorithm::ECDSA
++    }
++}
++impl<A: core::alloc::Allocator> Debug for RetainedP256SigningKey<A> {
++    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
++        formatter
++            .debug_struct("RetainedP256SigningKey")
++            .field("scheme", &SignatureScheme::ECDSA_NISTP256_SHA256)
++            .finish()
++    }
++}
+ 
+ /// Parse `der` as any supported key encoding/type, returning
+ /// the first which works.
+@@ -468,14 +561,12 @@
+         assert_eq!(format!("{k:?}"), "EcdsaSigningKey { algorithm: ECDSA }");
+         assert_eq!(k.algorithm(), SignatureAlgorithm::ECDSA);
+ 
+-        assert!(
+-            k.choose_scheme(&[SignatureScheme::RSA_PKCS1_SHA256])
+-                .is_none()
+-        );
+-        assert!(
+-            k.choose_scheme(&[SignatureScheme::ECDSA_NISTP384_SHA384])
+-                .is_none()
+-        );
++        assert!(k
++            .choose_scheme(&[SignatureScheme::RSA_PKCS1_SHA256])
++            .is_none());
++        assert!(k
++            .choose_scheme(&[SignatureScheme::ECDSA_NISTP384_SHA384])
++            .is_none());
+         let s = k
+             .choose_scheme(&[SignatureScheme::ECDSA_NISTP256_SHA256])
+             .unwrap();
+@@ -485,11 +576,7 @@
+         );
+         assert_eq!(s.scheme(), SignatureScheme::ECDSA_NISTP256_SHA256);
+         // nb. signature is variable length and asn.1-encoded
+-        assert!(
+-            s.sign(b"hello")
+-                .unwrap()
+-                .starts_with(&[0x30])
+-        );
++        assert!(s.sign(b"hello").unwrap().starts_with(&[0x30]));
+     }
+ 
+     #[test]
+@@ -521,14 +608,12 @@
+         assert_eq!(format!("{k:?}"), "EcdsaSigningKey { algorithm: ECDSA }");
+         assert_eq!(k.algorithm(), SignatureAlgorithm::ECDSA);
+ 
+-        assert!(
+-            k.choose_scheme(&[SignatureScheme::RSA_PKCS1_SHA256])
+-                .is_none()
+-        );
+-        assert!(
+-            k.choose_scheme(&[SignatureScheme::ECDSA_NISTP256_SHA256])
+-                .is_none()
+-        );
++        assert!(k
++            .choose_scheme(&[SignatureScheme::RSA_PKCS1_SHA256])
++            .is_none());
++        assert!(k
++            .choose_scheme(&[SignatureScheme::ECDSA_NISTP256_SHA256])
++            .is_none());
+         let s = k
+             .choose_scheme(&[SignatureScheme::ECDSA_NISTP384_SHA384])
+             .unwrap();
+@@ -538,11 +623,7 @@
+         );
+         assert_eq!(s.scheme(), SignatureScheme::ECDSA_NISTP384_SHA384);
+         // nb. signature is variable length and asn.1-encoded
+-        assert!(
+-            s.sign(b"hello")
+-                .unwrap()
+-                .starts_with(&[0x30])
+-        );
++        assert!(s.sign(b"hello").unwrap().starts_with(&[0x30]));
+     }
+ 
+     #[test]
+@@ -562,17 +643,13 @@
+         assert_eq!(format!("{k:?}"), "Ed25519SigningKey { algorithm: ED25519 }");
+         assert_eq!(k.algorithm(), SignatureAlgorithm::ED25519);
+ 
+-        assert!(
+-            k.choose_scheme(&[SignatureScheme::RSA_PKCS1_SHA256])
+-                .is_none()
+-        );
+-        assert!(
+-            k.choose_scheme(&[SignatureScheme::ECDSA_NISTP256_SHA256])
+-                .is_none()
+-        );
+-        let s = k
+-            .choose_scheme(&[SignatureScheme::ED25519])
+-            .unwrap();
++        assert!(k
++            .choose_scheme(&[SignatureScheme::RSA_PKCS1_SHA256])
++            .is_none());
++        assert!(k
++            .choose_scheme(&[SignatureScheme::ECDSA_NISTP256_SHA256])
++            .is_none());
++        let s = k.choose_scheme(&[SignatureScheme::ED25519]).unwrap();
+         assert_eq!(format!("{s:?}"), "Ed25519Signer { scheme: ED25519 }");
+         assert_eq!(s.scheme(), SignatureScheme::ED25519);
+         assert_eq!(s.sign(b"hello").unwrap().len(), 64);
+@@ -607,18 +684,12 @@
+         assert_eq!(format!("{k:?}"), "RsaSigningKey { algorithm: RSA }");
+         assert_eq!(k.algorithm(), SignatureAlgorithm::RSA);
+ 
+-        assert!(
+-            k.choose_scheme(&[SignatureScheme::ECDSA_NISTP256_SHA256])
+-                .is_none()
+-        );
+-        assert!(
+-            k.choose_scheme(&[SignatureScheme::ED25519])
+-                .is_none()
+-        );
+-
+-        let s = k
+-            .choose_scheme(&[SignatureScheme::RSA_PSS_SHA256])
+-            .unwrap();
++        assert!(k
++            .choose_scheme(&[SignatureScheme::ECDSA_NISTP256_SHA256])
++            .is_none());
++        assert!(k.choose_scheme(&[SignatureScheme::ED25519]).is_none());
++
++        let s = k.choose_scheme(&[SignatureScheme::RSA_PSS_SHA256]).unwrap();
+         assert_eq!(format!("{s:?}"), "RsaSigner { scheme: RSA_PSS_SHA256 }");
+         assert_eq!(s.scheme(), SignatureScheme::RSA_PSS_SHA256);
+         assert_eq!(s.sign(b"hello").unwrap().len(), 256);
+@@ -674,11 +745,7 @@
+             .unwrap();
+ 
+         b.iter(|| {
+-            test::black_box(
+-                signer
+-                    .sign(SAMPLE_TLS13_MESSAGE)
+-                    .unwrap(),
+-            );
++            test::black_box(signer.sign(SAMPLE_TLS13_MESSAGE).unwrap());
+         });
+     }
+ 
+@@ -693,11 +760,7 @@
+             .unwrap();
+ 
+         b.iter(|| {
+-            test::black_box(
+-                signer
+-                    .sign(SAMPLE_TLS13_MESSAGE)
+-                    .unwrap(),
+-            );
++            test::black_box(signer.sign(SAMPLE_TLS13_MESSAGE).unwrap());
+         });
+     }
+ 
+@@ -707,16 +770,10 @@
+             &include_bytes!("../../testdata/eddsakey.der")[..],
+         ));
+         let sk = super::any_supported_type(&key).unwrap();
+-        let signer = sk
+-            .choose_scheme(&[SignatureScheme::ED25519])
+-            .unwrap();
+-
+-        b.iter(|| {
+-            test::black_box(
+-                signer
+-                    .sign(SAMPLE_TLS13_MESSAGE)
+-                    .unwrap(),
+-            );
++        let signer = sk.choose_scheme(&[SignatureScheme::ED25519]).unwrap();
++
++        b.iter(|| {
++            test::black_box(signer.sign(SAMPLE_TLS13_MESSAGE).unwrap());
+         });
+     }
+ 
+@@ -731,11 +788,7 @@
+             .unwrap();
+ 
+         b.iter(|| {
+-            test::black_box(
+-                signer
+-                    .sign(SAMPLE_TLS13_MESSAGE)
+-                    .unwrap(),
+-            );
++            test::black_box(signer.sign(SAMPLE_TLS13_MESSAGE).unwrap());
+         });
+     }
+ 
+@@ -750,11 +803,7 @@
+             .unwrap();
+ 
+         b.iter(|| {
+-            test::black_box(
+-                signer
+-                    .sign(SAMPLE_TLS13_MESSAGE)
+-                    .unwrap(),
+-            );
++            test::black_box(signer.sign(SAMPLE_TLS13_MESSAGE).unwrap());
+         });
+     }
+ 
+--- a/src/x509.rs
++++ b/src/x509.rs
+@@ -38,10 +38,7 @@
+     } else {
+         // Long form
+         let size = len.to_be_bytes();
+-        let leading_zero_bytes = size
+-            .iter()
+-            .position(|&x| x != 0)
+-            .unwrap_or(size.len());
++        let leading_zero_bytes = size.iter().position(|&x| x != 0).unwrap_or(size.len());
+         assert!(leading_zero_bytes < size.len());
+         let encoded_bytes = size.len() - leading_zero_bytes;
+ 
+@@ -57,8 +54,46 @@
+     }
+ }
+ 
+-const DER_SEQUENCE_TAG: u8 = 0x30;
+-const DER_BIT_STRING_TAG: u8 = 0x03;
++/// The existing DER wrapper with caller-owned fallible backing. The header
++/// rules and encoded bytes match `asn1_wrap`; every growth is admitted first.
++pub(crate) fn try_asn1_wrap_in<A: core::alloc::Allocator>(
++    tag: u8,
++    bytes_a: &[u8],
++    bytes_b: &[u8],
++    allocator: A,
++) -> Result<Vec<u8, A>, core::alloc::AllocError> {
++    let len = bytes_a
++        .len()
++        .checked_add(bytes_b.len())
++        .ok_or(core::alloc::AllocError)?;
++    let size = len.to_be_bytes();
++    let leading = size
++        .iter()
++        .position(|&byte| byte != 0)
++        .unwrap_or(size.len());
++    let encoded = if len <= 0x7f { 0 } else { size.len() - leading };
++    let capacity = len
++        .checked_add(2)
++        .and_then(|n| n.checked_add(encoded))
++        .ok_or(core::alloc::AllocError)?;
++    let mut result = Vec::new_in(allocator);
++    result
++        .try_reserve_exact(capacity)
++        .map_err(|_| core::alloc::AllocError)?;
++    result.push(tag);
++    if encoded == 0 {
++        result.push(len as u8);
++    } else {
++        result.push(0x80 + encoded as u8);
++        result.extend_from_slice(&size[leading..]);
++    }
++    result.extend_from_slice(bytes_a);
++    result.extend_from_slice(bytes_b);
++    Ok(result)
++}
++
++pub(crate) const DER_SEQUENCE_TAG: u8 = 0x30;
++pub(crate) const DER_BIT_STRING_TAG: u8 = 0x03;
+ const DER_OCTET_STRING_TAG: u8 = 0x04;
+ 
+ #[cfg(test)]

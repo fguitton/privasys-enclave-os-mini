@@ -2,7 +2,7 @@
   "schema": 1,
   "profile": "retained-provider",
   "routing": "build-owned Cargo paths override; same package manifests, lock and dependency graph",
-  "patch_sha256": "f5e4859ead426eef776fa494be35df3ca4a11574fd3af047c8a60930bfad4204",
+  "patch_sha256": "13cf953004c1e862b92361e6ce47f26378447527f5206d288d45d67251aa2913",
   "suppliers": [
     {
       "package": "rustls",
@@ -28,7 +28,7 @@
         {
           "path": "src/server/builder.rs",
           "before_sha256": "4ec5532bbaaf9d60ae2fb577e8f463e2f3f6915aa80d0f11627829214fa7eb8c",
-          "after_sha256": "93b3885330a00e46ec587fad26ee6628827a54a121f09a9e5161c63e29817a0f"
+          "after_sha256": "73c268aa43a01d9b0f595222e0c6cf7c1ad8354a381cff40f4d9f7f6f2d93c19"
         },
         {
           "path": "src/server/server_conn.rs",
@@ -54,6 +54,16 @@
           "path": "src/crypto/ring/mod.rs",
           "before_sha256": "0548e46ea13e22f6f6f7918d99f68d724d1d7a3e6f3a5a8171c5c6741c2e88e3",
           "after_sha256": "4511612232d70dac900136e45cd7311ede3111aa466d75c36ff8bd4ae779ad46"
+        },
+        {
+          "path": "src/crypto/ring/sign.rs",
+          "before_sha256": "751b1ae4a16cd88bf9f9c450af043722f0e9eee19ba95ad51f3fd1893432b779",
+          "after_sha256": "d5c94439e0b3dedda1b0b95bb3067e15003c62d1a77e9f2582cc9f66e19c5c73"
+        },
+        {
+          "path": "src/x509.rs",
+          "before_sha256": "e036e80ceb688d1b7ff2ff82a63e99545678b262cf5af0c331fbebc714db4444",
+          "after_sha256": "829e9a657f23da05e39aafd6ef55457172c234038eb09a3c180af6179e83689e"
         }
       ]
     }

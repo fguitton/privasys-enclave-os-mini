@@ -77,6 +77,96 @@ pub fn check_paid_session_cache(pool: &Arc<AllocationPoolV1>) -> Result<(), &'st
     if pool.used() != before {
         return Err("cache owning pool not refunded");
     }
+    check_p256(pool)?;
     std::println!("TLS-SESSION-CACHE-SIM: actual-SDK backing entry get take exact-minus-one exact plus-one aliases returned-origin final-refund PASS");
+    Ok(())
+}
+
+fn p256_successful(pool: &Arc<AllocationPoolV1>) -> Result<usize, &'static str> {
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    let before = pool.used();
+    let mut fixed_bytes = 0_usize;
+    for layout in rustls::server::server_config_certificate_payload_layouts()
+        .into_iter()
+        .skip(2)
+    {
+        fixed_bytes = fixed_bytes
+            .checked_add(
+                enclave_os_common::allocation::shared_allocation_bytes_for_layout(layout)
+                    .ok_or("P256 Arc geometry")?,
+            )
+            .ok_or("P256 Arc sum")?;
+    }
+    let fixed = pool
+        .reserve_unpublished(fixed_bytes)
+        .ok_or("P256 fixed metadata refused")?;
+    let origin = LoanAllocator::from_pool_unpublished(pool).map_err(|_| "P256 origin refused")?;
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+        include_bytes!("fixtures/retained-p256-sim.pk8").as_slice(),
+    ));
+    let retained =
+        rustls::crypto::ring::sign::try_p256_signing_key_in(&key, origin.owned_allocator())
+            .map_err(|_| "P256 constructor refused")?;
+    let expected = include_bytes!("fixtures/retained-p256-sim.spki").as_slice();
+    if retained
+        .public_key()
+        .ok_or("P256 public key absent")?
+        .as_ref()
+        != expected
+    {
+        return Err("P256 independent SPKI bytes");
+    }
+    let peak = fixed_bytes
+        .checked_add(origin.peak_used())
+        .ok_or("P256 peak overflow")?;
+    let alias = retained.clone();
+    origin.activate_release_notification();
+    drop(origin);
+    drop(retained);
+    if pool.used() <= before
+        || alias.public_key().ok_or("P256 alias key absent")?.as_ref() != expected
+    {
+        return Err("P256 alias original origin");
+    }
+    drop(alias);
+    // Last key Arc and its SPKI/backing die before the fixed metadata credit.
+    drop(fixed);
+    if pool.used() != before {
+        return Err("P256 final backing/origin refund");
+    }
+    Ok(peak)
+}
+fn check_p256(pool: &Arc<AllocationPoolV1>) -> Result<(), &'static str> {
+    let before = pool.used();
+    let peak = p256_successful(pool)?;
+    let root = enclave_os_common::allocation::shared_allocation_bytes::<AllocationPoolV1>()
+        .ok_or("P256 pool root geometry")?;
+    let metadata = LoanAllocator::required_origin_bytes().ok_or("P256 origin geometry")?;
+    let required = root
+        .checked_add(metadata)
+        .and_then(|n| n.checked_add(peak))
+        .ok_or("P256 exact bound overflow")?;
+    for extra in [-1_isize, 0, 1] {
+        let capacity = required
+            .checked_add_signed(extra)
+            .ok_or("P256 exact capacity")?;
+        let isolated = AllocationPoolV1::try_new_with_release(capacity, None)
+            .ok_or("P256 exact pool root refused")?;
+        let result = p256_successful(&isolated);
+        if extra < 0 {
+            if result.is_ok() {
+                return Err("one-byte-short P256 constructor succeeded");
+            }
+        } else if result? != peak {
+            return Err("P256 exact geometry changed");
+        }
+        if isolated.used() != 0 {
+            return Err("P256 partial/successful refund");
+        }
+    }
+    if pool.used() != before {
+        return Err("P256 original owning pool changed");
+    }
+    std::println!("TLS-P256-CONSTRUCTOR-SIM: actual-SDK metadata SPKI exact-minus-one exact plus-one aliases original-origin final-refund PASS");
     Ok(())
 }

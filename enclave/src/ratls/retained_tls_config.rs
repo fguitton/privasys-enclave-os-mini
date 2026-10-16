@@ -134,9 +134,12 @@ impl ConfigReservation {
         let allocator = std::alloc::Global;
         #[cfg(feature = "fallible-allocation-v1")]
         let config = builder
-            .try_with_single_cert_in(certs, key, allocator)
+            .try_with_p256_single_cert_in(certs, key, allocator)
             .map_err(|error| match error {
                 rustls::server::ServerConfigAllocationError::Allocation => String::new(),
+                rustls::server::ServerConfigAllocationError::PrivateKey => {
+                    String::from("cert chain error: invalid current PKCS8 P256 private key")
+                }
                 rustls::server::ServerConfigAllocationError::Certificate(error) => {
                     format!("cert chain error: {:?}", error)
                 }
@@ -386,6 +389,145 @@ mod provider_refusal {
             assert_eq!(pool.used(), 0);
         }
         check_default_arcs();
+        check_p256_constructor();
+    }
+    fn check_p256_constructor() {
+        use rustls::crypto::ring::sign::{any_ecdsa_type, try_p256_signing_key_in};
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+        use rustls::server::ServerConfigAllocationError;
+        let original = rcgen::KeyPair::generate().unwrap();
+        let der = original.serialize_der();
+        let private = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der.as_slice()));
+        // The exact new Arc payload geometry comes from the private supplier
+        // types; no guessed payload/header size or blanket OOM injection.
+        for payload in rustls::server::server_config_certificate_payload_layouts()
+            .into_iter()
+            .skip(2)
+        {
+            let expected = Layout::new::<ArcHeader>()
+                .extend(payload)
+                .unwrap()
+                .0
+                .pad_to_align();
+            ARM.with(|cell| {
+                cell.set(Some(Arm {
+                    expected,
+                    refused: false,
+                    live: 0,
+                    skip_matching: 0,
+                }))
+            });
+            let result = try_p256_signing_key_in(&private, std::alloc::Global);
+            let refused = matches!(result, Err(ServerConfigAllocationError::Allocation));
+            drop(result);
+            let arm = ARM.with(|cell| cell.take()).unwrap();
+            assert!(
+                arm.refused && refused,
+                "actual P256 Arc refusal must propagate"
+            );
+            assert_eq!(arm.live, 0, "all key metadata and SPKI free on refusal");
+        }
+        for refuse in 1..=3 {
+            let counts = Arc::new(P256Counts::default());
+            counts
+                .refuse
+                .store(refuse, std::sync::atomic::Ordering::SeqCst);
+            let result = try_p256_signing_key_in(&private, P256Allocator(counts.clone()));
+            assert!(matches!(
+                result,
+                Err(ServerConfigAllocationError::Allocation)
+            ));
+            drop(result);
+            assert_eq!(
+                counts.calls.load(std::sync::atomic::Ordering::SeqCst),
+                refuse
+            );
+            assert_eq!(counts.live.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(Arc::strong_count(&counts), 1);
+        }
+        let counts = Arc::new(P256Counts::default());
+        let creator = P256Allocator(counts.clone());
+        let retained = try_p256_signing_key_in(&private, creator.clone()).unwrap();
+        let ordinary = any_ecdsa_type(&private).unwrap();
+        let expected = ordinary.public_key().unwrap().as_ref().to_vec();
+        assert_eq!(retained.public_key().unwrap().as_ref(), expected);
+        assert!(retained
+            .choose_scheme(&[rustls::SignatureScheme::ECDSA_NISTP384_SHA384])
+            .is_none());
+        let alias = retained.clone();
+        drop(creator);
+        drop(retained);
+        assert!(counts.live.load(std::sync::atomic::Ordering::SeqCst) > 0);
+        std::thread::spawn(move || {
+            assert_eq!(alias.public_key().unwrap().as_ref(), expected);
+            drop(alias);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(counts.live.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(Arc::strong_count(&counts), 1);
+        let malformed = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(&[0_u8][..]));
+        assert!(matches!(
+            try_p256_signing_key_in(&malformed, std::alloc::Global),
+            Err(ServerConfigAllocationError::PrivateKey)
+        ));
+        check_mismatched_p256_certificate(&original);
+    }
+    fn check_mismatched_p256_certificate(original: &rcgen::KeyPair) {
+        let cert = rcgen::CertificateParams::new(vec!["mismatch.test".into()])
+            .unwrap()
+            .self_signed(original)
+            .unwrap()
+            .der()
+            .to_vec();
+        let different = rcgen::KeyPair::generate().unwrap();
+        let authentication = ClientAuthentication::Anonymous;
+        let pool =
+            AllocationPoolV1::new(RetainedTlsConfig::required_bytes(authentication).unwrap())
+                .unwrap();
+        let result = RetainedTlsConfig::reserve(&pool, authentication)
+            .unwrap()
+            .configure(
+                vec![rustls::pki_types::CertificateDer::from(cert)],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(different.serialize_der()),
+                ),
+            );
+        assert!(
+            result.is_err(),
+            "original keys_match must still reject a different key"
+        );
+        drop(result);
+        assert_eq!(pool.used(), 0);
+    }
+    #[derive(Default)]
+    struct P256Counts {
+        calls: AtomicUsize,
+        live: AtomicUsize,
+        refuse: AtomicUsize,
+    }
+    #[derive(Clone)]
+    struct P256Allocator(Arc<P256Counts>);
+    unsafe impl std::alloc::Allocator for P256Allocator {
+        fn allocate(
+            &self,
+            layout: Layout,
+        ) -> Result<core::ptr::NonNull<[u8]>, std::alloc::AllocError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let call = self.0.calls.fetch_add(1, SeqCst) + 1;
+            if call == self.0.refuse.load(SeqCst) {
+                return Err(std::alloc::AllocError);
+            }
+            let block = std::alloc::Global.allocate(layout)?;
+            self.0.live.fetch_add(layout.size(), SeqCst);
+            Ok(block)
+        }
+        unsafe fn deallocate(&self, pointer: core::ptr::NonNull<u8>, layout: Layout) {
+            unsafe { std::alloc::Global.deallocate(pointer, layout) };
+            self.0
+                .live
+                .fetch_sub(layout.size(), std::sync::atomic::Ordering::SeqCst);
+        }
     }
     fn check_default_arcs() {
         let payloads = rustls::server::server_config_default_payload_layouts();
