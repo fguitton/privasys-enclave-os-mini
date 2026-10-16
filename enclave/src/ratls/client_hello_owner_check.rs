@@ -46,7 +46,7 @@ impl Original {
         }
     }
     /// The selected SDK context uses the same underlying original pool.
-    /// Native generic payload checks explicitly use the native Global capability.
+    /// Native generic payload checks use an explicit owned Global-backed capability.
     pub(super) fn context_allocator(&self) -> rustls::RetainedAllocator {
         #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
         {
@@ -54,7 +54,7 @@ impl Original {
         }
         #[cfg(not(any(target_env = "sgx", target_vendor = "teaclave")))]
         {
-            std::alloc::Global
+            rustls::RetainedAllocator::default()
         }
     }
     pub(super) fn requests(&self) -> usize {
@@ -233,6 +233,7 @@ pub(super) fn check_in(pool: &Arc<AllocationPoolV1>) {
     assert!(requests > 0);
     assert_eq!(pool.used(), metadata + origin.backend_bytes());
     check_wire(&value);
+    value.check_seeded_order_reference().unwrap();
     check_clone_refusals(&value, &origin, pool, metadata);
     drop(value);
     assert_eq!(pool.used(), metadata);

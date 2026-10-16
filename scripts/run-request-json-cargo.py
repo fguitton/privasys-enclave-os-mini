@@ -231,15 +231,16 @@ def native_json_run(cargo, build_root, arguments, resolved):
     required = any(packages[node['id']]['name'] == 'enclave-os-common'
                    and 'request-json-parser' in node['features']
                    for node in resolved['resolve']['nodes'])
-    if not required:
-        # No admitted parser is compiled; no supplier qualification is claimed.
+    retained = any(packages[node['id']]['name'] in
+                   ('enclave-os-egress', 'enclave-os-enclave', 'honest-time-source')
+                   and 'fallible-allocation-v1' in node['features']
+                   for node in resolved['resolve']['nodes'])
+    if not required and not retained:
+        # Neither admitted parser nor retained TLS consumer is compiled.
         return subprocess.run([str(cargo), *arguments]).returncode
     if build_root is None:
         build_root = Path(resolved['target_directory']) / 'request-json-source'
     build_root = build_root.absolute()
-    retained = any(packages[node['id']]['name'] in ('enclave-os-egress', 'enclave-os-enclave')
-                   and 'fallible-allocation-v1' in node['features']
-                   for node in resolved['resolve']['nodes'])
     if retained:
         # Reuse the current outer composition: rustls first, then this JSON owner.
         provider = runpy.run_path(str(Path(__file__).with_name('run-retained-provider-cargo.py')))

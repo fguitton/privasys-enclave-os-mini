@@ -1001,10 +1001,16 @@ mod module_tests {
         let module = new_module();
         let manager = ctx(Some(claims(&["privasys-platform:manager"])));
 
-        let oids = module.custom_oids();
+        let mut oids = Vec::new();
+        module
+            .custom_oids(&mut |oid, value| {
+                oids.push((oid, value.to_vec()));
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(oids.len(), 1);
-        assert_eq!(oids[0].value.len(), 40);
-        let before = oids[0].value.clone();
+        assert_eq!(oids[0].1.len(), 40);
+        let before = oids[0].1.clone();
 
         call(
             &module,
@@ -1012,7 +1018,13 @@ mod module_tests {
             &manager,
         )
         .unwrap();
-        let after = module.custom_oids()[0].value.clone();
+        let mut after = Vec::new();
+        module
+            .custom_oids(&mut |_, value| {
+                after.extend_from_slice(value);
+                Ok(())
+            })
+            .unwrap();
         assert_ne!(before, after);
         assert_eq!(&after[32..], &1u64.to_be_bytes());
     }

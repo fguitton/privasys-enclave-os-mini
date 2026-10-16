@@ -37,39 +37,23 @@ pub const CLIENT_IDENTITY_VALIDITY_SECS: u64 = 3600;
 pub use super::session::ca_context::{CaContext, RetainedCaContext};
 
 impl CaContext {
-    /// Generate a fresh enclave-owned intermediary CA for first boot.
-    pub fn generate() -> Result<Self, String> {
-        use rcgen::{
-            BasicConstraints, CertificateParams, DnType, DnValue, IsCa, KeyPair,
-            PKCS_ECDSA_P256_SHA256,
-        };
-
-        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
-            .map_err(|error| format!("CA key generation failed: {error}"))?;
-        let mut params = CertificateParams::new(Vec::<String>::new())
-            .map_err(|error| format!("CA parameters failed: {error}"))?;
-        params.distinguished_name.push(
-            DnType::CommonName,
-            DnValue::Utf8String("Honest enclave local CA".into()),
-        );
-        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        params.not_before = rcgen::date_time_ymd(2024, 1, 1);
-        params.not_after = rcgen::date_time_ymd(2124, 1, 1);
-        let certificate = params
-            .self_signed(&key)
-            .map_err(|error| format!("CA certificate generation failed: {error}"))?;
-        Self::from_parts(certificate.der().to_vec(), key.serialize_der())
+    /// Generate the current intermediary through the one paid certificate codec.
+    pub fn generate(
+        pool: &std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
+    ) -> Result<RetainedCaContext, String> {
+        let key = super::session::leaf_key::RetainedLeafKey::new(pool, 0)?;
+        let certificate = super::session::certificate_wire::ca(pool, &key).map_err(String::from)?;
+        RetainedCaContext::copy_from_parts(pool, certificate.as_slice(), &key.pkcs8)
+            .map_err(|_| String::new())
     }
 }
 
 pub use super::session::leaf_key::{generate_keypair, new_leaf_key, LeafKey};
 
-/// Result of certificate generation.
+/// Admitted current leaf DER; the existing CA and leaf key are borrowed by the
+/// final TLS factory rather than cloned into a temporary certificate graph.
 pub struct CertGenerationResult {
-    /// DER-encoded certificate chain (leaf, then the intermediary CA).
-    pub cert_chain_der: Vec<Vec<u8>>,
-    /// PKCS#8 private key of the leaf.
-    pub pkcs8_key: Vec<u8>,
+    pub(crate) leaf: super::session::certificate_wire::PaidDer,
 }
 
 // ---------------------------------------------------------------------------
@@ -90,23 +74,30 @@ pub fn compute_report_data(spki_der: &[u8], binding: &[u8]) -> [u8; 64] {
 /// the platform OIDs (config Merkle root, attestation servers hash, module
 /// OIDs) and no evidence. Valid from `now` until the key's 24-hour lifetime.
 pub fn generate_ratls_certificate(
+    pool: &std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
     ca: &CaContext,
     key: &LeafKey,
     now: u64,
 ) -> Result<CertGenerationResult, String> {
-    let mut extensions: Vec<(&'static [u64], Vec<u8>)> = Vec::new();
+    let mut extensions = super::session::certificate_wire::Extensions::new();
     if let Some(root) = crate::config_merkle_root() {
-        extensions.push((CONFIG_MERKLE_ROOT_OID, root.to_vec()));
+        extensions
+            .push(pool, CONFIG_MERKLE_ROOT_OID, &root)
+            .map_err(String::from)?;
     }
     if let Some(h) = enclave_os_common::attestation_servers::hash() {
-        extensions.push((
-            enclave_os_common::oids::ATTESTATION_SERVERS_HASH_OID,
-            h.to_vec(),
-        ));
+        extensions
+            .push(
+                pool,
+                enclave_os_common::oids::ATTESTATION_SERVERS_HASH_OID,
+                &h,
+            )
+            .map_err(String::from)?;
     }
-    for oid in &crate::modules::collect_module_oids() {
-        extensions.push((oid.oid, oid.value.clone()));
-    }
+    crate::modules::visit_module_oids(&mut |oid, value| {
+        extensions.push(pool, oid, value).map_err(|_| ())
+    })
+    .map_err(|_| String::new())?;
     let (nb, na) = leaf_validity(key, now)?;
     // These are fixed substrate routes, never host-selected or guest names.
     // Only the Honest operational profile exposes the peer/control aliases.
@@ -119,19 +110,18 @@ pub fn generate_ratls_certificate(
     } else {
         &["enclave-os.invalid"]
     };
-    let leaf_der = build_leaf_cert(
-        &key.pkcs8,
+    let leaf = super::session::certificate_wire::leaf(
+        pool,
+        key,
         nb,
         na,
         ca,
         "Enclave OS RA-TLS",
         names,
         &extensions,
-    )?;
-    Ok(CertGenerationResult {
-        cert_chain_der: vec![leaf_der, ca.ca_cert_der.clone()],
-        pkcs8_key: key.pkcs8.clone(),
-    })
+    )
+    .map_err(String::from)?;
+    Ok(CertGenerationResult { leaf })
 }
 
 /// Generate a per-app RA-TLS leaf for `key`: the app's config Merkle root
@@ -139,77 +129,107 @@ pub fn generate_ratls_certificate(
 /// configuration hash 5.2, app id 4.1, dependency set 7.1, app-defined 5.4.*),
 /// subject CN = app hostname (SNI). No evidence.
 pub fn generate_app_certificate(
+    pool: &std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
     ca: &CaContext,
     key: &LeafKey,
     app: &AppCertData,
     now: u64,
 ) -> Result<CertGenerationResult, String> {
-    let mut extensions: Vec<(&'static [u64], Vec<u8>)> = Vec::new();
+    let mut extensions = super::session::certificate_wire::Extensions::new();
     if app.merkle_root != [0u8; 32] {
-        extensions.push((APP_CONFIG_MERKLE_ROOT_OID, app.merkle_root.to_vec()));
+        extensions
+            .push(pool, APP_CONFIG_MERKLE_ROOT_OID, &app.merkle_root)
+            .map_err(String::from)?;
     }
     for (oid, value) in &app.oid_extensions {
-        extensions.push((*oid, value.clone()));
+        extensions.push(pool, *oid, value).map_err(String::from)?;
     }
     if let Some(endpoint) = app.attested_endpoint {
-        extensions.extend([
-            (
+        extensions
+            .push(
+                pool,
                 enclave_os_common::oids::HONEST_ENDPOINT_MANIFEST_ID_OID,
-                endpoint.endpoint_manifest_id.to_vec(),
-            ),
-            (
+                &endpoint.endpoint_manifest_id,
+            )
+            .map_err(String::from)?;
+        extensions
+            .push(
+                pool,
                 enclave_os_common::oids::HONEST_ENDPOINT_MANIFEST_DIGEST_OID,
-                endpoint.endpoint_manifest_digest.to_vec(),
-            ),
-            (
+                &endpoint.endpoint_manifest_digest,
+            )
+            .map_err(String::from)?;
+        extensions
+            .push(
+                pool,
                 enclave_os_common::oids::HONEST_ENDPOINT_ID_OID,
-                endpoint.endpoint_id.to_vec(),
-            ),
-            (
+                &endpoint.endpoint_id,
+            )
+            .map_err(String::from)?;
+        extensions
+            .push(
+                pool,
                 enclave_os_common::oids::HONEST_OPERATION_ID_OID,
-                endpoint.operation_id.to_vec(),
-            ),
-            (
+                &endpoint.operation_id,
+            )
+            .map_err(String::from)?;
+        extensions
+            .push(
+                pool,
                 enclave_os_common::oids::HONEST_WORKFLOW_GENERATION_ID_OID,
-                endpoint.workflow_generation_id.to_vec(),
-            ),
-            (
+                &endpoint.workflow_generation_id,
+            )
+            .map_err(String::from)?;
+        extensions
+            .push(
+                pool,
                 enclave_os_common::oids::HONEST_ENTRY_STAGE_ID_OID,
-                endpoint.entry_stage_id.to_be_bytes().to_vec(),
-            ),
-            (
+                &endpoint.entry_stage_id.to_be_bytes(),
+            )
+            .map_err(String::from)?;
+        extensions
+            .push(
+                pool,
                 enclave_os_common::oids::HONEST_WORKFLOW_ID_OID,
-                endpoint.workflow_id.to_vec(),
-            ),
-            (
+                &endpoint.workflow_id,
+            )
+            .map_err(String::from)?;
+        extensions
+            .push(
+                pool,
                 enclave_os_common::oids::HONEST_WORKFLOW_MANIFEST_DIGEST_OID,
-                endpoint.workflow_manifest_digest.to_vec(),
-            ),
-            (
+                &endpoint.workflow_manifest_digest,
+            )
+            .map_err(String::from)?;
+        extensions
+            .push(
+                pool,
                 enclave_os_common::oids::HONEST_ENDPOINT_ROUTE_DIGEST_OID,
-                endpoint.route_digest.to_vec(),
-            ),
-            (
+                &endpoint.route_digest,
+            )
+            .map_err(String::from)?;
+        extensions
+            .push(
+                pool,
                 enclave_os_common::oids::HONEST_ENDPOINT_ACTIVATION_EPOCH_OID,
-                endpoint.activation_epoch.to_be_bytes().to_vec(),
-            ),
-        ]);
+                &endpoint.activation_epoch.to_be_bytes(),
+            )
+            .map_err(String::from)?;
     }
 
     let (nb, na) = leaf_validity(key, now)?;
-    let leaf_der = build_leaf_cert(
-        &key.pkcs8,
+    let leaf = super::session::certificate_wire::leaf(
+        pool,
+        key,
         nb,
         na,
         ca,
         &app.hostname,
         &[&app.hostname],
         &extensions,
-    )?;
-    Ok(CertGenerationResult {
-        cert_chain_der: vec![leaf_der, ca.ca_cert_der.clone()],
-        pkcs8_key: key.pkcs8.clone(),
-    })
+    )
+    .map_err(String::from)?;
+    Ok(CertGenerationResult { leaf })
 }
 
 fn leaf_validity(key: &LeafKey, now: u64) -> Result<(OffsetDateTime, OffsetDateTime), String> {
@@ -227,41 +247,55 @@ fn leaf_validity(key: &LeafKey, now: u64) -> Result<(OffsetDateTime, OffsetDateT
 /// it is minted per connection with [`sgx_quote`] over the report_data the
 /// verifier predicts (`client_report_data`). Returns
 /// `(cert_chain_der, pkcs8_key_der, spki_hash)`.
+#[cfg(feature = "egress")]
 pub fn mint_client_identity(
+    pool: &std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
     ca: &CaContext,
     cwasm_code_hash: &[u8],
     app_id: Option<&[u8]>,
     now: u64,
-) -> Result<(Vec<Vec<u8>>, Vec<u8>, [u8; 32]), String> {
-    let key = new_leaf_key(now)?;
-    let mut oid_extensions: Vec<(&'static [u64], Vec<u8>)> = Vec::new();
-    oid_extensions.push((
-        enclave_os_common::oids::APP_CODE_HASH_OID,
-        cwasm_code_hash.to_vec(),
-    ));
+) -> Result<enclave_os_egress::ClientCredential, enclave_os_egress::ClientCredentialError> {
+    use enclave_os_egress::ClientCredentialError as Refusal;
+    let certificate_error = |error| match error {
+        super::session::certificate_wire::CertificateError::Allocation => Refusal::Allocation,
+        _ => Refusal::Signing,
+    };
+    let key =
+        super::session::leaf_key::RetainedLeafKey::new(pool, now).map_err(|error| match error {
+            super::session::leaf_key::LeafKeyError::Allocation => Refusal::Allocation,
+            _ => Refusal::Signing,
+        })?;
+    let mut oid_extensions = super::session::certificate_wire::Extensions::new();
+    oid_extensions
+        .push(
+            pool,
+            enclave_os_common::oids::APP_CODE_HASH_OID,
+            cwasm_code_hash,
+        )
+        .map_err(certificate_error)?;
     if let Some(id) = app_id {
         if !id.is_empty() {
-            oid_extensions.push((enclave_os_common::oids::APP_ID_OID, id.to_vec()));
+            oid_extensions
+                .push(pool, enclave_os_common::oids::APP_ID_OID, id)
+                .map_err(certificate_error)?;
         }
     }
     let nb = OffsetDateTime::from_unix_timestamp(now.saturating_sub(60) as i64)
-        .map_err(|e| format!("not_before out of range: {e}"))?;
+        .map_err(|_| Refusal::Signing)?;
     let na = OffsetDateTime::from_unix_timestamp((now + CLIENT_IDENTITY_VALIDITY_SECS) as i64)
-        .map_err(|e| format!("not_after out of range: {e}"))?;
-    let leaf_der = build_leaf_cert(
-        &key.pkcs8,
+        .map_err(|_| Refusal::Signing)?;
+    let leaf = super::session::certificate_wire::leaf(
+        pool,
+        &key,
         nb,
         na,
         ca,
         "enclave-os client",
         &[],
         &oid_extensions,
-    )?;
-    Ok((
-        vec![leaf_der, ca.ca_cert_der.clone()],
-        key.pkcs8,
-        key.spki_hash,
-    ))
+    )
+    .map_err(certificate_error)?;
+    enclave_os_egress::ClientCredential::new(pool, &[leaf.as_slice(), &ca.ca_cert_der], &key.pkcs8)
 }
 
 #[cfg(all(feature = "mock", not(feature = "sgx-sim-attestation")))]
@@ -495,89 +529,6 @@ pub fn self_mrenclave() -> Result<[u8; 32], String> {
 #[cfg(all(feature = "mock", not(feature = "sgx-sim-attestation")))]
 pub fn self_mrenclave() -> Result<[u8; 32], String> {
     Ok([0x11u8; 32])
-}
-
-// ---------------------------------------------------------------------------
-//  Certificate building with rcgen
-// ---------------------------------------------------------------------------
-
-/// Build a leaf certificate signed by the intermediary CA carrying
-/// `extensions` (Privasys OIDs) and no evidence. `common_name` is the Subject
-/// CN (the app hostname, or the enclave-wide name).
-fn build_leaf_cert(
-    leaf_pkcs8: &[u8],
-    not_before: OffsetDateTime,
-    not_after: OffsetDateTime,
-    ca: &CaContext,
-    common_name: &str,
-    server_names: &[&str],
-    extensions: &[(&'static [u64], Vec<u8>)],
-) -> Result<Vec<u8>, String> {
-    use rcgen::{
-        CertificateParams, CustomExtension, DnType, DnValue, IsCa, KeyPair, PKCS_ECDSA_P256_SHA256,
-    };
-    use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
-
-    let ca_cert_der = CertificateDer::from(ca.ca_cert_der.as_slice());
-    let ca_params = CertificateParams::from_ca_cert_der(&ca_cert_der)
-        .map_err(|e| format!("CA cert parse: {}", e))?;
-
-    let leaf_pkcs8_der = PrivatePkcs8KeyDer::from(leaf_pkcs8.to_vec());
-    let leaf_key = KeyPair::from_pkcs8_der_and_sign_algo(&leaf_pkcs8_der, &PKCS_ECDSA_P256_SHA256)
-        .map_err(|e| format!("leaf key: {}", e))?;
-
-    // --- Leaf params ---
-    // WebPKI does not fall back to Subject CN. Bind the leaf to an admitted DNS
-    // identity so a normal verifier can keep hostname checks enabled. The
-    // server must never pass through an arbitrary, unregistered SNI here.
-    let subject_alt_names: Vec<String> = server_names.iter().map(|name| name.to_string()).collect();
-    let mut leaf_params =
-        CertificateParams::new(subject_alt_names).map_err(|e| format!("leaf params: {}", e))?;
-
-    // CN is always the app hostname (or enclave-wide fallback name).
-    leaf_params
-        .distinguished_name
-        .push(DnType::CommonName, DnValue::Utf8String(common_name.into()));
-
-    // Copy C, ST, L, O, OU from the intermediate CA so the leaf's
-    // subject matches the issuer's organisation fields.
-    for dn_type in &[
-        DnType::CountryName,
-        DnType::StateOrProvinceName,
-        DnType::LocalityName,
-        DnType::OrganizationName,
-        DnType::OrganizationalUnitName,
-    ] {
-        if let Some(value) = ca_params.distinguished_name.get(dn_type) {
-            leaf_params
-                .distinguished_name
-                .push(dn_type.clone(), value.clone());
-        }
-    }
-
-    leaf_params.not_before = not_before;
-    leaf_params.not_after = not_after;
-
-    for (oid, value) in extensions {
-        let ext = CustomExtension::from_oid_content(*oid, value.clone());
-        leaf_params.custom_extensions.push(ext);
-    }
-
-    leaf_params.is_ca = IsCa::NoCa;
-
-    let ca_pkcs8_der = PrivatePkcs8KeyDer::from(ca.ca_key_pkcs8.clone());
-    let ca_key = KeyPair::from_pkcs8_der_and_sign_algo(&ca_pkcs8_der, &PKCS_ECDSA_P256_SHA256)
-        .map_err(|e| format!("CA key: {}", e))?;
-
-    let ca_cert = ca_params
-        .self_signed(&ca_key)
-        .map_err(|e| format!("CA cert reconstruct: {}", e))?;
-
-    let leaf_cert = leaf_params
-        .signed_by(&leaf_key, &ca_cert, &ca_key)
-        .map_err(|e| format!("leaf signing: {}", e))?;
-
-    Ok(leaf_cert.der().to_vec())
 }
 
 // ---------------------------------------------------------------------------

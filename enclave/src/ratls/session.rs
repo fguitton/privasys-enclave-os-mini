@@ -55,6 +55,18 @@ mod tls_output;
 pub use tls_output::TlsOutput;
 #[path = "cancellation.rs"]
 pub(crate) mod cancellation;
+#[cfg(test)]
+#[path = "certificate_generation_check.rs"]
+mod certificate_generation_check;
+#[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
+#[path = "certificate_issuer.rs"]
+pub(crate) mod certificate_issuer;
+#[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
+#[path = "certificate_wire.rs"]
+pub(crate) mod certificate_wire;
+#[cfg(test)]
+#[path = "certificate_wire_check.rs"]
+mod certificate_wire_check;
 #[path = "channel_output.rs"]
 pub(crate) mod channel_output;
 #[path = "http_request.rs"]

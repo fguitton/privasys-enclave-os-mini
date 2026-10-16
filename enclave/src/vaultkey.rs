@@ -38,16 +38,25 @@ static CLIENT_CERT_SIGNER: OsClientCertSigner = OsClientCertSigner {
 };
 
 impl EnclaveClientCertSigner for OsClientCertSigner {
-    fn identity(&self, identity: &ClientCertIdentity, now: u64) -> Option<(Vec<Vec<u8>>, Vec<u8>)> {
-        let ca = self.ca.get()?;
-        let (chain, pkcs8, _) = mint_client_identity(
+    fn identity(
+        &self,
+        identity: &ClientCertIdentity,
+        now: u64,
+        pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
+    ) -> Result<Option<enclave_os_egress::ClientCredential>, enclave_os_egress::ClientCredentialError>
+    {
+        let Some(ca) = self.ca.get() else {
+            return Ok(None);
+        };
+        let pool = pool.ok_or(enclave_os_egress::ClientCredentialError::Allocation)?;
+        mint_client_identity(
+            pool,
             ca.context(),
             &identity.code_hash,
             identity.app_id.as_deref(),
             now,
         )
-        .ok()?;
-        Some((chain, pkcs8))
+        .map(Some)
     }
 
     fn evidence(&self, report_data: &[u8; 64]) -> Option<Vec<u8>> {

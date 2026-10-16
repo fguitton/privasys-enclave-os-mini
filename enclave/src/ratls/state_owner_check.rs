@@ -116,20 +116,17 @@ fn erased(
     allocator: rustls::RetainedAllocator,
     counters: &Arc<Counters>,
 ) -> rustls::internal::state::RetainedProbe {
-    #[cfg(target_vendor = "teaclave")]
     let slot_allocator = allocator.clone();
-    #[cfg(not(target_vendor = "teaclave"))]
-    let slot_allocator = allocator;
     SlotProbe::try_new_in(slot_allocator, counters)
         .unwrap()
         .into_retained(allocator)
 }
 #[cfg(not(target_vendor = "teaclave"))]
 fn check_erased() {
-    // Native erased carrier has the explicit Global capability. Original-pool
+    // Native erased carrier has an explicit owned Global-backed capability. Original-pool
     // factory failure and normalization are proven separately above.
     let counters = Arc::new(Counters::default());
-    let mut state = erased(std::alloc::Global, &counters);
+    let mut state = erased(rustls::RetainedAllocator::default(), &counters);
     let before = state.allocation();
     for _ in 0..32 {
         state = state.stay().unwrap();

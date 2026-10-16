@@ -55,4 +55,8 @@ base64 = "0.21"
 sgx_types = { git = "https://github.com/Privasys/teaclave-sgx-sdk", rev = "2330b2a5aa8404d3c0a38e9d3a760144549f4943", optional = true }
 
 [dev-dependencies]
-rcgen = { version = "0.13.2", default-features = false, features = ["ring"] }
+rcgen = { version = "0.13.2", default-features = false, features = ["ring", "x509-parser"] }
+
+# Exact selected runtime certificate codec exercised through the original Session owner.
+der = { version = "=0.8.2", default-features = false }
+time = { version = "0.3", default-features = false }

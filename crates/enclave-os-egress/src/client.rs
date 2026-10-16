@@ -24,7 +24,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::client::{ResolvesClientCert, WebPkiServerVerifier};
 use rustls::crypto::ring::default_provider;
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::server::WebPkiClientVerifier;
 use rustls::sign::CertifiedKey;
 #[cfg(not(feature = "sgx-sim-attestation"))]
@@ -42,6 +42,8 @@ use sgx_types::types::Quote4;
 
 use enclave_os_common::oids;
 
+mod credential;
+pub use credential::{ClientCredential, ClientCredentialError};
 mod exchange;
 mod incremental;
 mod renewal;
@@ -470,9 +472,15 @@ pub struct ClientCertIdentity {
 /// real measurement and signs.
 pub trait EnclaveClientCertSigner: Send + Sync {
     /// Mint a client identity carrying `identity` (code digest OID 4.2, app id
-    /// OID 4.1), no evidence. Returns `(cert_chain_der, pkcs8_key_der)`, or
-    /// `None` to decline. `now` is seconds since the epoch.
-    fn identity(&self, identity: &ClientCertIdentity, now: u64) -> Option<(Vec<Vec<u8>>, Vec<u8>)>;
+    /// OID 4.1), no evidence. `Ok(None)` declines an unavailable identity;
+    /// resource and signing failures abort before handshake publication.
+    /// `now` is seconds since the epoch.
+    fn identity(
+        &self,
+        identity: &ClientCertIdentity,
+        now: u64,
+        pool: Option<&Arc<enclave_os_common::allocation::AllocationPoolV1>>,
+    ) -> Result<Option<ClientCredential>, ClientCredentialError>;
 
     /// Produce the SGX quote over `report_data` that proves the identity on one
     /// connection (the verifier predicted `report_data` from the identity key,
@@ -534,35 +542,76 @@ pub fn enclave_self_mrenclave() -> Option<[u8; 32]> {
 #[derive(Debug)]
 struct IdentityClientAuth {
     identity: ClientCertIdentity,
-    provider: Arc<CryptoProvider>,
-    /// DER of the leaf presented in the handshake, for the present step.
-    presented: std::sync::Mutex<Option<Vec<u8>>>,
+    /// Original connection resource capability, separate from semantic policy.
+    pool: Option<Arc<enclave_os_common::allocation::AllocationPoolV1>>,
+    #[cfg(feature = "fallible-allocation-v1")]
+    credentials: std::sync::Mutex<credential::Credentials>,
+    #[cfg(not(feature = "fallible-allocation-v1"))]
+    credentials: std::sync::Mutex<Vec<ClientCredential>>,
 }
 
 impl IdentityClientAuth {
     fn presented_leaf(&self) -> Option<Vec<u8>> {
-        self.presented.lock().ok().and_then(|g| g.clone())
+        let credentials = self.credentials.lock().ok()?;
+        #[cfg(feature = "fallible-allocation-v1")]
+        let credential = credentials.last()?;
+        #[cfg(not(feature = "fallible-allocation-v1"))]
+        let credential = credentials.last()?;
+        credential.leaf().map(<[u8]>::to_vec)
     }
 }
 
+impl IdentityClientAuth {
+    fn resolve_current(&self) -> Result<Option<Arc<CertifiedKey>>, ClientCredentialError> {
+        self.resolve_with_signer(CLIENT_CERT_SIGNER.get().copied())
+    }
+    fn resolve_with_signer(
+        &self,
+        signer: Option<&dyn EnclaveClientCertSigner>,
+    ) -> Result<Option<Arc<CertifiedKey>>, ClientCredentialError> {
+        let Some(signer) = signer else {
+            return Ok(None);
+        };
+        let mut credentials = self
+            .credentials
+            .lock()
+            .map_err(|_| ClientCredentialError::Signing)?;
+        #[cfg(feature = "fallible-allocation-v1")]
+        credentials
+            .prepare(self.pool.as_ref())
+            .ok_or(ClientCredentialError::Allocation)?;
+        #[cfg(not(feature = "fallible-allocation-v1"))]
+        credentials
+            .try_reserve(1)
+            .map_err(|_| ClientCredentialError::Allocation)?;
+        let Some(credential) = signer.identity(&self.identity, now_unix(), self.pool.as_ref())?
+        else {
+            return Ok(None);
+        };
+        let key = credential.key();
+        #[cfg(not(feature = "fallible-allocation-v1"))]
+        credential.publish();
+        credentials.push(credential);
+        Ok(Some(key))
+    }
+}
 impl ResolvesClientCert for IdentityClientAuth {
+    #[cfg(honest_retained_provider)]
+    fn resolve(
+        &self,
+        _root_hint_subjects: &[&[u8]],
+        _sigschemes: &[SignatureScheme],
+    ) -> Result<Option<Arc<CertifiedKey>>, rustls::Error> {
+        self.resolve_current().map_err(Into::into)
+    }
+    #[cfg(not(honest_retained_provider))]
     fn resolve(
         &self,
         _root_hint_subjects: &[&[u8]],
         _sigschemes: &[SignatureScheme],
     ) -> Option<Arc<CertifiedKey>> {
-        let signer = *CLIENT_CERT_SIGNER.get()?;
-        let (chain_der, pkcs8) = signer.identity(&self.identity, now_unix())?;
-        if let Ok(mut g) = self.presented.lock() {
-            *g = chain_der.first().cloned();
-        }
-        let certs: Vec<CertificateDer<'static>> =
-            chain_der.into_iter().map(CertificateDer::from).collect();
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8));
-        let signing_key = self.provider.key_provider.load_private_key(key).ok()?;
-        Some(Arc::new(CertifiedKey::new(certs, signing_key)))
+        self.resolve_current().ok().flatten()
     }
-
     fn has_certs(&self) -> bool {
         true
     }
@@ -578,62 +627,41 @@ impl ResolvesClientCert for IdentityClientAuth {
 /// presents a measurement-bound certificate minted on demand by the registered
 /// [`EnclaveClientCertSigner`], for mutual attestation against a server that
 /// requests one (e.g. a vault).
-fn build_client_config(
+mod config;
+pub(crate) use config::RetainedClientConfig;
+
+/// Exact retained configuration backing before the current single-connection
+/// constructor. Connection/handshake children have their own actual allocator
+/// admissions and are not a guessed extension of this quote.
+#[cfg(feature = "fallible-allocation-v1")]
+pub fn tls_configuration_allocation_bytes(
+    server_name: &str,
     root_store: &RootCertStore,
     ratls: Option<&RaTlsPolicy>,
-) -> Result<(Arc<ClientConfig>, Option<Arc<IdentityClientAuth>>), &'static str> {
-    let mut identity_auth: Option<Arc<IdentityClientAuth>> = None;
-    let provider = Arc::new(default_provider());
+) -> Option<usize> {
+    #[cfg(not(feature = "sgx-sim-attestation"))]
+    let roots = Some(root_store);
+    #[cfg(feature = "sgx-sim-attestation")]
+    let roots = ratls.is_none().then_some(root_store);
+    config::required_pool_bytes(server_name, roots, ratls, false)
+}
 
-    let config = if let Some(policy) = ratls {
-        #[cfg(not(feature = "sgx-sim-attestation"))]
-        let verifier: Arc<dyn ServerCertVerifier> = {
-            // Production RA-TLS retains standard chain validation in addition
-            // to quote appraisal.
-            let inner = WebPkiServerVerifier::builder_with_provider(
-                Arc::new(root_store.clone()),
-                provider.clone(),
-            )
-            .build()
-            .map_err(|_| "WebPKI verifier build error")?;
-            Arc::new(RaTlsVerifier {
-                inner,
-                policy: policy.clone(),
-            })
-        };
-        #[cfg(feature = "sgx-sim-attestation")]
-        let verifier: Arc<dyn ServerCertVerifier> = Arc::new(AttestedRaTlsVerifier {
-            provider: provider.clone(),
-            policy: policy.clone(),
-        });
+#[cfg(all(test, feature = "fallible-allocation-v1"))]
+pub(crate) fn check_configuration_owner(roots: &RootCertStore) {
+    config::check(roots);
+}
 
-        let wants_client_cert = ClientConfig::builder_with_provider(provider.clone())
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .map_err(|_| "TLS config error")?
-            .dangerous()
-            .with_custom_certificate_verifier(verifier);
-        match &policy.client_identity {
-            Some(identity) => {
-                let auth = Arc::new(IdentityClientAuth {
-                    identity: identity.clone(),
-                    provider: provider.clone(),
-                    presented: std::sync::Mutex::new(None),
-                });
-                identity_auth = Some(auth.clone());
-                wants_client_cert.with_client_cert_resolver(auth)
-            }
-            None => wants_client_cert.with_no_client_auth(),
-        }
-    } else {
-        // Standard TLS — no RA-TLS verification.
-        ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .map_err(|_| "TLS config error")?
-            .with_root_certificates(root_store.clone())
-            .with_no_client_auth()
-    };
-
-    Ok((Arc::new(config), identity_auth))
+pub(crate) fn build_client_config(
+    server_name: &str,
+    root_store: &RootCertStore,
+    ratls: Option<&RaTlsPolicy>,
+    pool: Option<&Arc<enclave_os_common::allocation::AllocationPoolV1>>,
+) -> Result<RetainedClientConfig, &'static str> {
+    #[cfg(not(feature = "sgx-sim-attestation"))]
+    let roots = Some(root_store);
+    #[cfg(feature = "sgx-sim-attestation")]
+    let roots = ratls.is_none().then_some(root_store);
+    config::build(server_name, roots, ratls, false, pool)
 }
 
 /// Build a TLS 1.3 client config whose certificate identity is the appraised
@@ -645,8 +673,10 @@ fn build_client_config(
 /// requires challenge/handshake-exporter binding. Production callers must
 /// provide at least one quote-appraisal service.
 fn build_attested_client_config(
+    server_name: &str,
     policy: &RaTlsPolicy,
-) -> Result<(Arc<ClientConfig>, Option<Arc<IdentityClientAuth>>), &'static str> {
+    pool: Option<&Arc<enclave_os_common::allocation::AllocationPoolV1>>,
+) -> Result<RetainedClientConfig, &'static str> {
     let ReportDataBinding::ChallengeResponse { nonce } = &policy.report_data else {
         return Err("attested-only TLS requires challenge-response report data");
     };
@@ -661,31 +691,7 @@ fn build_attested_client_config(
         return Err("attested-only TLS requires a quote-appraisal service");
     }
 
-    let provider = Arc::new(default_provider());
-    let verifier = AttestedRaTlsVerifier {
-        provider: provider.clone(),
-        policy: policy.clone(),
-    };
-    let wants_client_cert = ClientConfig::builder_with_provider(provider.clone())
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|_| "TLS config error")?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(verifier));
-    let mut identity_auth = None;
-    let mut config = match &policy.client_identity {
-        Some(identity) => {
-            let auth = Arc::new(IdentityClientAuth {
-                identity: identity.clone(),
-                provider,
-                presented: std::sync::Mutex::new(None),
-            });
-            identity_auth = Some(auth.clone());
-            wants_client_cert.with_client_cert_resolver(auth)
-        }
-        None => wants_client_cert.with_no_client_auth(),
-    };
-    config.alpn_protocols = vec![b"honest-local-control/1".to_vec()];
-    Ok((Arc::new(config), identity_auth))
+    config::build(server_name, None, Some(policy), true, pool)
 }
 
 // =========================================================================
@@ -759,6 +765,17 @@ impl ServerCertVerifier for AttestedRaTlsVerifier {
         )
     }
 
+    #[cfg(honest_retained_provider)]
+    fn supported_verify_schemes(
+        &self,
+        visit: &mut dyn FnMut(SignatureScheme) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        for (scheme, _) in self.provider.signature_verification_algorithms.mapping {
+            visit(*scheme)?;
+        }
+        Ok(())
+    }
+    #[cfg(not(honest_retained_provider))]
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.provider
             .signature_verification_algorithms
@@ -821,6 +838,14 @@ impl ServerCertVerifier for RaTlsVerifier {
         self.inner.verify_tls13_signature(message, cert, dss)
     }
 
+    #[cfg(honest_retained_provider)]
+    fn supported_verify_schemes(
+        &self,
+        visit: &mut dyn FnMut(SignatureScheme) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        self.inner.supported_verify_schemes(visit)
+    }
+    #[cfg(not(honest_retained_provider))]
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.inner.supported_verify_schemes()
     }
@@ -1272,4 +1297,9 @@ mod peer_appraisal_tests {
         .unwrap_err()
         .contains("certificate"));
     }
+}
+
+#[cfg(all(test, feature = "fallible-allocation-v1"))]
+pub(crate) fn check_credential_owner(certificates: &[&[u8]], pkcs8: &[u8]) {
+    credential::check(certificates, pkcs8);
 }

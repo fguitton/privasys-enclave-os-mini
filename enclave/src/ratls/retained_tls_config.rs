@@ -12,7 +12,13 @@ use std::sync::Arc;
 #[path = "record_owner_check.rs"]
 mod record_owner_check;
 
-type Payload = Arc<ServerConfig>;
+struct Payload {
+    config: Arc<ServerConfig>,
+    // Every config/connection alias precedes the certificate byte/outer-Vec
+    // credit. The final shared payload owns both until the final alias drops.
+    _certificates: Option<enclave_os_common::allocation::AllocationLeaseV1>,
+    _key_spki: Option<enclave_os_common::allocation::AllocationLeaseV1>,
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum ClientAuthentication {
@@ -80,7 +86,6 @@ pub(crate) struct RetainedTlsConfig(SharedAllocationV1<Payload>);
 pub(crate) struct ConfigReservation {
     allocation: SharedAllocationReservationV1<Payload>,
     authentication: ClientAuthentication,
-    #[cfg(all(feature = "fallible-allocation-v1", target_vendor = "teaclave"))]
     pool: Arc<AllocationPoolV1>,
 }
 
@@ -97,7 +102,6 @@ impl RetainedTlsConfig {
             |allocation| ConfigReservation {
                 allocation,
                 authentication,
-                #[cfg(all(feature = "fallible-allocation-v1", target_vendor = "teaclave"))]
                 pool: pool.clone(),
             },
         )
@@ -107,7 +111,7 @@ impl RetainedTlsConfig {
         self,
         accepted: rustls::server::Accepted,
     ) -> Result<RetainedConnection, (rustls::Error, rustls::server::AcceptedAlert)> {
-        let connection = accepted.into_connection(Arc::clone(&self.0))?;
+        let connection = accepted.into_connection(Arc::clone(&self.0.config))?;
         Ok(RetainedConnection {
             connection,
             _retained: self,
@@ -115,7 +119,7 @@ impl RetainedTlsConfig {
     }
     #[cfg(test)]
     pub(crate) fn connect(self) -> Result<RetainedConnection, rustls::Error> {
-        let connection = ServerConnection::new(Arc::clone(&self.0))?;
+        let connection = ServerConnection::new(Arc::clone(&self.0.config))?;
         Ok(RetainedConnection {
             connection,
             _retained: self,
@@ -123,11 +127,93 @@ impl RetainedTlsConfig {
     }
 }
 impl ConfigReservation {
+    pub(crate) fn certificate_bytes(
+        certificates: &[rustls::pki_types::CertificateDer<'_>],
+    ) -> Option<usize> {
+        let mut bytes = core::alloc::Layout::array::<rustls::pki_types::CertificateDer<'static>>(
+            certificates.len(),
+        )
+        .ok()?
+        .size();
+        for certificate in certificates {
+            bytes = bytes.checked_add(
+                core::alloc::Layout::array::<u8>(certificate.len())
+                    .ok()?
+                    .size(),
+            )?;
+        }
+        Some(bytes)
+    }
+    #[cfg(test)]
+    pub(crate) fn factory_bytes(
+        certificates: &[rustls::pki_types::CertificateDer<'_>],
+        key: &rustls::pki_types::PrivateKeyDer<'_>,
+    ) -> Option<usize> {
+        let bytes = Self::certificate_bytes(certificates)?;
+        #[cfg(all(feature = "fallible-allocation-v1", not(target_vendor = "teaclave")))]
+        {
+            let layouts =
+                rustls::crypto::ring::sign::retained_p256_spki_layouts_for_key(key).ok()?;
+            return layouts
+                .into_iter()
+                .try_fold(bytes, |sum, layout| sum.checked_add(layout.size()));
+        }
+        #[cfg(not(all(feature = "fallible-allocation-v1", not(target_vendor = "teaclave"))))]
+        {
+            let _ = key;
+            Some(bytes)
+        }
+    }
     pub(crate) fn configure(
         self,
-        certs: Vec<rustls::pki_types::CertificateDer<'static>>,
-        key: rustls::pki_types::PrivateKeyDer<'static>,
+        certificates: &[rustls::pki_types::CertificateDer<'_>],
+        key: rustls::pki_types::PrivateKeyDer<'_>,
     ) -> Result<RetainedTlsConfig, String> {
+        let certificate_bytes = Self::certificate_bytes(certificates).ok_or_else(String::new)?;
+        let certificate_credit = self
+            .pool
+            .reserve_unpublished(certificate_bytes)
+            .ok_or_else(String::new)?;
+        let mut certs = Vec::new();
+        certs
+            .try_reserve_exact(certificates.len())
+            .map_err(|_| String::new())?;
+        if certs.capacity() != certificates.len() {
+            return Err(String::new());
+        }
+        for certificate in certificates {
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(certificate.len())
+                .map_err(|_| String::new())?;
+            if bytes.capacity() != certificate.len() {
+                return Err(String::new());
+            }
+            bytes.extend_from_slice(certificate.as_ref());
+            certs.push(rustls::pki_types::CertificateDer::from(bytes));
+        }
+        #[cfg(all(feature = "fallible-allocation-v1", not(target_vendor = "teaclave")))]
+        let (key_spki_credit, working_credit) = {
+            let [algorithm, bits, retained] =
+                rustls::crypto::ring::sign::retained_p256_spki_layouts_for_key(&key)
+                    .map_err(|_| String::new())?;
+            let retained = self
+                .pool
+                .reserve_unpublished(retained.size())
+                .ok_or_else(String::new)?;
+            let working = self
+                .pool
+                .reserve_unpublished(
+                    algorithm
+                        .size()
+                        .checked_add(bits.size())
+                        .ok_or_else(String::new)?,
+                )
+                .ok_or_else(String::new)?;
+            (Some(retained), working)
+        };
+        #[cfg(not(all(feature = "fallible-allocation-v1", not(target_vendor = "teaclave"))))]
+        let key_spki_credit = None;
         let builder = self.builder()?;
         #[cfg(all(feature = "fallible-allocation-v1", target_vendor = "teaclave"))]
         let origin =
@@ -136,7 +222,7 @@ impl ConfigReservation {
         #[cfg(all(feature = "fallible-allocation-v1", target_vendor = "teaclave"))]
         let allocator = origin.owned_allocator();
         #[cfg(all(feature = "fallible-allocation-v1", not(target_vendor = "teaclave")))]
-        let allocator = std::alloc::Global;
+        let allocator = rustls::RetainedAllocator::default();
         #[cfg(feature = "fallible-allocation-v1")]
         let config = builder
             .try_with_p256_single_cert_in(certs, key, allocator)
@@ -151,9 +237,13 @@ impl ConfigReservation {
             })?;
         #[cfg(not(feature = "fallible-allocation-v1"))]
         let config = builder
-            .with_single_cert(certs, key)
+            .with_single_cert(certs, key.clone_key())
             .map_err(|e| format!("cert chain error: {:?}", e))?;
-        let config = self.finish(config).ok_or_else(String::new)?;
+        #[cfg(all(feature = "fallible-allocation-v1", not(target_vendor = "teaclave")))]
+        drop(working_credit);
+        let config = self
+            .finish(config, Some(certificate_credit), key_spki_credit)
+            .ok_or_else(String::new)?;
         #[cfg(all(feature = "fallible-allocation-v1", target_vendor = "teaclave"))]
         origin.activate_release_notification();
         Ok(config)
@@ -203,15 +293,37 @@ impl ConfigReservation {
         Some(provider)
     }
 
-    fn finish(self, config: ServerConfig) -> Option<RetainedTlsConfig> {
+    fn finish(
+        self,
+        config: ServerConfig,
+        certificates: Option<enclave_os_common::allocation::AllocationLeaseV1>,
+        key_spki: Option<enclave_os_common::allocation::AllocationLeaseV1>,
+    ) -> Option<RetainedTlsConfig> {
         #[cfg(feature = "fallible-allocation-v1")]
         let config = Arc::try_new(config).ok()?;
         #[cfg(not(feature = "fallible-allocation-v1"))]
         let config = Arc::new(config);
         #[cfg(feature = "fallible-allocation-v1")]
-        let retained = self.allocation.try_finish(config).ok()?;
+        let retained = self
+            .allocation
+            .try_finish(Payload {
+                config,
+                _certificates: certificates,
+                _key_spki: key_spki,
+            })
+            .ok()?;
         #[cfg(not(feature = "fallible-allocation-v1"))]
-        let retained = self.allocation.finish(config);
+        let retained = self.allocation.finish(Payload {
+            config,
+            _certificates: certificates,
+            _key_spki: key_spki,
+        });
+        if let Some(credit) = &retained._certificates {
+            credit.activate_release_notification();
+        }
+        if let Some(credit) = &retained._key_spki {
+            credit.activate_release_notification();
+        }
         Some(RetainedTlsConfig(retained))
     }
 }
@@ -259,6 +371,19 @@ impl RetainedConnection {
 #[cfg(all(test, feature = "fallible-allocation-v1"))]
 pub(crate) fn check_provider_allocation_refusals() {
     provider_refusal::check();
+}
+
+#[cfg(all(test, feature = "fallible-allocation-v1"))]
+pub(crate) fn client_config_backing_check(
+    layout: core::alloc::Layout,
+    skip: Option<usize>,
+    action: impl FnOnce(),
+) -> usize {
+    provider_refusal::client_config_backing_check(layout, skip, action)
+}
+#[cfg(all(test, feature = "fallible-allocation-v1"))]
+pub(crate) fn client_config_arc_layout(payload: core::alloc::Layout) -> core::alloc::Layout {
+    provider_refusal::client_config_arc_layout(payload)
 }
 
 /// Native-only observation: the supplied action must use its explicit allocator.
@@ -436,6 +561,48 @@ mod provider_refusal {
         strong: AtomicUsize,
         weak: AtomicUsize,
     }
+    pub(super) fn client_config_arc_layout(payload: Layout) -> Layout {
+        let layout = Layout::new::<ArcHeader>()
+            .extend(payload)
+            .unwrap()
+            .0
+            .pad_to_align();
+        assert_eq!(
+            Some(layout.size()),
+            enclave_os_common::allocation::shared_allocation_bytes_for_layout(payload)
+        );
+        layout
+    }
+    pub(super) fn client_config_backing_check(
+        layout: Layout,
+        skip: Option<usize>,
+        action: impl FnOnce(),
+    ) -> usize {
+        ARM.with(|cell| {
+            assert!(cell.get().is_none());
+            cell.set(Some(Arm {
+                expected: layout,
+                refused: false,
+                live: 0,
+                allocations: 0,
+                matching_allocations: 0,
+                skip_matching: skip.unwrap_or(usize::MAX),
+            }));
+        });
+        action();
+        let arm = ARM.with(|cell| cell.take()).unwrap();
+        assert_eq!(
+            arm.refused,
+            skip.is_some(),
+            "exact selected config backend refusal"
+        );
+        assert_eq!(
+            arm.live, 0,
+            "all actual config backing must free before quote refund"
+        );
+        arm.matching_allocations
+    }
+
     pub(super) fn check() {
         use rustls::crypto::{ring, CryptoProvider, SupportedKxGroup};
         // Same acquired ArcInner geometry quoted by Common; validate its size
@@ -537,7 +704,11 @@ mod provider_refusal {
                 "actual ring record keys must stay inline"
             );
             assert_eq!(arm.live, 0);
-            super::record_owner_check::check_record_wire(suite, independent, std::alloc::Global);
+            super::record_owner_check::check_record_wire(
+                suite,
+                independent,
+                rustls::RetainedAllocator::default(),
+            );
         }
     }
 
@@ -557,7 +728,7 @@ mod provider_refusal {
                     skip_matching: if growth { usize::MAX } else { 0 },
                 }))
             });
-            let mut acceptor = Acceptor::new_in(std::alloc::Global);
+            let mut acceptor = Acceptor::new_in(rustls::RetainedAllocator::default());
             if growth {
                 assert_eq!(
                     acceptor
@@ -731,17 +902,22 @@ mod provider_refusal {
             .to_vec();
         let different = rcgen::KeyPair::generate().unwrap();
         let authentication = ClientAuthentication::Anonymous;
-        let pool =
-            AllocationPoolV1::new(RetainedTlsConfig::required_bytes(authentication).unwrap())
-                .unwrap();
+        let certificates = [rustls::pki_types::CertificateDer::from(cert)];
+        let private_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(different.serialize_der()),
+        );
+        let certificate_bytes =
+            ConfigReservation::factory_bytes(&certificates, &private_key).unwrap();
+        let pool = AllocationPoolV1::new(
+            RetainedTlsConfig::required_bytes(authentication)
+                .unwrap()
+                .checked_add(certificate_bytes)
+                .unwrap(),
+        )
+        .unwrap();
         let result = RetainedTlsConfig::reserve(&pool, authentication)
             .unwrap()
-            .configure(
-                vec![rustls::pki_types::CertificateDer::from(cert)],
-                rustls::pki_types::PrivateKeyDer::Pkcs8(
-                    rustls::pki_types::PrivatePkcs8KeyDer::from(different.serialize_der()),
-                ),
-            );
+            .configure(&certificates, private_key);
         assert!(
             result.is_err(),
             "original keys_match must still reject a different key"
@@ -805,7 +981,9 @@ mod provider_refusal {
                     skip_matching,
                 }))
             });
-            let result = rustls::server::ServerConfigDefaults::try_new_in(std::alloc::Global);
+            let result = rustls::server::ServerConfigDefaults::try_new_in(
+                rustls::RetainedAllocator::default(),
+            );
             let refused = result.is_err();
             drop(result);
             let arm = ARM.with(|cell| cell.take()).unwrap();

@@ -82,9 +82,9 @@ ring = "0.17"
 # syscall(SYS_getrandom) and routes it to sgx_read_rand.
 getrandom = { version = "0.2", features = ["rdrand"] }
 # For RA-TLS certificate generation
-rcgen = { version = "0.13", default-features = false, features = ["ring", "x509-parser"] }
+der = { version = "=0.8.2", default-features = false }
 # Civil-time conversion for the deterministic cert NotBefore / ReportData binding.
-# Already in the graph via rcgen; default-features off keeps time-macros out.
+# Default-features off keeps time-macros out.
 time = { version = "0.3", default-features = false }
 
 # Serialization
@@ -118,3 +118,7 @@ wasmtime = { path = "../third_party/wasm64/wasmtime/crates/wasmtime" }
 
 [patch.crates-io]
 wasmparser = { path = "../third_party/wasm64/wasm-tools/crates/wasmparser" }
+
+[dev-dependencies]
+# Independent standards/wire oracle; not a runtime certificate producer.
+rcgen = { version = "0.13.2", default-features = false, features = ["ring", "x509-parser"] }

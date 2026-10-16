@@ -37,22 +37,6 @@ pub struct ConfigLeaf {
 }
 
 // ---------------------------------------------------------------------------
-//  Module OID
-// ---------------------------------------------------------------------------
-
-/// A custom X.509 OID extension registered by a module.
-///
-/// Each OID is embedded as a non-critical extension in every RA-TLS leaf
-/// certificate, allowing clients to verify individual module properties
-/// without computing the full config Merkle tree.
-pub struct ModuleOid {
-    /// OID arc sequence (e.g. `&[1, 3, 6, 1, 4, 1, 65230, 2, 1]`).
-    pub oid: &'static [u64],
-    /// Raw extension value bytes.
-    pub value: Vec<u8>,
-}
-
-// ---------------------------------------------------------------------------
 //  Per-app identity types
 // ---------------------------------------------------------------------------
 
@@ -311,8 +295,11 @@ pub trait EnclaveModule: Send + Sync {
     }
 
     /// Custom X.509 OIDs to embed in RA-TLS certificates.
-    fn custom_oids(&self) -> Vec<ModuleOid> {
-        Vec::new()
+    fn custom_oids(
+        &self,
+        _visit: &mut dyn FnMut(&'static [u64], &[u8]) -> Result<(), ()>,
+    ) -> Result<(), ()> {
+        Ok(())
     }
 
     /// App identities for per-app X.509 certificates.

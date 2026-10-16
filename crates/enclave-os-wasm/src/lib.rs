@@ -85,7 +85,7 @@ use std::vec::Vec;
 
 use enclave_os_common::hex::hex_decode;
 use enclave_os_common::modules::{
-    AppIdentity, ConfigEntry, ConfigLeaf, EnclaveModule, ModuleOid, RequestContext,
+    AppIdentity, ConfigEntry, ConfigLeaf, EnclaveModule, RequestContext,
 };
 use enclave_os_common::protocol::{Request, Response};
 use enclave_os_common::types::AEAD_KEY_SIZE;
@@ -1244,14 +1244,14 @@ impl WasmModule {
         };
 
         let hashes = registry.all_code_hashes();
-        if hashes.is_empty() {
+        if hashes.len() == 0 {
             return [0u8; 32];
         }
 
         let mut ctx = digest::Context::new(&digest::SHA256);
-        for (name, hash) in &hashes {
+        for (name, hash) in hashes {
             ctx.update(name.as_bytes());
-            ctx.update(*hash);
+            ctx.update(hash);
         }
         let result = ctx.finish();
         let mut out = [0u8; 32];
@@ -1343,7 +1343,6 @@ impl WasmModule {
             .lock()
             .map(|r| {
                 r.all_code_hashes()
-                    .iter()
                     .map(|(name, _)| name.to_string())
                     .collect()
             })
@@ -1462,8 +1461,11 @@ impl EnclaveModule for WasmModuleHandle {
     fn config_leaves(&self) -> Vec<enclave_os_common::modules::ConfigLeaf> {
         self.0.config_leaves()
     }
-    fn custom_oids(&self) -> Vec<enclave_os_common::modules::ModuleOid> {
-        self.0.custom_oids()
+    fn custom_oids(
+        &self,
+        visit: &mut dyn FnMut(&'static [u64], &[u8]) -> Result<(), ()>,
+    ) -> Result<(), ()> {
+        self.0.custom_oids(visit)
     }
     fn app_identities(&self) -> Vec<AppIdentity> {
         self.0.app_identities()
@@ -1493,7 +1495,6 @@ impl EnclaveModule for WasmModule {
 
         registry
             .all_code_hashes()
-            .iter()
             .filter_map(|(name, _)| registry.get_known(name).map(build_app_identity))
             .collect()
     }
@@ -2073,18 +2074,15 @@ impl EnclaveModule for WasmModule {
     /// Custom X.509 OIDs for RA-TLS certificates.
     ///
     /// Embeds the combined apps hash as OID `1.3.6.1.4.1.65230.2.5`.
-    fn custom_oids(&self) -> Vec<ModuleOid> {
+    fn custom_oids(
+        &self,
+        visit: &mut dyn FnMut(&'static [u64], &[u8]) -> Result<(), ()>,
+    ) -> Result<(), ()> {
         let combined = self.combined_apps_hash();
-
-        // Only include the OID if at least one app is known.
-        if combined == [0u8; 32] {
-            return Vec::new();
+        if combined != [0u8; 32] {
+            visit(COMBINED_WORKLOADS_HASH_OID, &combined)?;
         }
-
-        vec![ModuleOid {
-            oid: COMBINED_WORKLOADS_HASH_OID,
-            value: combined.to_vec(),
-        }]
+        Ok(())
     }
 }
 

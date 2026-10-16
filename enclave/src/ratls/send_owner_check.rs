@@ -271,4 +271,339 @@ pub(super) fn check() {
 pub(super) fn check_in(pool: &Arc<AllocationPoolV1>) {
     queue_checks(pool);
     record_checks(pool);
+    flight_checks(pool);
+    key_update_checks(pool);
+    parsed_handshake_checks(pool);
+}
+
+fn flight_checks(pool: &Arc<AllocationPoolV1>) {
+    use rustls::internal::send::FlightProbe;
+    let before = pool.used();
+    let origin = Original::new(pool);
+    let metadata = pool.used();
+    let input = [7; 32];
+    // Independent TLS handshake wire: Finished(type20,u24 length32), then Done.
+    let expected = [&[20, 0, 0, 32][..], &input].concat();
+    for existing in [false, true] {
+        let setup = || {
+            let mut probe =
+                FlightProbe::new_in(origin.clone(), origin.context_allocator()).unwrap();
+            if existing {
+                without_global(|| probe.add_finished(&input)).unwrap();
+            }
+            probe
+        };
+        let mut probe = setup();
+        origin.arm(None);
+        without_global(|| probe.add_finished(&input)).unwrap();
+        let requests = origin.requests();
+        assert_eq!(requests, 2, "actual flight and retained transcript backing");
+        assert_eq!(
+            probe.bytes(),
+            if existing {
+                [&expected[..], &expected[..]].concat()
+            } else {
+                expected.clone()
+            }
+        );
+        drop(probe);
+        for refused in 0..requests {
+            origin.arm(None);
+            let mut probe = setup();
+            let bytes = probe.bytes().to_vec();
+            let hash = probe.hash();
+            let pointer = probe.body_pointer();
+            let charge = pool.used();
+            let backing = origin.backend_bytes();
+            origin.arm(Some(refused));
+            let expected_error = if refused == 0 {
+                rustls::Error::AllocationFailed
+            } else {
+                // Preserve the existing transcript owner's public error kind.
+                rustls::Error::InvalidMessage(rustls::InvalidMessage::AllocationFailed)
+            };
+            assert_eq!(
+                without_global(|| probe.add_finished(&input)).err(),
+                Some(expected_error)
+            );
+            assert_eq!(probe.bytes(), bytes);
+            assert_eq!(probe.hash().as_ref(), hash.as_ref());
+            assert_eq!(probe.body_pointer(), pointer);
+            assert_eq!(pool.used(), charge, "refusal drops all staged growth");
+            assert_eq!(origin.backend_bytes(), backing);
+            assert_eq!(origin.requests(), refused + 1);
+            origin.arm(None);
+            without_global(|| probe.add_finished(&input)).unwrap();
+            without_global(|| probe.add_done()).unwrap();
+            let mut expected_retry = bytes;
+            expected_retry.extend_from_slice(&expected);
+            expected_retry.extend_from_slice(&[14, 0, 0, 0]);
+            assert_eq!(probe.bytes(), expected_retry);
+            drop(probe);
+        }
+    }
+    origin.arm(None);
+    let mut fitting = FlightProbe::new_in(origin.clone(), origin.context_allocator()).unwrap();
+    without_global(|| fitting.add_finished(&input)).unwrap();
+    without_global(|| fitting.add_finished(&input)).unwrap();
+    without_global(|| fitting.add_done()).unwrap();
+    let pointer = fitting.body_pointer();
+    let charge = pool.used();
+    origin.arm(Some(0));
+    without_global(|| fitting.add_done()).unwrap();
+    assert_eq!(
+        origin.requests(),
+        0,
+        "capacity-fit flight has no backing requests"
+    );
+    assert_eq!(fitting.body_pointer(), pointer);
+    assert_eq!(pool.used(), charge);
+    drop(fitting);
+    origin.arm(None);
+    // A real original-pool backend refusal must precede body/hash mutation.
+    let mut probe = FlightProbe::new_in(origin.clone(), origin.context_allocator()).unwrap();
+    let hash = probe.hash();
+    let blocker = pool
+        .reserve_unpublished(pool.capacity() - pool.used())
+        .unwrap();
+    assert!(without_global(|| probe.add_finished(&input)).is_err());
+    assert!(probe.bytes().is_empty());
+    assert_eq!(probe.hash().as_ref(), hash.as_ref());
+    drop(blocker);
+    without_global(|| probe.add_finished(&input)).unwrap();
+    assert_eq!(probe.bytes(), expected);
+    drop(probe);
+    assert_eq!(pool.used(), metadata);
+    drop(origin);
+    assert_eq!(pool.used(), before);
+}
+
+fn key_update_checks(pool: &Arc<AllocationPoolV1>) {
+    use rustls::internal::send::observe_key_update;
+    for requested in [false, true] {
+        // Independent TLS1.3 handshake type24/u24 length1/u8 request wire.
+        let plaintext = [24, 0, 0, 1, u8::from(requested)];
+        without_global(|| observe_key_update(requested, |bytes| assert_eq!(bytes, plaintext)));
+        let mut expected = plaintext.to_vec();
+        expected.push(u8::from(rustls::ContentType::Handshake));
+        let aad = rustls::crypto::cipher::make_tls13_aad(
+            expected.len() + ring::aead::AES_256_GCM.tag_len(),
+        );
+        ring::aead::LessSafeKey::new(
+            ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &[7; 32]).unwrap(),
+        )
+        .seal_in_place_append_tag(
+            ring::aead::Nonce::assume_unique_for_key([0; 12]),
+            ring::aead::Aad::from(aad),
+            &mut expected,
+        )
+        .unwrap();
+        let mut wire = vec![23, 3, 3];
+        wire.extend_from_slice(&u16::try_from(expected.len()).unwrap().to_be_bytes());
+        wire.extend_from_slice(&expected);
+
+        let before = pool.used();
+        let origin = Original::new(pool);
+        let mut probe = RecordProbe::new_in(origin.context_allocator(), u64::MAX);
+        #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
+        {
+            let state = probe.snapshot();
+            let charge = pool.used();
+            let blocker = pool.reserve_unpublished(pool.capacity() - charge).unwrap();
+            let refusal = without_global(|| {
+                if requested {
+                    probe.queue_request()
+                } else {
+                    probe.queue_pending()
+                }
+            });
+            assert_eq!(refusal.err(), Some(rustls::Error::AllocationFailed));
+            assert_eq!(
+                probe.snapshot(),
+                state,
+                "admission precedes nonce/queue/pending changes"
+            );
+            drop(blocker);
+            assert_eq!(pool.used(), charge);
+        }
+        let send = || {
+            if requested {
+                probe.queue_request()
+            } else {
+                probe.queue_pending()
+            }
+        };
+        #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
+        without_global(send).unwrap();
+        #[cfg(not(any(target_env = "sgx", target_vendor = "teaclave")))]
+        {
+            let mut send = send;
+            send().unwrap();
+        }
+        assert_eq!(probe.snapshot().sequence, 1);
+        if !requested {
+            assert_eq!(probe.pending(), Some(wire.as_slice()));
+            probe.flush_pending().unwrap();
+        }
+        let output = probe.pop().unwrap();
+        assert_eq!(output.as_slice(), wire);
+        assert!(
+            probe.pop().is_none(),
+            "one current notification/request record"
+        );
+        drop(probe);
+        drop(origin);
+        #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
+        assert!(
+            pool.used() > before,
+            "returned actual output retains its original payer"
+        );
+        drop(output);
+        assert_eq!(pool.used(), before);
+    }
+    #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
+    std::println!("TLS-KEYUPDATE-SERIALIZATION-SIM: inline-current-codec request-notify independent-wire original-pool refusal-before-nonce retained-output final-refund PASS");
+}
+
+fn parsed_handshake_checks(pool: &Arc<AllocationPoolV1>) {
+    use rustls::internal::send::{visit_message_in, ParsedHandshakeProbe};
+    let wire = [14, 0, 0, 0];
+    let malformed = [14, 0, 0, 1, 0];
+    let before = pool.used();
+    let origin = Original::new(pool);
+    let metadata = pool.used();
+    origin.arm(Some(0));
+    assert_eq!(
+        without_global(|| ParsedHandshakeProbe::read_in(
+            &malformed,
+            origin.clone(),
+            origin.context_allocator(),
+        ))
+        .err(),
+        Some(rustls::InvalidMessage::TrailingData("ServerHelloDone")),
+    );
+    assert_eq!(
+        origin.requests(),
+        0,
+        "malformed precedence before fixed owner"
+    );
+    origin.arm(None);
+    let read = || ParsedHandshakeProbe::read_in(&wire, origin.clone(), origin.context_allocator());
+    let probe = without_global(read).unwrap();
+    let required = pool.used() - metadata;
+    assert_eq!(required, origin.backend_bytes());
+    assert!(required >= probe.layout().size());
+    assert_eq!(
+        probe.handshake_type(),
+        rustls::HandshakeType::ServerHelloDone
+    );
+    drop(probe);
+    assert_eq!(pool.used(), metadata);
+    for available in [required - 1, required, required + 1] {
+        let held = pool
+            .reserve_unpublished(pool.capacity() - metadata - available)
+            .unwrap();
+        origin.arm(None);
+        let result = without_global(read);
+        if available < required {
+            assert_eq!(result.err(), Some(rustls::InvalidMessage::AllocationFailed));
+        } else {
+            drop(result.unwrap());
+        }
+        drop(held);
+        assert_eq!(pool.used(), metadata);
+    }
+    origin.arm(Some(0));
+    assert_eq!(
+        without_global(read).err(),
+        Some(rustls::InvalidMessage::AllocationFailed)
+    );
+    assert_eq!(pool.used(), metadata);
+    for available in [required - 1, required, required + 1] {
+        origin.arm(None);
+        let probe = without_global(read).unwrap();
+        let charge = pool.used();
+        let held = pool
+            .reserve_unpublished(pool.capacity() - charge - available)
+            .unwrap();
+        let owned = without_global(|| probe.try_into_owned());
+        if available < required {
+            assert_eq!(owned.err(), Some(rustls::InvalidMessage::AllocationFailed));
+        } else {
+            let owned = owned.unwrap();
+            assert_eq!(
+                owned.handshake_type(),
+                rustls::HandshakeType::ServerHelloDone
+            );
+            drop(owned);
+        }
+        drop(held);
+        assert_eq!(
+            pool.used(),
+            metadata,
+            "conversion drops/refunds both bounded owners"
+        );
+    }
+    let held = pool
+        .reserve_unpublished(pool.capacity() - metadata)
+        .unwrap();
+    for (typ, bytes) in [
+        (rustls::ContentType::ApplicationData, &b"application"[..]),
+        (rustls::ContentType::Alert, &[1, 0][..]),
+        (rustls::ContentType::ChangeCipherSpec, &[1][..]),
+    ] {
+        without_global(|| {
+            visit_message_in(typ, bytes, origin.context_allocator(), |parsed, encoded| {
+                assert_eq!(parsed, None);
+                assert_eq!(encoded, bytes);
+            })
+        })
+        .unwrap();
+    }
+    #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
+    {
+        let mut published = false;
+        let result = without_global(|| {
+            visit_message_in(
+                rustls::ContentType::Handshake,
+                &wire,
+                origin.context_allocator(),
+                |_, _| published = true,
+            )
+        });
+        assert_eq!(result.err(), Some(rustls::InvalidMessage::AllocationFailed));
+        assert!(!published);
+    }
+    drop(held);
+    let visit = || {
+        visit_message_in(
+            rustls::ContentType::Handshake,
+            &wire,
+            origin.context_allocator(),
+            |parsed, encoded| {
+                assert_eq!(parsed, Some(rustls::HandshakeType::ServerHelloDone));
+                assert_eq!(encoded, wire);
+                assert_eq!(
+                    encoded.as_ptr(),
+                    wire.as_ptr(),
+                    "unchanged borrowed transcript encoding"
+                );
+            },
+        )
+    };
+    #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
+    without_global(visit).unwrap();
+    #[cfg(not(any(target_env = "sgx", target_vendor = "teaclave")))]
+    visit().unwrap();
+    origin.arm(None);
+    let returned = without_global(read).unwrap();
+    drop(origin);
+    assert!(
+        pool.used() > before,
+        "actual parsed backing retains original origin"
+    );
+    drop(returned);
+    assert_eq!(pool.used(), before);
+    #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
+    std::println!("TLS-PARSED-HANDSHAKE-SIM: original-pool exact-layout malformed-before-admission overlap refusal unchanged-encoding no-nonhandshake-owner retained-drop final-refund PASS");
 }

@@ -31,7 +31,9 @@ use super::super::cert_store::CertStore;
 use super::{FidoIdentity, RaTlsSession, TlsOutput};
 use enclave_os_common::modules::{AppIdentity, PeerEvidence};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
-use rustls::{ClientConfig, ClientConnection, RootCertStore};
+#[cfg(not(feature = "fallible-allocation-v1"))]
+use rustls::ClientConfig;
+use rustls::{ClientConnection, RootCertStore};
 use std::io::{Cursor, Write};
 use std::sync::Arc;
 
@@ -43,7 +45,24 @@ fn register(store: &CertStore, name: &str) {
     });
 }
 
-fn pair(store: &CertStore, name: &str) -> (ClientConnection, RaTlsSession) {
+struct ClientForTest {
+    connection: ClientConnection,
+    #[cfg(feature = "fallible-allocation-v1")]
+    _retained: crate::client::RetainedClientConfig,
+}
+impl core::ops::Deref for ClientForTest {
+    type Target = ClientConnection;
+    fn deref(&self) -> &ClientConnection {
+        &self.connection
+    }
+}
+impl core::ops::DerefMut for ClientForTest {
+    fn deref_mut(&mut self) -> &mut ClientConnection {
+        &mut self.connection
+    }
+}
+
+fn pair(store: &CertStore, name: &str) -> (ClientForTest, RaTlsSession) {
     let (client, session, pool) = pair_with_certificate(store, name);
     assert!(pool.used() > 0);
     (client, session)
@@ -53,7 +72,7 @@ fn pair_with_certificate(
     store: &CertStore,
     name: &str,
 ) -> (
-    ClientConnection,
+    ClientForTest,
     RaTlsSession,
     Arc<enclave_os_common::allocation::AllocationPoolV1>,
 ) {
@@ -66,7 +85,7 @@ fn pair_with_all_pools(
     name: &str,
     extra_config_bytes: usize,
 ) -> (
-    ClientConnection,
+    ClientForTest,
     RaTlsSession,
     Arc<enclave_os_common::allocation::AllocationPoolV1>,
     Arc<enclave_os_common::allocation::AllocationPoolV1>,
@@ -78,35 +97,49 @@ fn pair_with_all_pools(
         .unwrap()
         .der()
         .to_vec();
+    super::certificate_wire_check::check();
+    super::certificate_generation_check::check();
     super::ca_context::check_runtime_ca_ownership(&cert, &key.serialize_der());
     use super::retained_tls_config::RetainedTlsConfig;
     let authentication = super::retained_tls_config::ClientAuthentication::Anonymous;
+    let certificates = [CertificateDer::from(cert.as_slice())];
+    let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
+    let certificate_bytes =
+        super::retained_tls_config::ConfigReservation::factory_bytes(&certificates, &private_key)
+            .unwrap();
     let config_bytes = RetainedTlsConfig::required_bytes(authentication).unwrap();
     let config_short =
         enclave_os_common::allocation::AllocationPoolV1::new(config_bytes - 1).unwrap();
     assert!(RetainedTlsConfig::reserve(&config_short, authentication).is_none());
     assert_eq!(config_short.used(), 0);
     let config_pool = enclave_os_common::allocation::AllocationPoolV1::new(
-        config_bytes.checked_add(extra_config_bytes).unwrap(),
+        config_bytes
+            .checked_add(certificate_bytes)
+            .unwrap()
+            .checked_add(extra_config_bytes)
+            .unwrap(),
     )
     .unwrap();
     #[cfg(feature = "fallible-allocation-v1")]
     super::retained_tls_config::check_provider_allocation_refusals();
     let reservation = RetainedTlsConfig::reserve(&config_pool, authentication).unwrap();
-    let retained_config = reservation
-        .configure(
-            vec![CertificateDer::from(cert.clone())],
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
-        )
-        .unwrap();
+    let retained_config = reservation.configure(&certificates, private_key).unwrap();
     let mut roots = RootCertStore::empty();
     roots.add(CertificateDer::from(cert.clone())).unwrap();
+    #[cfg(not(feature = "fallible-allocation-v1"))]
     let client =
         ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_protocol_versions(&[&rustls::version::TLS13])
             .unwrap()
             .with_root_certificates(roots)
             .with_no_client_auth();
+    #[cfg(feature = "fallible-allocation-v1")]
+    let client = {
+        crate::client::check_configuration_owner(&roots);
+        let bytes = crate::client::tls_configuration_allocation_bytes(name, &roots, None).unwrap();
+        let pool = enclave_os_common::allocation::AllocationPoolV1::new(bytes).unwrap();
+        crate::client::build_client_config(name, &roots, None, Some(&pool)).unwrap()
+    };
     let (app, lease) = store.snapshot(Some(name)).unwrap();
     assert_eq!(config_pool.used(), config_bytes);
     let config_alias = retained_config.clone();
@@ -127,11 +160,29 @@ fn pair_with_all_pools(
     assert_eq!(pool.used(), required);
     let session = RaTlsSession::new(server, retained, Some(name.into()), endpoint, lease);
     (
-        ClientConnection::new(
-            Arc::new(client),
-            ServerName::try_from(name.to_owned()).unwrap(),
-        )
-        .unwrap(),
+        {
+            #[cfg(feature = "fallible-allocation-v1")]
+            {
+                let connection =
+                    ClientConnection::new(client.config(), client.server_name(name).unwrap())
+                        .unwrap();
+                client.publish();
+                ClientForTest {
+                    connection,
+                    _retained: client,
+                }
+            }
+            #[cfg(not(feature = "fallible-allocation-v1"))]
+            {
+                ClientForTest {
+                    connection: ClientConnection::new(
+                        Arc::new(client),
+                        ServerName::try_from(name.to_owned()).unwrap(),
+                    )
+                    .unwrap(),
+                }
+            }
+        },
         session,
         pool,
         config_pool,

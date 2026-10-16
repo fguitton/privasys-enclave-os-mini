@@ -145,10 +145,12 @@ if command is None: raise SystemExit('unsupported trusted Cargo command')
 config=Path({combined})
 config.write_text('paths = '+json.dumps(list(dict.fromkeys(paths)))+'\\n')
 forward[command+1:command+1]=['--config',str(config)]
+os.environ['HONEST_RETAINED_PROVIDER_SOURCE_RECEIPT']={source_receipt}
 os.execv({cargo},[{cargo},*forward])
 """.format(python=sys.executable, paths=repr([str(destination),
               *(sdk_route['paths'] if sdk_route else [])]),
-           combined=repr(str(build_root / 'combined-source.toml')), cargo=repr(str(cargo)))
+           combined=repr(str(build_root / 'combined-source.toml')), cargo=repr(str(cargo)),
+           source_receipt=repr(str(destination / 'retained-provider-source-receipt.json')))
     wrapper.write_text(wrapper_code)
     wrapper.chmod(0o700)
     consumed = metadata(wrapper, manifest, selectors, target_path)

@@ -325,10 +325,31 @@ fn check_incremental_origin(pool: &Arc<AllocationPoolV1>) -> Result<(), &'static
     let root = enclave_os_common::allocation::shared_allocation_bytes::<AllocationPoolV1>()
         .ok_or("incremental pool geometry")?;
     // These are actual owner metadata layouts, never a guessed TLS input cap:
-    // one short refuses the origin; exact permits only origin metadata and
-    // therefore refuses the first actual ClientHello child/backend request.
+    // Configuration uses its separately derived complete fixed graph budget.
+    // One short then refuses the connection origin; exact permits only that
+    // origin and refuses its first actual ClientHello child/backend request.
+    let configuration = enclave_os_egress::client::tls_configuration_allocation_bytes(
+        "retained.invalid",
+        &roots,
+        None,
+    )
+    .ok_or("incremental configuration geometry")?;
+    let config_short = root
+        .checked_add(configuration)
+        .and_then(|bytes| bytes.checked_sub(1))
+        .ok_or("incremental configuration short sum")?;
+    let isolated = AllocationPoolV1::try_new_with_release(config_short, None)
+        .ok_or("incremental configuration root")?;
+    let refused =
+        IncrementalTlsClient::new("retained.invalid", &roots, None, Some(isolated.clone()));
+    if refused.err().as_deref() != Some("TLS config allocation refused") || isolated.used() != 0 {
+        return Err(
+            "incremental configuration refusal reached handshake or leaked original credit",
+        );
+    }
     let only_origin = root
-        .checked_add(metadata)
+        .checked_add(configuration)
+        .and_then(|bytes| bytes.checked_add(metadata))
         .ok_or("incremental exact origin sum")?;
     for extra in [-1_isize, 0] {
         let capacity = only_origin
@@ -446,7 +467,47 @@ fn check_sync_origin(pool: &Arc<AllocationPoolV1>) -> Result<(), &'static str> {
     }
     let root = enclave_os_common::allocation::shared_allocation_bytes::<AllocationPoolV1>()
         .ok_or("sync root geometry")?;
-    let required = root.checked_add(metadata).ok_or("sync origin total")?;
+    let configuration = enclave_os_egress::client::tls_configuration_allocation_bytes(
+        "retained.invalid",
+        &roots,
+        None,
+    )
+    .ok_or("sync configuration geometry")?;
+    let config_short = root
+        .checked_add(configuration)
+        .and_then(|bytes| bytes.checked_sub(1))
+        .ok_or("sync configuration short sum")?;
+    let isolated = AllocationPoolV1::try_new_with_release(config_short, None)
+        .ok_or("sync configuration root")?;
+    let mut config_io = RefuseTls {
+        pool: &isolated,
+        connects: 0,
+        closes: 0,
+        sends: 0,
+        retained: 0,
+    };
+    let config_error = https_fetch_authorized_interruptible_detailed(
+        &mut config_io,
+        &request,
+        &roots,
+        None,
+        &mut authorize,
+        Some(&isolated),
+    )
+    .err()
+    .ok_or("sync unavailable configuration admitted")?;
+    if config_error.phase != HttpsFetchFailurePhase::RequestRejectedBeforeDispatch
+        || config_error.to_string() != "TLS config allocation refused"
+        || config_error.request_may_have_been_dispatched()
+        || (config_io.connects, config_io.closes, config_io.sends) != (0, 0, 0)
+        || isolated.used() != 0
+    {
+        return Err("sync configuration refusal changed transport phase or original credit");
+    }
+    let required = root
+        .checked_add(configuration)
+        .and_then(|bytes| bytes.checked_add(metadata))
+        .ok_or("sync origin total")?;
     for short in [true, false] {
         let capacity = if short {
             required.checked_sub(1).ok_or("sync short capacity")?

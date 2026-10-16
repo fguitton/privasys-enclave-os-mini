@@ -15,7 +15,7 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 use zeroize::{Zeroize, Zeroizing};
 
-use super::{build_client_config, exchange, IdentityClientAuth, RaTlsPolicy};
+use super::{build_client_config, exchange, RaTlsPolicy};
 
 mod resource;
 pub use resource::{
@@ -468,12 +468,13 @@ fn https_request_inner(
             "trusted HTTPS requires the original allocation pool",
         ));
     }
-    let (tls_config, identity) = build_client_config(root_store, ratls).map_err(|error| {
-        HttpsFetchError::new(
-            HttpsFetchFailurePhase::RequestRejectedBeforeDispatch,
-            error.to_string(),
-        )
-    })?;
+    let tls_config =
+        build_client_config(host, root_store, ratls, request.pool).map_err(|error| {
+            HttpsFetchError::new(
+                HttpsFetchFailurePhase::RequestRejectedBeforeDispatch,
+                error.to_string(),
+            )
+        })?;
     let fd = io.tcp_connect(host, port).map_err(|error| {
         HttpsFetchError::new(
             HttpsFetchFailurePhase::ConnectBeforeDispatch,
@@ -489,7 +490,6 @@ fn https_request_inner(
             config: tls_config,
             pool: request.pool,
             ratls,
-            identity: identity.as_ref(),
         },
         authorize_peer,
     );
@@ -498,10 +498,9 @@ fn https_request_inner(
 }
 
 struct TlsSetup<'a> {
-    config: Arc<ClientConfig>,
+    config: super::RetainedClientConfig,
     pool: Option<&'a Arc<enclave_os_common::allocation::AllocationPoolV1>>,
     ratls: Option<&'a RaTlsPolicy>,
-    identity: Option<&'a Arc<IdentityClientAuth>>,
 }
 fn start_connection(
     config: Arc<ClientConfig>,
@@ -554,13 +553,17 @@ fn https_request_connected(
     setup: TlsSetup<'_>,
     authorize_peer: &mut dyn FnMut(&TlsPeerCertificateChain) -> Result<(), String>,
 ) -> Result<HttpResponse, HttpsFetchError> {
-    let server_name = ServerName::try_from(host.to_string()).map_err(|_| {
+    let server_name = setup.config.server_name(host).map_err(|error| {
         HttpsFetchError::new(
             HttpsFetchFailurePhase::RequestRejectedBeforeDispatch,
-            "invalid server name",
+            match error {
+                super::config::NameError::Allocation => "TLS config allocation refused",
+                super::config::NameError::Invalid => "invalid server name",
+            },
         )
     })?;
-    let mut tls_conn = start_connection(setup.config, server_name.to_owned(), setup.pool)?;
+    let mut tls_conn = start_connection(setup.config.config(), server_name, setup.pool)?;
+    setup.config.publish();
 
     tls_conn.set_buffer_limit(Some(
         (crate::attest::MAX_MESSAGE + 4096).max(TLS_OUTPUT_WINDOW),
@@ -572,14 +575,20 @@ fn https_request_connected(
         )
     })?;
     if let Some(policy) = setup.ratls {
-        exchange::run_blocking(io, fd, &mut tls_conn, policy, setup.identity, setup.pool).map_err(
-            |error| {
-                HttpsFetchError::new(
-                    HttpsFetchFailurePhase::PeerVerificationBeforeDispatch,
-                    error,
-                )
-            },
-        )?;
+        exchange::run_blocking(
+            io,
+            fd,
+            &mut tls_conn,
+            policy,
+            setup.config.identity(),
+            setup.pool,
+        )
+        .map_err(|error| {
+            HttpsFetchError::new(
+                HttpsFetchFailurePhase::PeerVerificationBeforeDispatch,
+                error,
+            )
+        })?;
     }
     let (tls_peer, tls_peer_chain) = tls_peer_certificate_evidence(&tls_conn)?;
     authorize_peer(&tls_peer_chain).map_err(|error| {

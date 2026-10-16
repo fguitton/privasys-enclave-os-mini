@@ -1296,11 +1296,10 @@ impl AppRegistry {
     }
 
     /// Get all known apps' code hashes (sorted by name).
-    pub fn all_code_hashes(&self) -> Vec<(&str, &[u8; 32])> {
+    pub fn all_code_hashes(&self) -> impl ExactSizeIterator<Item = (&str, &[u8; 32])> {
         self.known
             .iter()
             .map(|(name, meta)| (name.as_str(), &meta.code_hash))
-            .collect()
     }
 
     /// Get all known apps' attestation metadata (sorted by name).

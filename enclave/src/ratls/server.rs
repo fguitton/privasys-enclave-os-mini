@@ -1523,26 +1523,21 @@ fn build_tls_config(
     )
     .ok_or_else(String::new)?;
     let result = match app {
-        Some(a) => attestation::generate_app_certificate(ca, key, a, now)?,
-        None => attestation::generate_ratls_certificate(ca, key, now)?,
+        Some(a) => attestation::generate_app_certificate(&pool, ca, key, a, now)?,
+        None => attestation::generate_ratls_certificate(&pool, ca, key, now)?,
     };
 
-    let initial_leaf = result
-        .cert_chain_der
-        .first()
-        .ok_or_else(|| "RA-TLS certificate chain is empty".to_string())?;
-    let local_cert_der =
-        super::session::retained_certificate::RetainedCertificate::copy_from(&pool, initial_leaf)
-            .ok_or_else(String::new)?;
-    let certs: Vec<CertificateDer<'static>> = result
-        .cert_chain_der
-        .into_iter()
-        .map(|der| CertificateDer::from(der).into_owned())
-        .collect();
-
-    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(result.pkcs8_key));
-
-    let config = config_reservation.configure(certs, key)?;
+    let local_cert_der = super::session::retained_certificate::RetainedCertificate::copy_from(
+        &pool,
+        result.leaf.as_slice(),
+    )
+    .ok_or_else(String::new)?;
+    let certs = [
+        CertificateDer::from(result.leaf.as_slice()),
+        CertificateDer::from(ca.ca_cert_der.as_slice()),
+    ];
+    let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.pkcs8.as_slice()));
+    let config = config_reservation.configure(&certs, private_key)?;
 
     Ok(TlsConfigResult {
         config,

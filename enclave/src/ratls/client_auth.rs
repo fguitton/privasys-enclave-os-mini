@@ -117,6 +117,17 @@ impl ClientCertVerifier for AttestedClientAuth {
         )
     }
 
+    #[cfg(honest_retained_provider)]
+    fn supported_verify_schemes(
+        &self,
+        visit: &mut dyn FnMut(SignatureScheme) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        for (scheme, _) in self.provider.signature_verification_algorithms.mapping {
+            visit(*scheme)?;
+        }
+        Ok(())
+    }
+    #[cfg(not(honest_retained_provider))]
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.provider
             .signature_verification_algorithms
@@ -136,6 +147,15 @@ mod tests {
     struct UncheckedIdentity(Arc<CertifiedKey>);
 
     impl ResolvesClientCert for UncheckedIdentity {
+        #[cfg(honest_retained_provider)]
+        fn resolve(
+            &self,
+            _: &[&[u8]],
+            _: &[SignatureScheme],
+        ) -> Result<Option<Arc<CertifiedKey>>, Error> {
+            Ok(Some(self.0.clone()))
+        }
+        #[cfg(not(honest_retained_provider))]
         fn resolve(&self, _: &[&[u8]], _: &[SignatureScheme]) -> Option<Arc<CertifiedKey>> {
             Some(self.0.clone())
         }
@@ -154,18 +174,26 @@ mod tests {
         let provider = Arc::new(default_provider());
         use crate::ratls::session::retained_tls_config::{ClientAuthentication, RetainedTlsConfig};
         let authentication = ClientAuthentication::Attested { required };
+        let certificates = [server_identity.cert.der().clone()];
+        let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            server_identity.key_pair.serialize_der(),
+        ));
+        let certificate_bytes =
+            crate::ratls::session::retained_tls_config::ConfigReservation::factory_bytes(
+                &certificates,
+                &private_key,
+            )
+            .unwrap();
         let config_pool = enclave_os_common::allocation::AllocationPoolV1::new(
-            RetainedTlsConfig::required_bytes(authentication).unwrap(),
+            RetainedTlsConfig::required_bytes(authentication)
+                .unwrap()
+                .checked_add(certificate_bytes)
+                .unwrap(),
         )
         .unwrap();
         let server_config = RetainedTlsConfig::reserve(&config_pool, authentication)
             .unwrap()
-            .configure(
-                vec![server_identity.cert.der().clone()],
-                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-                    server_identity.key_pair.serialize_der(),
-                )),
-            )
+            .configure(&certificates, private_key)
             .unwrap();
         let mut roots = RootCertStore::empty();
         roots.add(server_identity.cert.der().clone()).unwrap();

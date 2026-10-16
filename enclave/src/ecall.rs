@@ -1286,15 +1286,20 @@ fn resolve_sealed_config(
         return Ok(existing);
     }
 
-    let ca = CaContext::generate()?;
+    let ca = CaContext::generate(pool)?;
     enclave_log_info!("Generated fresh enclave-owned local CA");
     let rng = ring::rand::SystemRandom::new();
     let mut master_key = [0u8; AEAD_KEY_SIZE];
     ring::rand::SecureRandom::fill(&rng, &mut master_key)
         .map_err(|_| String::from("Failed to generate master key"))?;
     enclave_log_info!("Generated fresh master encryption key");
-    let cfg = SealedConfig::from_parts(pool, master_key, &ca.ca_cert_der, &ca.ca_key_pkcs8)
-        .map_err(String::from)?;
+    let cfg = SealedConfig::from_parts(
+        pool,
+        master_key,
+        &ca.context().ca_cert_der,
+        &ca.context().ca_key_pkcs8,
+    )
+    .map_err(String::from)?;
     enclave_log_info!("First run: sealed config created");
     Ok(cfg)
 }

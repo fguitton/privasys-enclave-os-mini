@@ -61,19 +61,35 @@ impl core::ops::Deref for RetainedLeafKey {
         &self.0
     }
 }
+/// Local key-production refusal, separate from error-message formatting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LeafKeyError {
+    Allocation,
+    Generation,
+    InvalidKey,
+}
+impl From<LeafKeyError> for String {
+    fn from(error: LeafKeyError) -> Self {
+        match error {
+            LeafKeyError::Allocation => Self::new(),
+            LeafKeyError::Generation => Self::from("Key generation failed"),
+            LeafKeyError::InvalidKey => Self::from("Failed to parse generated key"),
+        }
+    }
+}
 impl RetainedLeafKey {
-    pub(crate) fn new(pool: &Arc<AllocationPoolV1>, now: u64) -> Result<Self, String> {
+    pub(crate) fn new(pool: &Arc<AllocationPoolV1>, now: u64) -> Result<Self, LeafKeyError> {
         let rng = SystemRandom::new();
         // Pinned ring's P-256 Document/keypair use fixed arrays and borrowed
         // DER; the current SGX RNG writes caller-owned bytes. Only the PKCS8
         // and SPKI Vec children below are retained. Rcgen/rustls factory
         // allocations are separate owners.
         let document = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)
-            .map_err(|_| String::from("Key generation failed"))?;
+            .map_err(|_| LeafKeyError::Generation)?;
         let pair =
             EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, document.as_ref(), &rng)
-                .map_err(|_| String::from("Failed to parse generated key"))?;
-        Self::from_generated(pool, now, &document, &pair).ok_or_else(String::new)
+                .map_err(|_| LeafKeyError::InvalidKey)?;
+        Self::from_generated(pool, now, &document, &pair).ok_or(LeafKeyError::Allocation)
     }
     fn from_generated(
         pool: &Arc<AllocationPoolV1>,

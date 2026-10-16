@@ -8,6 +8,18 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(honest_retained_provider)");
+    println!("cargo:rerun-if-env-changed=HONEST_RETAINED_PROVIDER_SOURCE_RECEIPT");
+    if let Some(receipt) = env::var_os("HONEST_RETAINED_PROVIDER_SOURCE_RECEIPT")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute() && path.is_file())
+    {
+        println!("cargo:rustc-cfg=honest_retained_provider");
+        println!("cargo:rerun-if-changed={}", receipt.display());
+    } else {
+        assert!(env::var_os("CARGO_FEATURE_FALLIBLE_ALLOCATION_V1").is_none(), "fallible enclave TLS requires scripts/run-request-json-cargo.py and its verified retained-provider source");
+    }
+
     let edl_dir = env::var("ENCLAVE_EDL_DIR").unwrap_or_else(|_| {
         let out = env::var("OUT_DIR").unwrap();
         let p = PathBuf::from(&out).ancestors().nth(4).unwrap().join("edl");

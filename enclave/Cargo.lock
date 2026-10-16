@@ -448,6 +448,7 @@ name = "enclave-os-enclave"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "der",
  "enclave-os-common",
  "enclave-os-egress",
  "enclave-os-fido2",

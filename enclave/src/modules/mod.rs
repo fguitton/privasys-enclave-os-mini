@@ -28,9 +28,7 @@ pub mod helloworld;
 use std::sync::Mutex;
 use std::vec::Vec;
 
-use enclave_os_common::modules::{
-    AppIdentity, ConfigLeaf, EnclaveModule, ModuleOid, RequestContext,
-};
+use enclave_os_common::modules::{AppIdentity, ConfigLeaf, EnclaveModule, RequestContext};
 use enclave_os_common::protocol::{Request, Response};
 
 // ---------------------------------------------------------------------------
@@ -54,13 +52,14 @@ pub fn collect_module_config_leaves() -> Vec<ConfigLeaf> {
     leaves
 }
 
-/// Collect custom OIDs from all registered modules.
-pub fn collect_module_oids() -> Vec<ModuleOid> {
-    let mut oids = Vec::new();
+/// Visit current module OID values without an owned intermediate graph.
+pub fn visit_module_oids(
+    visit: &mut dyn FnMut(&'static [u64], &[u8]) -> Result<(), ()>,
+) -> Result<(), ()> {
     for module in MODULES.lock().unwrap().iter() {
-        oids.extend(module.custom_oids());
+        module.custom_oids(visit)?;
     }
-    oids
+    Ok(())
 }
 
 /// Collect app identities from all registered modules.

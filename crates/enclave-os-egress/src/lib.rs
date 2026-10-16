@@ -51,7 +51,7 @@
 //! finalize_and_run(&config, &sealed_cfg, ca);
 //! ```
 
-#![cfg_attr(test, feature(allocator_api))]
+#![cfg_attr(any(test, feature = "fallible-allocation-v1"), feature(allocator_api))]
 #![cfg_attr(all(test, feature = "fallible-allocation-v1"), feature(btreemap_alloc))]
 
 pub mod attestation;
@@ -111,14 +111,15 @@ pub use client::{
     locally_verify_sgx_peer_certificate, mozilla_root_store, register_enclave_attestation_provider,
     register_enclave_client_cert_signer, root_store_from_der,
     verify_webpki_client_certificate_chain_at, verify_webpki_server_certificate_chain_at,
-    BoundedHttpsRequest, ClientCertIdentity, EnclaveAttestationProvider, EnclaveClientCertSigner,
-    ExpectedOid, GlobalOcallNetIo, HttpResponse, HttpsBodyLimitsV1, HttpsFetchError,
-    HttpsFetchFailurePhase, IncrementalTlsClient, IncrementalTlsOutput, IncrementalTlsPlaintext,
-    InterruptibleBlockingNetIo, RaTlsPolicy, ReportDataBinding, ResourceBoundHttpsRequest,
-    SgxPeerCertificateEvidence, TeeType, TlsPeerCertificateChain, TlsPeerCertificateEvidence,
-    MAX_INCREMENTAL_PLAINTEXT, MAX_INCREMENTAL_REQUEST, MAX_INCREMENTAL_TLS_FRAGMENT,
-    MAX_INCREMENTAL_TLS_OUTPUT, MAX_REQUEST_BODY, MAX_REQUEST_HEADERS, MAX_REQUEST_HEADER_BYTES,
-    MAX_RESPONSE_BODY, MAX_RESPONSE_HEADERS, MAX_RESPONSE_HEADER_BYTES, MAX_TLS_PEER_CERTIFICATES,
+    BoundedHttpsRequest, ClientCertIdentity, ClientCredential, ClientCredentialError,
+    EnclaveAttestationProvider, EnclaveClientCertSigner, ExpectedOid, GlobalOcallNetIo,
+    HttpResponse, HttpsBodyLimitsV1, HttpsFetchError, HttpsFetchFailurePhase, IncrementalTlsClient,
+    IncrementalTlsOutput, IncrementalTlsPlaintext, InterruptibleBlockingNetIo, RaTlsPolicy,
+    ReportDataBinding, ResourceBoundHttpsRequest, SgxPeerCertificateEvidence, TeeType,
+    TlsPeerCertificateChain, TlsPeerCertificateEvidence, MAX_INCREMENTAL_PLAINTEXT,
+    MAX_INCREMENTAL_REQUEST, MAX_INCREMENTAL_TLS_FRAGMENT, MAX_INCREMENTAL_TLS_OUTPUT,
+    MAX_REQUEST_BODY, MAX_REQUEST_HEADERS, MAX_REQUEST_HEADER_BYTES, MAX_RESPONSE_BODY,
+    MAX_RESPONSE_HEADERS, MAX_RESPONSE_HEADER_BYTES, MAX_TLS_PEER_CERTIFICATES,
     MAX_TLS_PEER_CERTIFICATE_BYTES, MAX_TLS_PEER_CHAIN_BYTES, OID_ATTESTATION_SERVERS_HASH,
     OID_CONFIG_MERKLE_ROOT, OID_EGRESS_CA_HASH, OID_WASM_APPS_HASH,
 };
@@ -131,7 +132,7 @@ use rustls::pki_types::{pem::PemObject, CertificateDer};
 pub use rustls::RootCertStore;
 
 use enclave_os_common::modules::ConfigLeaf;
-use enclave_os_common::modules::{EnclaveModule, ModuleOid, RequestContext};
+use enclave_os_common::modules::{EnclaveModule, RequestContext};
 use enclave_os_common::protocol::{Request, Response};
 
 /// OID for the egress CA bundle hash — imported from common.
@@ -231,14 +232,13 @@ impl EnclaveModule for EgressModule {
         }]
     }
 
-    fn custom_oids(&self) -> Vec<ModuleOid> {
-        let mut oids = Vec::new();
+    fn custom_oids(
+        &self,
+        visit: &mut dyn FnMut(&'static [u64], &[u8]) -> Result<(), ()>,
+    ) -> Result<(), ()> {
         if let Some(hash) = self.ca_hash {
-            oids.push(ModuleOid {
-                oid: EGRESS_CA_HASH_OID,
-                value: hash.to_vec(),
-            });
+            visit(EGRESS_CA_HASH_OID, &hash)?;
         }
-        oids
+        Ok(())
     }
 }

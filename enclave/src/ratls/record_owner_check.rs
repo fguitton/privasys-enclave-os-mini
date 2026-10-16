@@ -23,10 +23,7 @@ pub(super) fn check_record_wire(
     #[cfg(feature = "fallible-allocation-v1")]
     let encrypted = {
         use rustls::crypto::cipher::PrefixedPayload;
-        #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
         let short_allocator = allocator.clone();
-        #[cfg(not(any(target_env = "sgx", target_vendor = "teaclave")))]
-        let short_allocator = allocator;
         let short = PrefixedPayload::try_with_capacity_in(0, short_allocator).unwrap();
         assert!(matches!(
             enc.encrypt(message(), seq, short),

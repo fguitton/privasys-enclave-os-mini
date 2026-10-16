@@ -67,6 +67,8 @@ pub struct IncrementalTlsClient {
     exchange: Option<AttestationExchange>,
     appraisal_pending: bool,
     failed: bool,
+    // Drop after connection, exchange and private identity aliases.
+    _retained_config: super::RetainedClientConfig,
 }
 
 impl IncrementalTlsClient {
@@ -92,15 +94,28 @@ impl IncrementalTlsClient {
             return Err("incremental TLS requires separately pumped quote appraisal".to_string());
         }
         require_connection_origin(pool.as_ref())?;
-        let (config, identity) =
-            build_client_config(root_store, ratls.as_ref()).map_err(str::to_string)?;
-        let server_name = ServerName::try_from(server_name.to_string())
-            .map_err(|_| "invalid incremental TLS server name".to_string())?;
-        let mut tls_conn = start_client_connection(config, server_name, pool.as_ref())?;
+        let retained_config =
+            build_client_config(server_name, root_store, ratls.as_ref(), pool.as_ref())
+                .map_err(str::to_string)?;
+        let identity = retained_config.identity().cloned();
+        let server_name =
+            retained_config
+                .server_name(server_name)
+                .map_err(|error| match error {
+                    super::config::NameError::Allocation => {
+                        "TLS config allocation refused".to_string()
+                    }
+                    super::config::NameError::Invalid => {
+                        "invalid incremental TLS server name".to_string()
+                    }
+                })?;
+        let mut tls_conn =
+            start_client_connection(retained_config.config(), server_name, pool.as_ref())?;
         // Rustls's smaller default plaintext buffer would otherwise undercut
         // the explicit request bound below. Keep the queue finite and aligned
         // with the public incremental-client contract.
         tls_conn.set_buffer_limit(Some(MAX_INCREMENTAL_REQUEST));
+        retained_config.publish();
         Ok(Self {
             tls_conn,
             ratls,
@@ -112,6 +127,7 @@ impl IncrementalTlsClient {
             exchange: None,
             failed: false,
             appraisal_pending: false,
+            _retained_config: retained_config,
         })
     }
 
@@ -123,12 +139,25 @@ impl IncrementalTlsClient {
         pool: Option<std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
     ) -> Result<Self, String> {
         require_connection_origin(pool.as_ref())?;
-        let (config, identity) = build_attested_client_config(&policy).map_err(str::to_string)?;
+        let retained_config = build_attested_client_config(server_name, &policy, pool.as_ref())
+            .map_err(str::to_string)?;
+        let identity = retained_config.identity().cloned();
         let appraisal_pending = !policy.attestation_servers.is_empty();
-        let server_name = ServerName::try_from(server_name.to_string())
-            .map_err(|_| "invalid incremental TLS server name".to_string())?;
-        let mut tls_conn = start_client_connection(config, server_name, pool.as_ref())?;
+        let server_name =
+            retained_config
+                .server_name(server_name)
+                .map_err(|error| match error {
+                    super::config::NameError::Allocation => {
+                        "TLS config allocation refused".to_string()
+                    }
+                    super::config::NameError::Invalid => {
+                        "invalid incremental TLS server name".to_string()
+                    }
+                })?;
+        let mut tls_conn =
+            start_client_connection(retained_config.config(), server_name, pool.as_ref())?;
         tls_conn.set_buffer_limit(Some(MAX_INCREMENTAL_REQUEST));
+        retained_config.publish();
         Ok(Self {
             tls_conn,
             ratls: Some(policy),
@@ -140,6 +169,7 @@ impl IncrementalTlsClient {
             exchange: None,
             failed: false,
             appraisal_pending,
+            _retained_config: retained_config,
         })
     }
 

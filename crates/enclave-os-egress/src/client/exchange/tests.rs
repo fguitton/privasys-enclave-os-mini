@@ -61,8 +61,23 @@ impl Identity {
 }
 
 impl EnclaveClientCertSigner for Identity {
-    fn identity(&self, _: &ClientCertIdentity, _: u64) -> Option<(Vec<Vec<u8>>, Vec<u8>)> {
-        Some((vec![self.cert.clone()], self.key.clone()))
+    fn identity(
+        &self,
+        _: &ClientCertIdentity,
+        _: u64,
+        pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
+    ) -> Result<Option<crate::client::ClientCredential>, crate::client::ClientCredentialError> {
+        let native_pool;
+        let pool = if let Some(pool) = pool {
+            pool
+        } else {
+            native_pool = enclave_os_common::allocation::AllocationPoolV1::new(
+                crate::client::ClientCredential::required_pool_bytes(&[&self.cert], &self.key)
+                    .ok_or(crate::client::ClientCredentialError::Allocation)?,
+            );
+            &native_pool
+        };
+        crate::client::ClientCredential::new(pool, &[&self.cert], &self.key).map(Some)
     }
     fn evidence(&self, data: &[u8; 64]) -> Option<Vec<u8>> {
         Some(quote(data))

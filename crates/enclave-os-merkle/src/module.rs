@@ -34,7 +34,7 @@
 use std::sync::Mutex;
 
 use enclave_os_common::hex::{hex_decode, hex_encode};
-use enclave_os_common::modules::{ConfigLeaf, EnclaveModule, ModuleOid, RequestContext};
+use enclave_os_common::modules::{ConfigLeaf, EnclaveModule, RequestContext};
 use enclave_os_common::oids::MERKLE_STATE_ROOT_OID;
 use enclave_os_common::protocol::{Request, Response};
 use enclave_os_common::types::AEAD_KEY_SIZE;
@@ -297,15 +297,16 @@ impl<B: KvBackend + Send> EnclaveModule for MerkleModule<B> {
         }]
     }
 
-    fn custom_oids(&self) -> Vec<ModuleOid> {
+    fn custom_oids(
+        &self,
+        visit: &mut dyn FnMut(&'static [u64], &[u8]) -> Result<(), ()>,
+    ) -> Result<(), ()> {
         let store = self.store.lock().expect("merkle store lock poisoned");
         let (root, version) = store.root();
-        let mut value = Vec::with_capacity(40);
-        value.extend_from_slice(&root);
-        value.extend_from_slice(&version.to_be_bytes());
-        vec![ModuleOid {
-            oid: MERKLE_STATE_ROOT_OID,
-            value,
-        }]
+        let mut value = [0u8; core::mem::size_of::<crate::Hash>() + core::mem::size_of::<u64>()];
+        let (root_bytes, version_bytes) = value.split_at_mut(root.len());
+        root_bytes.copy_from_slice(&root);
+        version_bytes.copy_from_slice(&version.to_be_bytes());
+        visit(MERKLE_STATE_ROOT_OID, &value)
     }
 }
