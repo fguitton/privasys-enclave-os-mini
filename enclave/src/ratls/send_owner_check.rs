@@ -137,7 +137,7 @@ fn record_checks(pool: &Arc<AllocationPoolV1>) {
     let pending = probe.pending().unwrap().to_vec();
     let short = probe.close(&mut []);
     let Err(rustls::unbuffered::EncryptError::InsufficientSize(required)) = short else {
-        panic!("exact short-close refusal")
+        core::panic!("exact short-close refusal")
     };
     assert_eq!(probe.snapshot(), snapshot);
     assert_eq!(chunks(&probe), old);
@@ -247,7 +247,7 @@ fn record_checks(pool: &Arc<AllocationPoolV1>) {
         let Err(rustls::unbuffered::EncryptError::InsufficientSize(required)) =
             probe.write(b"x", &mut [])
         else {
-            panic!("TLS12 close size refusal")
+            core::panic!("TLS12 close size refusal")
         };
         assert_eq!(probe.snapshot(), snapshot);
         let mut output = vec![0; required.required_size];

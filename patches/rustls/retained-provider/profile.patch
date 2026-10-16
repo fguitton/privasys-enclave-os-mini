@@ -8254,7 +8254,7 @@
  use crate::client::ClientConnectionData;
  use crate::msgs::deframer::buffers::DeframerSliceBuffer;
  use crate::server::ServerConnectionData;
-+use crate::Error;
++use crate::{Error, RetainedAllocator};
  
  impl UnbufferedConnectionCommon<ClientConnectionData> {
      /// Processes the TLS records in `incoming_tls` buffer until a new [`UnbufferedStatus`] is
@@ -8375,7 +8375,7 @@
      }
  
      /// Encrypts a close_notify warning alert in `outgoing_tls`
-@@ -479,7 +439,7 @@
+@@ -479,18 +439,21 @@
      ///
      /// [`ConnectionCommon::refresh_traffic_keys()`]: crate::ConnectionCommon::refresh_traffic_keys
      pub fn refresh_traffic_keys(self) -> Result<(), Error> {
@@ -8384,7 +8384,23 @@
      }
  }
  
-@@ -537,12 +497,7 @@
+ /// A handshake record must be encoded
+ pub struct EncodeTlsData<'c, Data> {
+     conn: &'c mut UnbufferedConnectionCommon<Data>,
+-    chunk: Option<Vec<u8>>,
++    chunk: Option<Vec<u8, RetainedAllocator>>,
+ }
+ 
+ impl<'c, Data> EncodeTlsData<'c, Data> {
+-    fn new(conn: &'c mut UnbufferedConnectionCommon<Data>, chunk: Vec<u8>) -> Self {
++    fn new(
++        conn: &'c mut UnbufferedConnectionCommon<Data>,
++        chunk: Vec<u8, RetainedAllocator>,
++    ) -> Self {
+         Self {
+             conn,
+             chunk: Some(chunk),
+@@ -537,12 +500,7 @@
      ///
      /// If allowed at this stage of the handshake process
      pub fn may_encrypt_app_data(&mut self) -> Option<WriteTraffic<'_, Data>> {
@@ -8398,7 +8414,7 @@
              Some(WriteTraffic { conn: self.conn })
          } else {
              None
-@@ -589,6 +544,15 @@
+@@ -589,6 +547,15 @@
  
      /// Encrypter has been exhausted
      EncryptExhausted,
@@ -8414,7 +8430,7 @@
  }
  
  impl From<InsufficientSizeError> for EncryptError {
-@@ -605,6 +569,7 @@
+@@ -605,6 +572,7 @@
                  "cannot encrypt due to insufficient size, {required_size} bytes are required"
              ),
              Self::EncryptExhausted => f.write_str("encrypter has been exhausted"),
@@ -16644,7 +16660,42 @@
          }
      }
  
-@@ -987,9 +995,7 @@
+@@ -909,11 +917,11 @@
+     ///
+     /// When [`Acceptor::accept()`] returns an error, it yields an `AcceptedAlert` such that the
+     /// application can communicate failure to the client via [`AcceptedAlert::write()`].
+-    pub struct AcceptedAlert(ChunkVecBuffer);
++    pub struct AcceptedAlert(Option<ChunkVecBuffer<crate::RetainedAllocator>>);
+ 
+     impl AcceptedAlert {
+         pub(super) fn empty() -> Self {
+-            Self(ChunkVecBuffer::new(None))
++            Self(None)
+         }
+ 
+         /// Send the alert to the client.
+@@ -921,7 +929,10 @@
+         /// To account for short writes this function should be called repeatedly until it
+         /// returns `Ok(0)` or an error.
+         pub fn write(&mut self, wr: &mut dyn io::Write) -> Result<usize, io::Error> {
+-            self.0.write_to(wr)
++            match self.0.as_mut() {
++                Some(queue) => queue.write_to(wr),
++                None => Ok(0),
++            }
+         }
+ 
+         /// Send the alert to the client.
+@@ -935,7 +946,7 @@
+ 
+     impl From<ConnectionCommon<ServerConnectionData>> for AcceptedAlert {
+         fn from(conn: ConnectionCommon<ServerConnectionData>) -> Self {
+-            Self(conn.core.common_state.sendable_tls)
++            Self(Some(conn.core.common_state.sendable_tls))
+         }
+     }
+ 
+@@ -987,9 +998,7 @@
      pub fn dangerous_into_kernel_connection(
          self,
      ) -> Result<(ExtractedSecrets, KernelConnection<ServerConnectionData>), Error> {
@@ -16655,7 +16706,7 @@
      }
  }
  
-@@ -1033,17 +1039,11 @@
+@@ -1033,17 +1042,11 @@
          let ch = ClientHello {
              server_name: &self.connection.core.data.sni,
              signature_schemes: &self.sig_schemes,
@@ -16677,7 +16728,7 @@
              named_groups: payload.named_groups.as_deref(),
          };
  
-@@ -1072,7 +1072,11 @@
+@@ -1072,7 +1075,11 @@
  
          self.connection.enable_secret_extraction = config.enable_secret_extraction;
  
@@ -16690,7 +16741,7 @@
          let mut cx = hs::ServerContext::from(&mut self.connection);
  
          let ch = Self::client_hello_payload(&self.message);
-@@ -1101,27 +1105,6 @@
+@@ -1101,27 +1108,6 @@
  impl Debug for Accepted {
      fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
          f.debug_struct("Accepted").finish()
@@ -16718,7 +16769,7 @@
      }
  }
  
-@@ -1228,7 +1211,10 @@
+@@ -1228,7 +1214,10 @@
          common.enable_secret_extraction = config.enable_secret_extraction;
          common.fips = config.fips();
          Ok(Self::new(

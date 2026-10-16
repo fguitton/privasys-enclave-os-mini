@@ -2,7 +2,7 @@
   "schema": 1,
   "profile": "retained-provider",
   "routing": "build-owned Cargo paths override; same package manifests, lock and dependency graph",
-  "patch_sha256": "1d913b010b8c7dc85f315fb7699fc9b606eb5c6cf11b45faaf535e3a604957f5",
+  "patch_sha256": "fabbfe44f865b2de9d93c211e947431d77ea92f3e91733e83ea95e8129f35c8d",
   "suppliers": [
     {
       "package": "rustls",
@@ -73,7 +73,7 @@
         {
           "path": "src/conn/unbuffered.rs",
           "before_sha256": "d971c9c046b03e6a2147ab6f99635cf5272083d7c677d257403d7d40c887447f",
-          "after_sha256": "174f6fd0b16c476c10d98993e4c72a96c6f60c0178aafa75ae58524d0b8df49c"
+          "after_sha256": "e2d6254e25d2b3e1e890ccf047d27ed5b9cef9aba73d8dce40b7d8afa99715cc"
         },
         {
           "path": "src/crypto/aws_lc_rs/sign.rs",
@@ -251,7 +251,7 @@
         {
           "path": "src/server/server_conn.rs",
           "before_sha256": "603cddb8a3a415737b7e047deedd32a2a6e4f918c2372af0bfb50ebb04de2163",
-          "after_sha256": "facbb0180a9d21e6908b34407e16dfc71ac6950a4988b2676c9070ad05536496"
+          "after_sha256": "2a877cd2cbc1ef2ba9b12ddbd50502a941347a0a6eea96bcdbab4c4bbaeda8d7"
         },
         {
           "path": "src/server/tls12.rs",
