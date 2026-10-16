@@ -164,6 +164,9 @@ endfunction()
 #     feature vocabulary without inheriting Mini's `default-ecall` feature.
 #     When empty, default features are used.
 # ---------------------------------------------------------------------------
+set(RUST_REQUEST_JSON_CARGO_SCRIPT
+    "${CMAKE_CURRENT_LIST_DIR}/../scripts/run-request-json-cargo.py")
+
 function(rust_build_enclave CRATE_DIR OUTPUT_NAME FEATURES)
     set(_FEATURES "${FEATURES}")
 
@@ -220,7 +223,12 @@ function(rust_build_enclave CRATE_DIR OUTPUT_NAME FEATURES)
             "CC=${CMAKE_C_COMPILER}"
             "CXX=${CMAKE_CXX_COMPILER}"
             "RUSTFLAGS=${_ENCLAVE_RUSTFLAGS}"
-            ${CARGO_EXECUTABLE} build
+            "${RUST_HOST_CONTRACT_PYTHON}" -B
+                "${RUST_REQUEST_JSON_CARGO_SCRIPT}"
+                --cargo "${CARGO_EXECUTABLE}"
+                --manifest-path "${CRATE_DIR}/Cargo.toml"
+                --build-root "${_ENCLAVE_TARGET_DIR}/request-json-source"
+                -- build
                 ${CARGO_ENCLAVE_BUILD_TYPE}
                 -Zjson-target-spec
                 --locked

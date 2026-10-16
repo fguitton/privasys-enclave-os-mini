@@ -81,6 +81,9 @@ impl AttestationMode {
 
 /// Resource-aware inbound visitor for this same message field model.
 pub mod request;
+#[cfg(all(test, feature = "request-json-tests"))]
+#[path = "attest/request_tests.rs"]
+mod request_tests;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AttestRequest<T = String> {

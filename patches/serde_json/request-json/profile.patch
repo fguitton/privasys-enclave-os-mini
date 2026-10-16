@@ -1,0 +1,220 @@
+--- a/src/de.rs
++++ b/src/de.rs
+@@ -88,6 +88,47 @@
+     /// Creates a JSON deserializer from a `&[u8]`.
+     pub fn from_slice(bytes: &'a [u8]) -> Self {
+         Deserializer::new(read::SliceRead::new(bytes))
++    }
++
++    /// Scratch backing sufficient for a single immutable input slice.
++    ///
++    /// The slice string decoder copies at most the consumed source bytes; its
++    /// UTF-8 emitter may reserve one full codepoint before writing fewer bytes.
++    /// Ignored-container nesting stores at most one byte per input delimiter.
++    /// This covers parser scratch only, not visitor values or Error storage.
++
++    pub fn slice_scratch_capacity(input_bytes: usize) -> Option<usize> {
++        input_bytes.checked_add(read::UTF8_CODEPOINT_BYTES)
++    }
++
++    /// Use already owned scratch backing for the original slice parser.
++    ///
++    /// Returns the input backing unchanged if it cannot cover the complete
++    /// slice. The caller must admit its actual allocation before constructing
++    /// it. Existing visitor, recursion, error and string decoding semantics
++    /// are unchanged; their independent allocations are not paid by this API.
++
++    pub fn from_slice_with_scratch(
++        bytes: &'a [u8],
++        mut scratch: Vec<u8>,
++    ) -> core::result::Result<Self, Vec<u8>> {
++        let enough = Self::slice_scratch_capacity(bytes.len())
++            .map_or(false, |needed| scratch.capacity() >= needed);
++        if !enough {
++            return Err(scratch);
++        }
++        scratch.clear();
++        let mut deserializer = Self::from_slice(bytes);
++        deserializer.scratch = scratch;
++        Ok(deserializer)
++    }
++
++    /// Recover the scratch allocation after finishing the original parser.
++    ///
++    /// Any visitor-owned result remains independent of this temporary storage.
++
++    pub fn into_scratch(self) -> Vec<u8> {
++        self.scratch
+     }
+ }
+ 
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -15,10 +15,9 @@
+ /// This type represents all possible errors that can occur when serializing or
+ /// deserializing JSON data.
+ pub struct Error {
+-    /// This `Box` allows us to keep the size of `Error` as small as possible. A
+-    /// larger `Error` type was substantially slower due to all the functions
+-    /// that pass around `Result<T, Error>`.
+-    err: Box<ErrorImpl>,
++    /// Inline syntax error metadata; dynamic custom-message/IO children remain
++    /// independently owned by their actual producers.
++    err: ErrorImpl,
+ }
+ 
+ /// Alias for a `Result` with the error type `serde_json::Error`.
+@@ -314,7 +313,7 @@
+     #[cold]
+     pub(crate) fn syntax(code: ErrorCode, line: usize, column: usize) -> Self {
+         Error {
+-            err: Box::new(ErrorImpl { code, line, column }),
++            err: ErrorImpl { code, line, column },
+         }
+     }
+ 
+@@ -325,11 +324,11 @@
+     #[cold]
+     pub fn io(error: io::Error) -> Self {
+         Error {
+-            err: Box::new(ErrorImpl {
++            err: ErrorImpl {
+                 code: ErrorCode::Io(error),
+                 line: 0,
+                 column: 0,
+-            }),
++            },
+         }
+     }
+ 
+@@ -398,7 +397,7 @@
+ 
+ impl Display for Error {
+     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+-        Display::fmt(&*self.err, f)
++        Display::fmt(&self.err, f)
+     }
+ }
+ 
+@@ -483,11 +482,11 @@
+ fn make_error(mut msg: String) -> Error {
+     let (line, column) = parse_line_col(&mut msg).unwrap_or((0, 0));
+     Error {
+-        err: Box::new(ErrorImpl {
++        err: ErrorImpl {
+             code: ErrorCode::Message(msg.into_boxed_str()),
+             line,
+             column,
+-        }),
++        },
+     }
+ }
+ 
+--- a/src/read.rs
++++ b/src/read.rs
+@@ -4,6 +4,9 @@
+ use core::mem;
+ use core::ops::Deref;
+ use core::str;
++
++/// Maximum complete scalar emitted by the actual WTF-8 scratch writer.
++pub(crate) const UTF8_CODEPOINT_BYTES: usize = char::MAX.len_utf8();
+ 
+ #[cfg(feature = "std")]
+ use crate::io;
+@@ -981,7 +984,7 @@
+         return;
+     }
+ 
+-    scratch.reserve(4);
++    scratch.reserve(UTF8_CODEPOINT_BYTES);
+ 
+     // SAFETY: After the `reserve` call, `scratch` has at least 4 bytes of
+     // allocated but uninitialized memory after its last initialized byte, which
+@@ -1009,7 +1012,7 @@
+                     .write(((n >> 12) & 0b0011_1111) as u8 | 0b1000_0000);
+                 ptr.add(2)
+                     .write(((n >> 6) & 0b0011_1111) as u8 | 0b1000_0000);
+-                4
++                UTF8_CODEPOINT_BYTES
+             }
+             0x11_0000.. => unreachable!(),
+         };
+--- a/tests/test.rs
++++ b/tests/test.rs
+@@ -596,6 +596,25 @@
+     assert_eq!(E::N(0), E::deserialize(Number::from(0)).unwrap());
+ }
+ 
++// Same original parser and Error values, with only scratch ownership supplied.
++
++fn from_slice_preallocated<T: de::DeserializeOwned>(input: &[u8]) -> serde_json::Result<T> {
++    let capacity = Deserializer::slice_scratch_capacity(input.len()).unwrap();
++    let mut scratch = Vec::new();
++    scratch.try_reserve_exact(capacity).unwrap();
++    let pointer = scratch.as_ptr();
++    let actual_capacity = scratch.capacity();
++    let mut parser = match Deserializer::from_slice_with_scratch(input, scratch) {
++        Ok(parser) => parser,
++        Err(_) => panic!("complete caller backing refused"),
++    };
++    let result = T::deserialize(&mut parser).and_then(|value| parser.end().map(|()| value));
++    let scratch = parser.into_scratch();
++    assert_eq!(scratch.capacity(), actual_capacity);
++    assert_eq!(scratch.as_ptr(), pointer, "parser scratch reallocated");
++    result
++}
++
+ fn test_parse_ok<T>(tests: Vec<(&str, T)>)
+ where
+     T: Clone + Debug + PartialEq + ser::Serialize + de::DeserializeOwned,
+@@ -606,6 +625,8 @@
+ 
+         let v: T = from_slice(s.as_bytes()).unwrap();
+         assert_eq!(v, value.clone());
++
++        assert_eq!(from_slice_preallocated::<T>(s.as_bytes()).unwrap(), value);
+ 
+         // Make sure we can deserialize into a `Value`.
+         let json_value: Value = from_str(s).unwrap();
+@@ -652,6 +673,9 @@
+ 
+         let v: T = from_slice(s.as_bytes()).unwrap();
+         assert_eq!(v, value.clone());
++
++        assert_eq!(from_slice_preallocated::<T>(s.as_bytes()).unwrap(), value);
++
+     }
+ }
+ 
+@@ -669,6 +693,8 @@
+     for &(s, err) in errors {
+         test_parse_err!(from_str::<T>(s) => err);
+         test_parse_err!(from_slice::<T>(s.as_bytes()) => err);
++
++        test_parse_err!(from_slice_preallocated::<T>(s.as_bytes()) => err);
+     }
+ }
+ 
+@@ -678,6 +704,8 @@
+ {
+     for &(s, err) in errors {
+         test_parse_err!(from_slice::<T>(s) => err);
++
++        test_parse_err!(from_slice_preallocated::<T>(s) => err);
+     }
+ }
+ 
+@@ -1065,6 +1093,12 @@
+ 
+ #[test]
+ fn test_parse_string() {
++
++    {
++        assert_eq!(Deserializer::slice_scratch_capacity(usize::MAX), None);
++        assert!(Deserializer::from_slice_with_scratch(b"\"x\"", Vec::new()).is_err());
++    }
++
+     test_parse_err::<String>(&[
+         ("\"", "EOF while parsing a string at line 1 column 1"),
+         ("\"lol", "EOF while parsing a string at line 1 column 4"),

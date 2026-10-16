@@ -11,6 +11,8 @@ description = "Shared types and protocol definitions for enclave-os-mini"
 [features]
 # Explicit new-SDK loan API; native/default allocator behavior stays unchanged.
 fallible-allocation-v1 = []
+# Native admission proofs require the verified build-owned request JSON source.
+request-json-tests = ["crypto", "serde_json/std"]
 default = ["std"]
 std = []
 # Mutable attestation endpoints/tokens require real runtime synchronization.
@@ -38,4 +40,4 @@ ring = "0.17"
 base64 = "0.21"
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_vendor, values("teaclave"))'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_vendor, values("teaclave"))', 'cfg(feature, values("mock", "sgx-sim-attestation"))'] }

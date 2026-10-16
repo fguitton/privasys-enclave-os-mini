@@ -9,5 +9,6 @@
 pub mod attestation;
 pub mod cert_store;
 mod client_auth;
+mod request_json;
 pub mod server;
 pub mod session;

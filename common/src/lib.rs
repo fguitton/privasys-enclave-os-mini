@@ -21,8 +21,6 @@ extern crate std;
 #[cfg(test)]
 extern crate self as enclave_os_common;
 pub mod allocation;
-/// Admitted request parser backing and escaped-text ownership.
-pub mod request_json;
 pub mod channel;
 pub mod core_phase;
 pub mod dependencies;
@@ -31,6 +29,8 @@ pub mod modules;
 pub mod ocall;
 pub mod oids;
 pub mod protocol;
+/// Admitted request parser backing and escaped-text ownership.
+pub mod request_json;
 /// Versioned byte geometry only; never source or caller authority.
 pub mod source_upload_wire_v1 {
     include!(concat!(env!("OUT_DIR"), "/source_upload_wire_v1.rs"));

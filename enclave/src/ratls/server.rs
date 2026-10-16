@@ -2981,8 +2981,7 @@ impl IngressServer {
         http_req: &enclave_os_common::protocol::HttpRequest,
     ) -> HttpHandleResult {
         use enclave_os_common::attest::{
-            self as at, AttestRequest, CONTEXT_LEN, EXPORTER_LABEL_CLIENT, EXPORTER_LABEL_SERVER,
-            PROTOCOL_VERSION,
+            self as at, CONTEXT_LEN, EXPORTER_LABEL_CLIENT, EXPORTER_LABEL_SERVER, PROTOCOL_VERSION,
         };
         use enclave_os_common::protocol::HttpMethod;
 
@@ -2997,16 +2996,22 @@ impl IngressServer {
         if http_req.body.len() > at::MAX_MESSAGE {
             return HttpHandleResult::err(413, "attestation request too large");
         }
-        let req: AttestRequest = match serde_json::from_slice(&http_req.body) {
-            Ok(r) => r,
-            Err(_) => return HttpHandleResult::err(400, "malformed attest request"),
+        let Some(decode_pool) = crate::local_allocation_pool() else {
+            return HttpHandleResult::err(503, "attestation decoding unavailable");
+        };
+        use enclave_os_common::request_json::Refusal as JsonRefusal;
+        let req = match super::request_json::attest(&decode_pool, &http_req.body) {
+            Ok(request) => request,
+            Err(JsonRefusal::Malformed) => {
+                return HttpHandleResult::err(400, "malformed attest request")
+            }
+            Err(JsonRefusal::Unavailable) => {
+                return HttpHandleResult::err(503, "attestation decoding unavailable")
+            }
         };
         if req.v != PROTOCOL_VERSION {
             return HttpHandleResult::err(400, "unsupported protocol version");
         }
-        let Some(decode_pool) = crate::local_allocation_pool() else {
-            return HttpHandleResult::err(503, "attestation decoding unavailable");
-        };
         use super::session::decoded_attest::{Decoded, Refusal};
         let decode = |value: &str| Decoded::new(&decode_pool, value);
         let now = ocall::get_current_time().unwrap_or(0);
@@ -3056,7 +3061,7 @@ impl IngressServer {
                 }
                 let mut context = None;
                 let mut exporter = None;
-                let (quote, quote_time) = if req.mode == "deterministic" {
+                let (quote, quote_time) = if req.mode.as_str() == "deterministic" {
                     match self.deterministic_quote(&key, now) {
                         Ok(v) => v,
                         Err(e) => {
@@ -3121,7 +3126,7 @@ impl IngressServer {
                 ) else {
                     return HttpHandleResult::err(503, "evidence storage unavailable");
                 };
-                session.set_attestation(if req.mode == "deterministic" {
+                session.set_attestation(if req.mode.as_str() == "deterministic" {
                     "deterministic"
                 } else {
                     "challenge"

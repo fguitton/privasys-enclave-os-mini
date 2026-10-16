@@ -1,0 +1,65 @@
+{
+  "schema": 1,
+  "profile": "request-json",
+  "patch_sha256": "02a1eb717229cb6aa010301e997191a44ae46e9019d65b17e72acb2c2fbcea64",
+  "suppliers": [
+    {
+      "package": "serde_json",
+      "version": "1.0.149",
+      "base_package_checksum": "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86",
+      "base_checksum_manifest_sha256": "5e4227df532656c6d7f63b2912f5d27cdfd16a32e1185ff8a80da0d46e68b658",
+      "files": [
+        {
+          "path": "src/de.rs",
+          "before_sha256": "2364aaa767bb40eeedd4aa24e3bf917be5e007a00bd3d911b61f9de74aa5f074",
+          "after_sha256": "a0f385e37cf0ae361a598af4b8349414439562ed272aeb2f4638d25820587227"
+        },
+        {
+          "path": "src/error.rs",
+          "before_sha256": "a13add05a63adf53d89e37effa03221d897a60486cfe360a5a958c0dd2a7e90d",
+          "after_sha256": "f069c03cfdd4913ac33a12760da03bc765cb15f9afc3f4ff5d9a7efe4f8b5c69"
+        },
+        {
+          "path": "src/read.rs",
+          "before_sha256": "17a2efe49e5a6937c8d7d4a5c0b9eac84453de0f86bf8e7ee421387e82341bb3",
+          "after_sha256": "cd305e10ea44cf6f5d9e077358b1170bf8357c61c028dfe2e9d73ece33eff4e3"
+        },
+        {
+          "path": "tests/test.rs",
+          "before_sha256": "5c6e629525978c8fd190bdbbe3d62ff391bc8c8e86c143a0087b34ae2e7923e9",
+          "after_sha256": "ad0bf15bb52d21673e3e9ecc3926e47dd733045aeec173bb24a108af97c21c16"
+        }
+      ]
+    },
+    {
+      "package": "serde_json",
+      "version": "1.0.151",
+      "base_package_checksum": "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14",
+      "base_checksum_manifest_sha256": "9a55119e32d91e665abddabb56006cd3a0d3378f221d78d9cf6267266b420786",
+      "files": [
+        {
+          "path": "src/de.rs",
+          "before_sha256": "4998d7e252eb513be85b298e287048b4fb283882e9ba7df905f572f07200f3f3",
+          "after_sha256": "3f1ba46bd369c72c79c4d8bee5da77b97d96db99c7477e611e3317e9544f63dd"
+        },
+        {
+          "path": "src/error.rs",
+          "before_sha256": "a13add05a63adf53d89e37effa03221d897a60486cfe360a5a958c0dd2a7e90d",
+          "after_sha256": "f069c03cfdd4913ac33a12760da03bc765cb15f9afc3f4ff5d9a7efe4f8b5c69"
+        },
+        {
+          "path": "src/read.rs",
+          "before_sha256": "17a2efe49e5a6937c8d7d4a5c0b9eac84453de0f86bf8e7ee421387e82341bb3",
+          "after_sha256": "cd305e10ea44cf6f5d9e077358b1170bf8357c61c028dfe2e9d73ece33eff4e3"
+        },
+        {
+          "path": "tests/test.rs",
+          "before_sha256": "bfb44a3ff847299e7ae7b1801a47c273c7ae897f746d2bf2ac0a8d543143c494",
+          "after_sha256": "25a78ff7dfe5ec10c14247ddf4adf73f31603ed724bc9557be74b940b315a44b"
+        }
+      ]
+    }
+  ],
+  "routing": "Cargo paths override; original dependency/feature manifests and registry lock identity unchanged",
+  "scope": "Current Mini149 and Composition151 suppliers. Admitted scratch APIs and inline fixed ErrorImpl are unconditional in this generated source; custom Message/IO and visitor values remain separate owners. No vendor/checksum/lock edits."
+}
