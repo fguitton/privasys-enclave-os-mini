@@ -151,12 +151,24 @@ pub fn bounded_vec_capacity(required: usize, maximum: usize) -> Option<usize> {
 /// This contract tracks requested allocator layouts, not allocator-private metadata.
 /// Consumers must not substitute a copied pointer-count estimate.
 pub fn shared_allocation_bytes<T>() -> Option<usize> {
-    shared_allocation_bytes_for_layout(core::alloc::Layout::new::<T>())
+    shared_allocation_layout::<T>().map(|layout| layout.size())
+}
+
+/// Complete requested layout of the acquired ArcInner for one payload.
+/// All Arc consumers derive both size and alignment from this owner.
+pub fn shared_allocation_layout<T>() -> Option<core::alloc::Layout> {
+    shared_allocation_layout_for_payload(core::alloc::Layout::new::<T>())
 }
 
 /// Complete acquired ArcInner request for a concrete supplier payload layout.
 /// This uses the same header/padding owner as the typed form above.
 pub fn shared_allocation_bytes_for_layout(payload: core::alloc::Layout) -> Option<usize> {
+    shared_allocation_layout_for_payload(payload).map(|layout| layout.size())
+}
+
+fn shared_allocation_layout_for_payload(
+    payload: core::alloc::Layout,
+) -> Option<core::alloc::Layout> {
     #[repr(C, align(2))]
     struct Header {
         strong: AtomicUsize,
@@ -165,7 +177,7 @@ pub fn shared_allocation_bytes_for_layout(payload: core::alloc::Layout) -> Optio
     core::alloc::Layout::new::<Header>()
         .extend(payload)
         .ok()
-        .map(|(layout, _)| layout.pad_to_align().size())
+        .map(|(layout, _)| layout.pad_to_align())
 }
 
 /// Trusted local credit owner. Implementations retain their original admission

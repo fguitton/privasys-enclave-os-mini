@@ -51,6 +51,13 @@ impl PoolMapAllocator {
         self.origin.activate_release_notification();
     }
 
+    /// Current publication disposition of this same original allocator origin.
+    /// Independent metadata admissions use it only after their backing is freed.
+    #[must_use]
+    pub fn release_notification_active(&self) -> bool {
+        self.origin.published.load(Ordering::Acquire)
+    }
+
     /// Exact requested backend layout, including lease and alignment padding.
     /// # Errors
     /// Refuses header-plus-node geometry overflow before admission/allocation.
