@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import runpy
 import subprocess
@@ -14,6 +15,24 @@ GENERATOR = Path(__file__).with_name('prepare-request-json.py')
 def digest(path):
     with path.open('rb') as stream:
         return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def cargo_identity(cargo):
+    """Retain argv[0] dispatch while recording the executable behind the shim."""
+    if not cargo.is_absolute():
+        raise ValueError('Cargo invocation must be absolute')
+    resolved = cargo.resolve(strict=True)
+    if not resolved.is_file():
+        raise ValueError('Cargo executable is not a regular file')
+    links = []
+    current = cargo
+    while current.is_symlink():
+        target = os.readlink(current)
+        links.append({'path': str(current), 'target': target,
+                      'mode': current.lstat().st_mode & 0o777})
+        current = Path(os.path.abspath(current.parent / target))
+    return {'invoked_path': str(cargo), 'resolved_path': str(resolved),
+            'resolved_sha256': digest(resolved), 'symlinks': links}
 
 
 def metadata(cargo, manifest, selectors, config=None):
@@ -93,7 +112,7 @@ def verify_profile(source, destination, functions):
 def run(cargo, manifest, build_root, arguments):
     if not cargo.is_absolute() or not manifest.is_absolute() or not build_root.is_absolute():
         raise ValueError('build inputs must be absolute')
-    cargo = cargo.resolve(strict=True)
+    cargo_input = cargo_identity(cargo)
     manifest = manifest.resolve(strict=True)
     locate = subprocess.check_output([str(cargo), 'locate-project', '--workspace',
                                       '--manifest-path', str(manifest),
@@ -130,7 +149,9 @@ def run(cargo, manifest, build_root, arguments):
                   'profile_manifest_sha256': profile_hash,
                   'generated_receipt_sha256': digest(destination / 'request-json-source-receipt.json'),
                   'workspace_lock_sha256': lock_before, 'command': command,
-                  'cargo_sha256': digest(cargo), 'generator_sha256': digest(GENERATOR),
+                  'cargo': cargo_input, 'cargo_sha256': cargo_input['resolved_sha256'],
+                  'rustup_toolchain': os.environ.get('RUSTUP_TOOLCHAIN'),
+                  'generator_sha256': digest(GENERATOR),
                   'runner_sha256': digest(Path(__file__)),
                   'python': str(Path(sys.executable).resolve()),
                   'python_sha256': digest(Path(sys.executable).resolve()),
