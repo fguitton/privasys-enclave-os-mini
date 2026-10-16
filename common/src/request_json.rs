@@ -2,6 +2,10 @@
 //! The supplied parser must use the admitted scratch and an allocation-free
 //! syntax-error representation. This owner does not bless arbitrary parsers.
 pub(crate) mod fields;
+/// Original-pool sequence backing for parsed JSON arrays and typed lists.
+pub mod sequence;
+/// Parsed JSON values with admitted child backings.
+pub mod value;
 
 use crate::allocation::{AllocationLeaseV1, AllocationPoolV1};
 use alloc::{string::String, sync::Arc, vec::Vec};
@@ -131,5 +135,32 @@ fn publish(allocation: Option<&AllocationLeaseV1>) {
 impl AsRef<str> for Text<'_> {
     fn as_ref(&self) -> &str {
         self.as_str()
+    }
+}
+
+impl core::borrow::Borrow<str> for Text<'_> {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+impl PartialEq for Text<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+impl Eq for Text<'_> {}
+impl PartialOrd for Text<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Text<'_> {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+impl serde::Serialize for Text<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
     }
 }

@@ -2366,57 +2366,15 @@ fn handle_rpc_request(
         return HttpHandleResult::err(405, "POST required for /rpc/<app>/<function>");
     }
 
-    // Parse the request body as a JSON object (the named params).
-    let body_value: serde_json::Value = if http_req.body.is_empty() {
-        serde_json::Value::Object(serde_json::Map::new())
-    } else {
-        match serde_json::from_slice(&http_req.body) {
-            Ok(v) => v,
-            Err(e) => {
-                return HttpHandleResult::err(400, &format!("invalid JSON body: {e}"));
-            }
-        }
+    let Some(pool) = crate::local_allocation_pool() else {
+        return HttpHandleResult::err(503, "request resources unavailable");
     };
-
-    // Build app_auth from the body's "app_auth" field if present.
-    let app_auth = body_value
-        .get("app_auth")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    // Price consent (`x-privasys.price`). The runtime refuses a priced call
-    // unless this matches the measured price exactly, so it has to survive the
-    // hop from however the caller arrived: the `X-Billing-Approved` header
-    // (what a browser on a sealed session sends) wins, with a body field as the
-    // fallback for callers that cannot set headers. Without this the only way
-    // to approve a priced call was the control-plane proxy, which meant a
-    // direct or sealed caller 402'd with no way to consent.
-    let billing_approved = http_req.billing_approved.clone().or_else(|| {
-        body_value
-            .get("billing_approved")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    });
-
-    // Remove the transport-only fields so they don't pollute the params.
-    let params_body = if let serde_json::Value::Object(mut map) = body_value {
-        map.remove("app_auth");
-        map.remove("billing_approved");
-        serde_json::Value::Object(map)
-    } else {
-        body_value
+    let body = match super::request_json::rpc(&pool, &http_req.body, app_name, tail, http_req.billing_approved.as_deref()) {
+        Ok(body) => body,
+        Err(super::request_json::ValueError::Syntax(error)) => return HttpHandleResult::err(400, &format!("invalid JSON body: {error}")),
+        Err(super::request_json::ValueError::Refused(enclave_os_common::request_json::Refusal::Malformed)) => return HttpHandleResult::err(400, "invalid JSON body"),
+        Err(super::request_json::ValueError::Refused(enclave_os_common::request_json::Refusal::Unavailable)) => return HttpHandleResult::err(503, "request resources unavailable"),
     };
-
-    let envelope = serde_json::json!({
-        "connect_call": {
-            "app": app_name,
-            "function": tail,
-            "body": params_body,
-            "app_auth": app_auth,
-            "billing_approved": billing_approved,
-        }
-    });
-    let body = serde_json::to_vec(&envelope).unwrap_or_default();
     let req = Request::Data(body);
     dispatch_and_respond(req, &ctx)
 }
@@ -2523,38 +2481,15 @@ fn handle_mcp_tools_request(
         return HttpHandleResult::err(405, "POST required for /api/v1/mcp/tools/<function>");
     }
 
-    let body_value: serde_json::Value = if http_req.body.is_empty() {
-        serde_json::Value::Object(serde_json::Map::new())
-    } else {
-        match serde_json::from_slice(&http_req.body) {
-            Ok(v) => v,
-            Err(e) => {
-                return HttpHandleResult::err(400, &format!("invalid JSON body: {e}"));
-            }
-        }
+    let Some(pool) = crate::local_allocation_pool() else {
+        return HttpHandleResult::err(503, "request resources unavailable");
     };
-
-    // Allow an inline `app_auth` field on the body just like /rpc/.
-    let (params_body, app_auth) = match body_value {
-        serde_json::Value::Object(mut map) => {
-            let auth = map
-                .remove("app_auth")
-                .and_then(|v| v.as_str().map(|s| s.to_string()))
-                .or_else(|| http_req.app_auth.clone());
-            (serde_json::Value::Object(map), auth)
-        }
-        other => (other, http_req.app_auth.clone()),
+    let body = match super::request_json::mcp(&pool, &http_req.body, &app_from_host(http_req), fn_name, http_req.app_auth.as_deref()) {
+        Ok(body) => body,
+        Err(super::request_json::ValueError::Syntax(error)) => return HttpHandleResult::err(400, &format!("invalid JSON body: {error}")),
+        Err(super::request_json::ValueError::Refused(enclave_os_common::request_json::Refusal::Malformed)) => return HttpHandleResult::err(400, "invalid JSON body"),
+        Err(super::request_json::ValueError::Refused(enclave_os_common::request_json::Refusal::Unavailable)) => return HttpHandleResult::err(503, "request resources unavailable"),
     };
-
-    let envelope = serde_json::json!({
-        "connect_call": {
-            "app": app_from_host(http_req),
-            "function": fn_name,
-            "body": params_body,
-            "app_auth": app_auth,
-        }
-    });
-    let body = serde_json::to_vec(&envelope).unwrap_or_default();
     let result = dispatch_and_respond(Request::Data(body), &ctx);
     transform_mcp_call_response(result)
 }

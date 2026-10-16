@@ -411,4 +411,165 @@ mod tests {
             assert_eq!(pool.used(), 0);
         }
     }
+    #[test]
+    fn value_acceptance_numbers_unicode_sorted_keys_and_last_duplicate_match_original() {
+        for input in [
+            r#"null"#,
+            r#"true"#,
+            r#"false"#,
+            r#"0"#,
+            r#"-0"#,
+            r#"-1"#,
+            r#"1.25e-200"#,
+            r#"-9223372036854775808"#,
+            r#"18446744073709551615"#,
+            r#"18446744073709551616"#,
+            r#""日本😀""#,
+            r#""\uD834\uDD1E""#,
+            r#"{"z":1,"a":[true,null,"\u0061"],"z":2,"\u0061":{}}"#,
+            r#"[]"#,
+            r#"{}"#,
+            r#"[1,{}]"#,
+            r#"1e400"#,
+            r#"[1,]"#,
+            r#"{"x":}"#,
+            r#""\uD800""#,
+            r#"null []"#,
+        ] {
+            let pool = AllocationPoolV1::new(1 << 20).unwrap();
+            let original = serde_json::from_str::<serde_json::Value>(input);
+            let admitted = endpoint::value(&pool, input.as_bytes());
+            assert_eq!(original.is_ok(), admitted.is_ok(), "{input}");
+            if let (Ok(original), Ok(admitted)) = (original, admitted) {
+                assert_eq!(
+                    serde_json::to_vec(&original).unwrap(),
+                    serde_json::to_vec(&admitted).unwrap()
+                );
+            }
+            assert_eq!(pool.used(), 0);
+        }
+    }
+    #[test]
+    fn value_actual_array_map_and_escaped_children_keep_their_backings_paid() {
+        use enclave_os_common::request_json::{value::Value, Text};
+        let input = br#"["raw","\u0061",7]"#;
+        let scratch = serde_json::Deserializer::slice_scratch_capacity(input.len()).unwrap();
+        let item = core::mem::size_of::<Value<'_>>();
+        let pool = AllocationPoolV1::new(1 << 20).unwrap();
+        let (value, count) = measured(|| endpoint::value(&pool, input));
+        let value = value.unwrap();
+        assert_eq!(count, (5, scratch + item * (1 + 2 + 4) + 1));
+        assert_eq!(pool.used(), item * 4 + 1);
+        let values = value.as_array().unwrap();
+        assert_eq!(values[0].as_str(), Some("raw"));
+        assert_eq!(values[1].as_str(), Some("a"));
+        let bounds = input.as_ptr_range();
+        let raw = values[0].as_str().unwrap().as_ptr();
+        assert!(raw >= bounds.start && raw < bounds.end);
+        drop(value);
+        assert_eq!(pool.used(), 0);
+        let input = br#"{"raw":"borrowed","\u0065sc":"\u0061"}"#;
+        let scratch = serde_json::Deserializer::slice_scratch_capacity(input.len()).unwrap();
+        let entry = core::mem::size_of::<(Text<'_>, Value<'_>)>();
+        let (value, count) = measured(|| endpoint::value(&pool, input));
+        let value = value.unwrap();
+        assert_eq!(count, (5, scratch + entry * (1 + 2) + 4));
+        assert_eq!(pool.used(), entry * 2 + 4);
+        assert_eq!(value.get("esc").unwrap().as_str(), Some("a"));
+        assert_eq!(value.get("raw").unwrap().as_str(), Some("borrowed"));
+        drop(value);
+        assert_eq!(pool.used(), 0);
+    }
+    #[test]
+    fn value_growth_admits_both_live_buffers_before_allocation_and_refunds_refusal() {
+        use enclave_os_common::request_json::{value::Value, Text};
+        for (input, unit) in [
+            (
+                br#"[true,false]"#.as_slice(),
+                core::mem::size_of::<Value<'_>>(),
+            ),
+            (
+                br#"{"a":true,"b":false}"#,
+                core::mem::size_of::<(Text<'_>, Value<'_>)>(),
+            ),
+        ] {
+            let scratch = serde_json::Deserializer::slice_scratch_capacity(input.len()).unwrap();
+            for extra in [unit * 3 - 1, unit * 3] {
+                let pool = AllocationPoolV1::new(scratch + extra).unwrap();
+                let (value, count) = measured(|| endpoint::value(&pool, input));
+                if extra == unit * 3 {
+                    assert!(value.is_ok());
+                    assert_eq!(count, (3, scratch + unit * 3));
+                    assert_eq!(pool.used(), unit * 2);
+                } else {
+                    assert!(matches!(
+                        value,
+                        Err(endpoint::ValueError::Refused(Refusal::Unavailable))
+                    ));
+                    assert_eq!(count, (2, scratch + unit));
+                    assert_eq!(pool.used(), 0);
+                }
+                drop(value);
+                assert_eq!(pool.used(), 0);
+            }
+        }
+    }
+    #[test]
+    fn rpc_and_mcp_envelopes_preserve_transport_field_precedence_and_exact_bytes() {
+        for input in [
+            br#""#.as_slice(),
+            br#"null"#,
+            br#"[1,"x"]"#,
+            br#"{"x":"\u0061","app_auth":"body","billing_approved":"yes"}"#,
+            br#"{"app_auth":false,"billing_approved":7,"z":1,"a":2,"z":3}"#,
+        ] {
+            for header in [None, Some("header")] {
+                let pool = AllocationPoolV1::new(1 << 20).unwrap();
+                let parsed: serde_json::Value = if input.is_empty() {
+                    serde_json::json!({})
+                } else {
+                    serde_json::from_slice(input).unwrap()
+                };
+                let auth = parsed.get("app_auth").and_then(|v| v.as_str());
+                let billing =
+                    header.or_else(|| parsed.get("billing_approved").and_then(|v| v.as_str()));
+                let mut params = parsed.clone();
+                if let Some(object) = params.as_object_mut() {
+                    object.remove("app_auth");
+                    object.remove("billing_approved");
+                }
+                let expected = serde_json::to_vec(&serde_json::json!({"connect_call":{"app":"app","function":"call","body":params,"app_auth":auth,"billing_approved":billing}})).unwrap();
+                assert_eq!(
+                    endpoint::rpc(&pool, input, "app", "call", header).unwrap(),
+                    expected
+                );
+                assert_eq!(pool.used(), 0);
+                let mut params = parsed.clone();
+                if let Some(object) = params.as_object_mut() {
+                    object.remove("app_auth");
+                }
+                let expected = serde_json::to_vec(&serde_json::json!({"connect_call":{"app":"app","function":"call","body":params,"app_auth":auth.or(header)}})).unwrap();
+                assert_eq!(
+                    endpoint::mcp(&pool, input, "app", "call", header).unwrap(),
+                    expected
+                );
+                assert_eq!(pool.used(), 0);
+            }
+        }
+        let input = br#"{"x":]}"#;
+        let pool = AllocationPoolV1::new(1 << 20).unwrap();
+        let original = serde_json::from_slice::<serde_json::Value>(input).unwrap_err();
+        let error = endpoint::rpc(&pool, input, "app", "call", None).unwrap_err();
+        let endpoint::ValueError::Syntax(error) = error else {
+            panic!("syntax failure lost");
+        };
+        assert_eq!(error.to_string(), original.to_string());
+        assert_eq!(pool.used(), 0);
+        let pool = AllocationPoolV1::new(1).unwrap();
+        assert!(matches!(
+            endpoint::mcp(&pool, br#"{}"#, "app", "call", None),
+            Err(endpoint::ValueError::Refused(Refusal::Unavailable))
+        ));
+        assert_eq!(pool.used(), 0);
+    }
 }
