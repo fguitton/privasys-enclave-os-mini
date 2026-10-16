@@ -1668,10 +1668,8 @@ fn handle_http_request(
 
         // ── Readyz (monitoring+) ────────────────────────────────────
         (HttpMethod::Get, "/readyz") => {
-            if let Some(ctx) = require_monitoring(http_req, base_ctx) {
-                let _ = ctx; // auth passed
-            } else {
-                return monitoring_required_error(http_req);
+            if let Err(error) = require_monitoring(http_req, base_ctx) {
+                return error;
             }
             let module_count = modules::module_count();
             let status = if module_count > 0 {
@@ -1685,10 +1683,8 @@ fn handle_http_request(
 
         // ── Status (monitoring+) ────────────────────────────────────
         (HttpMethod::Get, "/status") => {
-            if let Some(ctx) = require_monitoring(http_req, base_ctx) {
-                let _ = ctx;
-            } else {
-                return monitoring_required_error(http_req);
+            if let Err(error) = require_monitoring(http_req, base_ctx) {
+                return error;
             }
             let statuses = modules::collect_module_statuses();
             let body = serde_json::to_vec(&statuses).unwrap_or_default();
@@ -1697,10 +1693,8 @@ fn handle_http_request(
 
         // ── Metrics (monitoring+) ───────────────────────────────────
         (HttpMethod::Get, "/metrics") => {
-            if let Some(ctx) = require_monitoring(http_req, base_ctx) {
-                let _ = ctx;
-            } else {
-                return monitoring_required_error(http_req);
+            if let Err(error) = require_monitoring(http_req, base_ctx) {
+                return error;
             }
             let mut metrics = enclave_os_common::protocol::EnclaveMetrics::default();
             modules::enrich_metrics(&mut metrics);
@@ -1721,7 +1715,8 @@ fn handle_http_request(
             if let Some(ref oidc_config) = crate::oidc_config() {
                 let _ = oidc_config;
                 match verify_auth_header(http_req) {
-                    Some(claims) if claims.has_manager() => {}
+                    Ok(Some(claims)) if claims.has_manager() => {}
+                    Err(error) => return error,
                     _ => return HttpHandleResult::err(403, "manager role required"),
                 }
             }
@@ -2001,23 +1996,30 @@ fn verify_encauth_request(
 /// Verify the `Authorization: Bearer` header and return OIDC claims.
 fn verify_auth_header(
     http_req: &enclave_os_common::protocol::HttpRequest,
-) -> Option<enclave_os_common::oidc::OidcClaims> {
-    let token = http_req.authorization.as_deref()?;
-    verify_oidc_token(token).ok()
+) -> Result<Option<enclave_os_common::oidc::OidcClaims>, HttpHandleResult> {
+    let Some(token) = http_req.authorization.as_deref() else {
+        return Ok(None);
+    };
+    match verify_oidc_token(token) {
+        Ok(claims) => Ok(Some(claims)),
+        Err(OidcError::Invalid) => Ok(None),
+        Err(OidcError::Unavailable) => {
+            Err(HttpHandleResult::err(503, "request resources unavailable"))
+        }
+    }
 }
 
-/// Check monitoring role requirement.  Returns `Some(claims)` if auth
-/// passes (or OIDC is not configured), `None` if auth fails.
+/// Preserve missing/invalid monitoring authorization separately from shortage.
 fn require_monitoring(
     http_req: &enclave_os_common::protocol::HttpRequest,
     _base_ctx: &enclave_os_common::modules::RequestContext,
-) -> Option<Option<enclave_os_common::oidc::OidcClaims>> {
+) -> Result<Option<enclave_os_common::oidc::OidcClaims>, HttpHandleResult> {
     if crate::oidc_config().is_none() {
-        return Some(None); // OIDC not configured, no auth needed
+        return Ok(None);
     }
-    match verify_auth_header(http_req) {
-        Some(claims) if claims.has_monitoring() => Some(Some(claims)),
-        _ => None,
+    match verify_auth_header(http_req)? {
+        Some(claims) if claims.has_monitoring() => Ok(Some(claims)),
+        _ => Err(monitoring_required_error(http_req)),
     }
 }
 
@@ -2060,7 +2062,8 @@ fn handle_set_attestation_servers(
     if let Some(ref oidc_config) = crate::oidc_config() {
         let _ = oidc_config;
         match verify_auth_header(http_req) {
-            Some(claims) if claims.has_manager() => {}
+            Ok(Some(claims)) if claims.has_manager() => {}
+            Err(error) => return error,
             _ => return HttpHandleResult::err(403, "manager role required"),
         }
     }
@@ -2138,7 +2141,10 @@ fn handle_fido2_request(
             }
         } else if crate::oidc_config().is_some() {
             // Try as OIDC token
-            verify_auth_header(http_req)
+            match verify_auth_header(http_req) {
+                Ok(claims) => claims,
+                Err(error) => return error,
+            }
         } else {
             None
         }
@@ -2193,11 +2199,12 @@ fn handle_data_request_http(
     // Extract auth from the Authorization header.
     let oidc_claims = if crate::oidc_config().is_some() {
         match verify_auth_header(http_req) {
-            Some(claims) => Some(claims),
-            None if http_req.authorization.is_some() => {
+            Ok(Some(claims)) => Some(claims),
+            Err(error) => return error,
+            Ok(None) if http_req.authorization.is_some() => {
                 return HttpHandleResult::err(401, "invalid or expired token");
             }
-            None => None,
+            Ok(None) => None,
         }
     } else {
         None
@@ -2276,11 +2283,12 @@ fn handle_rpc_request(
     // Build OIDC claims from auth header (same as /data).
     let oidc_claims = if crate::oidc_config().is_some() {
         match verify_auth_header(http_req) {
-            Some(claims) => Some(claims),
-            None if http_req.authorization.is_some() => {
+            Ok(Some(claims)) => Some(claims),
+            Err(error) => return error,
+            Ok(None) if http_req.authorization.is_some() => {
                 return HttpHandleResult::err(401, "invalid or expired token");
             }
-            None => None,
+            Ok(None) => None,
         }
     } else {
         None
@@ -2390,11 +2398,12 @@ fn handle_mcp_tools_request(
     // Build OIDC claims from auth header (same pattern as /data and /rpc/).
     let oidc_claims = if crate::oidc_config().is_some() {
         match verify_auth_header(http_req) {
-            Some(claims) => Some(claims),
-            None if http_req.authorization.is_some() => {
+            Ok(Some(claims)) => Some(claims),
+            Err(error) => return error,
+            Ok(None) if http_req.authorization.is_some() => {
                 return HttpHandleResult::err(401, "invalid or expired token");
             }
-            None => None,
+            Ok(None) => None,
         }
     } else {
         None
@@ -2577,100 +2586,120 @@ fn dispatch_and_respond(
 ///
 /// When running without egress, falls back to payload-only decoding over the
 /// RA-TLS channel (signature not verified cryptographically).
-fn verify_oidc_token(token: &str) -> Result<enclave_os_common::oidc::OidcClaims, String> {
-    let config = crate::oidc_config().ok_or_else(|| "OIDC not configured".to_string())?;
-
-    // ── Signature verification + payload decode ──────────────────────
+enum OidcError {
+    Invalid,
+    Unavailable,
+}
+fn verify_oidc_token(token: &str) -> Result<enclave_os_common::oidc::OidcClaims, OidcError> {
+    let config = crate::oidc_config().ok_or(OidcError::Invalid)?;
+    let pool = crate::local_allocation_pool().ok_or(OidcError::Unavailable)?;
     #[cfg(feature = "wasm")]
-    let claims: serde_json::Value = {
-        enclave_os_wasm::jwks_fetcher::verify_jwt_signature(
-            token,
-            &config.issuer,
-            &config.jwks_uri,
-        )?
-    };
-
+    let claims = enclave_os_wasm::jwks_fetcher::verify_jwt_signature(
+        &pool,
+        token,
+        &config.issuer,
+        &config.jwks_uri,
+    )
+    .map_err(|error| match error {
+        enclave_os_common::jwt::ClaimsError::Parse(
+            enclave_os_common::request_json::parse::Error::Refused(
+                enclave_os_common::request_json::Refusal::Unavailable,
+            ),
+        ) => OidcError::Unavailable,
+        _ => OidcError::Invalid,
+    })?;
     #[cfg(not(feature = "wasm"))]
-    let claims: serde_json::Value = {
-        // Fallback: decode payload without signature check (RA-TLS channel)
+    let claims = {
+        // Existing RA-TLS payload-only capability; its signature policy is unchanged.
         let parts: Vec<&str> = token.splitn(3, '.').collect();
         if parts.len() != 3 {
-            return Err("malformed JWT: expected 3 dot-separated parts".into());
+            return Err(OidcError::Invalid);
         }
-        let payload_bytes =
-            base64_url_decode(parts[1]).map_err(|e| format!("JWT payload base64: {e}"))?;
-        serde_json::from_slice(&payload_bytes).map_err(|e| format!("JWT payload JSON: {e}"))?
+        let payload = base64_url_decode(parts[1]).map_err(|_| OidcError::Invalid)?;
+        enclave_os_common::request_json::parse::retained(&pool, &payload).map_err(|error| {
+            match error {
+                enclave_os_common::request_json::parse::Error::Refused(
+                    enclave_os_common::request_json::Refusal::Unavailable,
+                ) => OidcError::Unavailable,
+                _ => OidcError::Invalid,
+            }
+        })?
     };
-
-    // Validate issuer
-    let iss = claims
-        .get("iss")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "JWT missing 'iss' claim".to_string())?;
-    if iss != config.issuer {
-        return Err(format!(
-            "JWT issuer '{}' != expected '{}'",
-            iss, config.issuer
-        ));
-    }
-
-    // Validate audience
-    let aud_ok = match claims.get("aud") {
-        Some(serde_json::Value::String(s)) => s == &config.audience,
-        Some(serde_json::Value::Array(arr)) => {
-            arr.iter().any(|v| v.as_str() == Some(&config.audience))
+    (|| -> Result<_, String> {
+        // Validate issuer
+        let iss = claims
+            .get("iss")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "JWT missing 'iss' claim".to_string())?;
+        if iss != config.issuer {
+            return Err(format!(
+                "JWT issuer '{}' != expected '{}'",
+                iss, config.issuer
+            ));
         }
-        _ => false,
-    };
-    if !aud_ok {
-        return Err(format!(
-            "JWT audience does not contain '{}'",
-            config.audience
-        ));
-    }
 
-    // Validate expiry
-    if let Some(exp) = claims.get("exp").and_then(|v| v.as_u64()) {
-        let now = enclave_os_common::ocall::get_current_time().unwrap_or(0);
-        if now > exp {
-            return Err("JWT token expired".into());
+        // Validate audience
+        let aud_ok = match claims.get("aud") {
+            Some(enclave_os_common::request_json::value::Value::String(s)) => {
+                s.as_str() == config.audience
+            }
+            Some(enclave_os_common::request_json::value::Value::Array(arr)) => arr
+                .as_slice()
+                .iter()
+                .any(|v| v.as_str() == Some(&config.audience)),
+            _ => false,
+        };
+        if !aud_ok {
+            return Err(format!(
+                "JWT audience does not contain '{}'",
+                config.audience
+            ));
         }
-    }
 
-    // Extract subject
-    let sub = claims
-        .get("sub")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+        // Validate expiry
+        if let Some(exp) = claims.get("exp").and_then(|v| v.as_u64()) {
+            let now = enclave_os_common::ocall::get_current_time().unwrap_or(0);
+            if now > exp {
+                return Err("JWT token expired".into());
+            }
+        }
 
-    // Extract roles
-    let roles = enclave_os_common::oidc::extract_roles(&claims, config);
+        // Extract subject
+        let sub = claims
+            .get("sub")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
-    // Step-up claims (amr/acr/iat + the operation-binding exp/vault_op/nonce)
-    // for conditions like the vault's OidcStepUp.
-    let amr = enclave_os_common::oidc::extract_amr(&claims);
-    let acr = claims
-        .get("acr")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let iat = claims.get("iat").and_then(|v| v.as_u64()).unwrap_or(0);
-    let exp = claims.get("exp").and_then(|v| v.as_u64()).unwrap_or(0);
-    let vault_op = claims
-        .get("vault_op")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let nonce = claims
-        .get("nonce")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+        // Extract roles
+        let roles = enclave_os_common::oidc::extract_roles(&claims, config);
 
-    let mut oc = enclave_os_common::oidc::OidcClaims::from_raw(sub, roles, config)
-        .with_step_up(amr, acr, iat);
-    oc.exp = exp;
-    oc.vault_op = vault_op;
-    oc.nonce = nonce;
-    Ok(oc)
+        // Step-up claims (amr/acr/iat + the operation-binding exp/vault_op/nonce)
+        // for conditions like the vault's OidcStepUp.
+        let amr = enclave_os_common::oidc::extract_amr(&claims);
+        let acr = claims
+            .get("acr")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let iat = claims.get("iat").and_then(|v| v.as_u64()).unwrap_or(0);
+        let exp = claims.get("exp").and_then(|v| v.as_u64()).unwrap_or(0);
+        let vault_op = claims
+            .get("vault_op")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let nonce = claims
+            .get("nonce")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let mut oc = enclave_os_common::oidc::OidcClaims::from_raw(sub, roles, config)
+            .with_step_up(amr, acr, iat);
+        oc.exp = exp;
+        oc.vault_op = vault_op;
+        oc.nonce = nonce;
+        Ok(oc)
+    })()
+    .map_err(|_| OidcError::Invalid)
 }
 
 /// Decode base64url (no padding) to bytes.

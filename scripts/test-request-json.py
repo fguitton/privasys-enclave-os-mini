@@ -93,24 +93,39 @@ def main():
                                                        '--', '--list', '--format=json', '-Z', 'unstable-options'])
     records = [json.loads(line) for line in discovery.read_text().splitlines() if line.startswith('{')]
     tests = [row for row in records if row.get('event') == 'discovered' and row.get('type') == 'test']
-    if len(tests) != 29 or any(row['ignore'] for row in tests):
+    if len(tests) != 32 or any(row['ignore'] for row in tests):
         raise ValueError('request admission discovery differs')
     execution = execute('request-admission', wrapper + ['test', *base, 'attest::request_tests::',
                                                       '--', '--test-threads=1'])
-    if '29 passed; 0 failed; 0 ignored' not in execution.read_text():
+    if '32 passed; 0 failed; 0 ignored' not in execution.read_text():
         raise ValueError('request admission execution count differs')
     execute('common-library-strict', wrapper + ['clippy', '--locked', '--offline', '--manifest-path', str(manifest),
                                                 '--features', 'crypto', '--lib', '--', '-D', 'warnings'])
     execute('request-all-targets-strict', wrapper + ['clippy', '--locked', '--offline', '--manifest-path', str(manifest),
                                                     '--features', 'request-json-tests', '--all-targets', '--', '-D', 'warnings'])
+    # Preserve original role/AMR assertions against the current retained value.
+    role_args = [*base, 'oidc::tests::']
+    role_discovery = execute('oidc-role-discovery', wrapper + ['test', *role_args,
+                                '--', '--list', '--format=json', '-Z', 'unstable-options'])
+    role_tests = [json.loads(line) for line in role_discovery.read_text().splitlines()
+                  if line.startswith('{')]
+    role_tests = [row for row in role_tests if row.get('event') == 'discovered' and row.get('type') == 'test']
+    if len(role_tests) != 16 or any(row['ignore'] for row in role_tests):
+        raise ValueError('original OIDC role discovery differs')
+    role_execution = execute('oidc-role-originals', wrapper + ['test', *role_args, '--', '--test-threads=1'])
+    if '16 passed; 0 failed; 0 ignored' not in role_execution.read_text():
+        raise ValueError('original OIDC role execution count differs')
+    execute('native-source-controls', [sys.executable, '-B', str(ROOT / 'tests/request-json/native_source_controls.py'),
+            '--cargo', str(args.cargo), '--manifest-path', str(manifest),
+            '--output', str(args.output / 'native-source-controls')])
     if expected_source != audit(source):
         raise ValueError('compiler source changed during qualification')
-    (args.output / 'receipt.json').write_text(json.dumps({'status': 'PASS', 'discovered': 29, 'executed': 29,
+    (args.output / 'receipt.json').write_text(json.dumps({'status': 'PASS', 'discovered': 32, 'executed': 32, 'original_oidc_roles_discovered': 16, 'original_oidc_roles_executed': 16,
                                                         'lock_input_sha256': digest(args.lock),
                                                         'resolved_lock_sha256': digest(source / 'Cargo.lock'),
                                                         'compiler_source_unchanged': True,
                                                         'claim': 'native request admission only; no endpoint/target/whole-parser qualification'}, indent=2) + '\n')
-    print('REQUEST-JSON-ADMISSION PASS discovered=29 executed=29')
+    print('REQUEST-JSON-ADMISSION PASS discovered=32 executed=32')
 
 
 if __name__ == '__main__':

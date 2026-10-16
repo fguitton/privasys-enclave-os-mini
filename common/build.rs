@@ -1,4 +1,5 @@
 fn main() {
+    require_request_json_supplier();
     generate_source_wire_bindings();
 }
 fn generate_source_wire_bindings() {
@@ -70,4 +71,16 @@ fn generate_source_wire_bindings() {
     assert!(!result.stdout.is_empty(), "source wire bindings missing");
     assert!(provenance.is_file(), "source wire build provenance missing");
     std::fs::write(output.join("source_upload_wire_v1.rs"), result.stdout).unwrap();
+}
+
+fn require_request_json_supplier() {
+    println!("cargo:rerun-if-env-changed=HONEST_REQUEST_JSON_SOURCE_RECEIPT");
+    if std::env::var_os("CARGO_FEATURE_REQUEST_JSON_PARSER").is_none() {
+        return;
+    }
+    let receipt = std::env::var_os("HONEST_REQUEST_JSON_SOURCE_RECEIPT")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute() && path.is_file());
+    assert!(receipt.is_some(), "request-json-parser requires its verified supplier; invoke scripts/run-request-json-cargo.py --cargo ABS_CARGO --manifest-path ABS_MANIFEST --build-root NEW_BUILD_DIR -- CARGO_COMMAND [ARGS] from enclave-os-mini");
+    println!("cargo:rerun-if-changed={}", receipt.unwrap().display());
 }

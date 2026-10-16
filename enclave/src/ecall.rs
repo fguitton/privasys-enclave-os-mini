@@ -1154,7 +1154,8 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
     // ── WASM module (Component Model runtime) ────────────────────────
     #[cfg(feature = "wasm")]
     {
-        let wasm = match enclave_os_wasm::WasmModule::new() {
+        let wasm = match enclave_os_wasm::WasmModule::new(crate::local_allocation_pool().ok_or(-2)?)
+        {
             Ok(m) => m,
             Err(e) => {
                 enclave_log_error!("WasmModule init failed: {}", e);

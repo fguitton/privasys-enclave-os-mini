@@ -272,7 +272,10 @@ impl OidcClaims {
 /// returned strings are not interpreted: it is up to the caller (or
 /// [`OidcClaims::from_raw`]) to map them to platform booleans and to
 /// the per-resource policy of feature crates.
-pub fn extract_roles(claims: &serde_json::Value, config: &OidcConfig) -> Vec<String> {
+pub fn extract_roles(
+    claims: &crate::request_json::value::Value<'_>,
+    config: &OidcConfig,
+) -> Vec<String> {
     let mut roles: Vec<String> = Vec::new();
 
     // Path 1: configured role_claim
@@ -300,17 +303,17 @@ pub fn extract_roles(claims: &serde_json::Value, config: &OidcConfig) -> Vec<Str
 /// Collect role strings from a JSON value that is either:
 /// - An object `{ "role-name": { ... } }` — keys are the role names
 /// - An array of strings `["role1", "role2"]`
-fn collect_role_strings(val: &serde_json::Value, out: &mut Vec<String>) {
+fn collect_role_strings(val: &crate::request_json::value::Value<'_>, out: &mut Vec<String>) {
     match val {
-        serde_json::Value::Object(map) => {
-            for key in map.keys() {
-                if !out.contains(key) {
-                    out.push(key.clone());
+        crate::request_json::value::Value::Object(map) => {
+            for (key, _) in map.iter() {
+                if !out.iter().any(|value| value == key.as_str()) {
+                    out.push(key.as_str().to_string());
                 }
             }
         }
-        serde_json::Value::Array(arr) => {
-            for item in arr {
+        crate::request_json::value::Value::Array(arr) => {
+            for item in arr.as_slice() {
                 if let Some(s) = item.as_str() {
                     let s = s.to_string();
                     if !out.contains(&s) {
@@ -326,10 +329,10 @@ fn collect_role_strings(val: &serde_json::Value, out: &mut Vec<String>) {
 /// Extract the `amr` (Authentication Methods References, RFC 8176) array from
 /// raw JWT claims. Returns the deduped method strings; empty when the claim is
 /// absent or not a string array.
-pub fn extract_amr(claims: &serde_json::Value) -> Vec<String> {
+pub fn extract_amr(claims: &crate::request_json::value::Value<'_>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    if let Some(serde_json::Value::Array(arr)) = claims.get("amr") {
-        for item in arr {
+    if let Some(crate::request_json::value::Value::Array(arr)) = claims.get("amr") {
+        for item in arr.as_slice() {
             if let Some(s) = item.as_str() {
                 let s = s.to_string();
                 if !out.contains(&s) {
@@ -348,7 +351,17 @@ pub fn extract_amr(claims: &serde_json::Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    // Inputs use the current paid value representation; this helper constructs
+    // semantic fixtures only, not parser resource evidence.
+    macro_rules! json {
+        ($($tokens:tt)*) => {{
+            use serde::de::DeserializeSeed;
+            let bytes = serde_json::to_vec(&serde_json::json!($($tokens)*)).unwrap();
+            let pool = crate::allocation::AllocationPoolV1::new(1 << 20).unwrap();
+            let mut decoder = serde_json::Deserializer::from_slice(&bytes);
+            crate::request_json::value::Seed::retained(&pool).deserialize(&mut decoder).unwrap().unwrap()
+        }};
+    }
 
     fn test_config() -> OidcConfig {
         OidcConfig {

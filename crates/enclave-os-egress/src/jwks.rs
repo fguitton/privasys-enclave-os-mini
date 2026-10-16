@@ -135,31 +135,48 @@ pub fn verify_jwt_with_jwks<T: serde::de::DeserializeOwned>(
     issuer: &str,
     jwks_uri: &str,
 ) -> Result<T, String> {
+    with_verifier(token, issuer, jwks_uri, |verifier| {
+        verifier.verify_and_decode(token.as_bytes())
+    })
+}
+
+fn with_verifier<T, E: From<String>>(
+    token: &str,
+    issuer: &str,
+    jwks_uri: &str,
+    consume: impl FnOnce(enclave_os_common::jwt::JwtVerifier) -> Result<T, E>,
+) -> Result<T, E> {
     let kid = extract_jwt_kid(token)?;
     let resolved_uri = resolve_jwks_uri(issuer, jwks_uri)?;
     get_or_fetch_cache(&resolved_uri)?;
-
     let store = JWKS_STORE.lock().unwrap_or_else(|e| e.into_inner());
     let entry = store
         .as_ref()
         .and_then(|s| s.get(&resolved_uri))
         .ok_or_else(|| "JWKS cache miss (should not happen)".to_string())?;
-
     let verifier = match &kid {
         Some(k) => entry.cache.verifier(k)?,
         None => entry.cache.first_verifier()?,
     };
-
-    verifier.verify_and_decode(token.as_bytes())
+    consume(verifier)
 }
 
-/// Same as [`verify_jwt_with_jwks`] but returns the raw claims JSON.
+/// Verify the JWT signature and parse its claims into original-pool retained backing.
+///
+/// # Errors
+/// Preserves verification/JSON failures and separately reports resource refusal.
 pub fn verify_jwt_signature(
+    pool: &std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
     token: &str,
     issuer: &str,
     jwks_uri: &str,
-) -> Result<serde_json::Value, String> {
-    verify_jwt_with_jwks(token, issuer, jwks_uri)
+) -> Result<
+    enclave_os_common::request_json::value::Value<'static>,
+    enclave_os_common::jwt::ClaimsError,
+> {
+    with_verifier(token, issuer, jwks_uri, |verifier| {
+        verifier.verify_claims(pool, token.as_bytes())
+    })
 }
 
 /// Return the IdP's current EC P-256 signing keys as SEC1 uncompressed points

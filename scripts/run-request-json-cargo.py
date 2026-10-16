@@ -158,8 +158,10 @@ def run(cargo, manifest, build_root, arguments):
                   'resolved_graph_unchanged': True, 'status': 'RUNNING'}
     record = build_root / 'request-json-build.json'
     record.write_text(json.dumps(provenance, indent=2) + '\n')
-    print('REQUEST-JSON-BUILD', receipt['version'], profile_hash, flush=True)
-    result = subprocess.run(command)
+    print('REQUEST-JSON-BUILD', receipt['version'], profile_hash, file=sys.stderr, flush=True)
+    environment = os.environ.copy()
+    environment['HONEST_REQUEST_JSON_SOURCE_RECEIPT'] = str(destination / 'request-json-source-receipt.json')
+    result = subprocess.run(command, env=environment)
     verify_profile(source, destination, functions)
     if digest(lock) != lock_before:
         raise ValueError('trusted build changed the locked workspace')
@@ -168,11 +170,53 @@ def run(cargo, manifest, build_root, arguments):
     return result.returncode
 
 
+def command_manifest(arguments):
+    manifests = []
+    iterator = iter(arguments)
+    for argument in iterator:
+        if argument == '--':
+            break
+        if argument == '--manifest-path':
+            manifests.append(Path(next(iterator)))
+        elif argument.startswith('--manifest-path='):
+            manifests.append(Path(argument.partition('=')[2]))
+    if len(manifests) > 1:
+        raise ValueError('multiple Cargo manifests are unsupported')
+    return (manifests[0] if manifests else Path.cwd() / 'Cargo.toml').resolve(strict=True)
+
+
+def native_run(cargo, build_root, arguments):
+    """Route actual parser consumers through the existing verified source owner."""
+    if not arguments or arguments[0] not in ('check', 'clippy', 'build', 'test'):
+        return subprocess.run([str(cargo), *arguments]).returncode
+    manifest = command_manifest(arguments)
+    resolved = metadata(cargo, manifest, feature_selectors(arguments))
+    packages = {row['id']: row for row in resolved['packages']}
+    required = any(packages[node['id']]['name'] == 'enclave-os-common'
+                   and 'request-json-parser' in node['features']
+                   for node in resolved['resolve']['nodes'])
+    if not required:
+        # No admitted parser is compiled; no supplier qualification is claimed.
+        return subprocess.run([str(cargo), *arguments]).returncode
+    if build_root is None:
+        build_root = Path(resolved['target_directory']) / 'request-json-source'
+    build_root = build_root.absolute()
+    retained = any(packages[node['id']]['name'] in ('enclave-os-egress', 'enclave-os-enclave')
+                   and 'fallible-allocation-v1' in node['features']
+                   for node in resolved['resolve']['nodes'])
+    if retained:
+        # Reuse the current outer composition: rustls first, then this JSON owner.
+        provider = runpy.run_path(str(Path(__file__).with_name('run-retained-provider-cargo.py')))
+        return provider['run'](cargo, manifest, build_root / 'retained-provider', arguments)
+    return run(cargo, manifest, build_root, arguments)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--cargo', type=Path, required=True)
-    parser.add_argument('--manifest-path', type=Path, required=True)
-    parser.add_argument('--build-root', type=Path, required=True)
+    parser.add_argument('--manifest-path', type=Path,
+                        help='explicit trusted source owner; native calls infer Cargo manifest')
+    parser.add_argument('--build-root', type=Path)
     parser.add_argument('arguments', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     arguments = args.arguments
@@ -180,6 +224,13 @@ def main():
         arguments = arguments[1:]
     if not arguments:
         parser.error('Cargo command is required')
+    cargo_identity(args.cargo)
+    if args.manifest_path is None:
+        return native_run(args.cargo, args.build_root, arguments)
+    if args.build_root is None:
+        parser.error('explicit trusted manifest requires --build-root')
+    if command_manifest(arguments) != args.manifest_path.resolve(strict=True):
+        parser.error('source owner and Cargo command select different manifests')
     return run(args.cargo, args.manifest_path, args.build_root, arguments)
 
 

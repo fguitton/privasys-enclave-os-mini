@@ -6,6 +6,9 @@ pub(crate) mod fields;
 pub mod sequence;
 /// Parsed JSON values with admitted child backings.
 pub mod value;
+/// Shared current parser for retained JWT claim trees.
+#[cfg(feature = "request-json-parser")]
+pub mod parse;
 
 use crate::allocation::{AllocationLeaseV1, AllocationPoolV1};
 use alloc::{string::String, sync::Arc, vec::Vec};

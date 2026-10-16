@@ -1445,4 +1445,124 @@ mod tests {
         ));
         assert_eq!(oidc::global_oidc_config().unwrap().issuer, "global issuer");
     }
+    #[test]
+    fn retained_claims_parser_preserves_current_json_and_original_syntax_diagnostics() {
+        use enclave_os_common::request_json::parse;
+        let pool = AllocationPoolV1::new(1 << 20).unwrap();
+        for input in [
+            r#"{"iss":"https://id.test","aud":["a","b"],"sub":"u","roles":["a","b"],"amr":["pwd"]}"#,
+            r#"{"s":"\uD834\uDD1E","s":"日本😀","roles":{"a":{},"b":null},"unknown":[true,null,-1,1.25]}"#,
+            r#"[1,"a",{},[]]"#,
+            "null",
+            "true",
+            "-0",
+            "1e2",
+            r#""\u0061""#,
+            "{",
+            "{\"x\":1,}",
+            "{\"x\":\"\\uD800\"}",
+            "{}[]",
+            "1e400",
+        ] {
+            let original = serde_json::from_str::<serde_json::Value>(input);
+            let retained = parse::retained(&pool, input.as_bytes());
+            match (original, retained) {
+                (Ok(original), Ok(retained)) => assert_eq!(
+                    serde_json::to_vec(&original).unwrap(),
+                    serde_json::to_vec(&retained).unwrap()
+                ),
+                (Err(original), Err(parse::Error::Syntax(retained))) => {
+                    assert_eq!(original.to_string(), retained.to_string());
+                    assert_eq!(original.classify(), retained.classify());
+                }
+                pair => panic!("retained claim parsing differs for {input}: {pair:?}"),
+            }
+            assert_eq!(pool.used(), 0);
+        }
+    }
+    #[test]
+    fn retained_claims_parser_keeps_original_pool_credit_and_refunds_failures() {
+        use enclave_os_common::request_json::parse;
+        let input = br#""\u0061""#;
+        let pool = AllocationPoolV1::new(1 << 20).unwrap();
+        let (parsed, allocations) = measured(|| parse::retained(&pool, input).unwrap());
+        let scratch = serde_json::Deserializer::slice_scratch_capacity(input.len()).unwrap();
+        // Scratch has already dropped; every still-live physical allocation is paid.
+        assert!(allocations.0 > 1);
+        assert_eq!(pool.used(), allocations.1 - scratch);
+        assert_eq!(parsed.as_str(), Some("a"));
+        drop(parsed);
+        assert_eq!(pool.used(), 0);
+        let empty = AllocationPoolV1::new(1).unwrap();
+        let (refused, allocations) = measured(|| parse::retained(&empty, input));
+        assert!(matches!(
+            refused,
+            Err(parse::Error::Refused(Refusal::Unavailable))
+        ));
+        assert_eq!(allocations, (0, 0));
+        let scratch_only = AllocationPoolV1::new(scratch).unwrap();
+        let (refused, allocations) = measured(|| parse::retained(&scratch_only, input));
+        assert!(matches!(
+            refused,
+            Err(parse::Error::Refused(Refusal::Unavailable))
+        ));
+        assert_eq!(allocations, (1, scratch));
+        assert_eq!(scratch_only.used(), 0);
+        assert!(matches!(
+            parse::retained(&scratch_only, b"{bad"),
+            Err(parse::Error::Syntax(_))
+        ));
+        assert_eq!(scratch_only.used(), 0);
+    }
+    #[test]
+    fn verified_claims_preserve_signature_precedence_and_retained_role_semantics() {
+        use enclave_os_common::jwt::{encode_jwt, ClaimsError, JwtVerifier};
+        use enclave_os_common::request_json::parse;
+        use ring::{
+            rand::SystemRandom,
+            signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING},
+        };
+        let random = SystemRandom::new();
+        let key = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &random).unwrap();
+        let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, key.as_ref(), &random)
+            .unwrap();
+        let verifier = JwtVerifier::from_public_key_bytes(key.public_key().as_ref()).unwrap();
+        let claims = serde_json::json!({"sub":"日本😀", "roles":["manager","manager"], "amr":["pwd","pwd"], "realm_access":{"roles":["monitor"]}});
+        let token = encode_jwt(&claims, &key, &random, Some("current-key")).unwrap();
+        let pool = AllocationPoolV1::new(1 << 20).unwrap();
+        let paid = verifier.verify_claims(&pool, &token).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&paid).unwrap(),
+            serde_json::to_vec(&claims).unwrap()
+        );
+        assert_eq!(enclave_os_common::oidc::extract_amr(&paid), ["pwd"]);
+        let config: enclave_os_common::oidc::OidcConfig =
+            serde_json::from_str(r#"{"issuer":"i","audience":"a"}"#).unwrap();
+        assert_eq!(
+            enclave_os_common::oidc::extract_roles(&paid, &config),
+            ["manager", "monitor"]
+        );
+        assert!(pool.used() > 0);
+        drop(paid);
+        assert_eq!(pool.used(), 0);
+        let empty = AllocationPoolV1::new(1).unwrap();
+        assert!(matches!(
+            verifier.verify_claims(&empty, &token),
+            Err(ClaimsError::Parse(parse::Error::Refused(
+                Refusal::Unavailable
+            )))
+        ));
+        let mut tampered = token;
+        let payload_start = tampered.iter().position(|byte| *byte == b'.').unwrap() + 1;
+        tampered[payload_start] = if tampered[payload_start] == b'A' {
+            b'B'
+        } else {
+            b'A'
+        };
+        assert!(matches!(
+            verifier.verify_claims(&empty, &tampered),
+            Err(ClaimsError::Verification(_))
+        ));
+        assert_eq!(empty.used(), 0);
+    }
 }

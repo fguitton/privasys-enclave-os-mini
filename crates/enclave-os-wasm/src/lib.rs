@@ -143,6 +143,7 @@ fn kv_bytes_key(name: &str) -> Vec<u8> {
 /// startup.  Only the 10 most recently used apps are kept compiled
 /// in memory (LRU eviction) to conserve EPC.
 pub struct WasmModule {
+    allocation_pool: std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
     registry: Mutex<AppRegistry>,
     metrics: Mutex<WasmMetricsStore>,
 }
@@ -153,7 +154,9 @@ impl WasmModule {
     /// Initialises wasmtime with SGX-appropriate settings and WASI
     /// host function bindings.  Restores persisted WASM app metadata
     /// from the sealed KV store (apps are compiled on demand).
-    pub fn new() -> Result<Self, String> {
+    pub fn new(
+        allocation_pool: std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
+    ) -> Result<Self, String> {
         let engine = crate::engine::WasmEngine::new()?;
         let mut registry = AppRegistry::new(engine);
 
@@ -206,6 +209,7 @@ impl WasmModule {
         }
 
         Ok(Self {
+            allocation_pool,
             registry: Mutex::new(registry),
             metrics: Mutex::new(metrics_store),
         })
@@ -624,7 +628,7 @@ impl WasmModule {
         if registry.config_api_function(&call.app) == Some(call.function.as_str()) {
             let app_id = registry.app_id(&call.app);
             drop(registry);
-            return Self::check_configure_authz(call, app_id).map(Some);
+            return Self::check_configure_authz(&self.allocation_pool, call, app_id).map(Some);
         }
 
         let permissions = match registry.app_permissions(&call.app) {
@@ -738,7 +742,12 @@ impl WasmModule {
                     return Err(Response::Data(serialize_or_error(&err)));
                 }
             };
-            let auth = match verify_auth_token(token_str, &permissions, role_store.as_ref()) {
+            let auth = match verify_auth_token(
+                &self.allocation_pool,
+                token_str,
+                &permissions,
+                role_store.as_ref(),
+            ) {
                 Ok(a) => a,
                 Err(e) => {
                     let err = WasmResult::Error {
@@ -790,7 +799,12 @@ impl WasmModule {
         };
 
         // Verify the token (FIDO2 session token or OIDC JWT).
-        let auth = match verify_auth_token(token_str, &permissions, role_store.as_ref()) {
+        let auth = match verify_auth_token(
+            &self.allocation_pool,
+            token_str,
+            &permissions,
+            role_store.as_ref(),
+        ) {
             Ok(r) => r,
             Err(e) => {
                 let err = WasmResult::Error {
@@ -862,6 +876,7 @@ impl WasmModule {
     /// Require the platform issuer's per-app owner/admin role on every
     /// `@config-api` call. Missing app identity or platform authority fails closed.
     fn check_configure_authz(
+        pool: &std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
         call: &WasmCall,
         app_id: Option<[u8; 16]>,
     ) -> Result<AuthResult, Response> {
@@ -885,7 +900,7 @@ impl WasmModule {
             audience: cfg.audience.clone(),
             roles_claim: cfg.role_claim.clone(),
         };
-        let (roles, sub) = verify_app_token(token, &platform).map_err(|error| {
+        let (roles, sub) = verify_app_token(pool, token, &platform).map_err(|error| {
             deny(format!(
                 "configure platform bearer verification failed: {error}"
             ))
@@ -955,7 +970,12 @@ impl WasmModule {
             }
         };
 
-        let caller_roles = match verify_auth_token(token_str, &permissions, role_store.as_ref()) {
+        let caller_roles = match verify_auth_token(
+            &self.allocation_pool,
+            token_str,
+            &permissions,
+            role_store.as_ref(),
+        ) {
             Ok(auth) => auth.roles,
             Err(e) => {
                 let err = WasmManagementResult::Error {
@@ -1053,7 +1073,12 @@ impl WasmModule {
                 }
             };
 
-            let auth = match verify_auth_token(token_str, &permissions, Some(&role_store)) {
+            let auth = match verify_auth_token(
+                &self.allocation_pool,
+                token_str,
+                &permissions,
+                Some(&role_store),
+            ) {
                 Ok(r) => r,
                 Err(e) => {
                     return WasmManagementResult::Error {
@@ -2515,6 +2540,7 @@ fn build_app_role_store(
 /// When `role_store` is provided, FIDO2 users get roles from the app's
 /// sealed KV space (with first-user bootstrap).
 fn verify_auth_token(
+    pool: &std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
     token: &str,
     permissions: &crate::protocol::AppPermissions,
     role_store: Option<&enclave_os_kvstore::SealedKvStore>,
@@ -2578,7 +2604,7 @@ fn verify_auth_token(
 
     // Try OIDC JWT verification.
     if let Some(oidc) = &permissions.oidc {
-        let (roles, sub) = verify_app_token(token, oidc)?;
+        let (roles, sub) = verify_app_token(pool, token, oidc)?;
         return Ok(AuthResult {
             roles,
             user_id: sub,
@@ -2597,12 +2623,14 @@ fn verify_auth_token(
 /// Does **not** use the platform's OIDC config — uses the app's own
 /// `AppOidcConfig`.
 fn verify_app_token(
+    pool: &std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
     token: &str,
     oidc: &crate::protocol::AppOidcConfig,
 ) -> Result<(Vec<String>, Option<String>), String> {
     // Verify ES256 signature via JWKS (rejects alg:none, fetches/caches keys)
-    let claims: serde_json::Value =
-        crate::jwks_fetcher::verify_jwt_signature(token, &oidc.issuer, &oidc.jwks_uri)?;
+    let claims =
+        crate::jwks_fetcher::verify_jwt_signature(pool, token, &oidc.issuer, &oidc.jwks_uri)
+            .map_err(|error| error.to_string())?;
 
     // Validate issuer
     let iss = claims
@@ -2618,10 +2646,13 @@ fn verify_app_token(
 
     // Validate audience
     let aud_ok = match claims.get("aud") {
-        Some(serde_json::Value::String(s)) => s == &oidc.audience,
-        Some(serde_json::Value::Array(arr)) => {
-            arr.iter().any(|v| v.as_str() == Some(&oidc.audience))
+        Some(enclave_os_common::request_json::value::Value::String(s)) => {
+            s.as_str() == oidc.audience
         }
+        Some(enclave_os_common::request_json::value::Value::Array(arr)) => arr
+            .as_slice()
+            .iter()
+            .any(|v| v.as_str() == Some(&oidc.audience)),
         _ => false,
     };
     if !aud_ok {
@@ -2668,18 +2699,21 @@ fn verify_app_token(
 
 /// Collect role strings from a JSON value (array of strings or map
 /// `{ "role": {...} }`).
-fn collect_role_strings(val: &serde_json::Value, out: &mut Vec<String>) {
+fn collect_role_strings(
+    val: &enclave_os_common::request_json::value::Value<'_>,
+    out: &mut Vec<String>,
+) {
     match val {
-        serde_json::Value::Array(arr) => {
-            for item in arr {
+        enclave_os_common::request_json::value::Value::Array(arr) => {
+            for item in arr.as_slice() {
                 if let Some(s) = item.as_str() {
                     out.push(s.to_string());
                 }
             }
         }
-        serde_json::Value::Object(map) => {
-            for key in map.keys() {
-                out.push(key.clone());
+        enclave_os_common::request_json::value::Value::Object(map) => {
+            for (key, _) in map.iter() {
+                out.push(key.as_str().to_string());
             }
         }
         _ => {}
@@ -2729,10 +2763,30 @@ mod configure_tests {
             app_auth: None,
             billing_approved: None,
         };
-        assert!(WasmModule::check_configure_authz(&call, None).is_err());
-        assert!(WasmModule::check_configure_authz(&call, Some([1; 16])).is_err());
+        assert!(WasmModule::check_configure_authz(
+            &enclave_os_common::allocation::AllocationPoolV1::new(1 << 20).unwrap(),
+            &call,
+            None
+        )
+        .is_err());
+        assert!(WasmModule::check_configure_authz(
+            &enclave_os_common::allocation::AllocationPoolV1::new(1 << 20).unwrap(),
+            &call,
+            Some([1; 16])
+        )
+        .is_err());
         call.app_auth = Some("pre-standard-owner-token".into());
-        assert!(WasmModule::check_configure_authz(&call, None).is_err());
-        assert!(WasmModule::check_configure_authz(&call, Some([1; 16])).is_err());
+        assert!(WasmModule::check_configure_authz(
+            &enclave_os_common::allocation::AllocationPoolV1::new(1 << 20).unwrap(),
+            &call,
+            None
+        )
+        .is_err());
+        assert!(WasmModule::check_configure_authz(
+            &enclave_os_common::allocation::AllocationPoolV1::new(1 << 20).unwrap(),
+            &call,
+            Some([1; 16])
+        )
+        .is_err());
     }
 }

@@ -81,6 +81,36 @@ pub enum JwtVerifier {
     Rs256(UnparsedPublicKey<Vec<u8>>),
 }
 
+/// Verification diagnostics and admitted claim-parser refusal have distinct owners.
+#[cfg(feature = "request-json-parser")]
+#[derive(Debug)]
+pub enum ClaimsError {
+    Verification(String),
+    Parse(crate::request_json::parse::Error),
+}
+#[cfg(feature = "request-json-parser")]
+impl From<String> for ClaimsError {
+    fn from(error: String) -> Self {
+        Self::Verification(error)
+    }
+}
+#[cfg(feature = "request-json-parser")]
+impl core::fmt::Display for ClaimsError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use crate::request_json::{parse::Error, Refusal};
+        match self {
+            Self::Verification(message) => f.write_str(message),
+            Self::Parse(Error::Syntax(error)) => write!(f, "jwt payload json: {error}"),
+            Self::Parse(Error::Refused(Refusal::Malformed)) => {
+                f.write_str("jwt payload json: malformed")
+            }
+            Self::Parse(Error::Refused(Refusal::Unavailable)) => {
+                f.write_str("JWT claims parser unavailable")
+            }
+        }
+    }
+}
+
 impl JwtVerifier {
     /// Construct an ES256 verifier from a raw ECDSA P-256 public key in
     /// **uncompressed point** format (65 bytes: `04 || x || y`).
@@ -124,6 +154,20 @@ impl JwtVerifier {
     ) -> Result<T, String> {
         let (payload_bytes, _header_raw) = self.verify(jwt)?;
         serde_json::from_slice(&payload_bytes).map_err(|e| format!("jwt payload json: {e}"))
+    }
+
+    /// Verify the signature before parsing claims with caller-admitted backing.
+    ///
+    /// # Errors
+    /// Keeps cryptographic/format refusal separate from JSON/resource refusal.
+    #[cfg(feature = "request-json-parser")]
+    pub fn verify_claims(
+        &self,
+        pool: &alloc::sync::Arc<crate::allocation::AllocationPoolV1>,
+        jwt: &[u8],
+    ) -> Result<crate::request_json::value::Value<'static>, ClaimsError> {
+        let (payload, _header) = self.verify(jwt)?;
+        crate::request_json::parse::retained(pool, &payload).map_err(ClaimsError::Parse)
     }
 
     /// Verify the JWT and return the raw payload bytes (without deserializing).
