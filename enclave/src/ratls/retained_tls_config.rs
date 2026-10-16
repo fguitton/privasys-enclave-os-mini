@@ -45,11 +45,39 @@ fn retained_children_bytes(authentication: ClientAuthentication) -> Option<usize
         .checked_add(shared_allocation_bytes::<
             rustls::time_provider::DefaultTimeProvider,
         >()?)?
-        .checked_add(authentication.allocation_bytes()?)
+        .checked_add(authentication.allocation_bytes()?)?
+        .checked_add(default_children_bytes()?)
+}
+fn default_children_bytes() -> Option<usize> {
+    #[cfg(feature = "fallible-allocation-v1")]
+    {
+        let mut bytes = 0_usize;
+        for layout in rustls::server::server_config_default_payload_layouts()
+            .into_iter()
+            .chain(rustls::server::server_config_certificate_payload_layouts())
+        {
+            bytes = bytes.checked_add(
+                enclave_os_common::allocation::shared_allocation_bytes_for_layout(layout)?,
+            )?;
+        }
+        for layout in rustls::server::server_config_default_buffer_layouts().ok()? {
+            bytes = bytes.checked_add(layout.size())?;
+        }
+        Some(bytes)
+    }
+    #[cfg(not(feature = "fallible-allocation-v1"))]
+    {
+        Some(0)
+    }
 }
 #[derive(Clone)]
 pub(crate) struct RetainedTlsConfig(SharedAllocationV1<Payload>);
-pub(crate) struct ConfigReservation(SharedAllocationReservationV1<Payload>, ClientAuthentication);
+pub(crate) struct ConfigReservation {
+    allocation: SharedAllocationReservationV1<Payload>,
+    authentication: ClientAuthentication,
+    #[cfg(all(feature = "fallible-allocation-v1", target_vendor = "teaclave"))]
+    pool: Arc<AllocationPoolV1>,
+}
 
 impl RetainedTlsConfig {
     #[cfg(test)]
@@ -60,8 +88,14 @@ impl RetainedTlsConfig {
         pool: &Arc<AllocationPoolV1>,
         authentication: ClientAuthentication,
     ) -> Option<ConfigReservation> {
-        SharedAllocationV1::<Payload>::reserve(pool, retained_children_bytes(authentication)?)
-            .map(|reservation| ConfigReservation(reservation, authentication))
+        SharedAllocationV1::<Payload>::reserve(pool, retained_children_bytes(authentication)?).map(
+            |allocation| ConfigReservation {
+                allocation,
+                authentication,
+                #[cfg(all(feature = "fallible-allocation-v1", target_vendor = "teaclave"))]
+                pool: pool.clone(),
+            },
+        )
     }
     #[cfg(target_vendor = "teaclave")]
     pub(crate) fn accept(
@@ -90,10 +124,31 @@ impl ConfigReservation {
         key: rustls::pki_types::PrivateKeyDer<'static>,
     ) -> Result<RetainedTlsConfig, String> {
         let builder = self.builder()?;
+        #[cfg(all(feature = "fallible-allocation-v1", target_vendor = "teaclave"))]
+        let origin =
+            enclave_os_common::allocation::LoanAllocator::from_pool_unpublished(&self.pool)
+                .map_err(|_| String::new())?;
+        #[cfg(all(feature = "fallible-allocation-v1", target_vendor = "teaclave"))]
+        let allocator = origin.owned_allocator();
+        #[cfg(all(feature = "fallible-allocation-v1", not(target_vendor = "teaclave")))]
+        let allocator = std::alloc::Global;
+        #[cfg(feature = "fallible-allocation-v1")]
+        let config = builder
+            .try_with_single_cert_in(certs, key, allocator)
+            .map_err(|error| match error {
+                rustls::server::ServerConfigAllocationError::Allocation => String::new(),
+                rustls::server::ServerConfigAllocationError::Certificate(error) => {
+                    format!("cert chain error: {:?}", error)
+                }
+            })?;
+        #[cfg(not(feature = "fallible-allocation-v1"))]
         let config = builder
             .with_single_cert(certs, key)
             .map_err(|e| format!("cert chain error: {:?}", e))?;
-        self.finish(config).ok_or_else(String::new)
+        let config = self.finish(config).ok_or_else(String::new)?;
+        #[cfg(all(feature = "fallible-allocation-v1", target_vendor = "teaclave"))]
+        origin.activate_release_notification();
+        Ok(config)
     }
     fn builder(
         &self,
@@ -107,7 +162,7 @@ impl ConfigReservation {
         let builder = ServerConfig::builder_with_details(provider.clone(), time)
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|e| format!("TLS config error: {:?}", e))?;
-        match self.1 {
+        match self.authentication {
             ClientAuthentication::Attested { required } => {
                 let verifier =
                     crate::ratls::client_auth::AttestedClientAuth::new(required, provider);
@@ -146,9 +201,9 @@ impl ConfigReservation {
         #[cfg(not(feature = "fallible-allocation-v1"))]
         let config = Arc::new(config);
         #[cfg(feature = "fallible-allocation-v1")]
-        let retained = self.0.try_finish(config).ok()?;
+        let retained = self.allocation.try_finish(config).ok()?;
         #[cfg(not(feature = "fallible-allocation-v1"))]
-        let retained = self.0.finish(config);
+        let retained = self.allocation.finish(config);
         Some(RetainedTlsConfig(retained))
     }
 }
@@ -212,6 +267,7 @@ mod provider_refusal {
         expected: Layout,
         refused: bool,
         live: usize,
+        skip_matching: usize,
     }
     thread_local! {
         static ARM: Cell<Option<Arm>> = const { Cell::new(None) };
@@ -228,9 +284,13 @@ mod provider_refusal {
                         return false;
                     };
                     if !arm.refused && arm.expected == layout {
-                        arm.refused = true;
+                        if arm.skip_matching == 0 {
+                            arm.refused = true;
+                            cell.set(Some(arm));
+                            return true;
+                        }
+                        arm.skip_matching -= 1;
                         cell.set(Some(arm));
-                        return true;
                     }
                     false
                 })
@@ -260,15 +320,15 @@ mod provider_refusal {
         }
     }
 
+    #[repr(C, align(2))]
+    struct ArcHeader {
+        strong: AtomicUsize,
+        weak: AtomicUsize,
+    }
     pub(super) fn check() {
         use rustls::crypto::{ring, CryptoProvider, SupportedKxGroup};
         // Same acquired ArcInner geometry quoted by Common; validate its size
         // against the real production quote before arming the exact request.
-        #[repr(C, align(2))]
-        struct ArcHeader {
-            strong: AtomicUsize,
-            weak: AtomicUsize,
-        }
         let arc = Layout::new::<ArcHeader>()
             .extend(Layout::new::<CryptoProvider>())
             .unwrap()
@@ -307,6 +367,7 @@ mod provider_refusal {
                     expected,
                     refused: false,
                     live: 0,
+                    skip_matching: 0,
                 }))
             });
             let result = reservation.builder();
@@ -323,6 +384,47 @@ mod provider_refusal {
             );
             drop(reservation);
             assert_eq!(pool.used(), 0);
+        }
+        check_default_arcs();
+    }
+    fn check_default_arcs() {
+        let payloads = rustls::server::server_config_default_payload_layouts();
+        let layouts: Vec<_> = payloads
+            .iter()
+            .map(|payload| {
+                Layout::new::<ArcHeader>()
+                    .extend(*payload)
+                    .unwrap()
+                    .0
+                    .pad_to_align()
+            })
+            .collect();
+        for (index, expected) in layouts.iter().copied().enumerate() {
+            let skip_matching = layouts[..index]
+                .iter()
+                .filter(|layout| **layout == expected)
+                .count();
+            ARM.with(|cell| {
+                cell.set(Some(Arm {
+                    expected,
+                    refused: false,
+                    live: 0,
+                    skip_matching,
+                }))
+            });
+            let result = rustls::server::ServerConfigDefaults::try_new_in(std::alloc::Global);
+            let refused = result.is_err();
+            drop(result);
+            let arm = ARM.with(|cell| cell.take()).unwrap();
+            assert!(
+                arm.refused,
+                "actual selected default Arc must hit the chosen request"
+            );
+            assert!(refused);
+            assert_eq!(
+                arm.live, 0,
+                "every prepared default/cache backing must free on refusal"
+            );
         }
     }
 }

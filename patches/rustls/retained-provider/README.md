@@ -1,18 +1,7 @@
-# Retained default provider source
+# Selected retained provider and cache profile
 
-This build-owned source adds a fallible constructor for the exact acquired
-rustls ring provider lists. The package manifests, algorithm lists, random
-provider and key provider remain the acquired definitions. Original vendor files
-are verified and never edited; the output and both Cargo source routes have
-independent byte, mode, lock and dependency-graph checks.
+This verified build-owned rustls 0.23.45 profile keeps the existing ring algorithm lists and server cache policies (256 sessions and four compression entries). It explicitly uses the pinned nightly allocator API and retains rustls's unsafe-code prohibition. Package manifests, Cargo lock and resolved dependency graph remain unchanged.
 
-The private TLS config carrier admits the actual two Vec layouts and full
-provider ArcInner request before construction and retains the charge through
-cached config and Session aliases. The selected constructor refuses unexpected
-retained Vec capacities. This requested-layout proof excludes allocator-private
-metadata and other config, certificate, signing and handshake allocations.
+The enclave passes the original SDK OwnedAllocator through the minimal owned-hash-map facade and allocator-backed queues before cache backing allocation. The opaque first-party config carrier separately prepays complete concrete Arc metadata layouts and default list buffers. The default unprofiled supplier source is untouched.
 
-The allocator failure shim is compiled only for native library tests. It arms
-one exact constructor request on the current test thread, retains ordinary
-System behavior otherwise, and verifies all prepared backing is freed. It does
-not select a production global allocator policy.
+Cache entry byte copies/returns and certificate, signing and handshake children remain separate owners. This profile alone is not global allocator enforcement or a complete TLS allocation claim.

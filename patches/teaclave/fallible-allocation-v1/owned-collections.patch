@@ -1,0 +1,16 @@
+--- a/sgx_tstd/src/collections/mod.rs
++++ b/sgx_tstd/src/collections/mod.rs
+@@ -442,3 +442,13 @@
+     //! A hash set implemented as a `HashMap` where the value is `()`.
+     pub use super::hash::set::*;
+ }
++
++/// Hash-map storage with an explicit retained allocator.
++/// This uses the same backend and RandomState as the current std HashMap.
++/// Capacity and insertion refusal are exposed by the backend's fallible APIs.
++pub mod owned_hash_map {
++    pub use hashbrown::hash_map::Entry;
++    /// Current hash-map backend with caller-owned backing allocation.
++    pub type HashMap<K, V, S = crate::hash::RandomState, A = crate::alloc::Global> =
++        hashbrown::HashMap<K, V, S, A>;
++}

@@ -23,6 +23,10 @@
     {
       "path": "typed-thread-allocation.patch",
       "sha256": "04b37f5b104638aa298a0c04e58e02dcc3e124d27bd76a3d30f74f748961b755"
+    },
+    {
+      "path": "owned-collections.patch",
+      "sha256": "e68636f6e9bb38034752aafa3bffa3d9430101c7cbda7011216defb6a4f573c9"
     }
   ],
   "files": [
@@ -135,6 +139,11 @@
       "path": "sgx_types/src/memory.rs",
       "before_sha256": null,
       "after_sha256": "fd2535930f345e187213bb13b055d4363ee1af9c2e99cf2b832f6656cefa2e6e"
+    },
+    {
+      "path": "sgx_tstd/src/collections/mod.rs",
+      "before_sha256": "5cf68d7af16f40415be5345e326fe14ab940ab92322e7964a9a094e7f9846650",
+      "after_sha256": "de5632ab2005869532317874193e0c042254cb1023e3621fd0f0d988b3adcb82"
     }
   ],
   "preserved": [

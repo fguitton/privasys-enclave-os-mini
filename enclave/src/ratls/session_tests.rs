@@ -1762,6 +1762,8 @@ fn checked_response_step_policy() {
 
 // The same genuine TLS fixture exercises the opaque top-level config owner.
 fn checked_retained_tls_config() {
+    #[cfg(feature = "fallible-allocation-v1")]
+    retained_cache_checks::check();
     use super::retained_tls_config::RetainedTlsConfig;
     let authentication = super::retained_tls_config::ClientAuthentication::Anonymous;
     let needed = RetainedTlsConfig::required_bytes(authentication).unwrap();
@@ -1792,5 +1794,103 @@ fn checked_retained_tls_config() {
         assert_eq!(config_pool.used(), needed);
         drop(alias);
         assert_eq!(config_pool.used(), 0);
+    }
+}
+
+#[cfg(feature = "fallible-allocation-v1")]
+mod retained_cache_checks {
+    use rustls::server::{ServerSessionMemoryCache, StoresServerSessions};
+    use std::alloc::{AllocError, Allocator, Global, Layout};
+    use std::ptr::NonNull;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    #[derive(Default)]
+    struct Counts {
+        live: AtomicUsize,
+        calls: AtomicUsize,
+        frees: AtomicUsize,
+        refuse: AtomicUsize,
+    }
+    #[derive(Clone)]
+    struct Original(Arc<Counts>);
+    unsafe impl Allocator for Original {
+        fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+            let call = self.0.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == self.0.refuse.load(Ordering::SeqCst) {
+                return Err(AllocError);
+            }
+            let block = Global.allocate(layout)?;
+            self.0.live.fetch_add(layout.size(), Ordering::SeqCst);
+            Ok(block)
+        }
+        unsafe fn deallocate(&self, pointer: NonNull<u8>, layout: Layout) {
+            unsafe { Global.deallocate(pointer, layout) };
+            self.0.live.fetch_sub(layout.size(), Ordering::SeqCst);
+            self.0.frees.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    pub(super) fn check() {
+        memory_cache();
+        compression_cache();
+    }
+    fn memory_cache() {
+        for refusal in 1..=2 {
+            let counts = Arc::new(Counts::default());
+            counts.refuse.store(refusal, Ordering::SeqCst);
+            let result = ServerSessionMemoryCache::try_new_in(256, Original(counts.clone()));
+            assert!(result.is_err());
+            assert_eq!(counts.calls.load(Ordering::SeqCst), refusal);
+            assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+            assert_eq!(Arc::strong_count(&counts), 1);
+        }
+        let counts = Arc::new(Counts::default());
+        let allocator = Original(counts.clone());
+        let cache = ServerSessionMemoryCache::try_new_in(2, allocator.clone()).unwrap();
+        let ordinary = ServerSessionMemoryCache::new(2);
+        for key in 0..6 {
+            assert_eq!(
+                cache.put(vec![key], vec![key + 10]),
+                ordinary.put(vec![key], vec![key + 10])
+            );
+            for seen in 0..=key {
+                assert_eq!(cache.get(&[seen]), ordinary.get(&[seen]));
+            }
+        }
+        for key in 0..6 {
+            assert_eq!(cache.take(&[key]), ordinary.take(&[key]));
+        }
+        let alias = cache.clone();
+        drop(allocator);
+        drop(cache);
+        assert!(counts.live.load(Ordering::SeqCst) > 0);
+        std::thread::spawn(move || drop(alias)).join().unwrap();
+        assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+        assert_eq!(Arc::strong_count(&counts), 1);
+    }
+    fn compression_cache() {
+        for refusal in 1..=1 {
+            let counts = Arc::new(Counts::default());
+            counts.refuse.store(refusal, Ordering::SeqCst);
+            let result =
+                rustls::compress::CompressionCache::try_new_in(4, Original(counts.clone()));
+            assert!(result.is_err());
+            assert_eq!(counts.calls.load(Ordering::SeqCst), refusal);
+            assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+            assert_eq!(Arc::strong_count(&counts), 1);
+        }
+        let counts = Arc::new(Counts::default());
+        let allocator = Original(counts.clone());
+        let cache = rustls::compress::CompressionCache::try_new_in(4, allocator.clone()).unwrap();
+        assert!(matches!(
+            cache,
+            rustls::compress::CompressionCache::Enabled(_)
+        ));
+        drop(allocator);
+        assert!(counts.live.load(Ordering::SeqCst) > 0);
+        drop(cache);
+        assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+        assert_eq!(Arc::strong_count(&counts), 1);
     }
 }

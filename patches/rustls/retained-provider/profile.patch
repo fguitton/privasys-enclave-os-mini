@@ -1,3 +1,816 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -330,7 +330,8 @@
+ 
+ // Require docs for public APIs, deny unsafe code, etc.
+ #![forbid(unsafe_code, unused_must_use)]
+-#![cfg_attr(not(any(read_buf, bench, coverage_nightly)), forbid(unstable_features))]
++// This verified generated profile uses the already pinned nightly allocator API.
++#![feature(allocator_api)]
+ #![warn(
+     clippy::alloc_instead_of_core,
+     clippy::manual_let_else,
+@@ -438,6 +439,8 @@
+ mod hash_hs;
+ #[cfg(any(feature = "std", feature = "hashbrown"))]
+ mod limited_cache;
++#[cfg(feature = "std")]
++pub use limited_cache::RetainedAllocator;
+ mod rand;
+ mod record_layer;
+ #[cfg(feature = "std")]
+@@ -533,20 +536,20 @@
+ /// [`unbuffered-client`]: https://github.com/rustls/rustls/blob/main/examples/src/bin/unbuffered-client.rs
+ /// [`unbuffered-server`]: https://github.com/rustls/rustls/blob/main/examples/src/bin/unbuffered-server.rs
+ pub mod unbuffered {
+-    pub use crate::conn::UnbufferedConnectionCommon;
+     pub use crate::conn::unbuffered::{
+         AppDataRecord, ConnectionState, EncodeError, EncodeTlsData, EncryptError,
+         InsufficientSizeError, ReadEarlyData, ReadTraffic, TransmitTlsData, UnbufferedStatus,
+         WriteTraffic,
+     };
++    pub use crate::conn::UnbufferedConnectionCommon;
+ }
+ 
+ // The public interface is:
+ pub use crate::builder::{ConfigBuilder, ConfigSide, WantsVerifier, WantsVersions};
+ pub use crate::common_state::{CommonState, HandshakeKind, IoState, Side};
++pub use crate::conn::{kernel, ConnectionCommon, SideData};
+ #[cfg(feature = "std")]
+ pub use crate::conn::{Connection, Reader, Writer};
+-pub use crate::conn::{ConnectionCommon, SideData, kernel};
+ pub use crate::enums::{
+     AlertDescription, CertificateCompressionAlgorithm, CipherSuite, ContentType, HandshakeType,
+     ProtocolVersion, SignatureAlgorithm, SignatureScheme,
+@@ -575,7 +578,7 @@
+ pub use crate::tls12::Tls12CipherSuite;
+ pub use crate::tls13::Tls13CipherSuite;
+ pub use crate::verify::DigitallySignedStruct;
+-pub use crate::versions::{ALL_VERSIONS, DEFAULT_VERSIONS, SupportedProtocolVersion};
++pub use crate::versions::{SupportedProtocolVersion, ALL_VERSIONS, DEFAULT_VERSIONS};
+ pub use crate::webpki::RootCertStore;
+ 
+ /// Items for use in a client.
+@@ -613,8 +616,8 @@
+ 
+     pub use crate::msgs::persist::{Tls12ClientSessionValue, Tls13ClientSessionValue};
+     pub use crate::webpki::{
+-        ServerCertVerifierBuilder, VerifierBuilderError, WebPkiServerVerifier,
+-        verify_server_cert_signed_by_trust_anchor, verify_server_name,
++        verify_server_cert_signed_by_trust_anchor, verify_server_name, ServerCertVerifierBuilder,
++        VerifierBuilderError, WebPkiServerVerifier,
+     };
+ }
+ 
+@@ -635,7 +638,11 @@
+     mod tls12;
+     mod tls13;
+ 
+-    pub use builder::WantsServerCert;
++    pub use builder::{
++        server_config_certificate_payload_layouts, server_config_default_buffer_layouts,
++        server_config_default_payload_layouts, ServerConfigAllocationError, ServerConfigDefaults,
++        WantsServerCert,
++    };
+     #[cfg(any(feature = "std", feature = "hashbrown"))]
+     pub use handy::ResolvesServerCertUsingSni;
+     #[cfg(any(feature = "std", feature = "hashbrown"))]
+@@ -682,7 +689,7 @@
+ /// Message signing interfaces.
+ pub mod sign {
+     pub use crate::crypto::signer::{
+-        CertifiedKey, Signer, SigningKey, SingleCertAndKey, public_key_to_spki,
++        public_key_to_spki, CertifiedKey, Signer, SigningKey, SingleCertAndKey,
+     };
+ }
+ 
+@@ -707,12 +714,12 @@
+ #[cfg(any(feature = "std", feature = "hashbrown"))]
+ mod hash_map {
+     #[cfg(feature = "std")]
++    pub(crate) use std::collections::hash_map::Entry;
++    #[cfg(feature = "std")]
+     pub(crate) use std::collections::HashMap;
+-    #[cfg(feature = "std")]
+-    pub(crate) use std::collections::hash_map::Entry;
+-
++
++    #[cfg(all(not(feature = "std"), feature = "hashbrown"))]
++    pub(crate) use hashbrown::hash_map::Entry;
+     #[cfg(all(not(feature = "std"), feature = "hashbrown"))]
+     pub(crate) use hashbrown::HashMap;
+-    #[cfg(all(not(feature = "std"), feature = "hashbrown"))]
+-    pub(crate) use hashbrown::hash_map::Entry;
+-}
++}
+--- a/src/limited_cache.rs
++++ b/src/limited_cache.rs
+@@ -2,7 +2,29 @@
+ use core::borrow::Borrow;
+ use core::hash::Hash;
+ 
++#[cfg(not(target_vendor = "teaclave"))]
+ use crate::hash_map::{Entry, HashMap};
++use core::alloc::Allocator;
++#[cfg(target_vendor = "teaclave")]
++use std::collections::owned_hash_map::{Entry, HashMap};
++
++/// Allocator accepted by the selected server-cache constructor.
++#[cfg(target_vendor = "teaclave")]
++pub type RetainedAllocator = std::alloc::OwnedAllocator;
++/// Native default allocator; generic cache constructors also accept test allocators.
++#[cfg(not(target_vendor = "teaclave"))]
++pub type RetainedAllocator = alloc::alloc::Global;
++
++pub(crate) fn default_allocator() -> RetainedAllocator {
++    #[cfg(target_vendor = "teaclave")]
++    {
++        std::alloc::system_allocator()
++    }
++    #[cfg(not(target_vendor = "teaclave"))]
++    {
++        alloc::alloc::Global
++    }
++}
+ 
+ /// A HashMap-alike, which never gets larger than a specified
+ /// capacity, and evicts the oldest insertion to maintain this.
+@@ -12,14 +34,14 @@
+ /// storage.
+ ///
+ /// This is inefficient: it stores keys twice.
+-pub(crate) struct LimitedCache<K: Clone + Hash + Eq, V> {
+-    map: HashMap<K, V>,
++pub(crate) struct LimitedCache<K: Clone + Hash + Eq, V, A: Allocator + Clone = RetainedAllocator> {
++    map: HashMap<K, V, std::collections::hash_map::RandomState, A>,
+ 
+     // first item is the oldest key
+-    oldest: VecDeque<K>,
+-}
+-
+-impl<K, V> LimitedCache<K, V>
++    oldest: VecDeque<K, A>,
++}
++
++impl<K, V, A: Allocator + Clone> LimitedCache<K, V, A>
+ where
+     K: Eq + Hash + Clone + core::fmt::Debug,
+     V: Default,
+@@ -31,8 +53,7 @@
+                 false
+             }
+             entry @ Entry::Vacant(_) => {
+-                self.oldest
+-                    .push_back(entry.key().clone());
++                self.oldest.push_back(entry.key().clone());
+                 edit(entry.or_insert_with(V::default));
+                 true
+             }
+@@ -54,17 +75,38 @@
+     }
+ }
+ 
+-impl<K, V> LimitedCache<K, V>
++impl<K, V, A: Allocator + Clone> LimitedCache<K, V, A>
+ where
+     K: Eq + Hash + Clone + core::fmt::Debug,
+     V: Default,
+ {
+     /// Create a new LimitedCache with the given rough capacity.
+-    pub(crate) fn new(capacity_order_of_magnitude: usize) -> Self {
++    fn new_in(capacity_order_of_magnitude: usize, allocator: A) -> Self {
+         Self {
+-            map: HashMap::with_capacity(capacity_order_of_magnitude),
+-            oldest: VecDeque::with_capacity(capacity_order_of_magnitude),
+-        }
++            map: HashMap::with_capacity_and_hasher_in(
++                capacity_order_of_magnitude,
++                std::collections::hash_map::RandomState::new(),
++                allocator.clone(),
++            ),
++            oldest: VecDeque::with_capacity_in(capacity_order_of_magnitude, allocator),
++        }
++    }
++
++    pub(crate) fn try_new_in(
++        capacity: usize,
++        allocator: A,
++    ) -> Result<Self, core::alloc::AllocError> {
++        let mut map = HashMap::with_hasher_in(
++            std::collections::hash_map::RandomState::new(),
++            allocator.clone(),
++        );
++        map.try_reserve(capacity)
++            .map_err(|_| core::alloc::AllocError)?;
++        let mut oldest = VecDeque::new_in(allocator);
++        oldest
++            .try_reserve_exact(capacity)
++            .map_err(|_| core::alloc::AllocError)?;
++        Ok(Self { map, oldest })
+     }
+ 
+     pub(crate) fn insert(&mut self, k: K, v: V) {
+@@ -76,8 +118,7 @@
+             }
+ 
+             entry @ Entry::Vacant(_) => {
+-                self.oldest
+-                    .push_back(entry.key().clone());
++                self.oldest.push_back(entry.key().clone());
+                 entry.or_insert(v);
+                 true
+             }
+@@ -105,11 +146,7 @@
+         let value = self.map.remove(k)?;
+ 
+         // O(N) search, followed by O(N) removal
+-        if let Some(index) = self
+-            .oldest
+-            .iter()
+-            .position(|item| item.borrow() == k)
+-        {
++        if let Some(index) = self.oldest.iter().position(|item| item.borrow() == k) {
+             self.oldest.remove(index);
+         }
+ 
+@@ -248,3 +285,13 @@
+         assert_eq!(t.get("abc"), Some(&6));
+     }
+ }
++
++impl<K, V> LimitedCache<K, V>
++where
++    K: Eq + Hash + Clone + core::fmt::Debug,
++    V: Default,
++{
++    pub(crate) fn new(capacity: usize) -> Self {
++        Self::new_in(capacity, default_allocator())
++    }
++}
+--- a/src/server/handy.rs
++++ b/src/server/handy.rs
+@@ -36,8 +36,10 @@
+     /// An implementer of `StoresServerSessions` that stores everything
+     /// in memory.  If enforces a limit on the number of stored sessions
+     /// to bound memory usage.
+-    pub struct ServerSessionMemoryCache {
+-        cache: Mutex<limited_cache::LimitedCache<Vec<u8>, Vec<u8>>>,
++    pub struct ServerSessionMemoryCache<
++        A: core::alloc::Allocator + Clone = crate::RetainedAllocator,
++    > {
++        cache: Mutex<limited_cache::LimitedCache<Vec<u8>, Vec<u8>, A>>,
+     }
+ 
+     impl ServerSessionMemoryCache {
+@@ -62,21 +64,27 @@
+         }
+     }
+ 
+-    impl server::StoresServerSessions for ServerSessionMemoryCache {
++    impl<A: core::alloc::Allocator + Clone> ServerSessionMemoryCache<A> {
++        /// Construct the same cache with fallible retained collection backings.
++        /// The outer Arc is a separately admitted allocation.
++        #[cfg(feature = "std")]
++        pub fn try_new_in(size: usize, allocator: A) -> Result<Arc<Self>, core::alloc::AllocError> {
++            Arc::try_new(Self {
++                cache: Mutex::new(limited_cache::LimitedCache::try_new_in(size, allocator)?),
++            })
++        }
++    }
++
++    impl<A: core::alloc::Allocator + Clone + Send + Sync + 'static> server::StoresServerSessions
++        for ServerSessionMemoryCache<A>
++    {
+         fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
+-            self.cache
+-                .lock()
+-                .unwrap()
+-                .insert(key, value);
++            self.cache.lock().unwrap().insert(key, value);
+             true
+         }
+ 
+         fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+-            self.cache
+-                .lock()
+-                .unwrap()
+-                .get(key)
+-                .cloned()
++            self.cache.lock().unwrap().get(key).cloned()
+         }
+ 
+         fn take(&self, key: &[u8]) -> Option<Vec<u8>> {
+@@ -88,10 +96,9 @@
+         }
+     }
+ 
+-    impl Debug for ServerSessionMemoryCache {
++    impl<A: core::alloc::Allocator + Clone> Debug for ServerSessionMemoryCache<A> {
+         fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+-            f.debug_struct("ServerSessionMemoryCache")
+-                .finish()
++            f.debug_struct("ServerSessionMemoryCache").finish()
+         }
+     }
+ 
+@@ -201,7 +208,7 @@
+     use crate::hash_map::HashMap;
+     use crate::server::ClientHello;
+     use crate::sync::Arc;
+-    use crate::webpki::{ParsedCertificate, verify_server_name};
++    use crate::webpki::{verify_server_name, ParsedCertificate};
+     use crate::{server, sign};
+ 
+     /// Something that resolves do different cert chains/keys based
+@@ -246,8 +253,7 @@
+                 .and_then(|cert| verify_server_name(&cert, &server_name))?;
+ 
+             if let ServerName::DnsName(name) = server_name {
+-                self.by_name
+-                    .insert(name.as_ref().to_string(), Arc::new(ck));
++                self.by_name.insert(name.as_ref().to_string(), Arc::new(ck));
+             }
+             Ok(())
+         }
+@@ -272,42 +278,36 @@
+         #[test]
+         fn test_resolvesservercertusingsni_requires_sni() {
+             let rscsni = ResolvesServerCertUsingSni::new();
+-            assert!(
+-                rscsni
+-                    .resolve(ClientHello {
+-                        server_name: &None,
+-                        signature_schemes: &[],
+-                        alpn: None,
+-                        server_cert_types: None,
+-                        client_cert_types: None,
+-                        cipher_suites: &[],
+-                        certificate_authorities: None,
+-                        named_groups: None,
+-                    })
+-                    .is_none()
+-            );
++            assert!(rscsni
++                .resolve(ClientHello {
++                    server_name: &None,
++                    signature_schemes: &[],
++                    alpn: None,
++                    server_cert_types: None,
++                    client_cert_types: None,
++                    cipher_suites: &[],
++                    certificate_authorities: None,
++                    named_groups: None,
++                })
++                .is_none());
+         }
+ 
+         #[test]
+         fn test_resolvesservercertusingsni_handles_unknown_name() {
+             let rscsni = ResolvesServerCertUsingSni::new();
+-            let name = DnsName::try_from("hello.com")
+-                .unwrap()
+-                .to_owned();
+-            assert!(
+-                rscsni
+-                    .resolve(ClientHello {
+-                        server_name: &Some(name),
+-                        signature_schemes: &[],
+-                        alpn: None,
+-                        server_cert_types: None,
+-                        client_cert_types: None,
+-                        cipher_suites: &[],
+-                        certificate_authorities: None,
+-                        named_groups: None,
+-                    })
+-                    .is_none()
+-            );
++            let name = DnsName::try_from("hello.com").unwrap().to_owned();
++            assert!(rscsni
++                .resolve(ClientHello {
++                    server_name: &Some(name),
++                    signature_schemes: &[],
++                    alpn: None,
++                    server_cert_types: None,
++                    client_cert_types: None,
++                    cipher_suites: &[],
++                    certificate_authorities: None,
++                    named_groups: None,
++                })
++                .is_none());
+         }
+     }
+ }
+--- a/src/server/builder.rs
++++ b/src/server/builder.rs
+@@ -3,13 +3,13 @@
+ 
+ use pki_types::{CertificateDer, PrivateKeyDer};
+ 
+-use super::{ResolvesServerCert, ServerConfig, handy};
++use super::{handy, ResolvesServerCert, ServerConfig};
+ use crate::builder::{ConfigBuilder, WantsVerifier};
+ use crate::error::Error;
+ use crate::sign::{CertifiedKey, SingleCertAndKey};
+ use crate::sync::Arc;
+ use crate::verify::{ClientCertVerifier, NoClientAuth};
+-use crate::{NoKeyLog, compress, versions};
++use crate::{compress, versions, NoKeyLog};
+ 
+ impl ConfigBuilder<ServerConfig, WantsVerifier> {
+     /// Choose how to verify client certificates.
+@@ -100,6 +100,42 @@
+ 
+     /// Sets a custom [`ResolvesServerCert`].
+     pub fn with_cert_resolver(self, cert_resolver: Arc<dyn ResolvesServerCert>) -> ServerConfig {
++        self.with_cert_resolver_defaults(cert_resolver, ServerConfigDefaults::new())
++    }
++
++    /// Construct identical server defaults with fallible retained cache backing.
++    /// Private-key parsing and the caller's certificate buffers remain separate owners.
++    pub fn try_with_single_cert_in(
++        self,
++        cert_chain: Vec<CertificateDer<'static>>,
++        key_der: PrivateKeyDer<'static>,
++        allocator: crate::RetainedAllocator,
++    ) -> Result<ServerConfig, ServerConfigAllocationError> {
++        let defaults = ServerConfigDefaults::try_new_in(allocator)?;
++        let certified_key = CertifiedKey::from_der(cert_chain, key_der, self.crypto_provider())
++            .map_err(ServerConfigAllocationError::Certificate)?;
++        let certified_key =
++            Arc::try_new(certified_key).map_err(|_| ServerConfigAllocationError::Allocation)?;
++        let resolver = Arc::try_new(SingleCertAndKey::from(certified_key))
++            .map_err(|_| ServerConfigAllocationError::Allocation)?;
++        Ok(self.with_cert_resolver_defaults(resolver, defaults))
++    }
++
++    /// Construct identical defaults for an already owned certificate resolver.
++    pub fn try_with_cert_resolver_in(
++        self,
++        cert_resolver: Arc<dyn ResolvesServerCert>,
++        allocator: crate::RetainedAllocator,
++    ) -> Result<ServerConfig, ServerConfigAllocationError> {
++        let defaults = ServerConfigDefaults::try_new_in(allocator)?;
++        Ok(self.with_cert_resolver_defaults(cert_resolver, defaults))
++    }
++
++    fn with_cert_resolver_defaults(
++        self,
++        cert_resolver: Arc<dyn ResolvesServerCert>,
++        defaults: ServerConfigDefaults,
++    ) -> ServerConfig {
+         #[cfg(feature = "tls12")]
+         let require_ems = self.provider.fips();
+ 
+@@ -110,13 +146,11 @@
+             ignore_client_order: false,
+             max_fragment_size: None,
+             #[cfg(feature = "std")]
+-            session_storage: handy::ServerSessionMemoryCache::new(256),
+-            #[cfg(not(feature = "std"))]
+-            session_storage: Arc::new(handy::NoServerSessionStorage {}),
+-            ticketer: Arc::new(handy::NeverProducesTickets {}),
++            session_storage: defaults.session_storage,
++            ticketer: defaults.ticketer,
+             alpn_protocols: Vec::new(),
+             versions: self.state.versions,
+-            key_log: Arc::new(NoKeyLog {}),
++            key_log: defaults.key_log,
+             enable_secret_extraction: false,
+             max_early_data_size: 0,
+             send_half_rtt_data: false,
+@@ -125,9 +159,119 @@
+             #[cfg(feature = "tls12")]
+             require_ems,
+             time_provider: self.time_provider,
++            cert_compressors: defaults.cert_compressors,
++            cert_compression_cache: defaults.cert_compression_cache,
++            cert_decompressors: defaults.cert_decompressors,
++        }
++    }
++}
++
++/// Refusal from retained default construction or the unchanged certificate parser.
++#[derive(Debug)]
++pub enum ServerConfigAllocationError {
++    /// No configuration was published after an allocation refusal.
++    Allocation,
++    /// The original certificate/key consistency checks rejected the input.
++    Certificate(Error),
++}
++
++/// Actual concrete payload layouts of the separately retained default Arc objects.
++/// The caller adds its acquired Arc header/padding before admitting these requests.
++pub fn server_config_default_payload_layouts() -> [core::alloc::Layout; 4] {
++    use core::alloc::Layout;
++    [
++        Layout::new::<handy::ServerSessionMemoryCache>(),
++        Layout::new::<handy::NeverProducesTickets>(),
++        Layout::new::<NoKeyLog>(),
++        Layout::new::<compress::CompressionCache>(),
++    ]
++}
++
++/// Actual single-certificate resolver Arc payload layouts, independently of key internals.
++pub fn server_config_certificate_payload_layouts() -> [core::alloc::Layout; 2] {
++    [
++        core::alloc::Layout::new::<CertifiedKey>(),
++        core::alloc::Layout::new::<SingleCertAndKey>(),
++    ]
++}
++
++/// Actual default compressor/decompressor Vec backing layouts, including empty lists.
++pub fn server_config_default_buffer_layouts(
++) -> Result<[core::alloc::Layout; 2], core::alloc::LayoutError> {
++    use core::alloc::Layout;
++    Ok([
++        Layout::array::<&'static dyn compress::CertCompressor>(
++            compress::default_cert_compressors().len(),
++        )?,
++        Layout::array::<&'static dyn compress::CertDecompressor>(
++            compress::default_cert_decompressors().len(),
++        )?,
++    ])
++}
++
++const DEFAULT_SESSION_CACHE_SIZE: usize = 256;
++/// Opaque identical server defaults, before any certificate/key publication.
++/// The caller separately admits concrete Arc metadata; the allocator owns cache backings.
++pub struct ServerConfigDefaults {
++    session_storage: Arc<dyn super::StoresServerSessions>,
++    ticketer: Arc<dyn super::ProducesTickets>,
++    key_log: Arc<dyn crate::KeyLog>,
++    cert_compressors: Vec<&'static dyn compress::CertCompressor>,
++    cert_compression_cache: Arc<compress::CompressionCache>,
++    cert_decompressors: Vec<&'static dyn compress::CertDecompressor>,
++}
++impl ServerConfigDefaults {
++    fn new() -> Self {
++        Self {
++            session_storage: handy::ServerSessionMemoryCache::new(DEFAULT_SESSION_CACHE_SIZE),
++            ticketer: Arc::new(handy::NeverProducesTickets {}),
++            key_log: Arc::new(NoKeyLog {}),
+             cert_compressors: compress::default_cert_compressors().to_vec(),
+             cert_compression_cache: Arc::new(compress::CompressionCache::default()),
+             cert_decompressors: compress::default_cert_decompressors().to_vec(),
+         }
+     }
+-}
++    /// Prepare identical defaults with fallible backing and Arc construction.
++    pub fn try_new_in(
++        allocator: crate::RetainedAllocator,
++    ) -> Result<Self, ServerConfigAllocationError> {
++        let session_storage = handy::ServerSessionMemoryCache::try_new_in(
++            DEFAULT_SESSION_CACHE_SIZE,
++            allocator.clone(),
++        )
++        .map_err(|_| ServerConfigAllocationError::Allocation)?;
++        let ticketer = Arc::try_new(handy::NeverProducesTickets {})
++            .map_err(|_| ServerConfigAllocationError::Allocation)?;
++        let key_log =
++            Arc::try_new(NoKeyLog {}).map_err(|_| ServerConfigAllocationError::Allocation)?;
++        let mut cert_compressors = Vec::new();
++        let mut cert_decompressors = Vec::new();
++        let compressors = compress::default_cert_compressors();
++        let decompressors = compress::default_cert_decompressors();
++        cert_compressors
++            .try_reserve_exact(compressors.len())
++            .map_err(|_| ServerConfigAllocationError::Allocation)?;
++        cert_decompressors
++            .try_reserve_exact(decompressors.len())
++            .map_err(|_| ServerConfigAllocationError::Allocation)?;
++        if cert_compressors.capacity() != compressors.len()
++            || cert_decompressors.capacity() != decompressors.len()
++        {
++            return Err(ServerConfigAllocationError::Allocation);
++        }
++        cert_compressors.extend_from_slice(compressors);
++        cert_decompressors.extend_from_slice(decompressors);
++        let cache = compress::CompressionCache::try_default_in(allocator)
++            .map_err(|_| ServerConfigAllocationError::Allocation)?;
++        let cert_compression_cache =
++            Arc::try_new(cache).map_err(|_| ServerConfigAllocationError::Allocation)?;
++        Ok(Self {
++            session_storage,
++            ticketer,
++            key_log,
++            cert_compressors,
++            cert_compression_cache,
++            cert_decompressors,
++        })
++    }
++}
+--- a/src/compress.rs
++++ b/src/compress.rs
+@@ -35,6 +35,7 @@
+ #[cfg(feature = "std")]
+ use alloc::collections::VecDeque;
+ use alloc::vec::Vec;
++use core::alloc::Allocator;
+ use core::fmt::Debug;
+ #[cfg(feature = "std")]
+ use std::sync::Mutex;
+@@ -126,7 +127,7 @@
+ #[cfg(feature = "zlib")]
+ mod feat_zlib_rs {
+     use zlib_rs::{
+-        DeflateConfig, InflateConfig, ReturnCode, compress_bound, compress_slice, decompress_slice,
++        compress_bound, compress_slice, decompress_slice, DeflateConfig, InflateConfig, ReturnCode,
+     };
+ 
+     use super::*;
+@@ -273,45 +274,45 @@
+ /// The prospect of being able to reuse a given compression for many connections
+ /// means we can afford to spend more time on that compression (by passing
+ /// `CompressionLevel::Amortized` to the compressor).
+-#[derive(Debug)]
+-pub enum CompressionCache {
++pub enum CompressionCache<A: Allocator + Clone = crate::RetainedAllocator> {
+     /// No caching happens, and compression happens each time using
+     /// `CompressionLevel::Interactive`.
+     Disabled,
+ 
+     /// Compressions are stored in an LRU cache.
+     #[cfg(feature = "std")]
+-    Enabled(CompressionCacheInner),
++    Enabled(CompressionCacheInner<A>),
+ }
+ 
+ /// Innards of an enabled CompressionCache.
+ ///
+ /// You cannot make one of these directly. Use [`CompressionCache::new`].
+ #[cfg(feature = "std")]
+-#[derive(Debug)]
+-pub struct CompressionCacheInner {
++pub struct CompressionCacheInner<A: Allocator + Clone = crate::RetainedAllocator> {
+     /// Maximum size of underlying storage.
+     size: usize,
+ 
+     /// LRU-order entries.
+     ///
+     /// First is least-used, last is most-used.
+-    entries: Mutex<VecDeque<Arc<CompressionCacheEntry>>>,
+-}
+-
+-impl CompressionCache {
+-    /// Make a `CompressionCache` that stores up to `size` compressed
+-    /// certificate messages.
++    entries: Mutex<VecDeque<Arc<CompressionCacheEntry>, A>>,
++}
++
++impl<A: Allocator + Clone> CompressionCache<A> {
++    /// Construct the same cache with fallible retained backing admission.
+     #[cfg(feature = "std")]
+-    pub fn new(size: usize) -> Self {
++    pub fn try_new_in(size: usize, allocator: A) -> Result<Self, core::alloc::AllocError> {
+         if size == 0 {
+-            return Self::Disabled;
+-        }
+-
+-        Self::Enabled(CompressionCacheInner {
++            return Ok(Self::Disabled);
++        }
++        let mut entries = VecDeque::new_in(allocator);
++        entries
++            .try_reserve_exact(size)
++            .map_err(|_| core::alloc::AllocError)?;
++        Ok(Self::Enabled(CompressionCacheInner {
+             size,
+-            entries: Mutex::new(VecDeque::with_capacity(size)),
+-        })
++            entries: Mutex::new(entries),
++        }))
+     }
+ 
+     /// Return a `CompressionCacheEntry`, which is an owning
+@@ -353,9 +354,7 @@
+         let encoding = original.get_encoding();
+         let algorithm = compressor.algorithm();
+ 
+-        let mut cache = entries
+-            .lock()
+-            .map_err(|_| CompressionFailed)?;
++        let mut cache = entries.lock().map_err(|_| CompressionFailed)?;
+         for (i, item) in cache.iter().enumerate() {
+             if item.algorithm == algorithm && item.original == encoding {
+                 // this item is now MRU
+@@ -380,9 +379,7 @@
+         });
+ 
+         // insert into cache
+-        let mut cache = entries
+-            .lock()
+-            .map_err(|_| CompressionFailed)?;
++        let mut cache = entries.lock().map_err(|_| CompressionFailed)?;
+         if cache.len() == max_size {
+             cache.pop_front();
+         }
+@@ -419,7 +416,7 @@
+         #[cfg(feature = "std")]
+         {
+             // 4 entries allows 2 certificate chains times 2 compression algorithms
+-            Self::new(4)
++            Self::new(DEFAULT_CACHE_SIZE)
+         }
+ 
+         #[cfg(not(feature = "std"))]
+@@ -481,9 +478,7 @@
+         let original = vec![0u8; plain_len];
+ 
+         for level in [CompressionLevel::Interactive, CompressionLevel::Amortized] {
+-            let compressed = comp
+-                .compress(original.clone(), level)
+-                .unwrap();
++            let compressed = comp.compress(original.clone(), level).unwrap();
+             println!(
+                 "{:?} compressed trivial {} -> {} using {:?} level",
+                 comp.algorithm(),
+@@ -492,9 +487,7 @@
+                 level
+             );
+             let mut recovered = vec![0xffu8; plain_len];
+-            decomp
+-                .decompress(&compressed, &mut recovered)
+-                .unwrap();
++            decomp.decompress(&compressed, &mut recovered).unwrap();
+             assert_eq!(original, recovered);
+         }
+     }
+@@ -508,23 +501,17 @@
+ 
+         // too big
+         let mut recovered = vec![0xffu8; original.len() + 1];
+-        decomp
+-            .decompress(&compressed, &mut recovered)
+-            .unwrap_err();
++        decomp.decompress(&compressed, &mut recovered).unwrap_err();
+ 
+         // too small
+         let mut recovered = vec![0xffu8; original.len() - 1];
+-        decomp
+-            .decompress(&compressed, &mut recovered)
+-            .unwrap_err();
++        decomp.decompress(&compressed, &mut recovered).unwrap_err();
+     }
+ 
+     fn test_decompress_garbage(decomp: &dyn CertDecompressor) {
+         let junk = [0u8; 1024];
+         let mut recovered = vec![0u8; 512];
+-        decomp
+-            .decompress(&junk, &mut recovered)
+-            .unwrap_err();
++        decomp.decompress(&junk, &mut recovered).unwrap_err();
+     }
+ 
+     #[test]
+@@ -677,3 +664,48 @@
+         }
+     }
+ }
++
++impl CompressionCache {
++    /// Make a `CompressionCache` that stores up to `size` compressed
++    /// certificate messages.
++    #[cfg(feature = "std")]
++    pub fn new(size: usize) -> Self {
++        if size == 0 {
++            return Self::Disabled;
++        }
++
++        Self::Enabled(CompressionCacheInner {
++            size,
++            entries: Mutex::new(VecDeque::with_capacity_in(
++                size,
++                crate::limited_cache::default_allocator(),
++            )),
++        })
++    }
++}
++
++impl<A: Allocator + Clone> Debug for CompressionCache<A> {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        match self {
++            Self::Disabled => f.write_str("Disabled"),
++            Self::Enabled(inner) => f.debug_tuple("Enabled").field(inner).finish(),
++        }
++    }
++}
++impl<A: Allocator + Clone> Debug for CompressionCacheInner<A> {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.debug_struct("CompressionCacheInner")
++            .field("size", &self.size)
++            .field("entries", &self.entries)
++            .finish()
++    }
++}
++
++const DEFAULT_CACHE_SIZE: usize = 4;
++impl CompressionCache {
++    pub(crate) fn try_default_in(
++        allocator: crate::RetainedAllocator,
++    ) -> Result<Self, core::alloc::AllocError> {
++        Self::try_new_in(DEFAULT_CACHE_SIZE, allocator)
++    }
++}
 --- a/src/crypto/ring/mod.rs
 +++ b/src/crypto/ring/mod.rs
 @@ -3,7 +3,6 @@
