@@ -2,7 +2,7 @@
   "schema": 1,
   "profile": "retained-provider",
   "routing": "build-owned Cargo paths override; same package manifests, lock and dependency graph",
-  "patch_sha256": "3fc64ab3f48c0699d844e12ce17a374d985e14aa32b8a99ddc51a193712b2af0",
+  "patch_sha256": "dd38d8b14ead1cdf091c83532d318264261545f194e438c75fd4944d2c3df819",
   "suppliers": [
     {
       "package": "rustls",
@@ -16,19 +16,24 @@
           "after_sha256": "82e787108456eb702b2049b0fbc63cde62a30775f3895f57b3d70a9ae0a9742e"
         },
         {
+          "path": "src/client/client_conn.rs",
+          "before_sha256": "7cf3803f3b95e078743d687ab08b8c1d183c0c27a502a2a3d4403a512874b92d",
+          "after_sha256": "573e2e194f37ce8e196e1e7999102265fb001dde947330834c9481bcfce89e34"
+        },
+        {
           "path": "src/client/common.rs",
           "before_sha256": "3a7485fc2ccc54e19c4e619654b854277b624dd53b4d0d7991b1a0ff546f621d",
-          "after_sha256": "1bd6d8ee83b9d732ebd1c9bce7e5446d616b65ed471f0df20ecf580d2b0d65e0"
+          "after_sha256": "a977c0ac700ef5e216569c69b87f0d0509302e56e326f9a9a59bfe15fcc25d80"
         },
         {
           "path": "src/client/ech.rs",
           "before_sha256": "267a66863904acef533de53562ef4bbb919f8e757392e41d7400e3325b601eb3",
-          "after_sha256": "f79d52cd3faf45330a1e80ce14373d5cdbbed9c043dc6229357de5dc58c2cf5b"
+          "after_sha256": "a61de34db6782853710c22156c2e523b47c1f9d972c72b2a8b845b22ec46ee91"
         },
         {
           "path": "src/client/hs.rs",
           "before_sha256": "db78250533e2639401fa05a7e63ed2172aea9e38558a767deecf140dfbe03afe",
-          "after_sha256": "bd28462e8ff0705d77d92de667ddf9b48cf3c447f921712cd372cce206b032df"
+          "after_sha256": "ab9c9fc87864b8793a6d58c76412f5cc3d7fcd7562a9ecd7eba02dc4d7dda212"
         },
         {
           "path": "src/client/test.rs",
@@ -38,17 +43,17 @@
         {
           "path": "src/client/tls12.rs",
           "before_sha256": "169295b363f745d24a7887521f6055161e40a2e91612bf0d1b92645062d9a8d3",
-          "after_sha256": "264f83a197e3153c14481aadb901e49f71f543595ce99aa9267b985026db73ef"
+          "after_sha256": "31fe4705d9eaac1765ad8d40b2353cf7cdc0db6b64714e394b46ac00122b8508"
         },
         {
           "path": "src/client/tls13.rs",
           "before_sha256": "f49fab299541467c377fabbef5f12f07472370be348aa18159e268bcd2c698fa",
-          "after_sha256": "7c5d7e29f91d4dc56490aafa63c3bb8d3db5c2622fa78472652473e59bb6019b"
+          "after_sha256": "0356d0f4ac143c43fcf32868001dff6e7b1708aa5f48029aeef0ee66b70fee15"
         },
         {
           "path": "src/common_state.rs",
           "before_sha256": "6b784b195653cefe0eb42e9e1beb7bf25b35991c1da484a57c1549dd2237072b",
-          "after_sha256": "8cc770b5d6658807822b120637717a02e6ff013f2d1da2fb20b8a3460b616e23"
+          "after_sha256": "d948ae2c6659e811ddbb03d210e4876bebaca1d6375529b72494e173625f24c4"
         },
         {
           "path": "src/compress.rs",
@@ -111,9 +116,14 @@
           "after_sha256": "c64f67d4283884a4cbe318d5b667a20a7e9f06a90d4727515e8761110d464220"
         },
         {
+          "path": "src/hash_hs.rs",
+          "before_sha256": "6a03da8c8aea2f44f162843bc803a0dfb683b4b99137e5e5f5a6dd7978b02849",
+          "after_sha256": "126201daf02ba23dbda79bba5fc2f98342691af01ac0ca2d46890a9882aaefda"
+        },
+        {
           "path": "src/lib.rs",
           "before_sha256": "7bd4855fe9628a0d596e89edf8130a6c099a14a0b7f7bbb28953b53c01810502",
-          "after_sha256": "640a11d3fb5fdc31b5d5c526f6cf89c57057175005b90687088a1c1bd64b317b"
+          "after_sha256": "0cbe70cbdf3a60b3ea9d7f2c461e0c9a6e077d2c63a5e28bcef0af7c9a173ee0"
         },
         {
           "path": "src/limited_cache.rs",
@@ -138,7 +148,7 @@
         {
           "path": "src/msgs/handshake.rs",
           "before_sha256": "9f9d9d4686e4a3f4433edf5fcc17c224155fa3eef747363bfa53802fd67dda7d",
-          "after_sha256": "19283822a215a3c9ff4c7517153b34adccccc891ce78de1fa47a6f1ccd778e1c"
+          "after_sha256": "8541f954f6bf343414a4d62ef0bead4753a65c5a74d0dcad400647d2db8b9aeb"
         },
         {
           "path": "src/msgs/message/mod.rs",
@@ -164,7 +174,7 @@
         {
           "path": "src/quic.rs",
           "before_sha256": "d84b2a42a37a0286966eaadfc716578697a515100c31a0d8814e006b3a80c6d7",
-          "after_sha256": "546643af20d4e8ebe5159ac9ffc59712c1e575dd76cb16a6155eb3ba8389614c"
+          "after_sha256": "a7d4d176dc353f2421b6bc8ca1dfde573b903bcc69f7bef03e6c4b015b9de225"
         },
         {
           "path": "src/record_layer.rs",
@@ -184,22 +194,22 @@
         {
           "path": "src/server/hs.rs",
           "before_sha256": "b1ed14e5e36ee46bfb843b86af58efda01cdaa71a7f25a2f647da21f52529f91",
-          "after_sha256": "ddece46a1ad19fc07506ae0c3c3749f3c575f009334da2a7d5e7bb21af490e5d"
+          "after_sha256": "d8cdbd817c9bc4caca2973176a112b0c6e10eb46e28f233c5221d872140dc56b"
         },
         {
           "path": "src/server/server_conn.rs",
           "before_sha256": "603cddb8a3a415737b7e047deedd32a2a6e4f918c2372af0bfb50ebb04de2163",
-          "after_sha256": "a94238caf28b0982445588537b500034075143d27446daad14c689f84eaa64ca"
+          "after_sha256": "086edff2b5569bf3170a9611ecbe7638f40db36dc75939b1c8c1d87d28f30cbd"
         },
         {
           "path": "src/server/tls12.rs",
           "before_sha256": "b7d083644d3be9bb6bf6cca4c654537cd22d3bc545f932ab2c9354503ebd7056",
-          "after_sha256": "bc174fed62c8298b02f5f8ec13ef88494ba08514771e779db2845a8a39fc0196"
+          "after_sha256": "2aa3c32fadbdcc9d1c16749525f9e0754f9b847bae739a6e017e6c4098d32e2a"
         },
         {
           "path": "src/server/tls13.rs",
           "before_sha256": "3305e69bd7fac1f08581b74799aab02f4751a262133767db3b1096c52c491a2a",
-          "after_sha256": "ebf0179d5115f8e2b2bd2dc0540850225ad16b69ab65ea84b5db15aad1cab039"
+          "after_sha256": "7965ddb1fb877390fdf67a8c91be6e324d0a9a37fde98b58ec89ef3390e0d518"
         },
         {
           "path": "src/tls12/mod.rs",

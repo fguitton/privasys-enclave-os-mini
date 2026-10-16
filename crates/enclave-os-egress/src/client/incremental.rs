@@ -13,6 +13,42 @@ use super::{
     IdentityClientAuth, RaTlsPolicy,
 };
 
+type ConnectionPool = std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>;
+
+fn require_connection_origin(pool: Option<&ConnectionPool>) -> Result<(), String> {
+    #[cfg(all(feature = "fallible-allocation-v1", target_vendor = "teaclave"))]
+    if pool.is_none() {
+        return Err("trusted incremental TLS requires the original allocation pool".into());
+    }
+    #[cfg(not(all(feature = "fallible-allocation-v1", target_vendor = "teaclave")))]
+    let _ = pool;
+    Ok(())
+}
+
+fn start_client_connection(
+    config: std::sync::Arc<rustls::ClientConfig>,
+    name: ServerName<'static>,
+    pool: Option<&ConnectionPool>,
+) -> Result<ClientConnection, String> {
+    #[cfg(all(feature = "fallible-allocation-v1", target_vendor = "teaclave"))]
+    {
+        let pool = pool.ok_or("trusted incremental TLS requires the original allocation pool")?;
+        let origin = enclave_os_common::allocation::LoanAllocator::from_pool_unpublished(pool)
+            .map_err(|_| "incremental TLS origin allocation refused".to_string())?;
+        let connection =
+            ClientConnection::new_with_allocator(config, name, origin.owned_allocator())
+                .map_err(|error| format!("incremental TLS init failed: {error}"))?;
+        origin.activate_release_notification();
+        Ok(connection)
+    }
+    #[cfg(not(all(feature = "fallible-allocation-v1", target_vendor = "teaclave")))]
+    {
+        let _ = pool;
+        ClientConnection::new(config, name)
+            .map_err(|error| format!("incremental TLS init failed: {error}"))
+    }
+}
+
 /// Incrementally advanced TLS client for the control-TCS raw multiplexer.
 ///
 /// It performs no socket calls and no internal waits. The caller feeds
@@ -35,6 +71,9 @@ pub struct IncrementalTlsClient {
 
 impl IncrementalTlsClient {
     /// Construct a fresh TLS client and queue its ClientHello.
+    /// The original pool is installed before handshake work and also owns
+    /// application plaintext. `None` is the explicit untrusted/native capability;
+    /// a selected trusted allocator build refuses it.
     ///
     /// Remote appraisal URLs are rejected here because the ordinary
     /// verifier calls them synchronously. Incremental users instead extract
@@ -44,6 +83,7 @@ impl IncrementalTlsClient {
         server_name: &str,
         root_store: &RootCertStore,
         ratls: Option<RaTlsPolicy>,
+        pool: Option<std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
     ) -> Result<Self, String> {
         if ratls
             .as_ref()
@@ -51,12 +91,12 @@ impl IncrementalTlsClient {
         {
             return Err("incremental TLS requires separately pumped quote appraisal".to_string());
         }
+        require_connection_origin(pool.as_ref())?;
         let (config, identity) =
             build_client_config(root_store, ratls.as_ref()).map_err(str::to_string)?;
         let server_name = ServerName::try_from(server_name.to_string())
             .map_err(|_| "invalid incremental TLS server name".to_string())?;
-        let mut tls_conn = ClientConnection::new(config, server_name)
-            .map_err(|error| format!("incremental TLS init failed: {error}"))?;
+        let mut tls_conn = start_client_connection(config, server_name, pool.as_ref())?;
         // Rustls's smaller default plaintext buffer would otherwise undercut
         // the explicit request bound below. Keep the queue finite and aligned
         // with the public incremental-client contract.
@@ -67,7 +107,7 @@ impl IncrementalTlsClient {
             channel_verified: false,
             plaintext: Vec::new(),
             plaintext_allocation: None,
-            application_pool: None,
+            application_pool: pool,
             identity,
             exchange: None,
             failed: false,
@@ -77,13 +117,17 @@ impl IncrementalTlsClient {
 
     /// Construct a TLS 1.3 client for an enclave-owned CA, authenticating the
     /// leaf through appraised, measurement-pinned, channel-bound RA-TLS.
-    pub fn new_attested(server_name: &str, policy: RaTlsPolicy) -> Result<Self, String> {
+    pub fn new_attested(
+        server_name: &str,
+        policy: RaTlsPolicy,
+        pool: Option<std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
+    ) -> Result<Self, String> {
+        require_connection_origin(pool.as_ref())?;
         let (config, identity) = build_attested_client_config(&policy).map_err(str::to_string)?;
         let appraisal_pending = !policy.attestation_servers.is_empty();
         let server_name = ServerName::try_from(server_name.to_string())
             .map_err(|_| "invalid incremental TLS server name".to_string())?;
-        let mut tls_conn = ClientConnection::new(config, server_name)
-            .map_err(|error| format!("incremental TLS init failed: {error}"))?;
+        let mut tls_conn = start_client_connection(config, server_name, pool.as_ref())?;
         tls_conn.set_buffer_limit(Some(MAX_INCREMENTAL_REQUEST));
         Ok(Self {
             tls_conn,
@@ -91,7 +135,7 @@ impl IncrementalTlsClient {
             channel_verified: false,
             plaintext: Vec::new(),
             plaintext_allocation: None,
-            application_pool: None,
+            application_pool: pool,
             identity,
             exchange: None,
             failed: false,
@@ -334,21 +378,6 @@ impl IncrementalTlsClient {
         Ok(())
     }
 
-    /// Attach the actual adopter pool before receiving application plaintext.
-    /// This accounts the adapter's plaintext Vec, not rustls internal state.
-    /// Existing native/unmetered clients remain explicit; a charged buffer can
-    /// never be detached from its reservation through `take_plaintext`.
-    pub fn account_application_buffers(
-        &mut self,
-        pool: std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
-    ) -> Result<(), String> {
-        if self.application_pool.is_some() || self.plaintext.capacity() != 0 {
-            return Err("TLS application buffer accounting must precede allocation".into());
-        }
-        self.application_pool = Some(pool);
-        Ok(())
-    }
-
     /// Move all accumulated plaintext together with its original allocation credit.
     pub fn take_plaintext(&mut self) -> IncrementalTlsPlaintext {
         IncrementalTlsPlaintext {
@@ -501,9 +530,9 @@ mod tests {
     #[test]
     fn rustls_buffer_does_not_undercut_the_declared_request_bound() {
         let roots = RootCertStore::empty();
-        let mut paid = IncrementalTlsClient::new("bounded.invalid", &roots, None).unwrap();
         let pool = enclave_os_common::allocation::AllocationPoolV1::new(3).unwrap();
-        paid.account_application_buffers(pool.clone()).unwrap();
+        let mut paid =
+            IncrementalTlsClient::new("bounded.invalid", &roots, None, Some(pool.clone())).unwrap();
         paid.append_plaintext(&[1]).unwrap();
         assert_eq!(pool.used(), 1);
         paid.append_plaintext(&[2]).unwrap();
@@ -520,17 +549,20 @@ mod tests {
             2,
             "HTTP recipient retains original plaintext credit"
         );
-        assert!(paid.account_application_buffers(pool.clone()).is_err());
+        assert!(std::sync::Arc::ptr_eq(
+            paid.application_pool.as_ref().unwrap(),
+            &pool
+        ));
         drop(paid);
         assert_eq!(pool.used(), 2);
         drop(held);
         assert_eq!(pool.used(), 0);
-        let mut paid = IncrementalTlsClient::new("bounded.invalid", &roots, None).unwrap();
         let pool = enclave_os_common::allocation::AllocationPoolV1::new(
             2 * super::MAX_INCREMENTAL_PLAINTEXT,
         )
         .unwrap();
-        paid.account_application_buffers(pool.clone()).unwrap();
+        let mut paid =
+            IncrementalTlsClient::new("bounded.invalid", &roots, None, Some(pool.clone())).unwrap();
         paid.append_plaintext(&vec![0; super::MAX_INCREMENTAL_PLAINTEXT - 1])
             .unwrap();
         paid.append_plaintext(&[1]).unwrap();
@@ -558,8 +590,8 @@ mod tests {
             .is_err());
         assert_eq!(empty.bytes.capacity(), 0);
         let roots = RootCertStore::empty();
-        let mut client =
-            IncrementalTlsClient::new("bounded.invalid", &roots, None).expect("incremental client");
+        let mut client = IncrementalTlsClient::new("bounded.invalid", &roots, None, None)
+            .expect("incremental client");
         let too_small = enclave_os_common::allocation::AllocationPoolV1::new(
             super::TLS_OUTPUT_WORKING_BYTES - 1,
         )
@@ -608,7 +640,7 @@ mod tests {
             dependencies: None,
         };
         assert_eq!(
-            IncrementalTlsClient::new_attested("local-control.invalid", policy)
+            IncrementalTlsClient::new_attested("local-control.invalid", policy, None)
                 .err()
                 .as_deref(),
             Some("attested-only TLS requires a quote-appraisal service")
@@ -630,6 +662,6 @@ mod tests {
             client_identity: None,
             dependencies: None,
         };
-        assert!(IncrementalTlsClient::new_attested("local-control.invalid", policy).is_ok());
+        assert!(IncrementalTlsClient::new_attested("local-control.invalid", policy, None).is_ok());
     }
 }

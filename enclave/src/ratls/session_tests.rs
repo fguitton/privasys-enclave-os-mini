@@ -7,6 +7,9 @@
 #[cfg(feature = "fallible-allocation-v1")]
 #[path = "client_hello_owner_check.rs"]
 mod client_hello_owner_check;
+#[cfg(feature = "fallible-allocation-v1")]
+#[path = "transcript_owner_check.rs"]
+mod transcript_owner_check;
 
 use super::super::cert_store::CertStore;
 use super::{FidoIdentity, RaTlsSession, TlsOutput};
@@ -166,6 +169,8 @@ fn replacement_during_handshake_requires_a_new_connection() {
 fn replacement_rejects_buffered_requests_and_re_attestation() {
     #[cfg(feature = "fallible-allocation-v1")]
     client_hello_owner_check::check();
+    #[cfg(feature = "fallible-allocation-v1")]
+    transcript_owner_check::check();
     streamed_request_preserves_tls_and_following_request();
     checked_plaintext_backing();
     checked_tls_output_backing();

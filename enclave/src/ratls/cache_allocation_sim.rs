@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 #[path = "client_hello_owner_check.rs"]
 mod client_hello_owner_check;
+#[path = "transcript_owner_check.rs"]
+mod transcript_owner_check;
 
 #[path = "record_owner_check.rs"]
 mod record_owner_check;
@@ -99,6 +101,13 @@ pub fn check_paid_session_cache(pool: &Arc<AllocationPoolV1>) -> Result<(), &'st
     std::println!("TLS-RECORD-CIPHER-SIM: actual-SDK inline keys independent-AEAD byte-equality plaintext corruption-refusal PASS");
     check_input_buffer(pool)?;
     client_hello_owner_check::check_in(pool);
+    transcript_owner_check::check_in(pool);
+    #[cfg(feature = "egress")]
+    {
+        check_incremental_origin(pool)?;
+        std::println!("TLS-INCREMENTAL-ORIGIN-SIM: current-constructor original-pool retained-backing missing-origin origin-refusal child-refusal final-refund PASS");
+    }
+    std::println!("TLS-TRANSCRIPT-BACKING-SIM: original-pool admission-before-hash clone HRR bytes refusal aliases refund PASS");
     std::println!("TLS-CLIENTHELLO-CHILDREN-SIM: original-pool exact-backing every-refusal clone aliases wire final-refund PASS");
     std::println!("TLS-SESSION-CACHE-SIM: actual-SDK backing entry get take exact-minus-one exact plus-one aliases returned-origin final-refund PASS");
     Ok(())
@@ -256,5 +265,68 @@ fn check_input_buffer(pool: &Arc<AllocationPoolV1>) -> Result<(), &'static str> 
         }
     }
     std::println!("TLS-INPUT-BUFFER-SIM: actual-SDK original-pool first-read minus-one exact plus-one allocator-lifetime final-refund PASS");
+    Ok(())
+}
+
+// Actual selected trusted constructor; the native Global type cannot prove this.
+// Caller supplies the same real pool as the existing signed ownership registry.
+#[cfg(feature = "egress")]
+fn check_incremental_origin(pool: &Arc<AllocationPoolV1>) -> Result<(), &'static str> {
+    use enclave_os_egress::IncrementalTlsClient;
+    let roots = rustls::RootCertStore::empty();
+    let missing = IncrementalTlsClient::new("retained.invalid", &roots, None, None);
+    if missing.err().as_deref()
+        != Some("trusted incremental TLS requires the original allocation pool")
+    {
+        return Err("incremental missing origin reached handshake construction");
+    }
+    let before = pool.used();
+    let metadata = LoanAllocator::required_origin_bytes().ok_or("incremental origin geometry")?;
+    let connection =
+        IncrementalTlsClient::new("retained.invalid", &roots, None, Some(pool.clone()))
+            .map_err(|_| "incremental paid constructor refused")?;
+    if pool.used()
+        <= before
+            .checked_add(metadata)
+            .ok_or("incremental retained sum")?
+    {
+        return Err("incremental handshake backing did not retain original pool");
+    }
+    drop(connection);
+    if pool.used() != before {
+        return Err("incremental constructor backing or origin leaked credit");
+    }
+    let root = enclave_os_common::allocation::shared_allocation_bytes::<AllocationPoolV1>()
+        .ok_or("incremental pool geometry")?;
+    // These are actual owner metadata layouts, never a guessed TLS input cap:
+    // one short refuses the origin; exact permits only origin metadata and
+    // therefore refuses the first actual ClientHello child/backend request.
+    let only_origin = root
+        .checked_add(metadata)
+        .ok_or("incremental exact origin sum")?;
+    for extra in [-1_isize, 0] {
+        let capacity = only_origin
+            .checked_add_signed(extra)
+            .ok_or("incremental origin bound")?;
+        let isolated = AllocationPoolV1::try_new_with_release(capacity, None)
+            .ok_or("incremental refused pool root")?;
+        let refused =
+            IncrementalTlsClient::new("retained.invalid", &roots, None, Some(isolated.clone()));
+        let error = refused
+            .err()
+            .ok_or("incremental admitted construction without actual child backing")?;
+        let expected = if extra < 0 {
+            "incremental TLS origin allocation refused"
+        } else {
+            "incremental TLS init failed: received corrupt message of type AllocationFailed"
+        };
+        if error != expected {
+            return Err("incremental refusal did not come from the expected original owner");
+        }
+        drop(error);
+        if isolated.used() != 0 {
+            return Err("incremental refused origin or child leaked credit");
+        }
+    }
     Ok(())
 }

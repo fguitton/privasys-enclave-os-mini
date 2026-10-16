@@ -18,7 +18,7 @@ crate-type = ["staticlib", "rlib"]
 
 [features]
 # Requires the verified fallible-allocation-v1 std source profile.
-fallible-allocation-v1 = ["enclave-os-common/fallible-allocation-v1"]
+fallible-allocation-v1 = ["enclave-os-common/fallible-allocation-v1", "enclave-os-egress?/fallible-allocation-v1"]
 # Untrusted elapsed observations only; disabled in product builds.
 diagnostic-transfer-profile = []
 default = ["sgx", "default-ecall"]

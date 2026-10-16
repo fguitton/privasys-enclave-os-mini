@@ -137,7 +137,7 @@ fn pair(
         dependencies: None,
     };
     (
-        IncrementalTlsClient::new("v2.test", &identity.roots(), Some(policy)).unwrap(),
+        IncrementalTlsClient::new("v2.test", &identity.roots(), Some(policy), None).unwrap(),
         ServerConnection::new(Arc::new(server)).unwrap(),
     )
 }

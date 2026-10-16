@@ -24,12 +24,12 @@ struct Observation {
     live: [Option<(usize, Layout)>; OBSERVED_REQUESTS],
 }
 #[derive(Clone)]
-struct Original {
+pub(super) struct Original {
     allocator: Backend,
     observation: Rc<RefCell<Observation>>,
 }
 impl Original {
-    fn new(pool: &Arc<AllocationPoolV1>) -> Self {
+    pub(super) fn new(pool: &Arc<AllocationPoolV1>) -> Self {
         #[cfg(not(any(target_env = "sgx", target_vendor = "teaclave")))]
         let allocator = PoolMapAllocator::try_new(pool).unwrap();
         #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
@@ -45,12 +45,15 @@ impl Original {
             })),
         }
     }
-    fn arm(&self, refusal: Option<usize>) {
+    pub(super) fn requests(&self) -> usize {
+        self.observation.borrow().requests
+    }
+    pub(super) fn arm(&self, refusal: Option<usize>) {
         let mut observed = self.observation.borrow_mut();
         observed.requests = 0;
         observed.refuse = refusal;
     }
-    fn backend_bytes(&self) -> usize {
+    pub(super) fn backend_bytes(&self) -> usize {
         self.observation
             .borrow()
             .live
@@ -107,7 +110,7 @@ fn backend_bytes(layout: Layout) -> usize {
         LoanAllocator::required_backend_bytes(layout).unwrap()
     }
 }
-fn without_global<T>(action: impl FnOnce() -> T) -> T {
+pub(super) fn without_global<T>(action: impl FnOnce() -> T) -> T {
     #[cfg(test)]
     {
         crate::ratls::session::retained_tls_config::check_no_global_children(action)
