@@ -5,20 +5,23 @@
 //! Anonymous clients may be allowed by the endpoint, but every supplied leaf
 //! must prove possession. Accepting its chain here grants no attested identity.
 
+#[cfg(test)]
 use rustls::crypto::ring::default_provider;
 use rustls::crypto::verify_tls13_signature;
 use rustls::pki_types::{CertificateDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, Error, SignatureScheme};
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub(crate) struct AttestedClientAuth {
     required: bool,
+    provider: Arc<rustls::crypto::CryptoProvider>,
 }
 
 impl AttestedClientAuth {
-    pub(crate) fn new(required: bool) -> Self {
-        Self { required }
+    pub(crate) fn new(required: bool, provider: Arc<rustls::crypto::CryptoProvider>) -> Self {
+        Self { required, provider }
     }
 }
 
@@ -110,12 +113,12 @@ impl ClientCertVerifier for AttestedClientAuth {
             message,
             cert,
             dss,
-            &default_provider().signature_verification_algorithms,
+            &self.provider.signature_verification_algorithms,
         )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        default_provider()
+        self.provider
             .signature_verification_algorithms
             .supported_schemes()
     }
@@ -127,8 +130,7 @@ mod tests {
     use rustls::client::ResolvesClientCert;
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
     use rustls::sign::CertifiedKey;
-    use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection};
-    use std::sync::Arc;
+    use rustls::{ClientConfig, ClientConnection, RootCertStore};
 
     #[derive(Debug)]
     struct UncheckedIdentity(Arc<CertifiedKey>);
@@ -150,11 +152,15 @@ mod tests {
         let different_identity =
             rcgen::generate_simple_self_signed(vec!["different.test".into()]).unwrap();
         let provider = Arc::new(default_provider());
-        let server_config = ServerConfig::builder_with_provider(provider.clone())
-            .with_protocol_versions(&[&rustls::version::TLS13])
+        use crate::ratls::session::retained_tls_config::{ClientAuthentication, RetainedTlsConfig};
+        let authentication = ClientAuthentication::Attested { required };
+        let config_pool = enclave_os_common::allocation::AllocationPoolV1::new(
+            RetainedTlsConfig::required_bytes(authentication).unwrap(),
+        )
+        .unwrap();
+        let server_config = RetainedTlsConfig::reserve(&config_pool, authentication)
             .unwrap()
-            .with_client_cert_verifier(Arc::new(AttestedClientAuth::new(required)))
-            .with_single_cert(
+            .configure(
                 vec![server_identity.cert.der().clone()],
                 PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     server_identity.key_pair.serialize_der(),
@@ -190,7 +196,7 @@ mod tests {
             ServerName::try_from("fixture.test").unwrap(),
         )
         .unwrap();
-        let mut server = ServerConnection::new(Arc::new(server_config)).unwrap();
+        let mut server = server_config.connect().unwrap();
         for _ in 0..8 {
             let mut wire = Vec::new();
             client.write_tls(&mut wire).unwrap();

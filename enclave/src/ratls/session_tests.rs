@@ -56,10 +56,11 @@ fn pair_with_all_pools(
         .der()
         .to_vec();
     use super::retained_tls_config::RetainedTlsConfig;
-    let config_bytes = RetainedTlsConfig::required_bytes().unwrap();
+    let authentication = super::retained_tls_config::ClientAuthentication::Anonymous;
+    let config_bytes = RetainedTlsConfig::required_bytes(authentication).unwrap();
     let config_short =
         enclave_os_common::allocation::AllocationPoolV1::new(config_bytes - 1).unwrap();
-    assert!(RetainedTlsConfig::reserve(&config_short).is_none());
+    assert!(RetainedTlsConfig::reserve(&config_short, authentication).is_none());
     assert_eq!(config_short.used(), 0);
     let config_pool = enclave_os_common::allocation::AllocationPoolV1::new(
         config_bytes.checked_add(extra_config_bytes).unwrap(),
@@ -67,12 +68,11 @@ fn pair_with_all_pools(
     .unwrap();
     #[cfg(feature = "fallible-allocation-v1")]
     super::retained_tls_config::check_provider_allocation_refusals();
-    let reservation = RetainedTlsConfig::reserve(&config_pool).unwrap();
+    let reservation = RetainedTlsConfig::reserve(&config_pool, authentication).unwrap();
     let retained_config = reservation
         .configure(
             vec![CertificateDer::from(cert.clone())],
             PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
-            None,
         )
         .unwrap();
     let mut roots = RootCertStore::empty();
@@ -1763,13 +1763,14 @@ fn checked_response_step_policy() {
 // The same genuine TLS fixture exercises the opaque top-level config owner.
 fn checked_retained_tls_config() {
     use super::retained_tls_config::RetainedTlsConfig;
-    let needed = RetainedTlsConfig::required_bytes().unwrap();
+    let authentication = super::retained_tls_config::ClientAuthentication::Anonymous;
+    let needed = RetainedTlsConfig::required_bytes(authentication).unwrap();
     for extra in [-1_isize, 0, 1] {
         let pool = enclave_os_common::allocation::AllocationPoolV1::new(
             needed.checked_add_signed(extra).unwrap(),
         )
         .unwrap();
-        let reserved = RetainedTlsConfig::reserve(&pool);
+        let reserved = RetainedTlsConfig::reserve(&pool, authentication);
         assert_eq!(reserved.is_some(), extra >= 0);
         drop(reserved);
         assert_eq!(pool.used(), 0);

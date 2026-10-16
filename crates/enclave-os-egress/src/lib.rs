@@ -63,7 +63,7 @@ pub mod client;
 mod cert_store;
 #[cfg(test)]
 #[path = "../../../enclave/src/ratls/client_auth.rs"]
-mod enclave_client_auth;
+pub(crate) mod enclave_client_auth;
 #[cfg(test)]
 #[allow(dead_code)]
 #[path = "../../../enclave/src/http_response.rs"]
@@ -89,6 +89,7 @@ mod deferred_ingress;
 mod stream_ingress;
 #[cfg(test)]
 mod ratls {
+    pub(crate) use crate::enclave_client_auth as client_auth;
     pub(crate) use crate::session;
 }
 pub use enclave_os_common::attest;

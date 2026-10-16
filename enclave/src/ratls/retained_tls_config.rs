@@ -9,7 +9,27 @@ use std::sync::Arc;
 
 type Payload = Arc<ServerConfig>;
 
-fn retained_children_bytes() -> Option<usize> {
+#[derive(Clone, Copy)]
+pub(crate) enum ClientAuthentication {
+    Attested {
+        required: bool,
+    },
+    #[cfg(test)]
+    Anonymous,
+}
+impl ClientAuthentication {
+    fn allocation_bytes(self) -> Option<usize> {
+        match self {
+            Self::Attested { .. } => {
+                shared_allocation_bytes::<crate::ratls::client_auth::AttestedClientAuth>()
+            }
+            #[cfg(test)]
+            Self::Anonymous => shared_allocation_bytes::<rustls::server::NoClientAuth>(),
+        }
+    }
+}
+
+fn retained_children_bytes(authentication: ClientAuthentication) -> Option<usize> {
     use rustls::crypto::{ring, CryptoProvider, SupportedKxGroup};
     let suites = core::alloc::Layout::array::<rustls::SupportedCipherSuite>(
         ring::DEFAULT_CIPHER_SUITES.len(),
@@ -21,20 +41,27 @@ fn retained_children_bytes() -> Option<usize> {
     shared_allocation_bytes::<ServerConfig>()?
         .checked_add(shared_allocation_bytes::<CryptoProvider>()?)?
         .checked_add(suites.size())?
-        .checked_add(groups.size())
+        .checked_add(groups.size())?
+        .checked_add(shared_allocation_bytes::<
+            rustls::time_provider::DefaultTimeProvider,
+        >()?)?
+        .checked_add(authentication.allocation_bytes()?)
 }
 #[derive(Clone)]
 pub(crate) struct RetainedTlsConfig(SharedAllocationV1<Payload>);
-pub(crate) struct ConfigReservation(SharedAllocationReservationV1<Payload>);
+pub(crate) struct ConfigReservation(SharedAllocationReservationV1<Payload>, ClientAuthentication);
 
 impl RetainedTlsConfig {
     #[cfg(test)]
-    pub(crate) fn required_bytes() -> Option<usize> {
-        SharedAllocationV1::<Payload>::required_bytes(retained_children_bytes()?)
+    pub(crate) fn required_bytes(authentication: ClientAuthentication) -> Option<usize> {
+        SharedAllocationV1::<Payload>::required_bytes(retained_children_bytes(authentication)?)
     }
-    pub(crate) fn reserve(pool: &Arc<AllocationPoolV1>) -> Option<ConfigReservation> {
-        SharedAllocationV1::<Payload>::reserve(pool, retained_children_bytes()?)
-            .map(ConfigReservation)
+    pub(crate) fn reserve(
+        pool: &Arc<AllocationPoolV1>,
+        authentication: ClientAuthentication,
+    ) -> Option<ConfigReservation> {
+        SharedAllocationV1::<Payload>::reserve(pool, retained_children_bytes(authentication)?)
+            .map(|reservation| ConfigReservation(reservation, authentication))
     }
     #[cfg(target_vendor = "teaclave")]
     pub(crate) fn accept(
@@ -61,20 +88,45 @@ impl ConfigReservation {
         self,
         certs: Vec<rustls::pki_types::CertificateDer<'static>>,
         key: rustls::pki_types::PrivateKeyDer<'static>,
-        verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
     ) -> Result<RetainedTlsConfig, String> {
-        let provider = self.provider().ok_or_else(String::new)?;
-        let builder = ServerConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .map_err(|e| format!("TLS config error: {:?}", e))?;
-        let builder = match verifier {
-            Some(verifier) => builder.with_client_cert_verifier(verifier),
-            None => builder.with_no_client_auth(),
-        };
+        let builder = self.builder()?;
         let config = builder
             .with_single_cert(certs, key)
             .map_err(|e| format!("cert chain error: {:?}", e))?;
         self.finish(config).ok_or_else(String::new)
+    }
+    fn builder(
+        &self,
+    ) -> Result<rustls::ConfigBuilder<ServerConfig, rustls::server::WantsServerCert>, String> {
+        let provider = self.provider().ok_or_else(String::new)?;
+        #[cfg(feature = "fallible-allocation-v1")]
+        let time =
+            Arc::try_new(rustls::time_provider::DefaultTimeProvider).map_err(|_| String::new())?;
+        #[cfg(not(feature = "fallible-allocation-v1"))]
+        let time = Arc::new(rustls::time_provider::DefaultTimeProvider);
+        let builder = ServerConfig::builder_with_details(provider.clone(), time)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|e| format!("TLS config error: {:?}", e))?;
+        match self.1 {
+            ClientAuthentication::Attested { required } => {
+                let verifier =
+                    crate::ratls::client_auth::AttestedClientAuth::new(required, provider);
+                #[cfg(feature = "fallible-allocation-v1")]
+                let verifier = Arc::try_new(verifier).map_err(|_| String::new())?;
+                #[cfg(not(feature = "fallible-allocation-v1"))]
+                let verifier = Arc::new(verifier);
+                Ok(builder.with_client_cert_verifier(verifier))
+            }
+            #[cfg(test)]
+            ClientAuthentication::Anonymous => {
+                #[cfg(feature = "fallible-allocation-v1")]
+                let verifier =
+                    Arc::try_new(rustls::server::NoClientAuth).map_err(|_| String::new())?;
+                #[cfg(not(feature = "fallible-allocation-v1"))]
+                let verifier = Arc::new(rustls::server::NoClientAuth);
+                Ok(builder.with_client_cert_verifier(verifier))
+            }
+        }
     }
     fn provider(&self) -> Option<Arc<rustls::crypto::CryptoProvider>> {
         #[cfg(feature = "fallible-allocation-v1")]
@@ -226,15 +278,30 @@ mod provider_refusal {
             Some(arc.size()),
             shared_allocation_bytes::<CryptoProvider>()
         );
+        let time = Layout::new::<ArcHeader>()
+            .extend(Layout::new::<rustls::time_provider::DefaultTimeProvider>())
+            .unwrap()
+            .0
+            .pad_to_align();
+        let verifier = Layout::new::<ArcHeader>()
+            .extend(Layout::new::<crate::ratls::client_auth::AttestedClientAuth>())
+            .unwrap()
+            .0
+            .pad_to_align();
+        let authentication = ClientAuthentication::Attested { required: true };
         let layouts = [
             Layout::array::<rustls::SupportedCipherSuite>(ring::DEFAULT_CIPHER_SUITES.len())
                 .unwrap(),
             Layout::array::<&'static dyn SupportedKxGroup>(ring::DEFAULT_KX_GROUPS.len()).unwrap(),
             arc,
+            time,
+            verifier,
         ];
         for expected in layouts {
-            let pool = AllocationPoolV1::new(RetainedTlsConfig::required_bytes().unwrap()).unwrap();
-            let reservation = RetainedTlsConfig::reserve(&pool).unwrap();
+            let pool =
+                AllocationPoolV1::new(RetainedTlsConfig::required_bytes(authentication).unwrap())
+                    .unwrap();
+            let reservation = RetainedTlsConfig::reserve(&pool, authentication).unwrap();
             ARM.with(|cell| {
                 cell.set(Some(Arm {
                     expected,
@@ -242,15 +309,18 @@ mod provider_refusal {
                     live: 0,
                 }))
             });
-            let result = reservation.provider();
+            let result = reservation.builder();
             let arm = ARM.with(|cell| cell.take()).unwrap();
             assert!(
                 arm.refused,
                 "actual provider request must hit the selected refusal"
             );
-            assert!(result.is_none());
+            assert!(result.is_err());
             assert_eq!(arm.live, 0, "all prepared provider backing must be freed");
-            assert_eq!(pool.used(), RetainedTlsConfig::required_bytes().unwrap());
+            assert_eq!(
+                pool.used(),
+                RetainedTlsConfig::required_bytes(authentication).unwrap()
+            );
             drop(reservation);
             assert_eq!(pool.used(), 0);
         }
