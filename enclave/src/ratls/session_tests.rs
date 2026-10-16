@@ -1855,19 +1855,69 @@ mod retained_cache_checks {
                 ordinary.put(vec![key], vec![key + 10])
             );
             for seen in 0..=key {
-                assert_eq!(cache.get(&[seen]), ordinary.get(&[seen]));
+                assert_eq!(
+                    cache.get(&[seen]).as_deref(),
+                    ordinary.get(&[seen]).as_deref()
+                );
             }
         }
         for key in 0..6 {
-            assert_eq!(cache.take(&[key]), ordinary.take(&[key]));
+            assert_eq!(
+                cache.take(&[key]).as_deref(),
+                ordinary.take(&[key]).as_deref()
+            );
         }
         let alias = cache.clone();
+        assert!(cache.put(vec![77], vec![88, 89]));
+        let retained_get = cache.get(&[77]).unwrap();
+        let retained_take = cache.take(&[77]).unwrap();
+        assert!(
+            cache.take(&[77]).is_none(),
+            "take removes the only stored value"
+        );
         drop(allocator);
         drop(cache);
         assert!(counts.live.load(Ordering::SeqCst) > 0);
         std::thread::spawn(move || drop(alias)).join().unwrap();
+        assert_eq!(retained_get.as_slice(), &[88, 89]);
+        assert_eq!(retained_take.as_slice(), &[88, 89]);
+        assert_eq!(
+            counts.live.load(Ordering::SeqCst),
+            4,
+            "only returned byte backings remain"
+        );
+        drop(retained_get);
+        std::thread::spawn(move || drop(retained_take))
+            .join()
+            .unwrap();
         assert_eq!(counts.live.load(Ordering::SeqCst), 0);
         assert_eq!(Arc::strong_count(&counts), 1);
+        refused_entry_bytes();
+    }
+    fn refused_entry_bytes() {
+        for refusal in 1..=3 {
+            let counts = Arc::new(Counts::default());
+            let cache = ServerSessionMemoryCache::try_new_in(8, Original(counts.clone())).unwrap();
+            assert!(cache.put(vec![1], vec![10]));
+            let baseline = counts.live.load(Ordering::SeqCst);
+            let next = counts.calls.load(Ordering::SeqCst);
+            counts.refuse.store(next + refusal, Ordering::SeqCst);
+            assert!(!cache.put(vec![2], vec![20]));
+            assert_eq!(counts.live.load(Ordering::SeqCst), baseline);
+            assert!(cache.get(&[2]).is_none());
+            assert_eq!(cache.get(&[1]).unwrap().as_slice(), &[10]);
+            counts
+                .refuse
+                .store(counts.calls.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
+            assert!(
+                cache.get(&[1]).is_none(),
+                "copy refusal does not expose unpaid bytes"
+            );
+            assert_eq!(cache.take(&[1]).unwrap().as_slice(), &[10]);
+            drop(cache);
+            assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+            assert_eq!(Arc::strong_count(&counts), 1);
+        }
     }
     fn compression_cache() {
         for refusal in 1..=1 {

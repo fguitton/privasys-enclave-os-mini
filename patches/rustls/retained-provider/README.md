@@ -4,4 +4,6 @@ This verified build-owned rustls 0.23.45 profile keeps the existing ring algorit
 
 The enclave passes the original SDK OwnedAllocator through the minimal owned-hash-map facade and allocator-backed queues before cache backing allocation. The opaque first-party config carrier separately prepays complete concrete Arc metadata layouts and default list buffers. The default unprofiled supplier source is untouched.
 
-Cache entry byte copies/returns and certificate, signing and handshake children remain separate owners. This profile alone is not global allocator enforcement or a complete TLS allocation claim.
+Session key, duplicate FIFO key and value copies are fallible allocator-owned vectors. Insertion prepares the copies and reserves collection backings before publishing an entry. Get copies and take transfers the value with its allocator, so a returned value keeps its original origin alive after cache/configuration release. The sole current get/take contract carries this ownership, including both TLS 1.2 and TLS 1.3 decoding consumers. Allocation refusal remains a cache miss or unsuccessful put, without a partial new entry.
+
+The selected ring/std feature graph enables neither certificate compressor, so compression-entry buffers are unreachable; the default four-entry queue is still paid. Certificate, signing and handshake children remain separate owners. This profile alone is not global allocator enforcement or a complete TLS allocation claim. Native adapter tests do not establish selected-target execution.

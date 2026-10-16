@@ -1271,3 +1271,17 @@ impl RaTlsSession {
         Ok(())
     }
 }
+
+#[cfg(all(
+    feature = "sgx-sim-attestation",
+    feature = "fallible-allocation-v1",
+    target_vendor = "teaclave"
+))]
+#[path = "cache_allocation_sim.rs"]
+mod cache_allocation_sim;
+#[cfg(all(
+    feature = "sgx-sim-attestation",
+    feature = "fallible-allocation-v1",
+    target_vendor = "teaclave"
+))]
+pub use cache_allocation_sim::check_paid_session_cache;

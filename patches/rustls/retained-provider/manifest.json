@@ -2,7 +2,7 @@
   "schema": 1,
   "profile": "retained-provider",
   "routing": "build-owned Cargo paths override; same package manifests, lock and dependency graph",
-  "patch_sha256": "6cbe555696726417a533972ea56e4a33a46b9bf5baef2a7faa393482db3ce34c",
+  "patch_sha256": "57a439544863edb5cb4fb4b503c04269b663c42407a124de04a7d0e86a322381",
   "suppliers": [
     {
       "package": "rustls",
@@ -18,17 +18,32 @@
         {
           "path": "src/limited_cache.rs",
           "before_sha256": "a53eb38036ab1db04fe7c561d804076690631dedb17040eaa006f1264cfed097",
-          "after_sha256": "5c5f8c8f0ea3e5f3dfe4648e2d018b841829902e17647835dadc0b4c5934aeb7"
+          "after_sha256": "61cd9d94e6b380e5f40ab3f2b97bb5cbfca4ce802e4db2cc3767de076cb2f122"
         },
         {
           "path": "src/server/handy.rs",
           "before_sha256": "85ce7ea135eb5582703cb41eb8a5ec7d1d6b9266a130935d291eb71c1327394d",
-          "after_sha256": "c081b14c940a0f70548f73a061b6d575c893828f27eb46404dc029adf67af3a6"
+          "after_sha256": "ce785554e7502d3e78a3c6a1dd8d3f481bb3b5a79962f1689d4b1385e70d0585"
         },
         {
           "path": "src/server/builder.rs",
           "before_sha256": "4ec5532bbaaf9d60ae2fb577e8f463e2f3f6915aa80d0f11627829214fa7eb8c",
           "after_sha256": "93b3885330a00e46ec587fad26ee6628827a54a121f09a9e5161c63e29817a0f"
+        },
+        {
+          "path": "src/server/server_conn.rs",
+          "before_sha256": "603cddb8a3a415737b7e047deedd32a2a6e4f918c2372af0bfb50ebb04de2163",
+          "after_sha256": "090fa799d922dbb1c9db51c126d02e1f4afd254549dd8c6b5350c23c83304caf"
+        },
+        {
+          "path": "src/server/tls12.rs",
+          "before_sha256": "b7d083644d3be9bb6bf6cca4c654537cd22d3bc545f932ab2c9354503ebd7056",
+          "after_sha256": "bc174fed62c8298b02f5f8ec13ef88494ba08514771e779db2845a8a39fc0196"
+        },
+        {
+          "path": "src/server/tls13.rs",
+          "before_sha256": "3305e69bd7fac1f08581b74799aab02f4751a262133767db3b1096c52c491a2a",
+          "after_sha256": "5fcbe632d9ebbea11c99e94ea3cc171097ea2b8118c90178f5c483e4b2ac223c"
         },
         {
           "path": "src/compress.rs",
