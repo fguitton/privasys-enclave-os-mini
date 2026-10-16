@@ -67,9 +67,24 @@ impl core::ops::Deref for RetainedConnection {
         &self.connection
     }
 }
-impl core::ops::DerefMut for RetainedConnection {
-    fn deref_mut(&mut self) -> &mut ServerConnection {
-        &mut self.connection
+impl RetainedConnection {
+    pub(crate) fn read_tls(&mut self, reader: &mut dyn std::io::Read) -> std::io::Result<usize> {
+        self.connection.read_tls(reader)
+    }
+    pub(crate) fn write_tls(&mut self, writer: &mut dyn std::io::Write) -> std::io::Result<usize> {
+        self.connection.write_tls(writer)
+    }
+    pub(crate) fn process_new_packets(&mut self) -> Result<rustls::IoState, rustls::Error> {
+        self.connection.process_new_packets()
+    }
+    pub(crate) fn reader(&mut self) -> rustls::Reader<'_> {
+        self.connection.reader()
+    }
+    pub(crate) fn writer(&mut self) -> rustls::Writer<'_> {
+        self.connection.writer()
+    }
+    pub(crate) fn send_close_notify(&mut self) {
+        self.connection.send_close_notify();
     }
 }
 #[cfg(test)]
