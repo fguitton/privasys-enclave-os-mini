@@ -96,7 +96,7 @@ fn name_value(tag: u8, bytes: &[u8]) -> der::Result<()> {
             .iter()
             .all(|b| b.is_ascii_alphanumeric() || b" '()+,-./:=?".contains(b)),
         0x1e => {
-            bytes.len() % 2 == 0
+            bytes.len().is_multiple_of(2)
                 && core::char::decode_utf16(
                     bytes
                         .chunks_exact(2)
@@ -105,7 +105,7 @@ fn name_value(tag: u8, bytes: &[u8]) -> der::Result<()> {
                 .all(|c| c.is_ok_and(|c| u32::from(c) < u32::from(u16::MAX)))
         }
         0x1c => {
-            bytes.len() % 4 == 0
+            bytes.len().is_multiple_of(4)
                 && bytes
                     .chunks_exact(4)
                     .all(|b| char::from_u32(u32::from_be_bytes([b[0], b[1], b[2], b[3]])).is_some())

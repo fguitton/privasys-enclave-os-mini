@@ -274,6 +274,7 @@ pub(super) fn check_in(pool: &Arc<AllocationPoolV1>) {
     flight_checks(pool);
     key_update_checks(pool);
     parsed_handshake_checks(pool);
+    plaintext_checks(pool);
 }
 
 fn flight_checks(pool: &Arc<AllocationPoolV1>) {
@@ -606,4 +607,127 @@ fn parsed_handshake_checks(pool: &Arc<AllocationPoolV1>) {
     assert_eq!(pool.used(), before);
     #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
     std::println!("TLS-PARSED-HANDSHAKE-SIM: original-pool exact-layout malformed-before-admission overlap refusal unchanged-encoding no-nonhandshake-owner retained-drop final-refund PASS");
+}
+
+fn plaintext_checks(pool: &Arc<AllocationPoolV1>) {
+    let before = pool.used();
+    let origin = Original::new(pool);
+    let metadata = pool.used();
+    for receive in [false, true] {
+        for existing in [false, true] {
+            let setup = || {
+                let mut queue = QueueProbe::new_in(origin.clone());
+                if existing {
+                    without_global(|| queue.try_append(&[b"prefix"])).unwrap();
+                    queue.consume(1);
+                }
+                queue
+            };
+            let input = b"new plaintext";
+            let limit = if existing { 8 } else { 3 };
+            let mut queue = setup();
+            origin.arm(None);
+            let count = without_global(|| {
+                if receive {
+                    queue.plaintext_receive(input)
+                } else {
+                    queue.plaintext_write(input, Some(limit))
+                }
+            })
+            .unwrap();
+            let requests = origin.requests();
+            assert_eq!(count, if receive { input.len() } else { 3 });
+            let expected = if existing {
+                [b"refix".as_slice(), &input[..count]].concat()
+            } else {
+                input[..count].to_vec()
+            };
+            assert_eq!(values(&queue).concat(), expected);
+            let at_limit = values(&queue);
+            if !receive {
+                origin.arm(None);
+                assert_eq!(
+                    without_global(|| queue.plaintext_write(input, Some(limit))).unwrap(),
+                    0
+                );
+                assert_eq!(origin.requests(), 0);
+                assert_eq!(values(&queue), at_limit);
+            }
+            drop(queue);
+            assert_eq!(pool.used(), metadata);
+            for refused in 0..requests {
+                origin.arm(None);
+                let mut queue = setup();
+                let old = values(&queue);
+                let pointer = queue.first().map(<[u8]>::as_ptr);
+                let charge = pool.used();
+                let backing = origin.backend_bytes();
+                origin.arm(Some(refused));
+                assert!(without_global(|| if receive {
+                    queue.plaintext_receive(input)
+                } else {
+                    queue.plaintext_write(input, Some(limit))
+                })
+                .is_err());
+                assert_eq!(values(&queue), old);
+                assert_eq!(queue.first().map(<[u8]>::as_ptr), pointer);
+                assert_eq!(pool.used(), charge);
+                assert_eq!(origin.backend_bytes(), backing);
+                origin.arm(None);
+                assert_eq!(
+                    without_global(|| if receive {
+                        queue.plaintext_receive(input)
+                    } else {
+                        queue.plaintext_write(input, Some(limit))
+                    })
+                    .unwrap(),
+                    count
+                );
+                assert_eq!(values(&queue).concat(), expected);
+                drop(queue);
+                assert_eq!(pool.used(), metadata);
+            }
+        }
+    }
+    #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
+    for receive in [false, true] {
+        let mut probe = rustls::internal::send::PlaintextProbe::new_in(origin.context_allocator());
+        let snapshot = probe.snapshot();
+        let charge = pool.used();
+        let blocker = pool
+            .reserve_unpublished(pool.capacity() - pool.used())
+            .unwrap();
+        if receive {
+            assert_eq!(
+                probe.receive(b"actual plaintext"),
+                Err(rustls::Error::AllocationFailed)
+            );
+        } else {
+            assert_eq!(
+                probe.write(b"actual plaintext", None),
+                Err(rustls::Error::AllocationFailed)
+            );
+        }
+        assert_eq!(probe.snapshot(), snapshot);
+        assert_eq!(probe.chunks(receive).count(), 0);
+        drop(blocker);
+        assert_eq!(pool.used(), charge);
+        if receive {
+            probe.receive(b"actual plaintext").unwrap();
+        } else {
+            assert_eq!(
+                probe.write(b"actual plaintext", None).unwrap(),
+                b"actual plaintext".len()
+            );
+        }
+        assert_eq!(
+            probe.chunks(receive).collect::<Vec<_>>(),
+            [b"actual plaintext".as_slice()]
+        );
+        assert!(pool.used() > charge);
+        drop(probe);
+        assert_eq!(pool.used(), charge);
+    }
+    drop(origin);
+    assert_eq!(pool.used(), before);
 }

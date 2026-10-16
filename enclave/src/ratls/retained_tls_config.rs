@@ -148,20 +148,22 @@ impl ConfigReservation {
     pub(crate) fn factory_bytes(
         certificates: &[rustls::pki_types::CertificateDer<'_>],
         key: &rustls::pki_types::PrivateKeyDer<'_>,
-    ) -> Option<usize> {
+    ) -> Option<(usize, usize)> {
         let bytes = Self::certificate_bytes(certificates)?;
         #[cfg(all(feature = "fallible-allocation-v1", not(target_vendor = "teaclave")))]
         {
             let layouts =
                 rustls::crypto::ring::sign::retained_p256_spki_layouts_for_key(key).ok()?;
-            return layouts
+            let retained = bytes.checked_add(layouts.last()?.size())?;
+            let peak = layouts
                 .into_iter()
-                .try_fold(bytes, |sum, layout| sum.checked_add(layout.size()));
+                .try_fold(bytes, |sum, layout| sum.checked_add(layout.size()))?;
+            Some((peak, retained))
         }
         #[cfg(not(all(feature = "fallible-allocation-v1", not(target_vendor = "teaclave"))))]
         {
             let _ = key;
-            Some(bytes)
+            Some((bytes, bytes))
         }
     }
     pub(crate) fn configure(
@@ -784,7 +786,7 @@ mod provider_refusal {
                     skip_matching: 0,
                 }))
             });
-            let result = try_p256_signing_key_in(&private, std::alloc::Global);
+            let result = try_p256_signing_key_in(&private, rustls::RetainedAllocator::default());
             let refused = matches!(result, Err(ServerConfigAllocationError::Allocation));
             drop(result);
             let arm = ARM.with(|cell| cell.take()).unwrap();
@@ -906,7 +908,7 @@ mod provider_refusal {
         let private_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
             rustls::pki_types::PrivatePkcs8KeyDer::from(different.serialize_der()),
         );
-        let certificate_bytes =
+        let (certificate_bytes, _) =
             ConfigReservation::factory_bytes(&certificates, &private_key).unwrap();
         let pool = AllocationPoolV1::new(
             RetainedTlsConfig::required_bytes(authentication)

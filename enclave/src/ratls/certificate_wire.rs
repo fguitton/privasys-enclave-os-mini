@@ -253,7 +253,7 @@ fn validate_name_value(value: NameValue<'_>) -> der::Result<()> {
             .iter()
             .all(|b| b.is_ascii_alphanumeric() || b" '()+,-./:=?".contains(b)),
         0x1e => {
-            bytes.len() % 2 == 0
+            bytes.len().is_multiple_of(2)
                 && core::char::decode_utf16(
                     bytes
                         .chunks_exact(2)
@@ -262,7 +262,7 @@ fn validate_name_value(value: NameValue<'_>) -> der::Result<()> {
                 .all(|c| c.is_ok_and(|c| u32::from(c) < u32::from(u16::MAX)))
         }
         0x1c => {
-            bytes.len() % 4 == 0
+            bytes.len().is_multiple_of(4)
                 && bytes
                     .chunks_exact(4)
                     .all(|b| char::from_u32(u32::from_be_bytes([b[0], b[1], b[2], b[3]])).is_some())
@@ -534,13 +534,13 @@ pub(crate) fn ca(pool: &Arc<AllocationPoolV1>, key: &super::leaf_key::LeafKey) -
 pub(crate) fn leaf(
     pool: &Arc<AllocationPoolV1>,
     key: &super::leaf_key::LeafKey,
-    before: OffsetDateTime,
-    after: OffsetDateTime,
+    validity: (OffsetDateTime, OffsetDateTime),
     ca: &super::ca_context::CaContext,
     subject: &str,
     names: &[&str],
     extensions: &Extensions,
 ) -> Result<PaidDer> {
+    let (before, after) = validity;
     let issuer = issuer_subject(&ca.ca_cert_der).map_err(|_| CertificateError::InvalidCa)?;
     let leaf = EcdsaKeyPair::from_pkcs8(
         &ECDSA_P256_SHA256_ASN1_SIGNING,

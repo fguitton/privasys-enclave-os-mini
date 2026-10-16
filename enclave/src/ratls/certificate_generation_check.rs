@@ -86,8 +86,7 @@ pub(super) fn check() {
     let paid_leaf = certificate_wire::leaf(
         &pool,
         &leaf_key,
-        before,
-        after,
+        (before, after),
         &ca,
         "Enclave OS RA-TLS",
         &names,

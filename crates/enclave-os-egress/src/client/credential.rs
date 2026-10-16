@@ -312,6 +312,7 @@ impl core::fmt::Debug for Credentials {
 
 #[cfg(all(test, feature = "fallible-allocation-v1"))]
 pub(super) fn check(certificates: &[&[u8]], pkcs8: &[u8]) {
+    super::install_test_ocalls();
     use super::{ClientCertIdentity, EnclaveClientCertSigner, IdentityClientAuth};
     use core::sync::atomic::{AtomicUsize, Ordering};
     let quote = ClientCredential::required_pool_bytes(certificates, pkcs8).unwrap();

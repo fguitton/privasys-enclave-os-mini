@@ -32,7 +32,7 @@ use super::{FidoIdentity, RaTlsSession, TlsOutput};
 use enclave_os_common::modules::{AppIdentity, PeerEvidence};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 #[cfg(not(feature = "fallible-allocation-v1"))]
-use rustls::ClientConfig;
+use rustls::{pki_types::ServerName, ClientConfig};
 use rustls::{ClientConnection, RootCertStore};
 use std::io::{Cursor, Write};
 use std::sync::Arc;
@@ -76,7 +76,7 @@ fn pair_with_certificate(
     RaTlsSession,
     Arc<enclave_os_common::allocation::AllocationPoolV1>,
 ) {
-    let (client, session, certificate, _) = pair_with_all_pools(store, name, 0);
+    let (client, session, certificate, _, _) = pair_with_all_pools(store, name, 0);
     (client, session, certificate)
 }
 
@@ -89,6 +89,7 @@ fn pair_with_all_pools(
     RaTlsSession,
     Arc<enclave_os_common::allocation::AllocationPoolV1>,
     Arc<enclave_os_common::allocation::AllocationPoolV1>,
+    usize,
 ) {
     let key = rcgen::KeyPair::generate().unwrap();
     let cert = rcgen::CertificateParams::new(vec![name.into()])
@@ -104,7 +105,7 @@ fn pair_with_all_pools(
     let authentication = super::retained_tls_config::ClientAuthentication::Anonymous;
     let certificates = [CertificateDer::from(cert.as_slice())];
     let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
-    let certificate_bytes =
+    let (certificate_peak_bytes, certificate_retained_bytes) =
         super::retained_tls_config::ConfigReservation::factory_bytes(&certificates, &private_key)
             .unwrap();
     let config_bytes = RetainedTlsConfig::required_bytes(authentication).unwrap();
@@ -114,7 +115,7 @@ fn pair_with_all_pools(
     assert_eq!(config_short.used(), 0);
     let config_pool = enclave_os_common::allocation::AllocationPoolV1::new(
         config_bytes
-            .checked_add(certificate_bytes)
+            .checked_add(certificate_peak_bytes)
             .unwrap()
             .checked_add(extra_config_bytes)
             .unwrap(),
@@ -141,10 +142,20 @@ fn pair_with_all_pools(
         crate::client::build_client_config(name, &roots, None, Some(&pool)).unwrap()
     };
     let (app, lease) = store.snapshot(Some(name)).unwrap();
-    assert_eq!(config_pool.used(), config_bytes);
+    assert_eq!(
+        config_pool.used(),
+        config_bytes
+            .checked_add(certificate_retained_bytes)
+            .unwrap()
+    );
     let config_alias = retained_config.clone();
     let server = retained_config.connect().unwrap();
-    assert_eq!(config_pool.used(), config_bytes);
+    assert_eq!(
+        config_pool.used(),
+        config_bytes
+            .checked_add(certificate_retained_bytes)
+            .unwrap()
+    );
     drop(config_alias);
 
     let endpoint = app.and_then(|app| app.attested_endpoint);
@@ -186,6 +197,7 @@ fn pair_with_all_pools(
         session,
         pool,
         config_pool,
+        certificate_retained_bytes,
     )
 }
 
@@ -1931,18 +1943,27 @@ fn checked_retained_tls_config() {
     for extra in [0, 1] {
         let store = CertStore::new();
         register(&store, "config-paid.test");
-        let (mut client, mut session, cert_pool, config_pool) =
+        let (mut client, mut session, cert_pool, config_pool, certificate_retained) =
             pair_with_all_pools(&store, "config-paid.test", extra);
-        assert_eq!(config_pool.used(), needed);
+        assert_eq!(
+            config_pool.used(),
+            needed.checked_add(certificate_retained).unwrap()
+        );
         // A real Session and a cached-style alias share one original payer.
         let alias = session.tls_conn.alias();
         handshake(&mut client, &mut session);
-        assert_eq!(config_pool.used(), needed);
+        assert_eq!(
+            config_pool.used(),
+            needed.checked_add(certificate_retained).unwrap()
+        );
         register(&store, "config-paid.test");
         assert!(session.feed_tls_bytes(&[]).is_err());
         drop(session);
         assert_eq!(cert_pool.used(), 0);
-        assert_eq!(config_pool.used(), needed);
+        assert_eq!(
+            config_pool.used(),
+            needed.checked_add(certificate_retained).unwrap()
+        );
         drop(alias);
         assert_eq!(config_pool.used(), 0);
     }

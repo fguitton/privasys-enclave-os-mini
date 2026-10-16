@@ -1220,6 +1220,37 @@ fn sha256_array(bytes: &[u8]) -> [u8; 32] {
 }
 
 #[cfg(test)]
+pub(crate) fn install_test_ocalls() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        enclave_os_common::ocall::register(enclave_os_common::ocall::OcallVtable {
+            net_tcp_listen: |_, _| panic!("incremental exchange attempted socket I/O"),
+            net_tcp_accept: |_| panic!("incremental exchange attempted socket I/O"),
+            net_tcp_connect: |_, _| panic!("incremental exchange attempted socket I/O"),
+            net_send: |_, _| panic!("incremental exchange attempted socket I/O"),
+            net_recv: |_, _| panic!("incremental exchange attempted socket I/O"),
+            net_close: |_| panic!("incremental exchange attempted socket I/O"),
+            kv_store_put: |_, _, _| panic!("unexpected storage I/O"),
+            kv_store_get: |_, _| panic!("unexpected storage I/O"),
+            kv_store_delete: |_, _| panic!("unexpected storage I/O"),
+            kv_store_list_keys: |_, _| panic!("unexpected storage I/O"),
+            kv_store_write_batch: |_, _| panic!("unexpected storage I/O"),
+            kv_store_multi_get: |_, _| panic!("unexpected storage I/O"),
+            kv_store_scan: |_, _, _, _| panic!("unexpected storage I/O"),
+            get_current_time: || Ok(1_788_811_200),
+            log: |_, _| {},
+            cert_store_register: |_| panic!("unexpected certificate registration"),
+            cert_store_unregister: |_| panic!("unexpected certificate registration"),
+        })
+    });
+}
+
+#[cfg(all(test, feature = "fallible-allocation-v1"))]
+pub(crate) fn check_credential_owner(certificates: &[&[u8]], pkcs8: &[u8]) {
+    credential::check(certificates, pkcs8);
+}
+
+#[cfg(test)]
 mod peer_appraisal_tests {
     use super::{
         legacy_quote_oid, locally_verify_sgx_peer_certificate,
@@ -1297,9 +1328,4 @@ mod peer_appraisal_tests {
         .unwrap_err()
         .contains("certificate"));
     }
-}
-
-#[cfg(all(test, feature = "fallible-allocation-v1"))]
-pub(crate) fn check_credential_owner(certificates: &[&[u8]], pkcs8: &[u8]) {
-    credential::check(certificates, pkcs8);
 }

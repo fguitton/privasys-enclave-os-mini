@@ -322,6 +322,33 @@ fn check_incremental_origin(pool: &Arc<AllocationPoolV1>) -> Result<(), &'static
     if pool.used() != before {
         return Err("incremental constructor backing or origin leaked credit");
     }
+    // The actual trusted constructor also retains policy/identity children and
+    // the explicit attested ALPN graph; no remote handshake is asserted here.
+    let policy = enclave_os_egress::RaTlsPolicy {
+        tee: enclave_os_egress::TeeType::Sgx,
+        mr_enclave: Some([7; 32]),
+        mr_signer: None,
+        mr_td: None,
+        report_data: enclave_os_egress::ReportDataBinding::ChallengeResponse { nonce: vec![3; 32] },
+        expected_oids: Vec::new(),
+        attestation_servers: vec!["https://appraiser.invalid/".to_string()],
+        acceptable_tcb_statuses: Vec::new(),
+        client_identity: Some(enclave_os_egress::ClientCertIdentity {
+            code_hash: vec![5; 32],
+            app_id: Some(vec![6; 32]),
+        }),
+        dependencies: Some(vec![8; 11]),
+    };
+    let attested =
+        IncrementalTlsClient::new_attested("retained.invalid", policy, Some(pool.clone()))
+            .map_err(|_| "incremental attested config/origin construction")?;
+    if pool.used() <= before {
+        return Err("incremental attested config lost original payer");
+    }
+    drop(attested);
+    if pool.used() != before {
+        return Err("incremental attested config/identity refund");
+    }
     let root = enclave_os_common::allocation::shared_allocation_bytes::<AllocationPoolV1>()
         .ok_or("incremental pool geometry")?;
     // These are actual owner metadata layouts, never a guessed TLS input cap:

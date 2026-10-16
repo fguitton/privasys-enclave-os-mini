@@ -113,8 +113,7 @@ pub fn generate_ratls_certificate(
     let leaf = super::session::certificate_wire::leaf(
         pool,
         key,
-        nb,
-        na,
+        (nb, na),
         ca,
         "Enclave OS RA-TLS",
         names,
@@ -221,8 +220,7 @@ pub fn generate_app_certificate(
     let leaf = super::session::certificate_wire::leaf(
         pool,
         key,
-        nb,
-        na,
+        (nb, na),
         ca,
         &app.hostname,
         &[&app.hostname],
@@ -287,8 +285,7 @@ pub fn mint_client_identity(
     let leaf = super::session::certificate_wire::leaf(
         pool,
         &key,
-        nb,
-        na,
+        (nb, na),
         ca,
         "enclave-os client",
         &[],

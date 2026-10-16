@@ -178,7 +178,7 @@ mod tests {
         let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
             server_identity.key_pair.serialize_der(),
         ));
-        let certificate_bytes =
+        let (certificate_bytes, _) =
             crate::ratls::session::retained_tls_config::ConfigReservation::factory_bytes(
                 &certificates,
                 &private_key,

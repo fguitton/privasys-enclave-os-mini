@@ -4837,7 +4837,7 @@
 +        let result: Result<Self, Error> = (move || {
 +            match m.payload {
 +                MessagePayload::ApplicationData(payload) => {
-+                    cx.common.take_received_plaintext(payload)
++                    cx.common.take_received_plaintext(payload)?;
 +                }
 +                payload => {
 +                    return Err(inappropriate_message(
@@ -6970,7 +6970,7 @@
 +        let result: Result<Self, Error> = (move || {
 +            match m.payload {
 +                MessagePayload::ApplicationData(payload) => {
-+                    cx.common.take_received_plaintext(payload)
++                    cx.common.take_received_plaintext(payload)?;
 +                }
 +                MessagePayload::Handshake { parsed, .. }
 +                    if matches!(&parsed.0, HandshakePayload::NewSessionTicketTls13(_)) =>
@@ -7155,12 +7155,14 @@
      /// If we signaled end of stream.
      pub(crate) has_sent_close_notify: bool,
      /// If the peer has signaled end of stream.
-@@ -50,8 +54,8 @@
+@@ -49,9 +53,9 @@
+     pub(crate) has_seen_eof: bool,
      pub(crate) peer_certificates: Option<CertificateChain<'static>>,
      message_fragmenter: MessageFragmenter,
-     pub(crate) received_plaintext: ChunkVecBuffer,
+-    pub(crate) received_plaintext: ChunkVecBuffer,
 -    pub(crate) sendable_tls: ChunkVecBuffer,
 -    queued_key_update_message: Option<Vec<u8>>,
++    pub(crate) received_plaintext: ChunkVecBuffer<crate::RetainedAllocator>,
 +    pub(crate) sendable_tls: ChunkVecBuffer<crate::RetainedAllocator>,
 +    pub(crate) queued_key_update_message: Option<Vec<u8, crate::RetainedAllocator>>,
  
@@ -7174,11 +7176,16 @@
              negotiated_version: None,
              handshake_kind: None,
              side,
-@@ -85,7 +90,10 @@
+@@ -84,8 +89,14 @@
+             has_seen_eof: false,
              peer_certificates: None,
              message_fragmenter: MessageFragmenter::default(),
-             received_plaintext: ChunkVecBuffer::new(Some(DEFAULT_RECEIVED_PLAINTEXT_LIMIT)),
+-            received_plaintext: ChunkVecBuffer::new(Some(DEFAULT_RECEIVED_PLAINTEXT_LIMIT)),
 -            sendable_tls: ChunkVecBuffer::new(Some(DEFAULT_BUFFER_LIMIT)),
++            received_plaintext: ChunkVecBuffer::new_in(
++                Some(DEFAULT_RECEIVED_PLAINTEXT_LIMIT),
++                crate::limited_cache::default_allocator(),
++            ),
 +            sendable_tls: ChunkVecBuffer::new_in(
 +                Some(DEFAULT_BUFFER_LIMIT),
 +                crate::limited_cache::default_allocator(),
@@ -7186,20 +7193,21 @@
              queued_key_update_message: None,
              protocol: Protocol::Tcp,
              quic: quic::Quic::default(),
-@@ -196,10 +204,10 @@
+@@ -196,10 +207,10 @@
      pub(crate) fn process_main_protocol<Data>(
          &mut self,
          msg: Message<'_>,
 -        mut state: Box<dyn State<Data>>,
 +        mut state: StateBox<Data>,
          data: &mut Data,
-         sendable_plaintext: Option<&mut ChunkVecBuffer>,
+-        sendable_plaintext: Option<&mut ChunkVecBuffer>,
 -    ) -> Result<Box<dyn State<Data>>, Error> {
++        sendable_plaintext: Option<&mut ChunkVecBuffer<crate::RetainedAllocator>>,
 +    ) -> Result<StateBox<Data>, Error> {
          // For TLS1.2, outside of the handshake, send rejection alerts for
          // renegotiation requests.  These can occur any time.
          if self.may_receive_application_data && !self.is_tls13() {
-@@ -208,9 +216,8 @@
+@@ -208,9 +219,8 @@
                  Side::Server => HandshakeType::ClientHello,
              };
              if msg.is_handshake_type(reject_ty) {
@@ -7211,7 +7219,7 @@
                  return Ok(state);
              }
          }
-@@ -222,7 +229,7 @@
+@@ -222,7 +232,7 @@
          };
          match state.handle(&mut cx, msg) {
              Ok(next) => {
@@ -7220,7 +7228,7 @@
                  Ok(state)
              }
              Err(e @ Error::InappropriateMessage { .. })
-@@ -242,30 +249,27 @@
+@@ -242,30 +252,27 @@
              return Ok(0);
          }
  
@@ -7262,7 +7270,7 @@
                          return Err(EncryptError::EncryptExhausted);
                      }
                  },
-@@ -275,19 +279,18 @@
+@@ -275,19 +282,18 @@
              }
          }
  
@@ -7290,7 +7298,7 @@
      }
  
      // Changing the keys must not span any fragmented handshake
-@@ -305,98 +308,111 @@
+@@ -305,98 +311,111 @@
          }
      }
  
@@ -7489,11 +7497,13 @@
      }
  
      /// Mark the connection as ready to send application data.
-@@ -405,47 +421,63 @@
+@@ -404,48 +423,67 @@
+     /// Also flush `sendable_plaintext` if it is `Some`.
      pub(crate) fn start_outgoing_traffic(
          &mut self,
-         sendable_plaintext: &mut Option<&mut ChunkVecBuffer>,
+-        sendable_plaintext: &mut Option<&mut ChunkVecBuffer>,
 -    ) {
++        sendable_plaintext: &mut Option<&mut ChunkVecBuffer<crate::RetainedAllocator>>,
 +    ) -> Result<(), Error> {
 +        // Buffered plaintext is removed only after the complete output is admitted.
 +        if let Some(sendable_plaintext) = sendable_plaintext {
@@ -7512,7 +7522,7 @@
 -    pub(crate) fn start_traffic(&mut self, sendable_plaintext: &mut Option<&mut ChunkVecBuffer>) {
 +    pub(crate) fn start_traffic(
 +        &mut self,
-+        sendable_plaintext: &mut Option<&mut ChunkVecBuffer>,
++        sendable_plaintext: &mut Option<&mut ChunkVecBuffer<crate::RetainedAllocator>>,
 +    ) -> Result<(), Error> {
 +        self.start_outgoing_traffic(sendable_plaintext)?;
          self.may_receive_application_data = true;
@@ -7542,7 +7552,10 @@
 -        if let Some(message) = self.queued_key_update_message.take() {
 -            self.sendable_tls.append(message);
 -        }
-+    fn flush_plaintext(&mut self, sendable_plaintext: &mut ChunkVecBuffer) -> Result<(), Error> {
++    fn flush_plaintext(
++        &mut self,
++        sendable_plaintext: &mut ChunkVecBuffer<crate::RetainedAllocator>,
++    ) -> Result<(), Error> {
 +        let fragmenter = self.message_fragmenter;
 +        self.send_fragments(
 +            || {
@@ -7580,7 +7593,7 @@
          {
              if let Protocol::Quic = self.protocol {
                  if let MessagePayload::Alert(alert) = m.payload {
-@@ -460,54 +492,54 @@
+@@ -460,54 +498,58 @@
                      );
                      let mut bytes = Vec::new();
                      m.payload.encode(&mut bytes);
@@ -7602,6 +7615,10 @@
 -            }
 -        } else {
 -            self.send_msg_encrypt(m.into());
+-        }
+-    }
+-
+-    pub(crate) fn take_received_plaintext(&mut self, bytes: Payload<'_>) {
 +                return Ok(());
 +            }
 +        }
@@ -7625,14 +7642,18 @@
 +                ccs.to_array().as_slice().into(),
 +                must_encrypt,
 +            ),
-         }
-     }
- 
-     pub(crate) fn take_received_plaintext(&mut self, bytes: Payload<'_>) {
++        }
++    }
++
++    pub(crate) fn take_received_plaintext(&mut self, bytes: Payload<'_>) -> Result<(), Error> {
++        // Refusal is terminal after decryption; publish no partial plaintext.
++        self.received_plaintext
++            .try_append_copy(bytes.bytes().into())
++            .map_err(|_| Error::AllocationFailed)?;
          self.temper_counters.received_app_data();
 -        self.received_plaintext
 -            .append(bytes.into_vec());
-+        self.received_plaintext.append(bytes.into_vec());
++        Ok(())
      }
  
      #[cfg(feature = "tls12")]
@@ -7664,7 +7685,7 @@
      }
  
      pub(crate) fn process_alert(&mut self, alert: &AlertMessagePayload) -> Result<(), Error> {
-@@ -530,8 +562,7 @@
+@@ -530,8 +572,7 @@
          // (except, for no good reason, user_cancelled).
          let err = Error::AlertReceived(alert.description);
          if alert.level == AlertLevel::Warning {
@@ -7674,7 +7695,7 @@
              if self.is_tls13() && alert.description != AlertDescription::UserCanceled {
                  return Err(self.send_fatal_alert(AlertDescription::DecodeError, err));
              }
-@@ -566,9 +597,14 @@
+@@ -566,9 +607,14 @@
      ) -> Error {
          debug_assert!(!self.sent_fatal_alert);
          let m = Message::build_alert(AlertLevel::Fatal, desc);
@@ -7692,7 +7713,7 @@
      }
  
      /// Queues a `close_notify` warning alert to be sent in the next
-@@ -579,27 +615,34 @@
+@@ -579,27 +625,34 @@
      ///
      /// [`Connection::write_tls`]: crate::Connection::write_tls
      pub fn send_close_notify(&mut self) {
@@ -7736,7 +7757,7 @@
      }
  
      fn check_required_size<'a>(
-@@ -607,12 +650,50 @@
+@@ -607,12 +660,50 @@
          outgoing_tls: &mut [u8],
          fragments: impl Iterator<Item = OutboundPlainMessage<'a>>,
      ) -> Result<(), EncryptError> {
@@ -7791,7 +7812,7 @@
          if required_size > outgoing_tls.len() {
              return Err(EncryptError::InsufficientSize(InsufficientSizeError {
                  required_size,
-@@ -622,44 +703,171 @@
+@@ -622,44 +713,171 @@
          Ok(())
      }
  
@@ -7986,7 +8007,7 @@
      }
  
      /// Returns true if the caller should call [`Connection::read_tls`] as soon
-@@ -699,8 +907,7 @@
+@@ -699,8 +917,7 @@
          &mut self,
          key_update_request: &KeyUpdateRequest,
      ) -> Result<bool, Error> {
@@ -7996,7 +8017,7 @@
  
          match key_update_request {
              KeyUpdateRequest::UpdateNotRequested => Ok(false),
-@@ -712,18 +919,23 @@
+@@ -712,18 +929,23 @@
          }
      }
  
@@ -8029,16 +8050,18 @@
      }
  }
  
-@@ -738,45 +950,115 @@
+@@ -737,46 +959,117 @@
+     pub(crate) fn buffer_plaintext(
          &mut self,
          payload: OutboundChunks<'_>,
-         sendable_plaintext: &mut ChunkVecBuffer,
+-        sendable_plaintext: &mut ChunkVecBuffer,
 -    ) -> usize {
 -        self.perhaps_write_key_update();
 -        self.send_plain(payload, Limit::Yes, sendable_plaintext)
 -    }
 -
 -    pub(crate) fn send_early_plaintext(&mut self, data: &[u8]) -> usize {
++        sendable_plaintext: &mut ChunkVecBuffer<crate::RetainedAllocator>,
 +    ) -> Result<usize, Error> {
 +        if payload.is_empty() {
 +            self.perhaps_write_key_update()?;
@@ -8075,8 +8098,9 @@
          &mut self,
          payload: OutboundChunks<'_>,
 -        limit: Limit,
-         sendable_plaintext: &mut ChunkVecBuffer,
+-        sendable_plaintext: &mut ChunkVecBuffer,
 -    ) -> usize {
++        sendable_plaintext: &mut ChunkVecBuffer<crate::RetainedAllocator>,
 +    ) -> Result<usize, Error> {
          if !self.may_send_application_data {
              // If we haven't completed handshaking, buffer
@@ -8089,8 +8113,9 @@
 -        }
 -
 -        self.send_plain_non_buffering(payload, limit)
-+            let len = sendable_plaintext.append_limited_copy(payload);
-+            return Ok(len);
++            return sendable_plaintext
++                .try_append_limited_copy(payload)
++                .map_err(|_| Error::AllocationFailed);
 +        }
 +
 +        self.send_plain_non_buffering(payload)
@@ -8169,7 +8194,7 @@
      }
  }
  
-@@ -843,15 +1125,35 @@
+@@ -843,15 +1136,35 @@
      }
  }
  
@@ -8208,7 +8233,7 @@
      fn export_keying_material(
          &self,
          _output: &mut [u8],
-@@ -865,17 +1167,213 @@
+@@ -865,17 +1178,213 @@
          Err(Error::HandshakeNotComplete)
      }
  
@@ -8428,7 +8453,16 @@
  }
  
  pub(crate) struct Context<'a, Data> {
-@@ -919,12 +1417,6 @@
+@@ -883,7 +1392,7 @@
+     pub(crate) data: &'a mut Data,
+     /// Buffered plaintext. This is `Some` if any plaintext was written during handshake and `None`
+     /// otherwise.
+-    pub(crate) sendable_plaintext: Option<&'a mut ChunkVecBuffer>,
++    pub(crate) sendable_plaintext: Option<&'a mut ChunkVecBuffer<crate::RetainedAllocator>>,
+ }
+ 
+ /// Side of the connection.
+@@ -919,12 +1428,6 @@
      }
  }
  
@@ -8441,7 +8475,7 @@
  /// Tracking technically-allowed protocol actions
  /// that we limit to avoid denial-of-service vectors.
  struct TemperCounters {
-@@ -1023,37 +1515,78 @@
+@@ -1023,37 +1526,78 @@
      }
  }
  
@@ -8799,6 +8833,15 @@
  
      /// A client or server connection.
      #[derive(Debug)]
+@@ -172,7 +171,7 @@
+ 
+     /// A structure that implements [`std::io::Read`] for reading plaintext.
+     pub struct Reader<'a> {
+-        pub(super) received_plaintext: &'a mut ChunkVecBuffer,
++        pub(super) received_plaintext: &'a mut ChunkVecBuffer<crate::RetainedAllocator>,
+         pub(super) has_received_close_notify: bool,
+         pub(super) has_seen_eof: bool,
+     }
 @@ -236,8 +235,7 @@
                  return Ok(len);
              }
@@ -8870,12 +8913,22 @@
              self.core.maybe_refresh_traffic_keys();
              Ok(len)
          }
-@@ -415,6 +411,12 @@
+@@ -411,10 +407,21 @@
+ pub struct ConnectionCommon<Data> {
+     pub(crate) core: ConnectionCore<Data>,
+     deframer_buffer: DeframerVecBuffer,
+-    sendable_plaintext: ChunkVecBuffer,
++    sendable_plaintext: ChunkVecBuffer<crate::RetainedAllocator>,
  }
  
  impl<Data> ConnectionCommon<Data> {
 +    pub(crate) fn with_input_allocator(mut self, allocator: crate::RetainedAllocator) -> Self {
 +        self.core.common_state.message_allocator = allocator.clone();
++        self.core
++            .common_state
++            .received_plaintext
++            .reset_empty_in(allocator.clone());
++        self.sendable_plaintext.reset_empty_in(allocator.clone());
 +        self.deframer_buffer = DeframerVecBuffer::new_in(allocator);
 +        self
 +    }
@@ -8883,7 +8936,7 @@
      /// Processes any new packets read by a previous call to
      /// [`Connection::read_tls`].
      ///
-@@ -463,8 +465,7 @@
+@@ -463,8 +470,7 @@
          label: &[u8],
          context: Option<&[u8]>,
      ) -> Result<T, Error> {
@@ -8893,7 +8946,7 @@
      }
  
      /// Extract secrets, so they can be used when configuring kTLS, for example.
-@@ -548,7 +549,7 @@
+@@ -548,7 +554,7 @@
      /// The main reason to call this manually is to roll keys when it is known
      /// a connection will be idle for a long period.
      pub fn refresh_traffic_keys(&mut self) -> Result<(), Error> {
@@ -8902,7 +8955,7 @@
      }
  }
  
-@@ -710,6 +711,7 @@
+@@ -710,6 +716,7 @@
      /// `process_handshake_messages()` path, specialized for the first handshake message.
      pub(crate) fn first_handshake_message(&mut self) -> Result<Option<Message<'static>>, Error> {
          let mut buffer_progress = self.core.hs_deframer.progress();
@@ -8910,7 +8963,7 @@
  
          let res = self
              .core
-@@ -718,20 +720,30 @@
+@@ -718,20 +725,30 @@
                  self.deframer_buffer.filled_mut(),
                  &mut buffer_progress,
              )
@@ -8946,7 +8999,20 @@
          self.core.state = Ok(new);
      }
  
-@@ -858,7 +870,7 @@
+@@ -816,10 +833,11 @@
+ 
+ impl<Data> From<ConnectionCore<Data>> for ConnectionCommon<Data> {
+     fn from(core: ConnectionCore<Data>) -> Self {
++        let allocator = core.common_state.message_allocator.clone();
+         Self {
+             core,
+             deframer_buffer: DeframerVecBuffer::default(),
+-            sendable_plaintext: ChunkVecBuffer::new(Some(DEFAULT_BUFFER_LIMIT)),
++            sendable_plaintext: ChunkVecBuffer::new_in(Some(DEFAULT_BUFFER_LIMIT), allocator),
+         }
+     }
+ }
+@@ -858,7 +876,7 @@
  }
  
  pub(crate) struct ConnectionCore<Data> {
@@ -8955,7 +9021,7 @@
      pub(crate) data: Data,
      pub(crate) common_state: CommonState,
      pub(crate) hs_deframer: HandshakeDeframer,
-@@ -869,7 +881,11 @@
+@@ -869,7 +887,11 @@
  }
  
  impl<Data> ConnectionCore<Data> {
@@ -8968,7 +9034,16 @@
          Self {
              state: Ok(state),
              data,
-@@ -896,7 +912,7 @@
+@@ -882,7 +904,7 @@
+     pub(crate) fn process_new_packets(
+         &mut self,
+         deframer_buffer: &mut DeframerVecBuffer,
+-        sendable_plaintext: &mut ChunkVecBuffer,
++        sendable_plaintext: &mut ChunkVecBuffer<crate::RetainedAllocator>,
+     ) -> Result<IoState, Error> {
+         let mut state = match mem::replace(&mut self.state, Err(Error::HandshakeNotComplete)) {
+             Ok(state) => state,
+@@ -896,7 +918,7 @@
  
          loop {
              let res = self.deframe(
@@ -8977,7 +9052,7 @@
                  deframer_buffer.filled_mut(),
                  &mut buffer_progress,
              );
-@@ -923,10 +939,7 @@
+@@ -923,10 +945,7 @@
                  }
              }
  
@@ -8989,7 +9064,7 @@
                  // "Any data received after a closure alert has been received MUST be ignored."
                  // -- <https://datatracker.ietf.org/doc/html/rfc8446#section-6.1>
                  // This is data that has already been accepted in `read_tls`.
-@@ -945,7 +958,7 @@
+@@ -945,7 +964,7 @@
      /// Pull a message out of the deframer and send any messages that need to be sent as a result.
      fn deframe<'b>(
          &mut self,
@@ -8998,7 +9073,7 @@
          buffer: &'b mut [u8],
          buffer_progress: &mut BufferProgress,
      ) -> Result<Option<InboundPlainMessage<'b>>, Error> {
-@@ -976,7 +989,7 @@
+@@ -976,7 +995,7 @@
  
      fn process_more_input<'b>(
          &mut self,
@@ -9007,7 +9082,7 @@
          buffer: &'b mut [u8],
          buffer_progress: &mut BufferProgress,
      ) -> Result<Option<InboundPlainMessage<'b>>, Error> {
-@@ -1008,10 +1021,7 @@
+@@ -1008,10 +1027,7 @@
                      // * The payload size is indicative of a plaintext alert message.
                      ContentType::Alert
                          if version_is_tls13
@@ -9019,7 +9094,7 @@
                              && message.payload.len() <= 2 =>
                      {
                          true
-@@ -1024,11 +1034,7 @@
+@@ -1024,11 +1040,7 @@
                      break (message.into_plain_message(), iter.bytes_consumed());
                  }
  
@@ -9032,7 +9107,7 @@
                      // failed decryption during trial decryption is not allowed to be
                      // interleaved with partial handshake data.
                      Ok(None) if !self.hs_deframer.is_aligned() => {
-@@ -1105,16 +1111,18 @@
+@@ -1105,16 +1117,18 @@
  
              if self.hs_deframer.has_message_ready() {
                  // trial decryption finishes with the first handshake message after it started.
@@ -9055,14 +9130,15 @@
          match error {
              error @ Error::InvalidMessage(_) => {
                  if self.common_state.is_quic() {
-@@ -1143,14 +1151,12 @@
+@@ -1143,14 +1157,12 @@
      fn process_msg(
          &mut self,
          msg: InboundPlainMessage<'_>,
 -        state: Box<dyn State<Data>>,
-+        state: crate::common_state::StateBox<Data>,
-         sendable_plaintext: Option<&mut ChunkVecBuffer>,
+-        sendable_plaintext: Option<&mut ChunkVecBuffer>,
 -    ) -> Result<Box<dyn State<Data>>, Error> {
++        state: crate::common_state::StateBox<Data>,
++        sendable_plaintext: Option<&mut ChunkVecBuffer<crate::RetainedAllocator>>,
 +    ) -> Result<crate::common_state::StateBox<Data>, Error> {
          // Drop CCS messages during handshake in TLS1.3
          if msg.typ == ContentType::ChangeCipherSpec
@@ -9073,7 +9149,7 @@
              && self.common_state.is_tls13()
          {
              if !msg.is_valid_ccs() {
-@@ -1163,14 +1169,13 @@
+@@ -1163,14 +1175,13 @@
                  ));
              }
  
@@ -9090,7 +9166,7 @@
              Ok(msg) => msg,
              Err(err) => {
                  return Err(self
-@@ -1190,18 +1195,13 @@
+@@ -1190,18 +1201,13 @@
      }
  
      pub(crate) fn dangerous_extract_secrets(self) -> Result<ExtractedSecrets, Error> {
@@ -9111,7 +9187,7 @@
              return Err(Error::General("Secret extraction is disabled".into()));
          }
  
-@@ -1209,11 +1209,7 @@
+@@ -1209,11 +1215,7 @@
              return Err(Error::HandshakeNotComplete);
          }
  
@@ -9124,7 +9200,7 @@
              return Err(Error::General(
                  "cannot convert into an KernelConnection while there are still buffered TLS records to send"
                      .into()
-@@ -1255,20 +1251,44 @@
+@@ -1255,20 +1257,44 @@
          }
      }
  
@@ -9353,6 +9429,15 @@
  
              Self::WriteTraffic(..) => f.debug_tuple("WriteTraffic").finish(),
          }
+@@ -332,7 +301,7 @@
+ 
+     // owner of the latest chunk obtained in `next_record`, as borrowed by
+     // `AppDataRecord`
+-    chunk: Option<Vec<u8>>,
++    chunk: Option<Vec<u8, RetainedAllocator>>,
+ }
+ 
+ impl<'c, 'i, Data> ReadTraffic<'c, 'i, Data> {
 @@ -347,12 +316,7 @@
      /// Decrypts and returns the next available app-data record
      // TODO deprecate in favor of `Iterator` implementation, which requires in-place decryption
@@ -12759,7 +12844,7 @@
  #[cfg(feature = "std")]
  mod stream;
  #[cfg(feature = "tls12")]
-@@ -468,6 +476,18 @@
+@@ -468,6 +476,19 @@
  #[allow(missing_docs)]
  #[doc(hidden)]
  pub mod internal {
@@ -12768,7 +12853,8 @@
 +    pub mod send {
 +        pub use crate::send_owner::{
 +            connection_snapshot, encrypt_connection, observe_key_update, request_refresh,
-+            visit_message_in, FlightProbe, ParsedHandshakeProbe, QueueProbe, RecordProbe, Snapshot,
++            visit_message_in, FlightProbe, ParsedHandshakeProbe, PlaintextProbe, QueueProbe,
++            RecordProbe, Snapshot,
 +        };
 +    }
 +    pub mod state {
@@ -12778,7 +12864,7 @@
      /// Low-level TLS message parsing and encoding functions.
      pub mod msgs {
          pub mod base {
-@@ -485,8 +505,11 @@
+@@ -485,8 +506,11 @@
              pub use crate::msgs::fragmenter::MessageFragmenter;
          }
          pub mod handshake {
@@ -12791,7 +12877,7 @@
              };
          }
          pub mod message {
-@@ -533,20 +556,20 @@
+@@ -533,20 +557,20 @@
  /// [`unbuffered-client`]: https://github.com/rustls/rustls/blob/main/examples/src/bin/unbuffered-client.rs
  /// [`unbuffered-server`]: https://github.com/rustls/rustls/blob/main/examples/src/bin/unbuffered-server.rs
  pub mod unbuffered {
@@ -12814,7 +12900,7 @@
  pub use crate::enums::{
      AlertDescription, CertificateCompressionAlgorithm, CipherSuite, ContentType, HandshakeType,
      ProtocolVersion, SignatureAlgorithm, SignatureScheme,
-@@ -575,7 +598,7 @@
+@@ -575,7 +599,7 @@
  pub use crate::tls12::Tls12CipherSuite;
  pub use crate::tls13::Tls13CipherSuite;
  pub use crate::verify::DigitallySignedStruct;
@@ -12823,7 +12909,7 @@
  pub use crate::webpki::RootCertStore;
  
  /// Items for use in a client.
-@@ -613,8 +636,12 @@
+@@ -613,8 +637,12 @@
  
      pub use crate::msgs::persist::{Tls12ClientSessionValue, Tls13ClientSessionValue};
      pub use crate::webpki::{
@@ -12838,7 +12924,7 @@
      };
  }
  
-@@ -635,7 +662,11 @@
+@@ -635,7 +663,11 @@
      mod tls12;
      mod tls13;
  
@@ -12851,7 +12937,7 @@
      #[cfg(any(feature = "std", feature = "hashbrown"))]
      pub use handy::ResolvesServerCertUsingSni;
      #[cfg(any(feature = "std", feature = "hashbrown"))]
-@@ -682,7 +713,8 @@
+@@ -682,7 +714,8 @@
  /// Message signing interfaces.
  pub mod sign {
      pub use crate::crypto::signer::{
@@ -12861,7 +12947,7 @@
      };
  }
  
-@@ -706,13 +738,13 @@
+@@ -706,13 +739,13 @@
  
  #[cfg(any(feature = "std", feature = "hashbrown"))]
  mod hash_map {
@@ -18919,6 +19005,15 @@
          }
      }
  
+@@ -359,7 +363,7 @@
+     pub struct ConnectionCommon<Data> {
+         core: ConnectionCore<Data>,
+         deframer_buffer: DeframerVecBuffer,
+-        sendable_plaintext: ChunkVecBuffer,
++        sendable_plaintext: ChunkVecBuffer<crate::RetainedAllocator>,
+     }
+ 
+     impl<Data: SideData> ConnectionCommon<Data> {
 @@ -389,11 +393,7 @@
              Some(DirectionalKeys::new(
                  suite,
@@ -18944,7 +19039,20 @@
          }
  
          /// Emit the TLS description code of a fatal alert, if one has arisen.
-@@ -473,7 +470,7 @@
+@@ -458,10 +455,11 @@
+ 
+     impl<Data> From<ConnectionCore<Data>> for ConnectionCommon<Data> {
+         fn from(core: ConnectionCore<Data>) -> Self {
++            let allocator = core.common_state.message_allocator.clone();
+             Self {
+                 core,
+                 deframer_buffer: DeframerVecBuffer::default(),
+-                sendable_plaintext: ChunkVecBuffer::new(Some(DEFAULT_BUFFER_LIMIT)),
++                sendable_plaintext: ChunkVecBuffer::new_in(Some(DEFAULT_BUFFER_LIMIT), allocator),
+             }
+         }
+     }
+@@ -473,7 +471,7 @@
  #[derive(Default)]
  pub(crate) struct Quic {
      /// QUIC transport parameters received from the peer during the handshake
@@ -18953,7 +19061,7 @@
      pub(crate) alert: Option<AlertDescription>,
      pub(crate) hs_queue: VecDeque<(bool, Vec<u8>)>,
      pub(crate) early_secret: Option<OkmBlock>,
-@@ -861,8 +858,7 @@
+@@ -861,8 +859,7 @@
  
          let packet_iv =
              hkdf_expand_label(self.expander.as_ref(), self.version.packet_iv_label(), &[]);
@@ -18963,7 +19071,7 @@
      }
  
      /// Derive header protection keys
-@@ -873,8 +869,7 @@
+@@ -873,8 +870,7 @@
              self.version.header_key_label(),
              &[],
          );
@@ -19181,7 +19289,7 @@
 +}
 --- /dev/null
 +++ b/src/send_owner.rs
-@@ -0,0 +1,416 @@
+@@ -0,0 +1,471 @@
 +//! Integration observations over the current queue and record transaction.
 +//! Fixed observer/provider metadata is outside measured product backing.
 +use alloc::boxed::Box;
@@ -19210,6 +19318,19 @@
 +            pending: None,
 +            allocator,
 +        }
++    }
++    /// Exercise the same prefix-limited admission used before a handshake.
++    pub fn plaintext_write(
++        &mut self,
++        bytes: &[u8],
++        limit: Option<usize>,
++    ) -> Result<usize, AllocError> {
++        self.queue.set_limit(limit);
++        self.queue.try_append_limited_copy(bytes.into())
++    }
++    /// Exercise the same full plaintext admission used after decryption.
++    pub fn plaintext_receive(&mut self, bytes: &[u8]) -> Result<usize, AllocError> {
++        self.queue.try_append_copy(bytes.into())
 +    }
 +    /// Observe the live descriptor capacity.
 +    pub fn descriptor_capacity(&self) -> usize {
@@ -19332,7 +19453,7 @@
 +/// Actual CommonState record owner with fixed fixture keys; no handshake authority.
 +pub struct RecordProbe {
 +    common: CommonState,
-+    plaintext: ChunkVecBuffer,
++    plaintext: ChunkVecBuffer<RetainedAllocator>,
 +}
 +impl RecordProbe {
 +    /// Create an empty owner with the supplied original allocator.
@@ -19341,7 +19462,7 @@
 +            .tls13()
 +            .unwrap();
 +        let mut common = CommonState::new(Side::Client);
-+        common.message_allocator = allocator;
++        common.message_allocator = allocator.clone();
 +        common.negotiated_version = Some(ProtocolVersion::TLSv1_3);
 +        common.may_send_application_data = true;
 +        common.aligned_handshake = true;
@@ -19353,7 +19474,7 @@
 +        );
 +        Self {
 +            common,
-+            plaintext: ChunkVecBuffer::new(None),
++            plaintext: ChunkVecBuffer::new_in(None, allocator),
 +        }
 +    }
 +    /// The injected provider delegates real encryption until the selected second nonce.
@@ -19597,6 +19718,48 @@
 +        _ => visit(None, wire),
 +    }
 +    Ok(())
++}
++
++/// Direct current CommonState plaintext boundaries; no decryption or peer authority is simulated.
++pub struct PlaintextProbe {
++    common: CommonState,
++    sending: ChunkVecBuffer<RetainedAllocator>,
++}
++impl PlaintextProbe {
++    /// Install the explicit original context allocator before any queue request.
++    pub fn new_in(allocator: RetainedAllocator) -> Self {
++        let mut common = CommonState::new(Side::Client);
++        common.received_plaintext.reset_empty_in(allocator.clone());
++        common.message_allocator = allocator.clone();
++        Self {
++            common,
++            sending: ChunkVecBuffer::new_in(None, allocator),
++        }
++    }
++    /// Queue an application prefix while the actual connection is not traffic-ready.
++    pub fn write(&mut self, bytes: &[u8], limit: Option<usize>) -> Result<usize, Error> {
++        self.sending.set_limit(limit);
++        self.common
++            .buffer_plaintext(bytes.into(), &mut self.sending)
++    }
++    /// Publish the actual received-plaintext boundary without claiming cipher rollback.
++    pub fn receive(&mut self, bytes: &[u8]) -> Result<(), Error> {
++        self.common
++            .take_received_plaintext(crate::msgs::base::Payload::Borrowed(bytes))
++    }
++    /// Observe record/flag state without cloning queue storage.
++    pub fn snapshot(&self) -> Snapshot {
++        observe(&self.common)
++    }
++    /// Borrow queued plaintext after successful publication.
++    pub fn chunks(&self, receive: bool) -> impl Iterator<Item = &[u8]> {
++        let queue = if receive {
++            &self.common.received_plaintext
++        } else {
++            &self.sending
++        };
++        queue.chunks()
++    }
 +}
 --- a/src/server/builder.rs
 +++ b/src/server/builder.rs
@@ -22096,7 +22259,7 @@
 +        let result: Result<Self, Error> = (move || {
 +            match m.payload {
 +                MessagePayload::ApplicationData(payload) => {
-+                    cx.common.take_received_plaintext(payload)
++                    cx.common.take_received_plaintext(payload)?;
 +                }
 +                payload => {
 +                    return Err(inappropriate_message(
@@ -23648,7 +23811,7 @@
 +        let result: Result<Self, Error> = (move || {
 +            match m.payload {
 +                MessagePayload::ApplicationData(payload) => {
-+                    cx.common.take_received_plaintext(payload)
++                    cx.common.take_received_plaintext(payload)?;
 +                }
 +                MessagePayload::Handshake { parsed, .. }
 +                    if matches!(&parsed.0, HandshakePayload::KeyUpdate(_)) =>
@@ -24974,6 +25137,21 @@
  }
  
  #[cfg(all(test, feature = "std"))]
+@@ -240,10 +370,10 @@
+     #[test]
+     fn short_append_copy_with_limit() {
+         let mut cvb = ChunkVecBuffer::new(Some(12));
+-        assert_eq!(cvb.append_limited_copy(b"hello"[..].into()), 5);
+-        assert_eq!(cvb.append_limited_copy(b"world"[..].into()), 5);
+-        assert_eq!(cvb.append_limited_copy(b"hello"[..].into()), 2);
+-        assert_eq!(cvb.append_limited_copy(b"world"[..].into()), 0);
++        assert_eq!(cvb.try_append_limited_copy(b"hello"[..].into()).unwrap(), 5);
++        assert_eq!(cvb.try_append_limited_copy(b"world"[..].into()).unwrap(), 5);
++        assert_eq!(cvb.try_append_limited_copy(b"hello"[..].into()).unwrap(), 2);
++        assert_eq!(cvb.try_append_limited_copy(b"world"[..].into()).unwrap(), 0);
+ 
+         let mut buf = [0u8; 12];
+         assert_eq!(cvb.read(&mut buf).unwrap(), 12);
 @@ -266,10 +396,7 @@
  
      #[test]
@@ -25011,7 +25189,7 @@
              }
          }
      }
-@@ -375,3 +520,57 @@
+@@ -375,3 +520,89 @@
          });
      }
  }
@@ -25060,13 +25238,45 @@
 +    }
 +}
 +#[cfg(feature = "std")]
-+impl ChunkVecBuffer {
-+    /// Append a copy of `bytes`, perhaps a prefix if
-+    /// we're near the limit.
-+    pub(crate) fn append_limited_copy(&mut self, payload: OutboundChunks<'_>) -> usize {
++impl<A: Allocator + Clone> ChunkVecBuffer<A> {
++    /// Rebind a newly constructed empty queue before its first allocation.
++    pub(crate) fn reset_empty_in(&mut self, allocator: A) {
++        assert!(
++            self.is_empty(),
++            "allocator selected before plaintext buffering"
++        );
++        *self = Self::new_in(self.limit, allocator);
++    }
++
++    /// Admit all descriptors and bytes before copying or publishing any payload.
++    pub(crate) fn try_append_copy(
++        &mut self,
++        payload: OutboundChunks<'_>,
++    ) -> Result<usize, AllocError> {
++        let length = payload.len();
++        if length == 0 {
++            return Ok(0);
++        }
++        let mut prepared = self.prepare_append(
++            core::iter::once(Ok(length)),
++            1,
++            false,
++            self.chunks.allocator().clone(),
++        )?;
++        let mut bytes = prepared.next_buffer();
++        payload.copy_to_vec(&mut bytes);
++        prepared.finish_buffer(bytes);
++        self.commit_append(prepared, None);
++        Ok(length)
++    }
++
++    /// Append only the allowed prefix; a full queue accepts zero without allocation.
++    pub(crate) fn try_append_limited_copy(
++        &mut self,
++        payload: OutboundChunks<'_>,
++    ) -> Result<usize, AllocError> {
 +        let take = self.apply_limit(payload.len());
-+        self.append(payload.split_at(take).0.to_vec());
-+        take
++        self.try_append_copy(payload.split_at(take).0)
 +    }
 +}
 --- a/src/verify.rs
