@@ -2,7 +2,7 @@
   "schema": 1,
   "profile": "retained-provider",
   "routing": "build-owned Cargo paths override; same package manifests, lock and dependency graph",
-  "patch_sha256": "57a439544863edb5cb4fb4b503c04269b663c42407a124de04a7d0e86a322381",
+  "patch_sha256": "f5e4859ead426eef776fa494be35df3ca4a11574fd3af047c8a60930bfad4204",
   "suppliers": [
     {
       "package": "rustls",
@@ -13,7 +13,7 @@
         {
           "path": "src/lib.rs",
           "before_sha256": "7bd4855fe9628a0d596e89edf8130a6c099a14a0b7f7bbb28953b53c01810502",
-          "after_sha256": "61005ceb998563b6bfcf743646094f38fb09c4f5964f87ac5f8e09ff84d131d9"
+          "after_sha256": "79f8435e9388087f0375ec5786c82d59ad08069e0d2d2508b1cfdad094146663"
         },
         {
           "path": "src/limited_cache.rs",

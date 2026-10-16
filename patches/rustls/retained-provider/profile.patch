@@ -84,12 +84,13 @@
      };
  }
  
-@@ -707,12 +714,12 @@
+@@ -706,13 +713,13 @@
+ 
  #[cfg(any(feature = "std", feature = "hashbrown"))]
  mod hash_map {
-     #[cfg(feature = "std")]
++    #[cfg(all(feature = "std", not(target_vendor = "teaclave")))]
 +    pub(crate) use std::collections::hash_map::Entry;
-+    #[cfg(feature = "std")]
+     #[cfg(feature = "std")]
      pub(crate) use std::collections::HashMap;
 -    #[cfg(feature = "std")]
 -    pub(crate) use std::collections::hash_map::Entry;

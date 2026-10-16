@@ -297,6 +297,7 @@ fn mcp_error(message: &str) -> Vec<u8> {
 }
 
 /// Preserve the existing FIDO route/query projection without an unpaid JSON tree.
+#[cfg_attr(not(test), cfg(feature = "fido2"))]
 pub(super) fn fido<'a>(
     pool: &Arc<AllocationPoolV1>,
     input: &'a [u8],
@@ -339,7 +340,9 @@ pub(super) fn fido<'a>(
 }
 /// Existing byte-by-byte percent decoding, including its malformed-pair behavior.
 /// Rendering is allocation-free; Text::display admits the actual UTF-8 byte count.
+#[cfg_attr(not(test), cfg(feature = "fido2"))]
 struct PercentDecoded<'a>(&'a str);
+#[cfg_attr(not(test), cfg(feature = "fido2"))]
 impl core::fmt::Display for PercentDecoded<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         use core::fmt::Write;
