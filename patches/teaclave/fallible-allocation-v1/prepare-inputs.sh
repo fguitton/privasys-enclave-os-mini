@@ -7,7 +7,7 @@ main_source=$(realpath -e -- "$1")
 teaclave_checkout=$(realpath -e -- "$2")
 [[ $3 == /* && ! -e $3 && ! -L $3 ]] || exit 64
 helper_root=$(cd -- "$(dirname -- "$0")" && pwd)
-[[ $(sha256sum "$main_source/scripts/ci/test-teaclave-sim.sh" | cut -d' ' -f1) == 6bcde05437c6a35c4766bbdf7b759c8c01b3f863693dab3b84759fc85b94dc25 ]]
+[[ $(sha256sum "$main_source/scripts/ci/test-teaclave-sim.sh" | cut -d' ' -f1) == 902e09180c6faacf7b158b09e189b94fae0bbc2137a8c8b79eebcb4da237407b ]]
 [[ $(sha256sum "$helper_root/approved-functions.sh" | cut -d' ' -f1) == 24acd61c83e3ed9155cf479a92f0fe864476f4be9ac5642aa41d6433ae77ab1c ]]
 mkdir -- "$3"
 BUILD_ROOT=$(realpath -e -- "$3")

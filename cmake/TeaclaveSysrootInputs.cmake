@@ -3,9 +3,43 @@
 # Version 1: owned outputs for the existing reviewed Teaclave sysroot recipe.
 # This file verifies inputs and declares build provenance. It never edits the SDK.
 
+# A selected source profile may add a direct SDK dependency. Its locked
+# dependency edge must be an exact guarded before/after image in that profile.
+option(HONEST_TEACLAVE_FALLIBLE_ALLOCATION_V1
+    "Verify the exact default-off fallible allocator/thread source profile" OFF)
+set(_locked_std_original_hash "e5f79c0fa641c519795bc43c4b204aa0351a94b4f9ee599f8c642be58ac54e99")
+set(_locked_std_selected_hash "${_locked_std_original_hash}")
+if(HONEST_TEACLAVE_FALLIBLE_ALLOCATION_V1)
+    set(_lock_profile "${CMAKE_SOURCE_DIR}/patches/teaclave/fallible-allocation-v1/manifest.json")
+    if(NOT EXISTS "${_lock_profile}" OR IS_SYMLINK "${_lock_profile}")
+        message(FATAL_ERROR "Locked SDK dependency profile is unavailable")
+    endif()
+    file(READ "${_lock_profile}" _lock_json)
+    string(JSON _lock_count LENGTH "${_lock_json}" files)
+    set(_lock_matches 0)
+    if(_lock_count GREATER 0)
+        math(EXPR _lock_last "${_lock_count}-1")
+        foreach(_index RANGE 0 ${_lock_last})
+            string(JSON _relative GET "${_lock_json}" files ${_index} path)
+            if(_relative STREQUAL "rustlib/std/Cargo.lock")
+                math(EXPR _lock_matches "${_lock_matches}+1")
+                string(JSON _before GET "${_lock_json}" files ${_index} before_sha256)
+                string(JSON _after GET "${_lock_json}" files ${_index} after_sha256)
+                if(NOT _before STREQUAL _locked_std_original_hash)
+                    message(FATAL_ERROR "SDK dependency lock has another original identity")
+                endif()
+                set(_locked_std_selected_hash "${_after}")
+            endif()
+        endforeach()
+    endif()
+    if(_lock_matches GREATER 1)
+        message(FATAL_ERROR "SDK dependency lock profile is ambiguous")
+    endif()
+endif()
+
 foreach(_pair IN ITEMS
     "CMakeLists.txt|2d9182fa1db6d902ad62b0b082997aee8578880f483ce4f11eda02ad3a11f378"
-    "rustlib/std/Cargo.lock|e5f79c0fa641c519795bc43c4b204aa0351a94b4f9ee599f8c642be58ac54e99")
+    "rustlib/std/Cargo.lock|${_locked_std_selected_hash}")
     string(REPLACE "|" ";" _parts "${_pair}")
     list(GET _parts 0 _relative)
     list(GET _parts 1 _expected)
@@ -45,8 +79,6 @@ string(REPLACE "\n" ";" _sdk_files "${_tree_files}")
 list(APPEND _sdk_files "rustlib/std/Cargo.lock")
 
 # Optional source ABI profile. It has no global allocator or implicit activation.
-option(HONEST_TEACLAVE_FALLIBLE_ALLOCATION_V1
-    "Verify the exact default-off fallible allocator/thread source profile" OFF)
 set(_allocation_profile_files)
 if(HONEST_TEACLAVE_FALLIBLE_ALLOCATION_V1)
     set(_allocation_profile_root "${CMAKE_SOURCE_DIR}/patches/teaclave/fallible-allocation-v1")

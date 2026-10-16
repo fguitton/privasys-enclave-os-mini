@@ -73,17 +73,34 @@ impl AllocationPoolV1 {
         if bytes == 0 {
             return None;
         }
+        self.reserve_backend_bytes(bytes)?;
+        Some(AllocationLeaseV1 {
+            pool: self.clone(),
+            bytes,
+            notify: AtomicBool::new(notify),
+        })
+    }
+    // The same original-pool admission serves move-only leases and explicit
+    // backend headers. Header owners retain the pool until actual free.
+    fn reserve_backend_bytes(&self, bytes: usize) -> Option<()> {
+        if bytes == 0 {
+            return None;
+        }
         self.used
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes)
                     .filter(|next| *next <= self.capacity)
             })
             .ok()?;
-        Some(AllocationLeaseV1 {
-            pool: self.clone(),
-            bytes,
-            notify: AtomicBool::new(notify),
-        })
+        Some(())
+    }
+    fn release_backend_bytes(&self, bytes: usize, notify: bool) {
+        self.used.fetch_sub(bytes, Ordering::AcqRel);
+        if notify {
+            if let Some(released) = self.released {
+                released();
+            }
+        }
     }
 }
 /// Move-only physical allocation credit; it cannot read, sign or acknowledge data.
@@ -107,12 +124,8 @@ impl AllocationLeaseV1 {
 }
 impl Drop for AllocationLeaseV1 {
     fn drop(&mut self) {
-        self.pool.used.fetch_sub(self.bytes, Ordering::AcqRel);
-        if self.notify.load(Ordering::Acquire) {
-            if let Some(released) = self.pool.released {
-                released();
-            }
-        }
+        self.pool
+            .release_backend_bytes(self.bytes, self.notify.load(Ordering::Acquire));
     }
 }
 /// Checked geometric Vec backing within the caller's existing byte maximum.

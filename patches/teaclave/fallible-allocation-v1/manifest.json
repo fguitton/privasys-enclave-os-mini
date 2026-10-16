@@ -19,13 +19,17 @@
     {
       "path": "explicit-c-allocation.patch",
       "sha256": "b476efeea6b8778bfc76e2c63f1a0e1d2075105146f6a855616bf7976036aabd"
+    },
+    {
+      "path": "typed-thread-allocation.patch",
+      "sha256": "ba970c543bcf80aeadee91ee4745a5f39de39646c0c4c0c94201f0aaee6103d2"
     }
   ],
   "files": [
     {
       "path": "sgx_alloc/src/lib.rs",
       "before_sha256": "7893e8e98a9d8248a7da0f3555bd3dca69ff4527daeba881e51af01f5525fe21",
-      "after_sha256": "e51f78b12de75dcb9b526a67b8e9bba9b01b5908f3750bb862e5030ff722691f"
+      "after_sha256": "4c29cab00bf5f53f355cfd71d1fbdfa747906b3548f871a69c253f249697c9f6"
     },
     {
       "path": "sgx_alloc/src/system.rs",
@@ -35,32 +39,32 @@
     {
       "path": "sgx_tstd/src/alloc.rs",
       "before_sha256": "77bd807108ac94bc83ce38652003f4ff8814b52d77c18111a3ecd90911916b24",
-      "after_sha256": "88c805b5e4d03d0367245932b2c7c36842aebf87b662ed37b4506895e67d2a38"
+      "after_sha256": "28588d8aecfb319dda5d329f8551c1b1b7d5024ffbbf4cd91e2b732b42917d93"
     },
     {
       "path": "sgx_alloc/src/fallible.rs",
       "before_sha256": null,
-      "after_sha256": "73828f6cced17b331c36ec711e9b8b6d53dbfa566ae37bba613575650c59b22b"
+      "after_sha256": "de99e8a932c380b7e9b9086935bbb53d75da1f132bfee72ca9d811829c934c2f"
     },
     {
       "path": "sgx_tstd/src/thread/mod.rs",
       "before_sha256": "9f312f6d393c2eb3f2a5ae88f0464e94b111ea82f0bd7ab58daf2e6f06ca6a3d",
-      "after_sha256": "ccfd6f5e9ddf3bece83233353825bd7ccda9ed48446936516f042623f62d9905"
+      "after_sha256": "69a4b7eef99ca188745878dad86e201b4fd7fa1e40ae6ed9cffb173cdfa52d06"
     },
     {
       "path": "sgx_tstd/src/sys/thread.rs",
       "before_sha256": "b7a511afc64e5c722d32b3fca056c7ca8b242f96fde821b816b0af912756a8da",
-      "after_sha256": "259ca8a2e8bc0b01f2b1a5cd2817c14a8b20a7dd50c4e78faef46e3fa831e76a"
+      "after_sha256": "6f0d68c6908c8ac105a4fc262c3a69df74945c9831fc50e8ea83e43c4e4471e7"
     },
     {
       "path": "sgx_trts/src/thread/native.rs",
       "before_sha256": "fa870ae91aab49b6d5d228e4621377fdabb5433585c14edcda1a096f1f2c86e9",
-      "after_sha256": "8e13f1a0a34d072a0b90731fb2162be879e4dd75920525dcb07bc4fe61652c1c"
+      "after_sha256": "997fbbe0e7a41add4b9f68e6603485639f50469c38009ee9069602935849d317"
     },
     {
       "path": "sgx_trts/src/thread/task.rs",
       "before_sha256": "4bdb8e5b813c1a165f4cfdd2844e31020e9f15cacfc8bf32eb9b2f6920c587f5",
-      "after_sha256": "b8aa1656ef2a5c225c2f4f0c4bf524af73d29f4cc82ae5db2f34c96c3a379b74"
+      "after_sha256": "fd2dcf64bbb55a800ff17aabe6125bdeecd948d2d782aaf3f12f3eda8d15b877"
     },
     {
       "path": "sgx_sync/src/lib.rs",
@@ -95,7 +99,42 @@
     {
       "path": "sgx_alloc/src/fallible_c.rs",
       "before_sha256": null,
-      "after_sha256": "f7585a89efee1396034116ca52342e1ff5060b16606a31b7a5300d413de30930"
+      "after_sha256": "3220d2d1c7da435e8ada8c428d4dbe2b4d952453d9701a7e19e4c3c4db0fde01"
+    },
+    {
+      "path": "rustlib/std/Cargo.lock",
+      "before_sha256": "e5f79c0fa641c519795bc43c4b204aa0351a94b4f9ee599f8c642be58ac54e99",
+      "after_sha256": "d36e7a755bfc34dc89fa9e7d64af7ba6e351d40ba303357fef9b70acaa772632"
+    },
+    {
+      "path": "sgx_alloc/Cargo.toml",
+      "before_sha256": "0b430576210f0c3c19c8c54ff2ac675035b072dede5496d5f68c4cadbf6224ac",
+      "after_sha256": "aaae7b3ab6ac73e746ce82398de8ce7538581f2d59b5b732f99e2ba6d3018d52"
+    },
+    {
+      "path": "sgx_alloc/src/owned.rs",
+      "before_sha256": null,
+      "after_sha256": "7ba96a4e1a673d2f89ea123825902a0e90e7273c66dc8a2f8447da044977dfed"
+    },
+    {
+      "path": "sgx_trts/src/thread/allocator.rs",
+      "before_sha256": null,
+      "after_sha256": "a041b71ff70ca4d96c6901c70953233d0dab8297e675819df8a0c6b957d88c4f"
+    },
+    {
+      "path": "sgx_trts/src/thread/mod.rs",
+      "before_sha256": "f5a4944ba35ce280e63ed56338ccd87266ea9c82f5173677d43360219c452d11",
+      "after_sha256": "cfe4161374f272fb25dd2b6c5dbec2d614e981a12a4213a6c3226c79274e4a10"
+    },
+    {
+      "path": "sgx_types/src/lib.rs",
+      "before_sha256": "30abb3cb23f937fd7eea2dc6ba9b114202ac45641411789736a6e08c915ead37",
+      "after_sha256": "c7bbc14a714cc08f17cbea06517348da409a52a7253f2d0227922ba9dd9af231"
+    },
+    {
+      "path": "sgx_types/src/memory.rs",
+      "before_sha256": null,
+      "after_sha256": "fd2535930f345e187213bb13b055d4363ee1af9c2e99cf2b832f6656cefa2e6e"
     }
   ],
   "preserved": [
@@ -111,13 +150,14 @@
     "Connected C allocation and raw ownership compatibility",
     "New std/native/trusted/signed-SIM owning qualification",
     "Early fixed-futex SDK startup/consumer runtime qualification; source wired, experimental profile remains default-off",
-    "Explicit C-system API is not C free/Drop or global/TLS enforcement: Busy retry, actual held-origin provider, no symbol interposition, fallible library consumer closure required."
+    "Explicit C-system API is not C free/Drop or global/TLS enforcement: Busy retry, actual held-origin provider, no symbol interposition, fallible library consumer closure required.",
+    "Typed thread factory source pending actual new std and runtime qualification; lazy current-thread and TLS remain open."
   ],
   "activation": "Never enable a global hard quota behind unclosed infallible allocations. This source profile adds explicit fallible ABI and partial thread Result paths only.",
   "build_inputs": [
     {
       "path": "prepare-inputs.sh",
-      "sha256": "55952a383e842c01686c50c65854fcc259868b5122a4dd8f0135267c894de7a2"
+      "sha256": "e3369bd791f31ff6980b8e712b29acf22076118856c23ae49d23bb186f794bca"
     },
     {
       "path": "approved-functions.sh",
@@ -126,6 +166,6 @@
   ],
   "autotools_owner": {
     "path": "scripts/ci/test-teaclave-sim.sh",
-    "sha256": "6bcde05437c6a35c4766bbdf7b759c8c01b3f863693dab3b84759fc85b94dc25"
+    "sha256": "902e09180c6faacf7b158b09e189b94fae0bbc2137a8c8b79eebcb4da237407b"
   }
 }

@@ -7,15 +7,34 @@ use core::{
     alloc::{AllocError, Allocator, Layout},
     mem::ManuallyDrop,
     ptr::NonNull,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::alloc::{AllocationTicket, FallibleAllocationHooks, FallibleSystem};
+enum Budget {
+    Reserved(AllocationLeaseV1),
+    Pool(Arc<AllocationPoolV1>),
+}
 struct LoanState {
-    lease: AllocationLeaseV1,
+    budget: Budget,
     used: AtomicUsize,
+    peak: AtomicUsize,
+    published: AtomicBool,
 }
 type Loan = SharedAllocationV1<LoanState>;
-static HOOKS: FallibleAllocationHooks = FallibleAllocationHooks { admit, release };
+static HOOKS: FallibleAllocationHooks = FallibleAllocationHooks {
+    admit,
+    release,
+    cancel,
+};
+static OWNERSHIP: std::alloc::OriginOperations = std::alloc::OriginOperations {
+    retain: retain_origin,
+    release: release_origin,
+};
+static OPERATIONS: std::alloc::AllocationOperations = std::alloc::AllocationOperations {
+    allocate: allocate_owned,
+    deallocate: deallocate_owned,
+    resize: resize_owned,
+};
 fn borrow(ticket: AllocationTicket) -> ManuallyDrop<Loan> {
     // SAFETY: the private safe allocator holds the original pair; every issued
     // header keeps another exact pair until backend free. This borrow never
@@ -29,12 +48,23 @@ fn borrow(ticket: AllocationTicket) -> ManuallyDrop<Loan> {
 }
 fn admit(origin: AllocationTicket, layout: Layout) -> Result<AllocationTicket, AllocError> {
     let loan = borrow(origin);
-    loan.used
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-            used.checked_add(layout.size())
-                .filter(|next| *next <= loan.lease.bytes())
-        })
-        .map_err(|_| AllocError)?;
+    let used = match &loan.budget {
+        Budget::Reserved(lease) => loan
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(layout.size())
+                    .filter(|next| *next <= lease.bytes())
+            })
+            .map_err(|_| AllocError)?
+            .checked_add(layout.size())
+            .ok_or(AllocError)?,
+        Budget::Pool(pool) => {
+            pool.reserve_backend_bytes(layout.size())
+                .ok_or(AllocError)?;
+            loan.used.fetch_add(layout.size(), Ordering::AcqRel) + layout.size()
+        }
+    };
+    loan.peak.fetch_max(used, Ordering::AcqRel);
     let ticket = loan.retain_raw_pair();
     Ok(AllocationTicket {
         owner: ticket.payload,
@@ -42,6 +72,12 @@ fn admit(origin: AllocationTicket, layout: Layout) -> Result<AllocationTicket, A
     })
 }
 fn release(ticket: AllocationTicket, layout: Layout) {
+    refund(ticket, layout, true);
+}
+fn cancel(ticket: AllocationTicket, layout: Layout) {
+    refund(ticket, layout, false);
+}
+fn refund(ticket: AllocationTicket, layout: Layout, backend_freed: bool) {
     let loan = unsafe {
         Loan::from_owned_raw_pair(RawSharedTicket {
             payload: ticket.owner,
@@ -49,9 +85,66 @@ fn release(ticket: AllocationTicket, layout: Layout) {
         })
     };
     loan.used.fetch_sub(layout.size(), Ordering::AcqRel);
-    // SDK already freed the backing block. Paired Drop frees the final loan
-    // payload before its separately paid metadata credit refunds the pool.
+    if let Budget::Pool(pool) = &loan.budget {
+        pool.release_backend_bytes(
+            layout.size(),
+            backend_freed && loan.published.load(Ordering::Acquire),
+        );
+    }
     drop(loan);
+}
+fn retain_origin(ticket: AllocationTicket) -> AllocationTicket {
+    let loan = borrow(ticket);
+    let pair = loan.retain_raw_pair();
+    AllocationTicket {
+        owner: pair.payload,
+        loan: pair.credit,
+    }
+}
+fn release_origin(ticket: AllocationTicket) {
+    drop(unsafe {
+        Loan::from_owned_raw_pair(RawSharedTicket {
+            payload: ticket.owner,
+            credit: ticket.loan,
+        })
+    });
+}
+fn allocate_owned(
+    ticket: AllocationTicket,
+    layout: Layout,
+    zero: bool,
+) -> Result<NonNull<[u8]>, ()> {
+    let system = unsafe { FallibleSystem::new(&HOOKS, ticket) };
+    if zero {
+        system.allocate_zeroed(layout)
+    } else {
+        system.allocate(layout)
+    }
+    .map_err(|_| ())
+}
+unsafe fn deallocate_owned(ticket: AllocationTicket, pointer: NonNull<u8>, layout: Layout) {
+    unsafe {
+        FallibleSystem::new(&HOOKS, ticket).deallocate(pointer, layout);
+    }
+}
+unsafe fn resize_owned(
+    ticket: AllocationTicket,
+    pointer: NonNull<u8>,
+    old: Layout,
+    new: Layout,
+    zero: bool,
+) -> Result<NonNull<[u8]>, ()> {
+    let system = unsafe { FallibleSystem::new(&HOOKS, ticket) };
+    unsafe {
+        if new.size() < old.size() {
+            system.shrink(pointer, old, new)
+        } else if zero {
+            system.grow_zeroed(pointer, old, new)
+        } else {
+            system.grow(pointer, old, new)
+        }
+    }
+    .map_err(|_| ())
 }
 #[derive(Clone)]
 pub struct LoanAllocator {
@@ -77,22 +170,62 @@ impl LoanAllocator {
         if !lease.covers(pool, lease.bytes()) {
             return Err(AllocError);
         }
+        let allocator = Self::from_budget(pool, Budget::Reserved(lease))?;
+        allocator.activate_release_notification();
+        Ok(allocator)
+    }
+    fn from_budget(pool: &Arc<AllocationPoolV1>, budget: Budget) -> Result<Self, AllocError> {
         let reservation = SharedAllocationV1::<LoanState>::reserve(pool, 0).ok_or(AllocError)?;
         let owner = reservation.try_finish_unpublished(LoanState {
-            lease,
+            budget,
             used: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            published: AtomicBool::new(false),
         })?;
         let ticket = owner.retain_raw_pair();
-        // Take a borrow identity, then return the temporary retained pair.
         let origin = AllocationTicket {
             owner: ticket.payload,
             loan: ticket.credit,
         };
         drop(unsafe { Loan::from_owned_raw_pair(ticket) });
-        // SAFETY: safe wrapper retains owner for every allocator use/clone.
         let system = unsafe { FallibleSystem::new(&HOOKS, origin) };
-        owner.activate_release_notification();
         Ok(Self { system, owner })
+    }
+    /// Admit each actual SDK backend layout from the original immutable pool.
+    /// No guessed worker capacity, global allocator or semantic authority.
+    /// # Errors
+    /// Refuses origin metadata admission/allocation before exposing any origin.
+    pub fn from_pool_unpublished(pool: &Arc<AllocationPoolV1>) -> Result<Self, AllocError> {
+        Self::from_budget(pool, Budget::Pool(pool.clone()))
+    }
+    /// Actual separately paid origin metadata, before any child backend exists.
+    pub fn required_origin_bytes() -> Option<usize> {
+        SharedAllocationV1::<LoanState>::required_bytes(0)
+    }
+    /// Publish only after the owning SDK factory succeeds. Failed construction
+    /// releases physical bytes without rearming a resource waiter.
+    pub fn activate_release_notification(&self) {
+        self.owner.published.store(true, Ordering::Release);
+        self.owner.activate_release_notification();
+    }
+    /// Retained typed SDK allocator. Every callback and backing header keeps
+    /// this same original paired origin independently of this wrapper's Drop.
+    pub fn owned_allocator(&self) -> std::alloc::OwnedAllocator {
+        let pair = self.owner.retain_raw_pair();
+        unsafe {
+            std::alloc::OwnedAllocator::from_retained_origin(
+                AllocationTicket {
+                    owner: pair.payload,
+                    loan: pair.credit,
+                },
+                &OPERATIONS,
+                &OWNERSHIP,
+            )
+        }
+    }
+    /// Measured peak of actual admitted backend layouts, excluding origin metadata.
+    pub fn peak_used(&self) -> usize {
+        self.owner.peak.load(Ordering::Acquire)
     }
     /// Exact C payload plus SDK side-record backing, with no pointer prefix.
     /// # Errors

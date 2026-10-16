@@ -1,0 +1,720 @@
+--- a/rustlib/std/Cargo.lock
++++ b/rustlib/std/Cargo.lock
+@@ -52,6 +52,9 @@
+ [[package]]
+ name = "sgx_alloc"
+ version = "2.0.0"
++dependencies = [
++ "sgx_types",
++]
+ 
+ [[package]]
+ name = "sgx_backtrace_sys"
+--- a/sgx_alloc/Cargo.toml
++++ b/sgx_alloc/Cargo.toml
+@@ -31,3 +31,6 @@
+ 
+ [features]
+ default = []
++
++[dependencies]
++sgx_types = { path = "../sgx_types" }
+--- a/sgx_alloc/src/fallible.rs
++++ b/sgx_alloc/src/fallible.rs
+@@ -6,18 +6,15 @@
+ 
+ /// Opaque fixed admission identity. Its provider retains stable origin/loan
+ /// state until release, even after the allocating actor or thread returns.
+-#[derive(Clone, Copy)]
+-#[repr(C)]
+-pub struct AllocationTicket {
+-    pub owner: usize,
+-    pub loan: usize,
+-}
++pub use sgx_types::memory::AllocationTicket;
+ /// Callbacks are trusted, process-lifetime, nonallocating and non-unwinding.
+ /// Each admits the complete requested backend layout before System allocates.
+ /// A loan spends an existing reservation rather than creating a second charge.
+ pub struct FallibleAllocationHooks {
+     pub admit: fn(AllocationTicket, Layout) -> Result<AllocationTicket, AllocError>,
+     pub release: fn(AllocationTicket, Layout),
++    /// Refund unpublished admission when no backend owner was published.
++    pub cancel: fn(AllocationTicket, Layout),
+ }
+ /// This allocator has no GlobalAlloc implementation: quota refusal must reach
+ /// an explicit Result, never an infallible library's allocation error handler.
+@@ -92,7 +89,7 @@
+             }
+         };
+         let Some(raw) = NonNull::new(raw) else {
+-            (hooks.release)(ticket, layout);
++            (hooks.cancel)(ticket, layout);
+             return Err(AllocError);
+         };
+         let user_pointer = unsafe { NonNull::new_unchecked(raw.as_ptr().add(offset)) };
+--- a/sgx_alloc/src/fallible_c.rs
++++ b/sgx_alloc/src/fallible_c.rs
+@@ -134,11 +134,11 @@
+             .map_err(|_| CAllocationError::GenerationExhausted)?;
+         let ticket = (self.hooks.admit)(self.origin, quote).map_err(|_| CAllocationError::Refused)?;
+         let pointer = unsafe { if zero { System.alloc_zeroed(user) } else { System.alloc(user) } };
+-        if pointer.is_null() { (self.hooks.release)(ticket, quote); return Err(CAllocationError::Refused); }
++        if pointer.is_null() { (self.hooks.cancel)(ticket, quote); return Err(CAllocationError::Refused); }
+         let entry = unsafe { System.alloc(Layout::new::<Record>()) }.cast::<Record>();
+         if entry.is_null() {
+             unsafe { System.dealloc(pointer, user); }
+-            (self.hooks.release)(ticket, quote); return Err(CAllocationError::Refused);
++            (self.hooks.cancel)(ticket, quote); return Err(CAllocationError::Refused);
+         }
+         unsafe { entry.write(Record { value: Value { pointer, layout: user, quote,
+             origin: self.origin, ticket, hooks: self.hooks, generation },
+@@ -200,7 +200,13 @@
+ }
+ struct Prepared(*mut Record);
+ impl Prepared { fn into_raw(self) -> *mut Record { let p = self.0; core::mem::forget(self); p } }
+-impl Drop for Prepared { fn drop(&mut self) { destroy(self.0, unsafe { (*self.0).value }); } }
++impl Drop for Prepared {
++    fn drop(&mut self) {
++        let value = unsafe { (*self.0).value };
++        unsafe { System.dealloc(self.0.cast(), Layout::new::<Record>()); System.dealloc(value.pointer, value.layout); }
++        (value.hooks.cancel)(value.ticket, value.quote);
++    }
++}
+ fn destroy(entry: *mut Record, value: Value) {
+     unsafe { System.dealloc(entry.cast(), Layout::new::<Record>()); System.dealloc(value.pointer, value.layout); }
+     (value.hooks.release)(value.ticket, value.quote);
+--- a/sgx_alloc/src/lib.rs
++++ b/sgx_alloc/src/lib.rs
+@@ -46,6 +46,8 @@
+ pub mod fallible;
+ pub use fallible::{AllocationTicket, FallibleAllocationHooks, FallibleSystem};
+ 
+-/// Explicit headerless fallible C-compatible ownership; no C symbol override.
++pub mod owned;
++pub use owned::{OwnedAllocator, system_allocator, AllocationOperations, OriginOperations};
++
+ pub mod fallible_c;
+ pub use fallible_c::{drain_pending_c_releases, CAllocationError, CAllocationHandle, FallibleCSystem, OwnedCAllocation};
+--- /dev/null
++++ b/sgx_alloc/src/owned.rs
+@@ -0,0 +1,14 @@
++//! Typed allocator capability; default System has no borrowed origin.
++use super::System;
++use core::{alloc::{Allocator, Layout}, ptr::NonNull};
++pub use sgx_types::memory::{AllocationCapability as OwnedAllocator, AllocationOperations, OriginOperations, AllocationTicket};
++fn allocate(_: AllocationTicket, layout: Layout, zero: bool) -> Result<NonNull<[u8]>, ()> {
++    if zero { System.allocate_zeroed(layout) } else { System.allocate(layout) }.map_err(|_| ())
++}
++unsafe fn deallocate(_: AllocationTicket, ptr: NonNull<u8>, layout: Layout) { unsafe { System.deallocate(ptr, layout) } }
++unsafe fn resize(_: AllocationTicket, ptr: NonNull<u8>, old: Layout, new: Layout, zero: bool) -> Result<NonNull<[u8]>, ()> {
++    unsafe { if new.size() < old.size() { System.shrink(ptr, old, new) }
++        else if zero { System.grow_zeroed(ptr, old, new) } else { System.grow(ptr, old, new) } }.map_err(|_| ())
++}
++static SYSTEM: AllocationOperations = AllocationOperations { allocate, deallocate, resize };
++pub fn system_allocator() -> OwnedAllocator { unsafe { OwnedAllocator::process_backend(&SYSTEM) } }
+--- /dev/null
++++ b/sgx_trts/src/thread/allocator.rs
+@@ -0,0 +1,22 @@
++//! SDK-native default backend for the neutral owned allocator contract.
++use alloc::alloc::Global;
++use core::{alloc::{Allocator, Layout}, ptr::NonNull};
++use sgx_types::memory::{AllocationCapability, AllocationOperations, AllocationTicket};
++fn allocate(_: AllocationTicket, layout: Layout, zero: bool) -> Result<NonNull<[u8]>, ()> {
++    if zero { Global.allocate_zeroed(layout) } else { Global.allocate(layout) }.map_err(|_| ())
++}
++unsafe fn deallocate(_: AllocationTicket, ptr: NonNull<u8>, layout: Layout) {
++    unsafe { Global.deallocate(ptr, layout) }
++}
++unsafe fn resize(_: AllocationTicket, ptr: NonNull<u8>, old: Layout, new: Layout, zero: bool)
++    -> Result<NonNull<[u8]>, ()> {
++    unsafe {
++        if new.size() < old.size() { Global.shrink(ptr, old, new) }
++        else if zero { Global.grow_zeroed(ptr, old, new) } else { Global.grow(ptr, old, new) }
++    }.map_err(|_| ())
++}
++static SYSTEM: AllocationOperations = AllocationOperations { allocate, deallocate, resize };
++pub(super) fn system() -> AllocationCapability {
++    // SAFETY: unchanged process-lived Global backend; it has no borrowed origin.
++    unsafe { AllocationCapability::process_backend(&SYSTEM) }
++}
+--- a/sgx_trts/src/thread/mod.rs
++++ b/sgx_trts/src/thread/mod.rs
+@@ -25,3 +25,5 @@
+ pub(crate) use native::thread_run;
+ 
+ pub use native::{current, Native, Thread};
++
++mod allocator;
+--- a/sgx_trts/src/thread/native.rs
++++ b/sgx_trts/src/thread/native.rs
+@@ -28,15 +28,16 @@
+ use core::ptr;
+ use core::sync::atomic::Ordering;
+ use sgx_types::error::{SgxResult, SgxStatus};
++use sgx_types::memory::AllocationCapability;
+ 
+ const WAIT_TIMEOUT_SECONDS: u64 = 5;
+ 
+ #[derive(Clone)]
+ pub struct Thread {
+-    native: Arc<Native>,
+-}
+-
+-pub struct Native(SpinMutex<Inner>);
++    native: Arc<Native, AllocationCapability>,
++}
++
++pub struct Native(SpinMutex<Inner>, AllocationCapability);
+ 
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ enum State {
+@@ -61,6 +62,12 @@
+     where
+         F: FnOnce(*mut c_void) -> *mut c_void + Send + 'static,
+     {
++        Self::new_in(p, arg, super::allocator::system())
++    }
++
++    pub fn new_in<F>(p: F, arg: *mut c_void, allocator: AllocationCapability) -> SgxResult<Thread>
++    where F: FnOnce(*mut c_void) -> *mut c_void + Send + 'static,
++    {
+         extern "C" {
+             fn pthread_create_ocall(ret: *mut SgxStatus, tcs: usize) -> SgxStatus;
+         }
+@@ -71,52 +78,43 @@
+ 
+         let tcs_id = tcs::current().id();
+         let thread = Thread {
+-            native: Arc::try_new(Native(SpinMutex::new(Inner {
++            native: Arc::try_new_in(Native(SpinMutex::new(Inner {
+                 state: State::Preparing,
+                 creater: tcs_id,
+                 joiner: None,
+                 retval: ptr::null_mut(),
+-            }))).map_err(|_| SgxStatus::OutOfMemory)?,
++            }), allocator.clone()), allocator.clone()).map_err(|_| SgxStatus::OutOfMemory)?,
+         };
+ 
+-        let p = Box::try_new(p).map_err(|_| SgxStatus::OutOfMemory)?;
++        let p = Box::try_new_in(p, allocator.clone()).map_err(|_| SgxStatus::OutOfMemory)?;
+         let task = task::Task::new(p, arg, thread.clone());
+-        task::push(task)?;
++        task::push_in(task, allocator)?;
+ 
+         let mut ret = SgxStatus::Unexpected;
+         unsafe {
+             pthread_create_ocall(&mut ret as *mut _, tcs_id.as_usize());
+         }
+         if ret != SgxStatus::Success {
+-            if let Some(task) = task::pop() {
+-                if task.thread().eq(&thread) {
+-                    bail!(ret);
+-                } else {
+-                    let state = if ret == SgxStatus::OutOfTcs {
+-                        State::OutOfTcs
+-                    } else {
+-                        State::Unexpected
+-                    };
+-                    let creater = {
+-                        let mut guard = task.thread().native.0.lock();
+-                        guard.state = state;
+-                        guard.creater
+-                    };
+-                    let _ = creater.wakeup();
++            if let Some(task) = task::withdraw(&thread) {
++                // No worker took this task. Drop its SDK owners before the
++                // caller recovers the still-unconsumed raw start envelope.
++                drop(task);
++                bail!(ret);
++            }
++            // A worker already took ownership. Host failure cannot revoke its
++            // live start envelope or turn publication into caller rollback.
++        }
++
++        loop {
++            let state = thread.native.0.lock().state;
++            if state != State::Preparing { break; }
++            if let Err(error) = tcs_id.wait_timeout(WAIT_TIMEOUT_SECONDS) {
++                if let Some(task) = task::withdraw(&thread) {
++                    drop(task);
++                    bail!(error);
+                 }
+-            }
+-        }
+-
+-        loop {
+-            tcs_id.wait_timeout(WAIT_TIMEOUT_SECONDS)?;
+-
+-            let guard = thread.native.0.lock();
+-            let state = guard.state;
+-            match state {
+-                State::Preparing => (),
+-                State::OutOfTcs => bail!(SgxStatus::OutOfTcs),
+-                State::Unexpected => bail!(SgxStatus::Unexpected),
+-                _ => break,
++                // The worker owns the envelope; wait for actual startup state.
++                // A hostile host may delay progress but cannot double-free it.
+             }
+         }
+ 
+@@ -163,12 +161,15 @@
+     }
+ 
+     pub fn into_raw(self) -> *const Native {
+-        Arc::into_raw(self.native)
++        let (pointer, allocator) = Arc::into_raw_with_allocator(self.native);
++        // Native retains another exact capability through the raw strong owner.
++        drop(allocator);
++        pointer
+     }
+ 
+     pub unsafe fn from_raw(native: *const Native) -> Thread {
+         Thread {
+-            native: Arc::from_raw(native),
++            native: Arc::from_raw_in(native, unsafe { (*native).1.clone() }),
+         }
+     }
+ 
+--- a/sgx_trts/src/thread/task.rs
++++ b/sgx_trts/src/thread/task.rs
+@@ -21,17 +21,18 @@
+ use core::ptr;
+ use sgx_types::error::{SgxResult, SgxStatus};
+ use core::ffi::c_void;
++use sgx_types::memory::AllocationCapability;
+ 
+ // One fallibly allocated node owns each task. Queue operations never allocate.
+ // The raw tail is only accessed under TASK_QUEUE and always points into head's
+ // owned chain. No caller can detach a node without repairing head/tail first.
+ struct Node {
+     task: Task,
+-    next: Option<Box<Node>>,
++    next: Option<Box<Node, AllocationCapability>>,
+ }
+ 
+ struct Queue {
+-    head: Option<Box<Node>>,
++    head: Option<Box<Node, AllocationCapability>>,
+     tail: *mut Node,
+ }
+ 
+@@ -40,7 +41,7 @@
+         Self { head: None, tail: ptr::null_mut() }
+     }
+ 
+-    fn push(&mut self, mut node: Box<Node>) {
++    fn push(&mut self, mut node: Box<Node, AllocationCapability>) {
+         let tail = &mut *node as *mut Node;
+         if self.tail.is_null() {
+             self.head = Some(node);
+@@ -52,26 +53,45 @@
+         self.tail = tail;
+     }
+ 
+-    fn pop(&mut self) -> Option<Task> {
++    fn pop_node(&mut self) -> Option<Box<Node, AllocationCapability>> {
+         let mut node = self.head.take()?;
+         self.head = node.next.take();
+         if self.head.is_none() { self.tail = ptr::null_mut(); }
+-        let Node { task, .. } = *node;
+-        Some(task)
++        Some(node)
+     }
++
++    // Withdraw only this creator's unpublished task. A worker pops under the
++    // same lock, so exactly one path takes ownership of its start envelope.
++    fn withdraw(&mut self, thread: &Thread) -> Option<Box<Node, AllocationCapability>> {
++        let mut link = &mut self.head;
++        let mut previous = ptr::null_mut();
++        while link.as_ref().is_some() {
++            if link.as_ref().unwrap().task.thread().eq(thread) {
++                let mut node = link.take().unwrap();
++                *link = node.next.take();
++                if ptr::eq(&*node, self.tail) { self.tail = previous; }
++                return Some(node);
++            }
++            let node = link.as_mut().unwrap();
++            previous = &mut **node as *mut Node;
++            link = &mut node.next;
++        }
++        None
++    }
++
+ }
+ 
+ static mut TASK_QUEUE: SpinMutex<Queue> = SpinMutex::new(Queue::new());
+ 
+ pub struct Task {
+-    p: Box<dyn FnOnce(*mut c_void) -> *mut c_void>,
++    p: Box<dyn FnOnce(*mut c_void) -> *mut c_void, AllocationCapability>,
+     arg: *mut c_void,
+     thread: Thread,
+ }
+ 
+ impl Task {
+     pub fn new(
+-        p: Box<dyn FnOnce(*mut c_void) -> *mut c_void>,
++        p: Box<dyn FnOnce(*mut c_void) -> *mut c_void, AllocationCapability>,
+         arg: *mut c_void,
+         thread: Thread,
+     ) -> Task {
+@@ -88,13 +108,25 @@
+     }
+ }
+ 
+-pub fn push(task: Task) -> SgxResult {
+-    let node = Box::try_new(Node { task, next: None })
++pub fn push_in(task: Task, allocator: AllocationCapability) -> SgxResult {
++    let node = Box::try_new_in(Node { task, next: None }, allocator)
+         .map_err(|_| SgxStatus::OutOfMemory)?;
+     unsafe { TASK_QUEUE.lock().push(node); }
+     Ok(())
+ }
+ 
++fn take_task(node: Box<Node, AllocationCapability>) -> Task {
++    let Node { task, .. } = *node;
++    task
++}
++
+ pub fn pop() -> Option<Task> {
+-    unsafe { TASK_QUEUE.lock().pop() }
++    let node = unsafe { TASK_QUEUE.lock().pop_node() };
++    // Free the node and run allocator callbacks after releasing TASK_QUEUE.
++    node.map(take_task)
+ }
++
++pub fn withdraw(thread: &Thread) -> Option<Task> {
++    let node = unsafe { TASK_QUEUE.lock().withdraw(thread) };
++    node.map(take_task)
++}
+--- a/sgx_tstd/src/alloc.rs
++++ b/sgx_tstd/src/alloc.rs
+@@ -79,8 +79,6 @@
+ pub use sgx_alloc::System;
+ /// Explicit fallible allocator; quota refusal never enters a global OOM handler.
+ pub use sgx_alloc::{AllocationTicket, FallibleAllocationHooks, FallibleSystem};
+-/// Headerless explicit C allocations, never an infallible/global NULL hook.
+-pub use sgx_alloc::{drain_pending_c_releases, CAllocationError, CAllocationHandle, FallibleCSystem, OwnedCAllocation};
+ 
+ static HOOK: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+ 
+@@ -201,3 +199,7 @@
+         System.alloc_zeroed(layout)
+     }
+ }
++
++pub use sgx_alloc::{OwnedAllocator, system_allocator, AllocationOperations, OriginOperations};
++
++pub use sgx_alloc::{drain_pending_c_releases, CAllocationError, CAllocationHandle, FallibleCSystem, OwnedCAllocation};
+--- a/sgx_tstd/src/sys/thread.rs
++++ b/sgx_tstd/src/sys/thread.rs
+@@ -51,6 +51,40 @@
+             unsafe {
+                 // Finally, let's run some code.
+                 Box::from_raw(main as *mut Box<dyn FnOnce()>)();
++            }
++            ptr::null_mut()
++        }
++    }
++
++    // The envelope carries a capability until it is taken by the actual native
++    // trampoline. Its backing is freed before the captured owner is dropped.
++    pub unsafe fn new_in(
++        main: Box<dyn FnOnce(), crate::alloc::OwnedAllocator>,
++        allocator: crate::alloc::OwnedAllocator,
++    ) -> io::Result<Thread> {
++        struct Start {
++            main: Option<Box<dyn FnOnce(), crate::alloc::OwnedAllocator>>,
++            allocator: crate::alloc::OwnedAllocator,
++        }
++        let start = Box::try_new_in(Start { main: Some(main), allocator: allocator.clone() }, allocator.clone())
++            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
++        let (pointer, outside) = Box::into_raw_with_allocator(start);
++        let result = NativeThread::new_in(thread_start, pointer.cast(), allocator)
++            .map(|native| Thread { native })
++            .map_err(|error| {
++                // Publication failed: recover the original envelope exactly.
++                drop(Box::from_raw_in(pointer, outside));
++                io::Error::from_sgx_error(error)
++            });
++        return result;
++
++        fn thread_start(pointer: *mut libc::c_void) -> *mut libc::c_void {
++            unsafe {
++                let pointer = pointer.cast::<Start>();
++                let allocator = (*pointer).allocator.clone();
++                let boxed = Box::from_raw_in(pointer, allocator);
++                let mut start = *boxed;
++                start.main.take().expect("live thread start")();
+             }
+             ptr::null_mut()
+         }
+--- a/sgx_tstd/src/thread/mod.rs
++++ b/sgx_tstd/src/thread/mod.rs
+@@ -393,6 +393,17 @@
+         unsafe { self.spawn_unchecked(f) }
+     }
+ 
++    /// Spawn with an explicitly retained original physical allocator.
++    /// Only fallible allocator-aware constructors are selected internally.
++    pub fn spawn_in<F, T>(self, f: F, allocator: crate::alloc::OwnedAllocator,
++        name: Option<&'static CStr>) -> io::Result<JoinHandle<T>>
++    where F: FnOnce() -> T + Send + 'static, T: Send + 'static {
++        if self.name.is_some() || name.is_some_and(|name| name.to_str().is_err()) {
++            return Err(io::Error::from(io::ErrorKind::InvalidInput));
++        }
++        unsafe { self.spawn_unchecked_in_(f, None, allocator, name).map(JoinHandle) }
++    }
++
+     /// Spawns a new thread without any lifetime restrictions by taking ownership
+     /// of the `Builder`, and returns an [`io::Result`] to its [`JoinHandle`].
+     ///
+@@ -471,17 +482,38 @@
+         T: Send + 'a,
+         'scope: 'a,
+     {
++        self.spawn_unchecked_in_(f, scope_data, crate::alloc::system_allocator(), None)
++    }
++
++    unsafe fn spawn_unchecked_in_<'a, 'scope, F, T>(
++        self,
++        f: F,
++        scope_data: Option<Arc<scoped::ScopeData>>,
++        allocator: crate::alloc::OwnedAllocator,
++        static_name: Option<&'static CStr>,
++    ) -> io::Result<JoinInner<'scope, T>>
++    where
++        F: FnOnce() -> T,
++        F: Send + 'a,
++        T: Send + 'a,
++        'scope: 'a,
++    {
+         let Builder { name } = self;
+ 
+-        let name = name.map(try_thread_name).transpose()?;
+-        let my_thread = Thread::try_new(name)?;
++        let my_thread = if static_name.is_some() {
++            Thread::try_new_in(static_name, allocator.clone())?
++        } else if name.is_some() {
++            // Default historical path keeps its owned name. Selected spawn_in
++            // already refused such a builder, before any child allocation.
++            Thread::try_new(name.map(try_thread_name).transpose()?)?
++        } else { Thread::try_new_in(None, allocator.clone())? };
+         let their_thread = my_thread.clone();
+ 
+-        let mut my_packet: Arc<Packet<'scope, T>> = Arc::try_new(Packet {
++        let mut my_packet: Arc<Packet<'scope, T>, _> = Arc::try_new_in(Packet {
+             scope: None,
+             result: UnsafeCell::new(None),
+             _marker: PhantomData,
+-        }).map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
++        }, allocator.clone()).map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+         // The failed Arc allocation drops an unarmed packet. Only attach the
+         // scope after a packet exists, so every later failure refunds exactly
+         // the running-thread increment through the original Packet::drop.
+@@ -555,14 +587,15 @@
+             // after that before returning itself.
+         };
+ 
+-        let main = Box::try_new(main).map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
++        let main = Box::try_new_in(main, allocator.clone()).map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+         // SAFETY: dynamic size and alignment of the Box remain the same. See below for why the
+         // lifetime change is justified.
+         // raw-pointer `as` casts can no longer extend trait-object lifetimes (rust#141402);
+         // unsize with the natural lifetime, then transmute the lifetime to 'static.
+-        let main: *mut (dyn FnOnce() + '_) = Box::into_raw(main);
++        let (main, main_allocator) = Box::into_raw_with_allocator(main);
++        let main: *mut (dyn FnOnce() + '_) = main;
+         let main = unsafe {
+-            Box::from_raw(crate::mem::transmute::<_, *mut (dyn FnOnce() + 'static)>(main))
++            Box::from_raw_in(crate::mem::transmute::<_, *mut (dyn FnOnce() + 'static)>(main), main_allocator)
+         };
+ 
+         Ok(JoinInner {
+@@ -579,7 +612,7 @@
+             // Similarly, the `sys` implementation must guarantee that no references to the closure
+             // exist after the thread has terminated, which is signaled by `Thread::join`
+             // returning.
+-            native: unsafe { imp::Thread::new(main)? },
++            native: unsafe { imp::Thread::new_in(main, allocator)? },
+             thread: my_thread,
+             packet: my_packet,
+         })
+@@ -1238,8 +1271,11 @@
+ ////////////////////////////////////////////////////////////////////////////////
+ 
+ /// The internal representation of a `Thread` handle
++enum ThreadName { Owned(CString), Static(&'static CStr) }
++impl ThreadName { fn as_cstr(&self) -> &CStr { match self { Self::Owned(name) => name.as_c_str(), Self::Static(name) => name } } }
++
+ struct Inner {
+-    name: Option<CString>, // Guaranteed to be UTF-8
++    name: Option<ThreadName>, // Guaranteed to be UTF-8
+     id: ThreadId,
+     parker: Parker,
+ }
+@@ -1270,7 +1306,7 @@
+ ///
+ /// [`thread::current`]: current
+ pub struct Thread {
+-    inner: Pin<Arc<Inner>>,
++    inner: Pin<Arc<Inner, crate::alloc::OwnedAllocator>>,
+ }
+ 
+ impl Thread {
+@@ -1283,9 +1319,9 @@
+         // SAFETY: We pin the Arc immediately after creation, so its address never
+         // changes.
+         let inner = unsafe {
+-            let mut arc = Arc::<Inner>::new_uninit();
++            let mut arc = Arc::<Inner, _>::new_uninit_in(crate::alloc::system_allocator());
+             let ptr = Arc::get_mut_unchecked(&mut arc).as_mut_ptr();
+-            addr_of_mut!((*ptr).name).write(name);
++            addr_of_mut!((*ptr).name).write(name.map(ThreadName::Owned));
+             addr_of_mut!((*ptr).id).write(ThreadId::new());
+             Parker::new_in_place(addr_of_mut!((*ptr).parker));
+             Pin::new_unchecked(arc.assume_init())
+@@ -1299,15 +1335,28 @@
+     /// separate until its complete TCS preallocation route is connected.
+     pub(crate) fn try_new(name: Option<CString>) -> io::Result<Thread> {
+         let inner = unsafe {
+-            let mut arc = Arc::<mem::MaybeUninit<Inner>>::try_new(mem::MaybeUninit::uninit())
++            let mut arc = Arc::<mem::MaybeUninit<Inner>, _>::try_new_in(mem::MaybeUninit::uninit(), crate::alloc::system_allocator())
+                 .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+             let ptr = Arc::get_mut_unchecked(&mut arc).as_mut_ptr();
+-            addr_of_mut!((*ptr).name).write(name);
++            addr_of_mut!((*ptr).name).write(name.map(ThreadName::Owned));
+             addr_of_mut!((*ptr).id).write(ThreadId::new());
+             Parker::new_in_place(addr_of_mut!((*ptr).parker));
+             Pin::new_unchecked(arc.assume_init())
+         };
+ 
++        Ok(Thread { inner })
++    }
++
++    pub(crate) fn try_new_in(name: Option<&'static CStr>, allocator: crate::alloc::OwnedAllocator) -> io::Result<Thread> {
++        let inner = unsafe {
++            let mut arc = Arc::<mem::MaybeUninit<Inner>, _>::try_new_in(mem::MaybeUninit::uninit(), allocator)
++                .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
++            let ptr = Arc::get_mut_unchecked(&mut arc).as_mut_ptr();
++            addr_of_mut!((*ptr).name).write(name.map(ThreadName::Static));
++            addr_of_mut!((*ptr).id).write(ThreadId::new());
++            Parker::new_in_place(addr_of_mut!((*ptr).parker));
++            Pin::new_unchecked(arc.assume_init())
++        };
+         Ok(Thread { inner })
+     }
+ 
+@@ -1408,7 +1457,7 @@
+     }
+ 
+     fn cname(&self) -> Option<&CStr> {
+-        self.inner.name.as_deref()
++        self.inner.name.as_ref().map(ThreadName::as_cstr)
+     }
+ }
+ 
+@@ -1529,7 +1578,7 @@
+ struct JoinInner<'scope, T> {
+     native: imp::Thread,
+     thread: Thread,
+-    packet: Arc<Packet<'scope, T>>,
++    packet: Arc<Packet<'scope, T>, crate::alloc::OwnedAllocator>,
+ }
+ 
+ #[cfg(feature = "thread")]
+--- a/sgx_types/src/lib.rs
++++ b/sgx_types/src/lib.rs
+@@ -1,3 +1,4 @@
++#![feature(allocator_api)]
+ // Licensed to the Apache Software Foundation (ASF) under one
+ // or more contributor license agreements.  See the NOTICE file
+ // distributed with this work for additional information
+@@ -36,3 +37,5 @@
+ pub mod memeq;
+ pub mod metadata;
+ pub mod types;
++
++pub mod memory;
+--- /dev/null
++++ b/sgx_types/src/memory.rs
+@@ -0,0 +1,79 @@
++//! Trusted, fixed-size allocation ownership shared across SDK layers.
++//! Carries physical lifetime only, never source, signing or caller authority.
++use core::{alloc::{Layout, Allocator, AllocError}, ptr::NonNull};
++#[derive(Clone, Copy)]
++#[repr(C)]
++pub struct AllocationTicket { pub owner: usize, pub loan: usize }
++pub struct OriginOperations {
++    pub retain: fn(AllocationTicket) -> AllocationTicket,
++    pub release: fn(AllocationTicket),
++}
++/// Implementations admit the complete backend before allocation and refund only
++/// after actual backend free. They may allocate only the admitted backing and must not wait or unwind.
++pub struct AllocationOperations {
++    pub allocate: fn(AllocationTicket, Layout, bool) -> Result<NonNull<[u8]>, ()>,
++    pub deallocate: unsafe fn(AllocationTicket, NonNull<u8>, Layout),
++    pub resize: unsafe fn(AllocationTicket, NonNull<u8>, Layout, Layout, bool) -> Result<NonNull<[u8]>, ()>,
++}
++/// Every capability owns one original origin reference; backing allocations
++/// issued through it must retain independent origin tickets until deallocation.
++pub struct AllocationCapability {
++    origin: AllocationTicket,
++    operations: &'static AllocationOperations,
++    ownership: Option<&'static OriginOperations>,
++}
++impl AllocationCapability {
++    /// # Safety
++    /// Moves exactly one retained, thread-safe origin reference. Both operation
++    /// tables must preserve original pool identity and alias lifetime. Callbacks
++    /// may not access invalid mutable state through caller-declared raw userdata.
++    pub unsafe fn from_retained_origin(
++        origin: AllocationTicket,
++        operations: &'static AllocationOperations,
++        ownership: &'static OriginOperations,
++    ) -> Self { Self { origin, operations, ownership: Some(ownership) } }
++    /// # Safety
++    /// The process-lived backend needs no origin ownership and must satisfy the
++    /// same allocation/free contracts. This is for the SDK's unchanged System.
++    pub const unsafe fn process_backend(operations: &'static AllocationOperations) -> Self {
++        Self { origin: AllocationTicket { owner: 0, loan: 0 }, operations, ownership: None }
++    }
++    pub fn allocate_block(&self, layout: Layout, zero: bool) -> Result<NonNull<[u8]>, ()> {
++        (self.operations.allocate)(self.origin, layout, zero)
++    }
++    /// # Safety
++    /// Pointer/layout belong to one exclusive allocation issued by this backend.
++    pub unsafe fn deallocate_block(&self, pointer: NonNull<u8>, layout: Layout) {
++        unsafe { (self.operations.deallocate)(self.origin, pointer, layout) }
++    }
++    /// # Safety
++    /// Pointer/old layout are live and exclusively owned; failure preserves both.
++    pub unsafe fn resize_block(&self, pointer: NonNull<u8>, old: Layout, new: Layout, zero: bool)
++        -> Result<NonNull<[u8]>, ()> {
++        unsafe { (self.operations.resize)(self.origin, pointer, old, new, zero) }
++    }
++}
++impl Clone for AllocationCapability {
++    fn clone(&self) -> Self {
++        let origin = self.ownership.map_or(self.origin, |hooks| (hooks.retain)(self.origin));
++        Self { origin, operations: self.operations, ownership: self.ownership }
++    }
++}
++impl Drop for AllocationCapability {
++    fn drop(&mut self) { if let Some(hooks) = self.ownership { (hooks.release)(self.origin); } }
++}
++// SAFETY: both unsafe constructors require thread-safe static backend and
++// retained ownership operations. No lifetime is inferred from raw integers.
++unsafe impl Send for AllocationCapability {}
++unsafe impl Sync for AllocationCapability {}
++
++// SAFETY: the unsafe constructors establish the backend Allocator contracts;
++// the capability retains its original context through every operation/alias.
++unsafe impl Allocator for AllocationCapability {
++    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> { self.allocate_block(layout, false).map_err(|_| AllocError) }
++    fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> { self.allocate_block(layout, true).map_err(|_| AllocError) }
++    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) { unsafe { self.deallocate_block(ptr, layout) } }
++    unsafe fn grow(&self, ptr: NonNull<u8>, old: Layout, new: Layout) -> Result<NonNull<[u8]>, AllocError> { unsafe { self.resize_block(ptr, old, new, false).map_err(|_| AllocError) } }
++    unsafe fn grow_zeroed(&self, ptr: NonNull<u8>, old: Layout, new: Layout) -> Result<NonNull<[u8]>, AllocError> { unsafe { self.resize_block(ptr, old, new, true).map_err(|_| AllocError) } }
++    unsafe fn shrink(&self, ptr: NonNull<u8>, old: Layout, new: Layout) -> Result<NonNull<[u8]>, AllocError> { unsafe { self.resize_block(ptr, old, new, false).map_err(|_| AllocError) } }
++}
