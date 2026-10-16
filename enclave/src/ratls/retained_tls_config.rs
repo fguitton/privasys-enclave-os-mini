@@ -8,6 +8,10 @@ use enclave_os_common::allocation::{
 use rustls::{ServerConfig, ServerConnection};
 use std::sync::Arc;
 
+#[cfg(test)]
+#[path = "record_owner_check.rs"]
+mod record_owner_check;
+
 type Payload = Arc<ServerConfig>;
 
 #[derive(Clone, Copy)]
@@ -395,7 +399,45 @@ mod provider_refusal {
         check_default_arcs();
         check_p256_constructor();
         check_input_buffer();
+        check_inline_record_keys();
     }
+    fn check_inline_record_keys() {
+        use rustls::crypto::cipher::{AeadKey, Iv};
+        for (suite, independent) in [
+            (
+                rustls::crypto::ring::cipher_suite::TLS13_AES_256_GCM_SHA384,
+                &ring::aead::AES_256_GCM,
+            ),
+            (
+                rustls::crypto::ring::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+                &ring::aead::CHACHA20_POLY1305,
+            ),
+        ] {
+            let cipher = suite.tls13().unwrap().aead_alg;
+            ARM.with(|cell| {
+                cell.set(Some(Arm {
+                    expected: Layout::new::<rustls::crypto::cipher::SelectedEncrypter>(),
+                    refused: false,
+                    live: 0,
+                    allocations: 0,
+                    skip_matching: usize::MAX,
+                }))
+            });
+            let enc = cipher.encrypter(AeadKey::from([7; 32]), Iv::from([0; 12]));
+            let dec = cipher.decrypter(AeadKey::from([7; 32]), Iv::from([0; 12]));
+            drop(enc);
+            drop(dec);
+            let arm = ARM.with(|cell| cell.take()).unwrap();
+            assert!(!arm.refused);
+            assert_eq!(
+                arm.allocations, 0,
+                "actual ring record keys must stay inline"
+            );
+            assert_eq!(arm.live, 0);
+            super::record_owner_check::check_record_wire(suite, independent);
+        }
+    }
+
     fn check_input_buffer() {
         use rustls::server::Acceptor;
         use std::io::{Cursor, ErrorKind};

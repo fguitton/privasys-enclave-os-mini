@@ -3838,3 +3838,1300 @@
              let _ = self.refresh_traffic_keys();
          }
      }
+--- a/src/client/test.rs
++++ b/src/client/test.rs
+@@ -1,4 +1,5 @@
+ #![cfg(any(feature = "ring", feature = "aws_lc_rs"))]
++use crate::crypto::cipher::{SelectedDecrypter, SelectedEncrypter};
+ use alloc::boxed::Box;
+ use alloc::vec;
+ use alloc::vec::Vec;
+@@ -42,7 +43,7 @@
+     use crate::sign::CertifiedKey;
+     use crate::tls13::key_schedule::{derive_traffic_iv, derive_traffic_key};
+     use crate::verify::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+-    use crate::{DigitallySignedStruct, DistinguishedName, KeyLog, version};
++    use crate::{version, DigitallySignedStruct, DistinguishedName, KeyLog};
+ 
+     /// Tests that session_ticket(35) extension
+     /// is not sent if the client does not support TLS 1.2.
+@@ -70,10 +71,9 @@
+                 .with_no_client_auth(),
+         )
+         .unwrap();
+-        assert!(
+-            !ch.cipher_suites
+-                .contains(&CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV)
+-        );
++        assert!(!ch
++            .cipher_suites
++            .contains(&CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV));
+     }
+ 
+     #[test]
+@@ -170,8 +170,7 @@
+                 }),
+             )),
+         };
+-        conn.read_tls(&mut sh.into_wire_bytes().as_slice())
+-            .unwrap();
++        conn.read_tls(&mut sh.into_wire_bytes().as_slice()).unwrap();
+ 
+         assert_eq!(
+             conn.process_new_packets(),
+@@ -240,8 +239,7 @@
+                 }),
+             )),
+         };
+-        conn.read_tls(&mut sh.into_wire_bytes().as_slice())
+-            .unwrap();
++        conn.read_tls(&mut sh.into_wire_bytes().as_slice()).unwrap();
+         conn.process_new_packets().unwrap();
+ 
+         let cert = Message {
+@@ -290,11 +288,7 @@
+             .unwrap();
+         conn.process_new_packets().unwrap();
+ 
+-        assert!(
+-            verifier
+-                .seen_sha1_signature
+-                .load(Ordering::SeqCst)
+-        );
++        assert!(verifier.seen_sha1_signature.load(Ordering::SeqCst));
+     }
+ 
+     #[derive(Debug, Default)]
+@@ -321,8 +315,7 @@
+             dss: &DigitallySignedStruct,
+         ) -> Result<HandshakeSignatureValid, Error> {
+             assert_eq!(dss.scheme, SignatureScheme::ECDSA_SHA1_Legacy);
+-            self.seen_sha1_signature
+-                .store(true, Ordering::SeqCst);
++            self.seen_sha1_signature.store(true, Ordering::SeqCst);
+             Ok(HandshakeSignatureValid::assertion())
+         }
+ 
+@@ -426,8 +419,7 @@
+                 }),
+             )),
+         };
+-        conn.read_tls(&mut sh.into_wire_bytes().as_slice())
+-            .unwrap();
++        conn.read_tls(&mut sh.into_wire_bytes().as_slice()).unwrap();
+         conn.process_new_packets().unwrap();
+ 
+         let ee = Message {
+@@ -441,8 +433,7 @@
+         let enc_ee = encrypter
+             .encrypt(PlainMessage::from(ee).borrow_outbound(), 0)
+             .unwrap();
+-        conn.read_tls(&mut enc_ee.encode().as_slice())
+-            .unwrap();
++        conn.read_tls(&mut enc_ee.encode().as_slice()).unwrap();
+         conn.process_new_packets().map(|_| ())
+     }
+ 
+@@ -465,10 +456,7 @@
+             .load_private_key(client_key())
+             .unwrap();
+         let public_key_as_cert = vec![CertificateDer::from(
+-            key.public_key()
+-                .unwrap()
+-                .as_ref()
+-                .to_vec(),
++            key.public_key().unwrap().as_ref().to_vec(),
+         )];
+         CertifiedKey::new(public_key_as_cert, key)
+     }
+@@ -591,15 +579,12 @@
+             }
+         }
+ 
+-        fn server_handshake_encrypter(&self) -> Box<dyn MessageEncrypter> {
++        fn server_handshake_encrypter(&self) -> SelectedEncrypter {
+             let cipher_suite = super::provider::cipher_suite::TLS13_AES_128_GCM_SHA256
+                 .tls13()
+                 .unwrap();
+ 
+-            let secret = self
+-                .server_handshake_secret
+-                .get()
+-                .unwrap();
++            let secret = self.server_handshake_secret.get().unwrap();
+ 
+             let expander = cipher_suite
+                 .hkdf_provider
+@@ -619,9 +604,7 @@
+ 
+         fn log(&self, label: &str, _client_random: &[u8], secret: &[u8]) {
+             if label == "SERVER_HANDSHAKE_TRAFFIC_SECRET" {
+-                self.server_handshake_secret
+-                    .set(secret.to_vec())
+-                    .unwrap();
++                self.server_handshake_secret.set(secret.to_vec()).unwrap();
+             }
+         }
+     }
+@@ -644,11 +627,7 @@
+     )
+     .unwrap();
+ 
+-    let key_shares = ch
+-        .extensions
+-        .key_shares
+-        .as_ref()
+-        .unwrap();
++    let key_shares = ch.extensions.key_shares.as_ref().unwrap();
+     assert_eq!(key_shares.len(), 2);
+     assert_eq!(key_shares[0].group, NamedGroup::X25519MLKEM768);
+     assert_eq!(key_shares[1].group, NamedGroup::X25519);
+@@ -671,11 +650,7 @@
+     )
+     .unwrap();
+ 
+-    let key_shares = ch
+-        .extensions
+-        .key_shares
+-        .as_ref()
+-        .unwrap();
++    let key_shares = ch.extensions.key_shares.as_ref().unwrap();
+     assert_eq!(key_shares.len(), 1);
+     assert_eq!(key_shares[0].group, NamedGroup::X25519MLKEM768);
+ }
+--- a/src/crypto/aws_lc_rs/tls12.rs
++++ b/src/crypto/aws_lc_rs/tls12.rs
+@@ -1,10 +1,11 @@
++use crate::crypto::cipher::{SelectedDecrypter, SelectedEncrypter};
+ use alloc::boxed::Box;
+ 
+ use aws_lc_rs::{aead, tls_prf};
+ 
+ use crate::crypto::cipher::{
+-    AeadKey, InboundOpaqueMessage, Iv, KeyBlockShape, MessageDecrypter, MessageEncrypter,
+-    NONCE_LEN, Nonce, Tls12AeadAlgorithm, UnsupportedOperationError, make_tls12_aad,
++    make_tls12_aad, AeadKey, InboundOpaqueMessage, Iv, KeyBlockShape, MessageDecrypter,
++    MessageEncrypter, Nonce, Tls12AeadAlgorithm, UnsupportedOperationError, NONCE_LEN,
+ };
+ use crate::crypto::tls12::Prf;
+ use crate::crypto::{ActiveKeyExchange, KeyExchangeAlgorithm};
+@@ -124,7 +125,7 @@
+ pub(crate) struct GcmAlgorithm(&'static aead::Algorithm);
+ 
+ impl Tls12AeadAlgorithm for GcmAlgorithm {
+-    fn decrypter(&self, dec_key: AeadKey, dec_iv: &[u8]) -> Box<dyn MessageDecrypter> {
++    fn decrypter(&self, dec_key: AeadKey, dec_iv: &[u8]) -> SelectedDecrypter {
+         // safety: see `encrypter()`.
+         let dec_key =
+             aead::TlsRecordOpeningKey::new(self.0, aead::TlsProtocolId::TLS12, dec_key.as_ref())
+@@ -137,15 +138,10 @@
+ 
+         debug_assert_eq!(dec_iv.len(), 4);
+         ret.dec_salt.copy_from_slice(dec_iv);
+-        Box::new(ret)
+-    }
+-
+-    fn encrypter(
+-        &self,
+-        enc_key: AeadKey,
+-        write_iv: &[u8],
+-        explicit: &[u8],
+-    ) -> Box<dyn MessageEncrypter> {
++        Box::new(ret).into()
++    }
++
++    fn encrypter(&self, enc_key: AeadKey, write_iv: &[u8], explicit: &[u8]) -> SelectedEncrypter {
+         // safety: `TlsRecordSealingKey::new` fails if
+         // - `enc_key`'s length is wrong for `algorithm`.  But the length is defined by
+         //   `algorithm.key_len()` in `key_block_shape()`, below.
+@@ -162,7 +158,7 @@
+             aead::TlsRecordSealingKey::new(self.0, aead::TlsProtocolId::TLS13, enc_key.as_ref())
+                 .unwrap();
+         let iv = gcm_iv(write_iv, explicit);
+-        Box::new(GcmMessageEncrypter { enc_key, iv })
++        Box::new(GcmMessageEncrypter { enc_key, iv }).into()
+     }
+ 
+     fn key_block_shape(&self) -> KeyBlockShape {
+@@ -195,7 +191,7 @@
+ pub(crate) struct ChaCha20Poly1305;
+ 
+ impl Tls12AeadAlgorithm for ChaCha20Poly1305 {
+-    fn decrypter(&self, dec_key: AeadKey, iv: &[u8]) -> Box<dyn MessageDecrypter> {
++    fn decrypter(&self, dec_key: AeadKey, iv: &[u8]) -> SelectedDecrypter {
+         let dec_key = aead::LessSafeKey::new(
+             aead::UnboundKey::new(&aead::CHACHA20_POLY1305, dec_key.as_ref()).unwrap(),
+         );
+@@ -203,9 +199,10 @@
+             dec_key,
+             dec_offset: Iv::copy(iv),
+         })
+-    }
+-
+-    fn encrypter(&self, enc_key: AeadKey, enc_iv: &[u8], _: &[u8]) -> Box<dyn MessageEncrypter> {
++        .into()
++    }
++
++    fn encrypter(&self, enc_key: AeadKey, enc_iv: &[u8], _: &[u8]) -> SelectedEncrypter {
+         let enc_key = aead::LessSafeKey::new(
+             aead::UnboundKey::new(&aead::CHACHA20_POLY1305, enc_key.as_ref()).unwrap(),
+         );
+@@ -213,6 +210,7 @@
+             enc_key,
+             enc_offset: Iv::copy(enc_iv),
+         })
++        .into()
+     }
+ 
+     fn key_block_shape(&self) -> KeyBlockShape {
+--- a/src/crypto/aws_lc_rs/tls13.rs
++++ b/src/crypto/aws_lc_rs/tls13.rs
+@@ -1,3 +1,4 @@
++use crate::crypto::cipher::{SelectedDecrypter, SelectedEncrypter};
+ use alloc::boxed::Box;
+ 
+ use aws_lc_rs::hkdf::KeyType;
+@@ -5,8 +6,8 @@
+ 
+ use crate::crypto;
+ use crate::crypto::cipher::{
+-    AeadKey, InboundOpaqueMessage, Iv, MessageDecrypter, MessageEncrypter, Nonce,
+-    Tls13AeadAlgorithm, UnsupportedOperationError, make_tls13_aad,
++    make_tls13_aad, AeadKey, InboundOpaqueMessage, Iv, MessageDecrypter, MessageEncrypter, Nonce,
++    Tls13AeadAlgorithm, UnsupportedOperationError,
+ };
+ use crate::crypto::tls13::{Hkdf, HkdfExpander, OkmBlock, OutputLengthError};
+ use crate::enums::{CipherSuite, ContentType, ProtocolVersion};
+@@ -85,20 +86,26 @@
+ struct Chacha20Poly1305Aead(AeadAlgorithm);
+ 
+ impl Tls13AeadAlgorithm for Chacha20Poly1305Aead {
+-    fn encrypter(&self, key: AeadKey, iv: Iv) -> Box<dyn MessageEncrypter> {
++    fn encrypter(&self, key: AeadKey, iv: Iv) -> SelectedEncrypter {
+         // safety: the caller arranges that `key` is `key_len()` in bytes, so this unwrap is safe.
+         Box::new(AeadMessageEncrypter {
+-            enc_key: aead::LessSafeKey::new(aead::UnboundKey::new(self.0.0, key.as_ref()).unwrap()),
++            enc_key: aead::LessSafeKey::new(
++                aead::UnboundKey::new(self.0 .0, key.as_ref()).unwrap(),
++            ),
+             iv,
+         })
+-    }
+-
+-    fn decrypter(&self, key: AeadKey, iv: Iv) -> Box<dyn MessageDecrypter> {
++        .into()
++    }
++
++    fn decrypter(&self, key: AeadKey, iv: Iv) -> SelectedDecrypter {
+         // safety: the caller arranges that `key` is `key_len()` in bytes, so this unwrap is safe.
+         Box::new(AeadMessageDecrypter {
+-            dec_key: aead::LessSafeKey::new(aead::UnboundKey::new(self.0.0, key.as_ref()).unwrap()),
++            dec_key: aead::LessSafeKey::new(
++                aead::UnboundKey::new(self.0 .0, key.as_ref()).unwrap(),
++            ),
+             iv,
+         })
++        .into()
+     }
+ 
+     fn key_len(&self) -> usize {
+@@ -121,11 +128,11 @@
+ struct Aes256GcmAead(AeadAlgorithm);
+ 
+ impl Tls13AeadAlgorithm for Aes256GcmAead {
+-    fn encrypter(&self, key: AeadKey, iv: Iv) -> Box<dyn MessageEncrypter> {
++    fn encrypter(&self, key: AeadKey, iv: Iv) -> SelectedEncrypter {
+         self.0.encrypter(key, iv)
+     }
+ 
+-    fn decrypter(&self, key: AeadKey, iv: Iv) -> Box<dyn MessageDecrypter> {
++    fn decrypter(&self, key: AeadKey, iv: Iv) -> SelectedDecrypter {
+         self.0.decrypter(key, iv)
+     }
+ 
+@@ -149,11 +156,11 @@
+ struct Aes128GcmAead(AeadAlgorithm);
+ 
+ impl Tls13AeadAlgorithm for Aes128GcmAead {
+-    fn encrypter(&self, key: AeadKey, iv: Iv) -> Box<dyn MessageEncrypter> {
++    fn encrypter(&self, key: AeadKey, iv: Iv) -> SelectedEncrypter {
+         self.0.encrypter(key, iv)
+     }
+ 
+-    fn decrypter(&self, key: AeadKey, iv: Iv) -> Box<dyn MessageDecrypter> {
++    fn decrypter(&self, key: AeadKey, iv: Iv) -> SelectedDecrypter {
+         self.0.decrypter(key, iv)
+     }
+ 
+@@ -179,7 +186,7 @@
+ 
+ impl AeadAlgorithm {
+     // using aead::TlsRecordSealingKey
+-    fn encrypter(&self, key: AeadKey, iv: Iv) -> Box<dyn MessageEncrypter> {
++    fn encrypter(&self, key: AeadKey, iv: Iv) -> SelectedEncrypter {
+         // safety:
+         // - the caller arranges that `key` is `key_len()` in bytes, so this unwrap is safe.
+         // - this function should only be used for `Algorithm::AES_128_GCM` or `Algorithm::AES_256_GCM`
+@@ -192,10 +199,11 @@
+             .unwrap(),
+             iv,
+         })
++        .into()
+     }
+ 
+     // using aead::TlsRecordOpeningKey
+-    fn decrypter(&self, key: AeadKey, iv: Iv) -> Box<dyn MessageDecrypter> {
++    fn decrypter(&self, key: AeadKey, iv: Iv) -> SelectedDecrypter {
+         // safety:
+         // - the caller arranges that `key` is `key_len()` in bytes, so this unwrap is safe.
+         // - this function should only be used for `Algorithm::AES_128_GCM` or `Algorithm::AES_256_GCM`
+@@ -208,6 +216,7 @@
+             .unwrap(),
+             iv,
+         })
++        .into()
+     }
+ 
+     fn key_len(&self) -> usize {
+--- a/src/crypto/cipher.rs
++++ b/src/crypto/cipher.rs
+@@ -13,13 +13,151 @@
+ };
+ use crate::suites::ConnectionTrafficSecrets;
+ 
++/// Current selected cipher owner; ring state is inline and other providers retain their own boxes.
++pub struct SelectedEncrypter(SelectedEncrypterKind);
++enum SelectedEncrypterKind {
++    Provider(Box<dyn MessageEncrypter>),
++    #[cfg(feature = "ring")]
++    Ring13(crate::crypto::ring::tls13::Tls13MessageEncrypter),
++    #[cfg(all(feature = "ring", feature = "tls12"))]
++    Ring12Gcm(crate::crypto::ring::tls12::GcmMessageEncrypter),
++    #[cfg(all(feature = "ring", feature = "tls12"))]
++    Ring12ChaCha(crate::crypto::ring::tls12::ChaCha20Poly1305MessageEncrypter),
++}
++impl SelectedEncrypter {
++    fn as_mut(&mut self) -> &mut dyn MessageEncrypter {
++        match &mut self.0 {
++            SelectedEncrypterKind::Provider(value) => value.as_mut(),
++            #[cfg(feature = "ring")]
++            SelectedEncrypterKind::Ring13(value) => value,
++            #[cfg(all(feature = "ring", feature = "tls12"))]
++            SelectedEncrypterKind::Ring12Gcm(value) => value,
++            #[cfg(all(feature = "ring", feature = "tls12"))]
++            SelectedEncrypterKind::Ring12ChaCha(value) => value,
++        }
++    }
++    fn as_ref(&self) -> &dyn MessageEncrypter {
++        match &self.0 {
++            SelectedEncrypterKind::Provider(value) => value.as_ref(),
++            #[cfg(feature = "ring")]
++            SelectedEncrypterKind::Ring13(value) => value,
++            #[cfg(all(feature = "ring", feature = "tls12"))]
++            SelectedEncrypterKind::Ring12Gcm(value) => value,
++            #[cfg(all(feature = "ring", feature = "tls12"))]
++            SelectedEncrypterKind::Ring12ChaCha(value) => value,
++        }
++    }
++}
++impl<T: MessageEncrypter + 'static> From<Box<T>> for SelectedEncrypter {
++    fn from(value: Box<T>) -> Self {
++        Self(SelectedEncrypterKind::Provider(value))
++    }
++}
++impl From<Box<dyn MessageEncrypter>> for SelectedEncrypter {
++    fn from(value: Box<dyn MessageEncrypter>) -> Self {
++        Self(SelectedEncrypterKind::Provider(value))
++    }
++}
++#[cfg(feature = "ring")]
++impl From<crate::crypto::ring::tls13::Tls13MessageEncrypter> for SelectedEncrypter {
++    fn from(value: crate::crypto::ring::tls13::Tls13MessageEncrypter) -> Self {
++        Self(SelectedEncrypterKind::Ring13(value))
++    }
++}
++#[cfg(all(feature = "ring", feature = "tls12"))]
++impl From<crate::crypto::ring::tls12::GcmMessageEncrypter> for SelectedEncrypter {
++    fn from(value: crate::crypto::ring::tls12::GcmMessageEncrypter) -> Self {
++        Self(SelectedEncrypterKind::Ring12Gcm(value))
++    }
++}
++#[cfg(all(feature = "ring", feature = "tls12"))]
++impl From<crate::crypto::ring::tls12::ChaCha20Poly1305MessageEncrypter> for SelectedEncrypter {
++    fn from(value: crate::crypto::ring::tls12::ChaCha20Poly1305MessageEncrypter) -> Self {
++        Self(SelectedEncrypterKind::Ring12ChaCha(value))
++    }
++}
++impl MessageEncrypter for SelectedEncrypter {
++    fn encrypt(
++        &mut self,
++        msg: OutboundPlainMessage<'_>,
++        seq: u64,
++    ) -> Result<OutboundOpaqueMessage, Error> {
++        self.as_mut().encrypt(msg, seq)
++    }
++    fn encrypted_payload_len(&self, payload_len: usize) -> usize {
++        self.as_ref().encrypted_payload_len(payload_len)
++    }
++}
++
++/// Current selected cipher owner; ring state is inline and other providers retain their own boxes.
++pub struct SelectedDecrypter(SelectedDecrypterKind);
++enum SelectedDecrypterKind {
++    Provider(Box<dyn MessageDecrypter>),
++    #[cfg(feature = "ring")]
++    Ring13(crate::crypto::ring::tls13::Tls13MessageDecrypter),
++    #[cfg(all(feature = "ring", feature = "tls12"))]
++    Ring12Gcm(crate::crypto::ring::tls12::GcmMessageDecrypter),
++    #[cfg(all(feature = "ring", feature = "tls12"))]
++    Ring12ChaCha(crate::crypto::ring::tls12::ChaCha20Poly1305MessageDecrypter),
++}
++impl SelectedDecrypter {
++    fn as_mut(&mut self) -> &mut dyn MessageDecrypter {
++        match &mut self.0 {
++            SelectedDecrypterKind::Provider(value) => value.as_mut(),
++            #[cfg(feature = "ring")]
++            SelectedDecrypterKind::Ring13(value) => value,
++            #[cfg(all(feature = "ring", feature = "tls12"))]
++            SelectedDecrypterKind::Ring12Gcm(value) => value,
++            #[cfg(all(feature = "ring", feature = "tls12"))]
++            SelectedDecrypterKind::Ring12ChaCha(value) => value,
++        }
++    }
++}
++impl<T: MessageDecrypter + 'static> From<Box<T>> for SelectedDecrypter {
++    fn from(value: Box<T>) -> Self {
++        Self(SelectedDecrypterKind::Provider(value))
++    }
++}
++impl From<Box<dyn MessageDecrypter>> for SelectedDecrypter {
++    fn from(value: Box<dyn MessageDecrypter>) -> Self {
++        Self(SelectedDecrypterKind::Provider(value))
++    }
++}
++#[cfg(feature = "ring")]
++impl From<crate::crypto::ring::tls13::Tls13MessageDecrypter> for SelectedDecrypter {
++    fn from(value: crate::crypto::ring::tls13::Tls13MessageDecrypter) -> Self {
++        Self(SelectedDecrypterKind::Ring13(value))
++    }
++}
++#[cfg(all(feature = "ring", feature = "tls12"))]
++impl From<crate::crypto::ring::tls12::GcmMessageDecrypter> for SelectedDecrypter {
++    fn from(value: crate::crypto::ring::tls12::GcmMessageDecrypter) -> Self {
++        Self(SelectedDecrypterKind::Ring12Gcm(value))
++    }
++}
++#[cfg(all(feature = "ring", feature = "tls12"))]
++impl From<crate::crypto::ring::tls12::ChaCha20Poly1305MessageDecrypter> for SelectedDecrypter {
++    fn from(value: crate::crypto::ring::tls12::ChaCha20Poly1305MessageDecrypter) -> Self {
++        Self(SelectedDecrypterKind::Ring12ChaCha(value))
++    }
++}
++impl MessageDecrypter for SelectedDecrypter {
++    fn decrypt<'a>(
++        &mut self,
++        msg: InboundOpaqueMessage<'a>,
++        seq: u64,
++    ) -> Result<InboundPlainMessage<'a>, Error> {
++        self.as_mut().decrypt(msg, seq)
++    }
++}
++
+ /// Factory trait for building `MessageEncrypter` and `MessageDecrypter` for a TLS1.3 cipher suite.
+ pub trait Tls13AeadAlgorithm: Send + Sync {
+     /// Build a `MessageEncrypter` for the given key/iv.
+-    fn encrypter(&self, key: AeadKey, iv: Iv) -> Box<dyn MessageEncrypter>;
++    fn encrypter(&self, key: AeadKey, iv: Iv) -> SelectedEncrypter;
+ 
+     /// Build a `MessageDecrypter` for the given key/iv.
+-    fn decrypter(&self, key: AeadKey, iv: Iv) -> Box<dyn MessageDecrypter>;
++    fn decrypter(&self, key: AeadKey, iv: Iv) -> SelectedDecrypter;
+ 
+     /// The length of key in bytes required by `encrypter()` and `decrypter()`.
+     fn key_len(&self) -> usize;
+@@ -50,14 +188,14 @@
+     /// The length of `iv` is set by [`KeyBlockShape::fixed_iv_len`].
+     ///
+     /// The length of `extra` is set by [`KeyBlockShape::explicit_nonce_len`].
+-    fn encrypter(&self, key: AeadKey, iv: &[u8], extra: &[u8]) -> Box<dyn MessageEncrypter>;
++    fn encrypter(&self, key: AeadKey, iv: &[u8], extra: &[u8]) -> SelectedEncrypter;
+ 
+     /// Build a `MessageDecrypter` for the given key/iv.
+     ///
+     /// The length of `key` is set by [`KeyBlockShape::enc_key_len`].
+     ///
+     /// The length of `iv` is set by [`KeyBlockShape::fixed_iv_len`].
+-    fn decrypter(&self, key: AeadKey, iv: &[u8]) -> Box<dyn MessageDecrypter>;
++    fn decrypter(&self, key: AeadKey, iv: &[u8]) -> SelectedDecrypter;
+ 
+     /// Return a `KeyBlockShape` that defines how large the `key_block` is and how it
+     /// is split up prior to calling `encrypter()`, `decrypter()` and/or `extract_keys()`.
+@@ -160,14 +298,14 @@
+ }
+ 
+ impl dyn MessageEncrypter {
+-    pub(crate) fn invalid() -> Box<dyn MessageEncrypter> {
+-        Box::new(InvalidMessageEncrypter {})
++    pub(crate) fn invalid() -> SelectedEncrypter {
++        Box::new(InvalidMessageEncrypter {}).into()
+     }
+ }
+ 
+ impl dyn MessageDecrypter {
+-    pub(crate) fn invalid() -> Box<dyn MessageDecrypter> {
+-        Box::new(InvalidMessageDecrypter {})
++    pub(crate) fn invalid() -> SelectedDecrypter {
++        Box::new(InvalidMessageDecrypter {}).into()
+     }
+ }
+ 
+@@ -232,11 +370,9 @@
+     /// Creates a unique nonce based on the `iv` and sequence number `seq`.
+     #[inline]
+     fn new_from_seq(iv: &Iv, mut seq: [u8; NONCE_LEN]) -> Self {
+-        seq.iter_mut()
+-            .zip(iv.0.iter())
+-            .for_each(|(s, iv)| {
+-                *s ^= *iv;
+-            });
++        seq.iter_mut().zip(iv.0.iter()).for_each(|(s, iv)| {
++            *s ^= *iv;
++        });
+ 
+         Self(seq)
+     }
+--- a/src/crypto/ring/tls12.rs
++++ b/src/crypto/ring/tls12.rs
+@@ -1,12 +1,12 @@
+-use alloc::boxed::Box;
++use crate::crypto::cipher::{SelectedDecrypter, SelectedEncrypter};
+ 
+ use super::ring_like::aead;
+-use crate::crypto::KeyExchangeAlgorithm;
+ use crate::crypto::cipher::{
+-    AeadKey, InboundOpaqueMessage, Iv, KeyBlockShape, MessageDecrypter, MessageEncrypter,
+-    NONCE_LEN, Nonce, Tls12AeadAlgorithm, UnsupportedOperationError, make_tls12_aad,
++    make_tls12_aad, AeadKey, InboundOpaqueMessage, Iv, KeyBlockShape, MessageDecrypter,
++    MessageEncrypter, Nonce, Tls12AeadAlgorithm, UnsupportedOperationError, NONCE_LEN,
+ };
+ use crate::crypto::tls12::PrfUsingHmac;
++use crate::crypto::KeyExchangeAlgorithm;
+ use crate::enums::{CipherSuite, SignatureScheme};
+ use crate::error::Error;
+ use crate::msgs::fragmenter::MAX_FRAGMENT_LEN;
+@@ -122,7 +122,7 @@
+ pub(crate) struct GcmAlgorithm(&'static aead::Algorithm);
+ 
+ impl Tls12AeadAlgorithm for GcmAlgorithm {
+-    fn decrypter(&self, dec_key: AeadKey, dec_iv: &[u8]) -> Box<dyn MessageDecrypter> {
++    fn decrypter(&self, dec_key: AeadKey, dec_iv: &[u8]) -> SelectedDecrypter {
+         let dec_key =
+             aead::LessSafeKey::new(aead::UnboundKey::new(self.0, dec_key.as_ref()).unwrap());
+ 
+@@ -133,19 +133,14 @@
+ 
+         debug_assert_eq!(dec_iv.len(), 4);
+         ret.dec_salt.copy_from_slice(dec_iv);
+-        Box::new(ret)
+-    }
+-
+-    fn encrypter(
+-        &self,
+-        enc_key: AeadKey,
+-        write_iv: &[u8],
+-        explicit: &[u8],
+-    ) -> Box<dyn MessageEncrypter> {
++        (ret).into()
++    }
++
++    fn encrypter(&self, enc_key: AeadKey, write_iv: &[u8], explicit: &[u8]) -> SelectedEncrypter {
+         let enc_key =
+             aead::LessSafeKey::new(aead::UnboundKey::new(self.0, enc_key.as_ref()).unwrap());
+         let iv = gcm_iv(write_iv, explicit);
+-        Box::new(GcmMessageEncrypter { enc_key, iv })
++        (GcmMessageEncrypter { enc_key, iv }).into()
+     }
+ 
+     fn key_block_shape(&self) -> KeyBlockShape {
+@@ -178,24 +173,26 @@
+ pub(crate) struct ChaCha20Poly1305;
+ 
+ impl Tls12AeadAlgorithm for ChaCha20Poly1305 {
+-    fn decrypter(&self, dec_key: AeadKey, iv: &[u8]) -> Box<dyn MessageDecrypter> {
++    fn decrypter(&self, dec_key: AeadKey, iv: &[u8]) -> SelectedDecrypter {
+         let dec_key = aead::LessSafeKey::new(
+             aead::UnboundKey::new(&aead::CHACHA20_POLY1305, dec_key.as_ref()).unwrap(),
+         );
+-        Box::new(ChaCha20Poly1305MessageDecrypter {
++        (ChaCha20Poly1305MessageDecrypter {
+             dec_key,
+             dec_offset: Iv::copy(iv),
+         })
+-    }
+-
+-    fn encrypter(&self, enc_key: AeadKey, enc_iv: &[u8], _: &[u8]) -> Box<dyn MessageEncrypter> {
++        .into()
++    }
++
++    fn encrypter(&self, enc_key: AeadKey, enc_iv: &[u8], _: &[u8]) -> SelectedEncrypter {
+         let enc_key = aead::LessSafeKey::new(
+             aead::UnboundKey::new(&aead::CHACHA20_POLY1305, enc_key.as_ref()).unwrap(),
+         );
+-        Box::new(ChaCha20Poly1305MessageEncrypter {
++        (ChaCha20Poly1305MessageEncrypter {
+             enc_key,
+             enc_offset: Iv::copy(enc_iv),
+         })
++        .into()
+     }
+ 
+     fn key_block_shape(&self) -> KeyBlockShape {
+@@ -226,13 +223,13 @@
+ }
+ 
+ /// A `MessageEncrypter` for AES-GCM AEAD ciphersuites. TLS 1.2 only.
+-struct GcmMessageEncrypter {
++pub(crate) struct GcmMessageEncrypter {
+     enc_key: aead::LessSafeKey,
+     iv: Iv,
+ }
+ 
+ /// A `MessageDecrypter` for AES-GCM AEAD ciphersuites.  TLS1.2 only.
+-struct GcmMessageDecrypter {
++pub(crate) struct GcmMessageDecrypter {
+     dec_key: aead::LessSafeKey,
+     dec_salt: [u8; 4],
+ }
+@@ -311,7 +308,7 @@
+ /// The RFC7905/RFC7539 ChaCha20Poly1305 construction.
+ /// This implementation does the AAD construction required in TLS1.2.
+ /// TLS1.3 uses `TLS13MessageEncrypter`.
+-struct ChaCha20Poly1305MessageEncrypter {
++pub(crate) struct ChaCha20Poly1305MessageEncrypter {
+     enc_key: aead::LessSafeKey,
+     enc_offset: Iv,
+ }
+@@ -319,7 +316,7 @@
+ /// The RFC7905/RFC7539 ChaCha20Poly1305 construction.
+ /// This implementation does the AAD construction required in TLS1.2.
+ /// TLS1.3 uses `TLS13MessageDecrypter`.
+-struct ChaCha20Poly1305MessageDecrypter {
++pub(crate) struct ChaCha20Poly1305MessageDecrypter {
+     dec_key: aead::LessSafeKey,
+     dec_offset: Iv,
+ }
+--- a/src/crypto/ring/tls13.rs
++++ b/src/crypto/ring/tls13.rs
+@@ -1,11 +1,12 @@
++use crate::crypto::cipher::{SelectedDecrypter, SelectedEncrypter};
+ use alloc::boxed::Box;
+ 
+ use super::ring_like::hkdf::KeyType;
+ use super::ring_like::{aead, hkdf, hmac};
+ use crate::crypto;
+ use crate::crypto::cipher::{
+-    AeadKey, InboundOpaqueMessage, Iv, MessageDecrypter, MessageEncrypter, Nonce,
+-    Tls13AeadAlgorithm, UnsupportedOperationError, make_tls13_aad,
++    make_tls13_aad, AeadKey, InboundOpaqueMessage, Iv, MessageDecrypter, MessageEncrypter, Nonce,
++    Tls13AeadAlgorithm, UnsupportedOperationError,
+ };
+ use crate::crypto::tls13::{Hkdf, HkdfExpander, OkmBlock, OutputLengthError};
+ use crate::enums::{CipherSuite, ContentType, ProtocolVersion};
+@@ -84,11 +85,11 @@
+ struct Chacha20Poly1305Aead(AeadAlgorithm);
+ 
+ impl Tls13AeadAlgorithm for Chacha20Poly1305Aead {
+-    fn encrypter(&self, key: AeadKey, iv: Iv) -> Box<dyn MessageEncrypter> {
++    fn encrypter(&self, key: AeadKey, iv: Iv) -> SelectedEncrypter {
+         self.0.encrypter(key, iv)
+     }
+ 
+-    fn decrypter(&self, key: AeadKey, iv: Iv) -> Box<dyn MessageDecrypter> {
++    fn decrypter(&self, key: AeadKey, iv: Iv) -> SelectedDecrypter {
+         self.0.decrypter(key, iv)
+     }
+ 
+@@ -112,11 +113,11 @@
+ struct Aes256GcmAead(AeadAlgorithm);
+ 
+ impl Tls13AeadAlgorithm for Aes256GcmAead {
+-    fn encrypter(&self, key: AeadKey, iv: Iv) -> Box<dyn MessageEncrypter> {
++    fn encrypter(&self, key: AeadKey, iv: Iv) -> SelectedEncrypter {
+         self.0.encrypter(key, iv)
+     }
+ 
+-    fn decrypter(&self, key: AeadKey, iv: Iv) -> Box<dyn MessageDecrypter> {
++    fn decrypter(&self, key: AeadKey, iv: Iv) -> SelectedDecrypter {
+         self.0.decrypter(key, iv)
+     }
+ 
+@@ -140,11 +141,11 @@
+ struct Aes128GcmAead(AeadAlgorithm);
+ 
+ impl Tls13AeadAlgorithm for Aes128GcmAead {
+-    fn encrypter(&self, key: AeadKey, iv: Iv) -> Box<dyn MessageEncrypter> {
++    fn encrypter(&self, key: AeadKey, iv: Iv) -> SelectedEncrypter {
+         self.0.encrypter(key, iv)
+     }
+ 
+-    fn decrypter(&self, key: AeadKey, iv: Iv) -> Box<dyn MessageDecrypter> {
++    fn decrypter(&self, key: AeadKey, iv: Iv) -> SelectedDecrypter {
+         self.0.decrypter(key, iv)
+     }
+ 
+@@ -169,20 +170,22 @@
+ struct AeadAlgorithm(&'static aead::Algorithm);
+ 
+ impl AeadAlgorithm {
+-    fn encrypter(&self, key: AeadKey, iv: Iv) -> Box<dyn MessageEncrypter> {
++    fn encrypter(&self, key: AeadKey, iv: Iv) -> SelectedEncrypter {
+         // safety: the caller arranges that `key` is `key_len()` in bytes, so this unwrap is safe.
+-        Box::new(Tls13MessageEncrypter {
++        (Tls13MessageEncrypter {
+             enc_key: aead::LessSafeKey::new(aead::UnboundKey::new(self.0, key.as_ref()).unwrap()),
+             iv,
+         })
+-    }
+-
+-    fn decrypter(&self, key: AeadKey, iv: Iv) -> Box<dyn MessageDecrypter> {
++        .into()
++    }
++
++    fn decrypter(&self, key: AeadKey, iv: Iv) -> SelectedDecrypter {
+         // safety: the caller arranges that `key` is `key_len()` in bytes, so this unwrap is safe.
+-        Box::new(Tls13MessageDecrypter {
++        (Tls13MessageDecrypter {
+             dec_key: aead::LessSafeKey::new(aead::UnboundKey::new(self.0, key.as_ref()).unwrap()),
+             iv,
+         })
++        .into()
+     }
+ 
+     fn key_len(&self) -> usize {
+@@ -190,12 +193,12 @@
+     }
+ }
+ 
+-struct Tls13MessageEncrypter {
++pub(crate) struct Tls13MessageEncrypter {
+     enc_key: aead::LessSafeKey,
+     iv: Iv,
+ }
+ 
+-struct Tls13MessageDecrypter {
++pub(crate) struct Tls13MessageDecrypter {
+     dec_key: aead::LessSafeKey,
+     iv: Iv,
+ }
+--- a/src/record_layer.rs
++++ b/src/record_layer.rs
+@@ -1,3 +1,5 @@
++use crate::crypto::cipher::{SelectedDecrypter, SelectedEncrypter};
++#[cfg(test)]
+ use alloc::boxed::Box;
+ use core::cmp::min;
+ 
+@@ -20,8 +22,8 @@
+ 
+ /// Record layer that tracks decryption and encryption keys.
+ pub(crate) struct RecordLayer {
+-    message_encrypter: Box<dyn MessageEncrypter>,
+-    message_decrypter: Box<dyn MessageDecrypter>,
++    message_encrypter: SelectedEncrypter,
++    message_decrypter: SelectedDecrypter,
+     write_seq_max: u64,
+     write_seq: u64,
+     read_seq: u64,
+@@ -78,10 +80,7 @@
+         let want_close_before_decrypt = self.read_seq == SEQ_SOFT_LIMIT;
+ 
+         let encrypted_len = encr.payload.len();
+-        match self
+-            .message_decrypter
+-            .decrypt(encr, self.read_seq)
+-        {
++        match self.message_decrypter.decrypt(encr, self.read_seq) {
+             Ok(plaintext) => {
+                 self.read_seq += 1;
+                 if !self.has_decrypted {
+@@ -112,16 +111,14 @@
+         assert!(self.next_pre_encrypt_action() != PreEncryptAction::Refuse);
+         let seq = self.write_seq;
+         self.write_seq += 1;
+-        self.message_encrypter
+-            .encrypt(plain, seq)
+-            .unwrap()
++        self.message_encrypter.encrypt(plain, seq).unwrap()
+     }
+ 
+     /// Prepare to use the given `MessageEncrypter` for future message encryption.
+     /// It is not used until you call `start_encrypting`.
+     pub(crate) fn prepare_message_encrypter(
+         &mut self,
+-        cipher: Box<dyn MessageEncrypter>,
++        cipher: SelectedEncrypter,
+         max_messages: u64,
+     ) {
+         self.message_encrypter = cipher;
+@@ -132,7 +129,7 @@
+ 
+     /// Prepare to use the given `MessageDecrypter` for future message decryption.
+     /// It is not used until you call `start_decrypting`.
+-    pub(crate) fn prepare_message_decrypter(&mut self, cipher: Box<dyn MessageDecrypter>) {
++    pub(crate) fn prepare_message_decrypter(&mut self, cipher: SelectedDecrypter) {
+         self.message_decrypter = cipher;
+         self.read_seq = 0;
+         self.decrypt_state = DirectionState::Prepared;
+@@ -154,18 +151,14 @@
+ 
+     /// Set and start using the given `MessageEncrypter` for future outgoing
+     /// message encryption.
+-    pub(crate) fn set_message_encrypter(
+-        &mut self,
+-        cipher: Box<dyn MessageEncrypter>,
+-        max_messages: u64,
+-    ) {
++    pub(crate) fn set_message_encrypter(&mut self, cipher: SelectedEncrypter, max_messages: u64) {
+         self.prepare_message_encrypter(cipher, max_messages);
+         self.start_encrypting();
+     }
+ 
+     /// Set and start using the given `MessageDecrypter` for future incoming
+     /// message decryption.
+-    pub(crate) fn set_message_decrypter(&mut self, cipher: Box<dyn MessageDecrypter>) {
++    pub(crate) fn set_message_decrypter(&mut self, cipher: SelectedDecrypter) {
+         self.prepare_message_decrypter(cipher);
+         self.start_decrypting();
+         self.trial_decryption_len = None;
+@@ -176,7 +169,7 @@
+     /// 0-RTT is attempted but rejected by the server.
+     pub(crate) fn set_message_decrypter_with_trial_decryption(
+         &mut self,
+-        cipher: Box<dyn MessageDecrypter>,
++        cipher: SelectedDecrypter,
+         max_length: usize,
+     ) {
+         self.prepare_message_decrypter(cipher);
+@@ -223,8 +216,7 @@
+     }
+ 
+     pub(crate) fn encrypted_len(&self, payload_len: usize) -> usize {
+-        self.message_encrypter
+-            .encrypted_payload_len(payload_len)
++        self.message_encrypter.encrypted_payload_len(payload_len)
+     }
+ 
+     fn doing_trial_decryption(&mut self, requested: usize) -> bool {
+@@ -299,7 +291,7 @@
+ 
+         // Preparing the record layer should update the decrypt state, but shouldn't affect whether it
+         // has decrypted.
+-        record_layer.prepare_message_decrypter(Box::new(PassThroughDecrypter));
++        record_layer.prepare_message_decrypter(Box::new(PassThroughDecrypter).into());
+         assert!(matches!(
+             record_layer.decrypt_state,
+             DirectionState::Prepared
+@@ -328,7 +320,7 @@
+ 
+         // Resetting the record layer message decrypter (as if a key update occurred) should reset
+         // the read_seq number, but not our knowledge of whether we have decrypted previously.
+-        record_layer.set_message_decrypter(Box::new(PassThroughDecrypter));
++        record_layer.set_message_decrypter(Box::new(PassThroughDecrypter).into());
+         assert!(matches!(record_layer.decrypt_state, DirectionState::Active));
+         assert_eq!(record_layer.read_seq, 0);
+         assert!(record_layer.has_decrypted());
+--- a/src/tls12/mod.rs
++++ b/src/tls12/mod.rs
+@@ -1,3 +1,4 @@
++use crate::crypto::cipher::{SelectedDecrypter, SelectedEncrypter};
+ use alloc::boxed::Box;
+ use alloc::vec;
+ use alloc::vec::Vec;
+@@ -8,7 +9,7 @@
+ use crate::common_state::{CommonState, Side};
+ use crate::conn::ConnectionRandoms;
+ use crate::crypto;
+-use crate::crypto::cipher::{AeadKey, MessageDecrypter, MessageEncrypter, Tls12AeadAlgorithm};
++use crate::crypto::cipher::{AeadKey, Tls12AeadAlgorithm};
+ use crate::crypto::hash;
+ use crate::enums::{AlertDescription, SignatureScheme};
+ use crate::error::{Error, InvalidMessage};
+@@ -124,15 +125,13 @@
+         // slice parameters are non-empty.
+         // `label` is guaranteed non-empty because it's assigned from a `&str` above.
+         // `seed.as_ref()` is guaranteed non-empty by documentation on the AsRef impl.
+-        ret.suite
+-            .prf_provider
+-            .for_key_exchange(
+-                &mut ret.master_secret,
+-                kx,
+-                peer_pub_key,
+-                label.as_bytes(),
+-                seed.as_ref(),
+-            )?;
++        ret.suite.prf_provider.for_key_exchange(
++            &mut ret.master_secret,
++            kx,
++            peer_pub_key,
++            label.as_bytes(),
++            seed.as_ref(),
++        )?;
+ 
+         Ok(ret)
+     }
+@@ -147,8 +146,7 @@
+             suite,
+             master_secret: [0u8; 48],
+         };
+-        ret.master_secret
+-            .copy_from_slice(master_secret);
++        ret.master_secret.copy_from_slice(master_secret);
+         ret
+     }
+ 
+@@ -318,7 +316,7 @@
+     randoms
+ }
+ 
+-type MessageCipherPair = (Box<dyn MessageDecrypter>, Box<dyn MessageEncrypter>);
++type MessageCipherPair = (SelectedDecrypter, SelectedEncrypter);
+ 
+ pub(crate) fn decode_kx_params<'a, T: KxDecode<'a>>(
+     kx_algorithm: KeyExchangeAlgorithm,
+@@ -355,26 +353,22 @@
+         server_buf.push(34);
+ 
+         let mut common = CommonState::new(Side::Client);
+-        assert!(
+-            decode_kx_params::<ServerKeyExchangeParams>(
+-                KeyExchangeAlgorithm::ECDHE,
+-                &mut common,
+-                &server_buf
+-            )
+-            .is_err()
+-        );
++        assert!(decode_kx_params::<ServerKeyExchangeParams>(
++            KeyExchangeAlgorithm::ECDHE,
++            &mut common,
++            &server_buf
++        )
++        .is_err());
+     }
+ 
+     #[test]
+     fn client_ecdhe_invalid() {
+         let mut common = CommonState::new(Side::Server);
+-        assert!(
+-            decode_kx_params::<ServerKeyExchangeParams>(
+-                KeyExchangeAlgorithm::ECDHE,
+-                &mut common,
+-                &[34],
+-            )
+-            .is_err()
+-        );
+-    }
+-}
++        assert!(decode_kx_params::<ServerKeyExchangeParams>(
++            KeyExchangeAlgorithm::ECDHE,
++            &mut common,
++            &[34],
++        )
++        .is_err());
++    }
++}
+--- a/src/tls13/key_schedule.rs
++++ b/src/tls13/key_schedule.rs
+@@ -1,17 +1,18 @@
+ //! Key schedule maintenance for TLS1.3
+ 
++use crate::crypto::cipher::SelectedDecrypter;
+ use alloc::boxed::Box;
+ use alloc::string::ToString;
+ use core::ops::Deref;
+ 
+ use crate::common_state::{CommonState, Side};
+-use crate::crypto::cipher::{AeadKey, Iv, MessageDecrypter, Tls13AeadAlgorithm};
+-use crate::crypto::tls13::{Hkdf, HkdfExpander, OkmBlock, OutputLengthError, expand};
+-use crate::crypto::{SharedSecret, hash, hmac};
++use crate::crypto::cipher::{AeadKey, Iv, Tls13AeadAlgorithm};
++use crate::crypto::tls13::{expand, Hkdf, HkdfExpander, OkmBlock, OutputLengthError};
++use crate::crypto::{hash, hmac, SharedSecret};
+ use crate::error::Error;
+ use crate::msgs::message::Message;
+ use crate::suites::PartiallyExtractedSecrets;
+-use crate::{ConnectionTrafficSecrets, KeyLog, Tls13CipherSuite, quic};
++use crate::{quic, ConnectionTrafficSecrets, KeyLog, Tls13CipherSuite};
+ 
+ // We express the state of a contained KeySchedule using these
+ // typestates.  This means we can write code that cannot accidentally
+@@ -61,12 +62,8 @@
+         );
+ 
+         match common.side {
+-            Side::Client => self
+-                .ks
+-                .set_encrypter(&client_early_traffic_secret, common),
+-            Side::Server => self
+-                .ks
+-                .set_decrypter(&client_early_traffic_secret, common),
++            Side::Client => self.ks.set_encrypter(&client_early_traffic_secret, common),
++            Side::Server => self.ks.set_decrypter(&client_early_traffic_secret, common),
+         }
+ 
+         if common.is_quic() {
+@@ -133,8 +130,7 @@
+         mut self,
+         shared_secret: SharedSecret,
+     ) -> KeyScheduleHandshakeStart {
+-        self.ks
+-            .input_secret(shared_secret.secret_bytes());
++        self.ks.input_secret(shared_secret.secret_bytes());
+         KeyScheduleHandshakeStart { ks: self.ks }
+     }
+ }
+@@ -317,9 +313,7 @@
+             &before_finished.current_server_traffic_secret,
+         );
+ 
+-        before_finished
+-            .ks
+-            .set_encrypter(server_secret, common);
++        before_finished.ks.set_encrypter(server_secret, common);
+ 
+         if common.is_quic() {
+             common.quic.traffic_secrets = Some(quic::Secrets::new(
+@@ -450,10 +444,8 @@
+             &next.current_server_traffic_secret,
+         );
+ 
+-        next.ks
+-            .set_decrypter(server_secret, common);
+-        next.ks
+-            .set_encrypter(client_secret, common);
++        next.ks.set_decrypter(server_secret, common);
++        next.ks.set_encrypter(client_secret, common);
+ 
+         if common.is_quic() {
+             common.quic.traffic_secrets = Some(quic::Secrets::new(
+@@ -498,12 +490,9 @@
+             .sign_finish(&self.handshake_client_traffic_secret, hs_hash);
+ 
+         // Install keying to read future messages.
+-        self.before_finished.ks.set_decrypter(
+-            &self
+-                .before_finished
+-                .current_client_traffic_secret,
+-            common,
+-        );
++        self.before_finished
++            .ks
++            .set_decrypter(&self.before_finished.current_client_traffic_secret, common);
+ 
+         (self.before_finished, tag)
+     }
+@@ -572,11 +561,7 @@
+             self.ks.suite.hkdf_provider,
+             self.ks.suite.aead_alg.key_len(),
+         );
+-        Ok(self
+-            .ks
+-            .suite
+-            .aead_alg
+-            .extract_keys(key, iv)?)
++        Ok(self.ks.suite.aead_alg.extract_keys(key, iv)?)
+     }
+ 
+     pub(crate) fn extract_secrets(&self, side: Side) -> Result<PartiallyExtractedSecrets, Error> {
+@@ -590,16 +575,8 @@
+             self.ks.suite.hkdf_provider,
+             self.ks.suite.aead_alg.key_len(),
+         );
+-        let client_secrets = self
+-            .ks
+-            .suite
+-            .aead_alg
+-            .extract_keys(client_key, client_iv)?;
+-        let server_secrets = self
+-            .ks
+-            .suite
+-            .aead_alg
+-            .extract_keys(server_key, server_iv)?;
++        let client_secrets = self.ks.suite.aead_alg.extract_keys(client_key, client_iv)?;
++        let server_secrets = self.ks.suite.aead_alg.extract_keys(server_key, server_iv)?;
+ 
+         let (tx, rx) = match side {
+             Side::Client => (client_secrets, server_secrets),
+@@ -641,9 +618,7 @@
+ impl KeySchedule {
+     fn new(suite: &'static Tls13CipherSuite, secret: &[u8]) -> Self {
+         Self {
+-            current: suite
+-                .hkdf_provider
+-                .extract_from_secret(None, secret),
++            current: suite.hkdf_provider.extract_from_secret(None, secret),
+             inner: suite.into(),
+         }
+     }
+@@ -651,9 +626,7 @@
+     /// Creates a key schedule without a PSK.
+     fn new_with_empty_secret(suite: &'static Tls13CipherSuite) -> Self {
+         Self {
+-            current: suite
+-                .hkdf_provider
+-                .extract_from_zero_ikm(None),
++            current: suite.hkdf_provider.extract_from_zero_ikm(None),
+             inner: suite.into(),
+         }
+     }
+@@ -700,9 +673,7 @@
+     ) -> OkmBlock {
+         let output = self.derive(kind, hs_hash);
+ 
+-        let log_label = kind
+-            .log_label()
+-            .expect("not a loggable secret");
++        let log_label = kind.log_label().expect("not a loggable secret");
+         if key_log.will_log(log_label) {
+             key_log.log(log_label, client_random, output.as_ref());
+         }
+@@ -749,19 +720,14 @@
+ 
+ impl KeyScheduleSuite {
+     fn set_encrypter(&self, secret: &OkmBlock, common: &mut CommonState) {
+-        let expander = self
+-            .suite
+-            .hkdf_provider
+-            .expander_for_okm(secret);
++        let expander = self.suite.hkdf_provider.expander_for_okm(secret);
+         let key = derive_traffic_key(expander.as_ref(), self.suite.aead_alg);
+         let iv = derive_traffic_iv(expander.as_ref());
+ 
+-        common
+-            .record_layer
+-            .set_message_encrypter(
+-                self.suite.aead_alg.encrypter(key, iv),
+-                self.suite.common.confidentiality_limit,
+-            );
++        common.record_layer.set_message_encrypter(
++            self.suite.aead_alg.encrypter(key, iv),
++            self.suite.common.confidentiality_limit,
++        );
+     }
+ 
+     fn set_decrypter(&self, secret: &OkmBlock, common: &mut CommonState) {
+@@ -770,11 +736,8 @@
+             .set_message_decrypter(self.derive_decrypter(secret));
+     }
+ 
+-    fn derive_decrypter(&self, secret: &OkmBlock) -> Box<dyn MessageDecrypter> {
+-        let expander = self
+-            .suite
+-            .hkdf_provider
+-            .expander_for_okm(secret);
++    fn derive_decrypter(&self, secret: &OkmBlock) -> SelectedDecrypter {
++        let expander = self.suite.hkdf_provider.expander_for_okm(secret);
+         let key = derive_traffic_key(expander.as_ref(), self.suite.aead_alg);
+         let iv = derive_traffic_iv(expander.as_ref());
+         self.suite.aead_alg.decrypter(key, iv)
+@@ -793,10 +756,7 @@
+     ///
+     /// See RFC 8446 section 4.4.4.
+     fn sign_verify_data(&self, base_key: &OkmBlock, hs_hash: &hash::Output) -> hmac::Tag {
+-        let expander = self
+-            .suite
+-            .hkdf_provider
+-            .expander_for_okm(base_key);
++        let expander = self.suite.hkdf_provider.expander_for_okm(base_key);
+         let hmac_key = hkdf_expand_label_block(expander.as_ref(), b"finished", &[]);
+ 
+         self.suite
+@@ -806,20 +766,14 @@
+ 
+     /// Derive the next application traffic secret, returning it.
+     fn derive_next(&self, base_key: &OkmBlock) -> OkmBlock {
+-        let expander = self
+-            .suite
+-            .hkdf_provider
+-            .expander_for_okm(base_key);
++        let expander = self.suite.hkdf_provider.expander_for_okm(base_key);
+         hkdf_expand_label_block(expander.as_ref(), b"traffic upd", &[])
+     }
+ 
+     /// Derive the PSK to use given a resumption_master_secret and
+     /// ticket_nonce.
+     fn derive_ticket_psk(&self, rms: &OkmBlock, nonce: &[u8]) -> OkmBlock {
+-        let expander = self
+-            .suite
+-            .hkdf_provider
+-            .expander_for_okm(rms);
++        let expander = self.suite.hkdf_provider.expander_for_okm(rms);
+         hkdf_expand_label_block(expander.as_ref(), b"resumption", nonce)
+     }
+ 
+@@ -831,11 +785,7 @@
+         context: Option<&[u8]>,
+     ) -> Result<(), Error> {
+         let secret = {
+-            let h_empty = self
+-                .suite
+-                .common
+-                .hash_provider
+-                .hash(&[]);
++            let h_empty = self.suite.common.hash_provider.hash(&[]);
+ 
+             let expander = self
+                 .suite
+@@ -844,16 +794,9 @@
+             hkdf_expand_label_block(expander.as_ref(), label, h_empty.as_ref())
+         };
+ 
+-        let h_context = self
+-            .suite
+-            .common
+-            .hash_provider
+-            .hash(context.unwrap_or(&[]));
+-
+-        let expander = self
+-            .suite
+-            .hkdf_provider
+-            .expander_for_okm(&secret);
++        let h_context = self.suite.common.hash_provider.hash(context.unwrap_or(&[]));
++
++        let expander = self.suite.hkdf_provider.expander_for_okm(&secret);
+         hkdf_expand_label_slice(expander.as_ref(), b"exporter", h_context.as_ref(), out)
+             .map_err(|_| Error::General("exporting too much".to_string()))
+     }
+@@ -1046,9 +989,9 @@
+     use super::provider::tls13::{
+         TLS13_AES_128_GCM_SHA256_INTERNAL, TLS13_CHACHA20_POLY1305_SHA256_INTERNAL,
+     };
+-    use super::{KeySchedule, SecretKind, derive_traffic_iv, derive_traffic_key};
++    use super::{derive_traffic_iv, derive_traffic_key, KeySchedule, SecretKind};
++    use crate::msgs::enums::HashAlgorithm;
+     use crate::KeyLog;
+-    use crate::msgs::enums::HashAlgorithm;
+ 
+     #[test]
+     fn empty_hash() {
+@@ -1079,11 +1022,7 @@
+         );
+ 
+         // a theoretical example of unsupported hash
+-        assert!(
+-            HashAlgorithm::SHA1
+-                .hash_for_empty_input()
+-                .is_none()
+-        );
++        assert!(HashAlgorithm::SHA1.hash_for_empty_input().is_none());
+     }
+ 
+     #[test]
+@@ -1268,7 +1207,7 @@
+         use core::fmt::Debug;
+ 
+         use super::provider::tls13::TLS13_CHACHA20_POLY1305_SHA256_INTERNAL;
+-        use super::{KeySchedule, SecretKind, derive_traffic_iv, derive_traffic_key};
++        use super::{derive_traffic_iv, derive_traffic_key, KeySchedule, SecretKind};
+         use crate::KeyLog;
+ 
+         fn extract_traffic_secret(ks: &KeySchedule, kind: SecretKind) {

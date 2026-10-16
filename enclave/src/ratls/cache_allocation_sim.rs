@@ -3,6 +3,9 @@ use enclave_os_common::allocation::{AllocationPoolV1, LoanAllocator};
 use rustls::server::{ServerSessionMemoryCache, StoresServerSessions};
 use std::sync::Arc;
 
+#[path = "record_owner_check.rs"]
+mod record_owner_check;
+
 fn successful(pool: &Arc<AllocationPoolV1>) -> Result<usize, &'static str> {
     let before = pool.used();
     // The production config carrier prepays this exact Arc payload layout.
@@ -78,6 +81,19 @@ pub fn check_paid_session_cache(pool: &Arc<AllocationPoolV1>) -> Result<(), &'st
         return Err("cache owning pool not refunded");
     }
     check_p256(pool)?;
+    for (suite, independent) in [
+        (
+            rustls::crypto::ring::cipher_suite::TLS13_AES_256_GCM_SHA384,
+            &ring::aead::AES_256_GCM,
+        ),
+        (
+            rustls::crypto::ring::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+            &ring::aead::CHACHA20_POLY1305,
+        ),
+    ] {
+        record_owner_check::check_record_wire(suite, independent);
+    }
+    std::println!("TLS-RECORD-CIPHER-SIM: actual-SDK inline keys independent-AEAD byte-equality plaintext corruption-refusal PASS");
     check_input_buffer(pool)?;
     std::println!("TLS-SESSION-CACHE-SIM: actual-SDK backing entry get take exact-minus-one exact plus-one aliases returned-origin final-refund PASS");
     Ok(())

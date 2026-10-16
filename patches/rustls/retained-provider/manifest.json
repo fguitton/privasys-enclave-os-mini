@@ -2,7 +2,7 @@
   "schema": 1,
   "profile": "retained-provider",
   "routing": "build-owned Cargo paths override; same package manifests, lock and dependency graph",
-  "patch_sha256": "9dc292b520c26abdfc978a6f25068f7273e772d9c09d5f8ee8f013c4c4f2bf27",
+  "patch_sha256": "aa03baf7fbb9640f1a8f47a4d1cea8e61d6c7b406fc1be343b77e32b8d595f1e",
   "suppliers": [
     {
       "package": "rustls",
@@ -114,6 +114,51 @@
           "path": "src/conn.rs",
           "before_sha256": "a8866f067c993bc5591b36c1428ee529764eda77ec486b9740f4b3d811fc18cd",
           "after_sha256": "93a7e6886f015cf482da06088eaa1b4624f91ec0a68b5bea1f73dfa5303e3ed0"
+        },
+        {
+          "path": "src/client/test.rs",
+          "before_sha256": "7e1b05243a6315e2c061fa28729067b0bab8cf8982760765bc83090a1add5e27",
+          "after_sha256": "7808aca0be315d9f227aeeb7316e828405a03b8010ee8ffc39f9c4bb0f8083c8"
+        },
+        {
+          "path": "src/crypto/aws_lc_rs/tls12.rs",
+          "before_sha256": "9e3a9220b68ce2a340d2289d376107bf4b75bc73319d1562c2800c5c01476d28",
+          "after_sha256": "b1b987c831ed9a9519e5c8855632b0ad62ba84df181bc37dadcef31330b97c0e"
+        },
+        {
+          "path": "src/crypto/aws_lc_rs/tls13.rs",
+          "before_sha256": "e9998aa39049aa886c34c7ffb0da3b8d74388ce823bd310d07e1cd83b3559857",
+          "after_sha256": "4b0a81b2c2bd320c4671ddb84052f717fd052d6f4160ffe0aaf10f1077805f95"
+        },
+        {
+          "path": "src/crypto/cipher.rs",
+          "before_sha256": "067842d11b0f2d373ced097392503c36eb318e685d85e1147048c7fbad421672",
+          "after_sha256": "90ec1277eb2b1812b65efed21321ab7505ea4b14e976f5d20cdc649c3c8ecff1"
+        },
+        {
+          "path": "src/crypto/ring/tls12.rs",
+          "before_sha256": "a3a65ebd7cf6fe7157dd19500d35ac7a948970fc64f94909ec4cc22e889e3a44",
+          "after_sha256": "9c412ccf7cf6c45d0c82ca4c97978299052b8601da9691a37b972ceceb9eb1e9"
+        },
+        {
+          "path": "src/crypto/ring/tls13.rs",
+          "before_sha256": "2d093ce74d9ad824ed15f0a18abf5d845fd701a5b8de2d7db088e706dd49ab62",
+          "after_sha256": "f45e85d507c61aa630479f4235b1b816974c779f12f6a645c69e1547897e7c45"
+        },
+        {
+          "path": "src/record_layer.rs",
+          "before_sha256": "299c725f5bb3e032ecb17e9d1b228a1fa6fc580714c1470d5ff93c54592dc97d",
+          "after_sha256": "26992e8d136f44cf052f38d699f86e78ba21993ba0b06cfb8330dcec52b2959d"
+        },
+        {
+          "path": "src/tls12/mod.rs",
+          "before_sha256": "159fb6a519534986e1d1fd2326d30ffa0422650d9fe636c3dac8a5bd113c7c8b",
+          "after_sha256": "493b39b70aec3d5610bd8dabfc3c1422b13d8fc9b3ec02df419360ce6896d9fb"
+        },
+        {
+          "path": "src/tls13/key_schedule.rs",
+          "before_sha256": "dfe3a46dc72f4b175c70f0e0504819697a4876eed1e68715348d3f30585185cf",
+          "after_sha256": "1a38830f00fc088d002a83905dba2fb0b3de86a9ffee29535f0fb185d3dd87f5"
         }
       ]
     }
