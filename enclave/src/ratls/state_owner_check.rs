@@ -216,20 +216,28 @@ fn check_extensions() {
     let metadata = metadata_bytes();
     let backend = backend_bytes(server_extensions_layout());
     for (slots, delta) in [(1_usize, -1_isize), (2, -1), (2, 0), (2, 1)] {
-        let capacity = metadata.checked_add(backend.checked_mul(slots).unwrap())
-            .unwrap().checked_add_signed(delta).unwrap();
+        let capacity = metadata
+            .checked_add(backend.checked_mul(slots).unwrap())
+            .unwrap()
+            .checked_add_signed(delta)
+            .unwrap();
         let pool = AllocationPoolV1::new(capacity).unwrap();
         let origin = Original::new(&pool);
         origin.arm(None);
         let mut observed = false;
-        let result = without_global(|| server_extensions_owner_probe(origin.clone(), || {
-            observed = true;
-            assert_eq!(pool.used(), metadata + backend);
-            assert_eq!(origin.backend_bytes(), backend);
-        }));
+        let result = without_global(|| {
+            server_extensions_owner_probe(origin.clone(), || {
+                observed = true;
+                assert_eq!(pool.used(), metadata + backend);
+                assert_eq!(origin.backend_bytes(), backend);
+            })
+        });
         assert_eq!(observed, slots == 2);
         if delta < 0 {
-            assert!(matches!(result, Err(rustls::InvalidMessage::AllocationFailed)));
+            assert!(matches!(
+                result,
+                Err(rustls::InvalidMessage::AllocationFailed)
+            ));
         } else {
             result.unwrap();
         }
@@ -244,11 +252,16 @@ fn check_extensions() {
         let origin = Original::new(&pool);
         origin.arm(Some(failed_request));
         let mut observed = false;
-        let result = without_global(|| server_extensions_owner_probe(origin.clone(), || {
-            observed = true;
-            assert_eq!(pool.used(), metadata + backend);
-        }));
-        assert!(matches!(result, Err(rustls::InvalidMessage::AllocationFailed)));
+        let result = without_global(|| {
+            server_extensions_owner_probe(origin.clone(), || {
+                observed = true;
+                assert_eq!(pool.used(), metadata + backend);
+            })
+        });
+        assert!(matches!(
+            result,
+            Err(rustls::InvalidMessage::AllocationFailed)
+        ));
         assert_eq!(observed, failed_request == 1);
         assert_eq!(origin.requests(), failed_request + 1);
         assert_eq!(origin.backend_bytes(), 0);
@@ -272,24 +285,27 @@ fn check_extension_parser_precedence() {
         let pool = AllocationPoolV1::new(metadata + backend).unwrap();
         let origin = Original::new(&pool);
         origin.arm(Some(0));
-        let error = without_global(|| {
-            server_extensions_parser_probe(origin.clone(), server_hello, true)
-        }).unwrap_err();
-        let label = if server_hello { "ServerHelloPayload" } else { "HandshakeMessagePayload" };
+        let error =
+            without_global(|| server_extensions_parser_probe(origin.clone(), server_hello, true))
+                .unwrap_err();
+        let label = if server_hello {
+            "ServerHelloPayload"
+        } else {
+            "HandshakeMessagePayload"
+        };
         assert_eq!(error, rustls::InvalidMessage::TrailingData(label));
         assert_eq!(origin.requests(), 0);
         assert_eq!(pool.used(), metadata);
         assert_eq!(origin.backend_bytes(), 0);
-        let error = without_global(|| {
-            server_extensions_parser_probe(origin.clone(), server_hello, false)
-        }).unwrap_err();
+        let error =
+            without_global(|| server_extensions_parser_probe(origin.clone(), server_hello, false))
+                .unwrap_err();
         assert_eq!(error, rustls::InvalidMessage::AllocationFailed);
         assert_eq!(origin.requests(), 1);
         assert_eq!(pool.used(), metadata);
         origin.arm(None);
-        without_global(|| {
-            server_extensions_parser_probe(origin.clone(), server_hello, false)
-        }).unwrap();
+        without_global(|| server_extensions_parser_probe(origin.clone(), server_hello, false))
+            .unwrap();
         assert_eq!(origin.requests(), 1);
         assert_eq!(origin.backend_bytes(), 0);
         assert_eq!(pool.used(), metadata);
