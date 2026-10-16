@@ -268,6 +268,16 @@ pub(crate) fn check_no_global_children<T>(action: impl FnOnce() -> T) -> T {
     provider_refusal::without_global_children(action)
 }
 
+/// Native generic payload oracle: permit only the explicit native hash context.
+/// This observes exactly one dynamic context Layout, not a trusted pool fallback.
+#[cfg(all(test, feature = "fallible-allocation-v1"))]
+pub(crate) fn check_one_native_context<T>(
+    layout: std::alloc::Layout,
+    action: impl FnOnce() -> T,
+) -> T {
+    provider_refusal::one_native_context(layout, action)
+}
+
 // This native fixture changes no production allocator. A thread-local arm
 // refuses one exact provider request and counts only that constructor's scope.
 #[cfg(all(test, feature = "fallible-allocation-v1"))]
@@ -283,6 +293,7 @@ mod provider_refusal {
         refused: bool,
         live: usize,
         allocations: usize,
+        matching_allocations: usize,
         skip_matching: usize,
     }
     thread_local! {
@@ -320,6 +331,7 @@ mod provider_refusal {
                     if let Some(mut arm) = cell.get() {
                         arm.live += 1;
                         arm.allocations += 1;
+                        arm.matching_allocations += usize::from(layout == arm.expected);
                         cell.set(Some(arm));
                     }
                 });
@@ -341,15 +353,49 @@ mod provider_refusal {
         ARM.with(|cell| {
             assert!(cell.get().is_none());
             cell.set(Some(Arm {
-                expected: Layout::new::<u8>(), refused: false, live: 0,
-                allocations: 0, skip_matching: usize::MAX,
+                expected: Layout::new::<u8>(),
+                refused: false,
+                live: 0,
+                allocations: 0,
+                matching_allocations: 0,
+                skip_matching: usize::MAX,
             }));
         });
         let result = action();
         let arm = ARM.with(|cell| cell.take()).unwrap();
         assert!(!arm.refused);
-        assert_eq!(arm.allocations, 0, "parsed children must use the supplied origin");
+        assert_eq!(
+            arm.allocations, 0,
+            "parsed children must use the supplied origin"
+        );
         assert_eq!(arm.live, 0);
+        result
+    }
+
+    pub(super) fn one_native_context<T>(layout: Layout, action: impl FnOnce() -> T) -> T {
+        ARM.with(|cell| {
+            assert!(cell.get().is_none());
+            cell.set(Some(Arm {
+                expected: layout,
+                refused: false,
+                live: 0,
+                allocations: 0,
+                matching_allocations: 0,
+                skip_matching: usize::MAX,
+            }));
+        });
+        let result = action();
+        let arm = ARM.with(|cell| cell.take()).unwrap();
+        assert!(!arm.refused);
+        assert_eq!(
+            arm.allocations, 1,
+            "only the explicit native context may use Global"
+        );
+        assert_eq!(
+            arm.matching_allocations, 1,
+            "the allocation must match the dynamic context Layout"
+        );
+        assert_eq!(arm.live, 0, "temporary context must be freed on refusal");
         result
     }
 
@@ -401,6 +447,7 @@ mod provider_refusal {
                     refused: false,
                     live: 0,
                     allocations: 0,
+                    matching_allocations: 0,
                     skip_matching: 0,
                 }))
             });
@@ -443,6 +490,7 @@ mod provider_refusal {
                     refused: false,
                     live: 0,
                     allocations: 0,
+                    matching_allocations: 0,
                     skip_matching: usize::MAX,
                 }))
             });
@@ -473,6 +521,7 @@ mod provider_refusal {
                     refused: false,
                     live: 0,
                     allocations: 0,
+                    matching_allocations: 0,
                     skip_matching: if growth { usize::MAX } else { 0 },
                 }))
             });
@@ -528,6 +577,7 @@ mod provider_refusal {
                     refused: false,
                     live: 0,
                     allocations: 0,
+                    matching_allocations: 0,
                     skip_matching: 0,
                 }))
             });
@@ -576,6 +626,7 @@ mod provider_refusal {
                 refused: false,
                 live: 0,
                 allocations: 0,
+                matching_allocations: 0,
                 skip_matching: usize::MAX,
             }))
         });
@@ -718,6 +769,7 @@ mod provider_refusal {
                     refused: false,
                     live: 0,
                     allocations: 0,
+                    matching_allocations: 0,
                     skip_matching,
                 }))
             });

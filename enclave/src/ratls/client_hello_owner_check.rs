@@ -45,6 +45,18 @@ impl Original {
             })),
         }
     }
+    /// The selected SDK context uses the same underlying original pool.
+    /// Native generic payload checks explicitly use the native Global capability.
+    pub(super) fn context_allocator(&self) -> rustls::RetainedAllocator {
+        #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
+        {
+            self.allocator.clone()
+        }
+        #[cfg(not(any(target_env = "sgx", target_vendor = "teaclave")))]
+        {
+            std::alloc::Global
+        }
+    }
     pub(super) fn requests(&self) -> usize {
         self.observation.borrow().requests
     }

@@ -156,24 +156,57 @@
      },
 --- a/src/client/ech.rs
 +++ b/src/client/ech.rs
-@@ -1,6 +1,7 @@
+@@ -1,3 +1,4 @@
++use crate::msgs::retained::TryCloneIn;
  use alloc::boxed::Box;
  use alloc::vec;
  use alloc::vec::Vec;
-+use crate::msgs::retained::TryCloneIn;
- use core::iter;
- 
+@@ -6,11 +7,10 @@
  use pki_types::{DnsName, EchConfigListBytes, ServerName};
-@@ -19,7 +20,7 @@
+ use subtle::ConstantTimeEq;
+ 
+-use crate::CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV;
+ use crate::client::tls13;
+-use crate::crypto::SecureRandom;
+ use crate::crypto::hash::Hash;
+ use crate::crypto::hpke::{EncapsulatedSecret, Hpke, HpkePublicKey, HpkeSealer, HpkeSuite};
++use crate::crypto::SecureRandom;
+ use crate::hash_hs::{HandshakeHash, HandshakeHashBuffer};
+ use crate::log::{debug, trace, warn};
+ use crate::msgs::base::{Payload, PayloadU16};
+@@ -19,15 +19,16 @@
  use crate::msgs::handshake::{
      ClientExtensions, ClientHelloPayload, EchConfigContents, EchConfigPayload, Encoding,
      EncryptedClientHello, EncryptedClientHelloOuter, HandshakeMessagePayload, HandshakePayload,
 -    HelloRetryRequest, HpkeKeyConfig, HpkeSymmetricCipherSuite, PresharedKeyBinder,
-+    HelloRetryRequest, HpkeKeyConfig, HpkeSymmetricCipherSuite,
-     PresharedKeyOffer, Random, ServerHelloPayload, ServerNamePayload,
+-    PresharedKeyOffer, Random, ServerHelloPayload, ServerNamePayload,
++    HelloRetryRequest, HpkeKeyConfig, HpkeSymmetricCipherSuite, PresharedKeyOffer, Random,
++    ServerHelloPayload, ServerNamePayload,
  };
  use crate::msgs::message::{Message, MessagePayload};
-@@ -162,6 +163,7 @@
+ use crate::msgs::persist;
+ use crate::msgs::persist::Retrieved;
+ use crate::tls13::key_schedule::{
+-    KeyScheduleEarly, KeyScheduleHandshakeStart, server_ech_hrr_confirmation_secret,
++    server_ech_hrr_confirmation_secret, KeyScheduleEarly, KeyScheduleHandshakeStart,
+ };
++use crate::CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV;
+ use crate::{
+     AlertDescription, ClientConfig, CommonState, EncryptedClientHelloError, Error,
+     PeerIncompatible, PeerMisbehaved, ProtocolVersion, Tls13CipherSuite,
+@@ -139,10 +140,7 @@
+                     kem: key_config.kem_id,
+                     sym: *cipher_suite,
+                 };
+-                if let Some(hpke) = hpke_suites
+-                    .iter()
+-                    .find(|hpke| hpke.suite() == suite)
+-                {
++                if let Some(hpke) = hpke_suites.iter().find(|hpke| hpke.suite() == suite) {
+                     debug!(
+                         "selected ECH config ID {:?} suite {:?} public_name {:?}",
+                         key_config.config_id, suite, contents.public_name
+@@ -162,15 +160,15 @@
          &self,
          server_name: ServerName<'static>,
          config: &ClientConfig,
@@ -181,15 +214,18 @@
      ) -> Result<EchState, Error> {
          EchState::new(
              self,
-@@ -171,6 +173,7 @@
-                 .has_certs(),
+             server_name.clone(),
+-            config
+-                .client_auth_cert_resolver
+-                .has_certs(),
++            config.client_auth_cert_resolver.has_certs(),
              config.provider.secure_random,
              config.enable_sni,
 +            allocator,
          )
      }
  
-@@ -219,7 +222,7 @@
+@@ -219,7 +217,7 @@
          secure_random: &'static dyn SecureRandom,
          inner_name: ServerName<'static>,
          outer_hello: &ClientHelloPayload,
@@ -198,7 +234,7 @@
          trace!("Preparing GREASE ECH extension");
  
          // Pick a random config id.
-@@ -249,11 +252,12 @@
+@@ -249,11 +247,12 @@
              false,
              secure_random,
              false, // Does not matter if we enable/disable SNI here. Inner hello is not used.
@@ -212,13 +248,14 @@
  
          // Generate a payload of random data equivalent in length to a real inner hello.
          let payload_len = encoded_inner_hello.len()
-@@ -264,15 +268,16 @@
+@@ -264,15 +263,20 @@
                  // Safety: we have confirmed the AEAD is supported when building the config. All
                  //  supported AEADs have a tag length.
                  .unwrap();
 -        let mut payload = vec![0; payload_len];
 +        let allocator = outer_hello.extensions.allocator.clone();
-+        let mut payload = crate::msgs::retained::zero_bytes_in(payload_len, allocator.clone()).map_err(|_| crate::InvalidMessage::AllocationFailed)?;
++        let mut payload = crate::msgs::retained::zero_bytes_in(payload_len, allocator.clone())
++            .map_err(|_| crate::InvalidMessage::AllocationFailed)?;
          secure_random.fill(&mut payload)?;
  
          // Return the GREASE extension.
@@ -227,12 +264,15 @@
              config_id: config_id[0],
 -            enc: PayloadU16::new(grease_state.enc.0),
 -            payload: PayloadU16::new(payload),
-+            enc: PayloadU16::from_vec_in(crate::msgs::retained::copy_bytes_in(&grease_state.enc.0, allocator).map_err(|_| crate::InvalidMessage::AllocationFailed)?),
++            enc: PayloadU16::from_vec_in(
++                crate::msgs::retained::copy_bytes_in(&grease_state.enc.0, allocator)
++                    .map_err(|_| crate::InvalidMessage::AllocationFailed)?,
++            ),
 +            payload: PayloadU16::from_vec_in(payload),
          }))
      }
  }
-@@ -335,6 +340,7 @@
+@@ -335,6 +339,7 @@
          client_auth_enabled: bool,
          secure_random: &'static dyn SecureRandom,
          enable_sni: bool,
@@ -240,16 +280,16 @@
      ) -> Result<Self, Error> {
          let EchConfigPayload::V18(config_contents) = &config.config else {
              // the public EchConfig::new() constructor ensures we only have supported
-@@ -351,7 +357,7 @@
+@@ -351,7 +356,7 @@
          )?;
  
          // Start a new transcript buffer for the inner hello.
 -        let mut inner_hello_transcript = HandshakeHashBuffer::new();
-+        let mut inner_hello_transcript = HandshakeHashBuffer::new_in(allocator);
++        let mut inner_hello_transcript = HandshakeHashBuffer::new_in(allocator.clone(), allocator);
          if client_auth_enabled {
              inner_hello_transcript.set_client_auth_enabled();
          }
-@@ -393,7 +399,7 @@
+@@ -393,7 +398,7 @@
          );
  
          // Construct the encoded inner hello and update the transcript.
@@ -258,7 +298,7 @@
  
          // Complete the ClientHelloOuterAAD with an ech extension, the payload should be a placeholder
          // of size L, all zeroes. L == length of encrypting encoded client hello inner w/ the selected
-@@ -408,19 +414,10 @@
+@@ -408,19 +413,20 @@
                  .unwrap();
  
          // Outer hello's created in response to a hello retry request omit the enc value.
@@ -276,36 +316,63 @@
 -            })
 -        }
 +        let allocator = outer_hello.extensions.allocator.clone();
-+        let enc: &[u8] = if retry_req.is_some() { &[] } else { &self.enc.0 };
-+        let enc = PayloadU16::from_vec_in(crate::msgs::retained::copy_bytes_in(enc, allocator.clone()).map_err(|_| crate::InvalidMessage::AllocationFailed)?);
-+        let placeholder = PayloadU16::from_vec_in(crate::msgs::retained::zero_bytes_in(payload_len, allocator.clone()).map_err(|_| crate::InvalidMessage::AllocationFailed)?);
++        let enc: &[u8] = if retry_req.is_some() {
++            &[]
++        } else {
++            &self.enc.0
++        };
++        let enc = PayloadU16::from_vec_in(
++            crate::msgs::retained::copy_bytes_in(enc, allocator.clone())
++                .map_err(|_| crate::InvalidMessage::AllocationFailed)?,
++        );
++        let placeholder = PayloadU16::from_vec_in(
++            crate::msgs::retained::zero_bytes_in(payload_len, allocator.clone())
++                .map_err(|_| crate::InvalidMessage::AllocationFailed)?,
++        );
  
          // The outer handshake is not permitted to resume a session. If we're resuming in the
          // inner handshake we remove the PSK extension from the outer hello, replacing it
-@@ -432,7 +429,9 @@
+@@ -432,7 +438,12 @@
  
          // To compute the encoded AAD we add a placeholder extension with an empty payload.
          outer_hello.encrypted_client_hello =
 -            Some(outer_hello_ext(self, enc.clone(), vec![0; payload_len]));
 +            Some(EncryptedClientHello::Outer(EncryptedClientHelloOuter {
-+                cipher_suite: self.cipher_suite, config_id: self.config_id, enc, payload: placeholder,
++                cipher_suite: self.cipher_suite,
++                config_id: self.config_id,
++                enc,
++                payload: placeholder,
 +            }));
  
          // Next we compute the proper extension payload.
          let payload = self
-@@ -440,7 +439,10 @@
+@@ -440,7 +451,17 @@
              .seal(&outer_hello.get_encoding(), &encoded_inner_hello)?;
  
          // And then we replace the placeholder extension with the real one.
 -        outer_hello.encrypted_client_hello = Some(outer_hello_ext(self, enc, payload));
-+        let payload = PayloadU16::from_vec_in(crate::msgs::retained::copy_bytes_in(&payload, allocator).map_err(|_| crate::InvalidMessage::AllocationFailed)?);
-+        if let Some(EncryptedClientHello::Outer(extension)) = &mut outer_hello.encrypted_client_hello {
++        let payload = PayloadU16::from_vec_in(
++            crate::msgs::retained::copy_bytes_in(&payload, allocator)
++                .map_err(|_| crate::InvalidMessage::AllocationFailed)?,
++        );
++        if let Some(EncryptedClientHello::Outer(extension)) =
++            &mut outer_hello.encrypted_client_hello
++        {
 +            extension.payload = payload;
-+        } else { unreachable!("installed ECH placeholder"); }
++        } else {
++            unreachable!("installed ECH placeholder");
++        }
  
          Ok(outer_hello)
      }
-@@ -461,12 +463,12 @@
+@@ -455,18 +476,16 @@
+         server_name: &mut ServerName<'static>,
+     ) -> Result<Option<EchAccepted>, Error> {
+         // Start the inner transcript hash now that we know the hash algorithm to use.
+-        let inner_transcript = self
+-            .inner_hello_transcript
+-            .start_hash(hash);
++        let inner_transcript = self.inner_hello_transcript.start_hash(hash)?;
  
          // Fork the transcript that we've started with the inner hello to use for a confirmation step.
          // We need to preserve the original inner_transcript to use if this confirmation succeeds.
@@ -320,37 +387,43 @@
  
          // Derive a confirmation secret from the inner hello random and the confirmation transcript.
          let derived = ks.server_ech_confirmation_secret(
-@@ -525,11 +527,11 @@
+@@ -525,11 +544,11 @@
  
          // Otherwise the client computes hrr_accept_confirmation as described in Section
          // 7.2.1
 -        let confirmation_transcript = self.inner_hello_transcript.clone();
 +        let confirmation_transcript = self.inner_hello_transcript.try_clone()?;
          let mut confirmation_transcript =
-             confirmation_transcript.start_hash(cs.common.hash_provider);
+-            confirmation_transcript.start_hash(cs.common.hash_provider);
 -        confirmation_transcript.rollup_for_hrr();
 -        confirmation_transcript.add_message(&Self::hello_retry_request_conf(hrr));
++            confirmation_transcript.start_hash(cs.common.hash_provider)?;
 +        confirmation_transcript.rollup_for_hrr()?;
 +        confirmation_transcript.add_message(&Self::hello_retry_request_conf(hrr))?;
  
          let derived = server_ech_hrr_confirmation_secret(
              cs.hkdf_provider,
-@@ -553,17 +555,18 @@
+@@ -553,17 +572,19 @@
      ///
      /// This will start the in-progress transcript using the given `hash`, convert it into an HRR
      /// buffer, and then add the hello retry message `m`.
 -    pub(crate) fn transcript_hrr_update(&mut self, hash: &'static dyn Hash, m: &Message<'_>) {
-+    pub(crate) fn transcript_hrr_update(&mut self, hash: &'static dyn Hash, m: &Message<'_>) -> Result<(), Error> {
++    pub(crate) fn transcript_hrr_update(
++        &mut self,
++        hash: &'static dyn Hash,
++        m: &Message<'_>,
++    ) -> Result<(), Error> {
          trace!("Updating ECH inner transcript for HRR");
  
-         let inner_transcript = self
-             .inner_hello_transcript
+-        let inner_transcript = self
+-            .inner_hello_transcript
 -            .clone()
-+            .try_clone()?
-             .start_hash(hash);
- 
+-            .start_hash(hash);
+-
 -        let mut inner_transcript_buffer = inner_transcript.into_hrr_buffer();
 -        inner_transcript_buffer.add_message(m);
++        let inner_transcript = self.inner_hello_transcript.try_clone()?.start_hash(hash)?;
++
 +        let mut inner_transcript_buffer = inner_transcript.into_hrr_buffer()?;
 +        inner_transcript_buffer.add_message(m)?;
          self.inner_hello_transcript = inner_transcript_buffer;
@@ -358,7 +431,7 @@
      }
  
      // 5.1 "Encoding the ClientHelloInner"
-@@ -572,16 +575,16 @@
+@@ -572,16 +593,23 @@
          outer_hello: &ClientHelloPayload,
          retryreq: Option<&HelloRetryRequest>,
          resuming: &Option<Retrieved<&persist::Tls13ClientSessionValue>>,
@@ -370,54 +443,78 @@
              client_version: outer_hello.client_version,
              session_id: outer_hello.session_id,
 -            compression_methods: outer_hello.compression_methods.clone(),
-+            compression_methods: outer_hello.compression_methods.try_clone_in(outer_hello.extensions.allocator.clone()).map_err(|_| crate::InvalidMessage::AllocationFailed)?,
++            compression_methods: outer_hello
++                .compression_methods
++                .try_clone_in(outer_hello.extensions.allocator.clone())
++                .map_err(|_| crate::InvalidMessage::AllocationFailed)?,
  
              // We will build up the included extensions ourselves.
 -            extensions: Box::new(ClientExtensions::default()),
-+            extensions: Box::try_new_in(ClientExtensions::new_in(outer_hello.extensions.allocator.clone()), outer_hello.extensions.allocator.clone()).map_err(|_| crate::InvalidMessage::AllocationFailed)?,
++            extensions: Box::try_new_in(
++                ClientExtensions::new_in(outer_hello.extensions.allocator.clone()),
++                outer_hello.extensions.allocator.clone(),
++            )
++            .map_err(|_| crate::InvalidMessage::AllocationFailed)?,
  
              // Set the inner hello random to the one we generated when creating the ECH state.
              // We hold on to the inner_hello_random in the ECH state to use later for confirming
-@@ -591,12 +594,11 @@
+@@ -591,12 +619,15 @@
              // We remove the empty renegotiation info SCSV from the outer hello's ciphersuite.
              // Similar to the TLS 1.2 specific extensions we will filter out, this is seen as a
              // TLS 1.2 only feature by bogo.
 -            cipher_suites: outer_hello
-+            cipher_suites: crate::msgs::retained::collect_in(outer_hello
-                 .cipher_suites
-                 .iter()
-                 .filter(|cs| **cs != TLS_EMPTY_RENEGOTIATION_INFO_SCSV)
+-                .cipher_suites
+-                .iter()
+-                .filter(|cs| **cs != TLS_EMPTY_RENEGOTIATION_INFO_SCSV)
 -                .cloned()
 -                .collect(),
-+                .cloned(), outer_hello.extensions.allocator.clone()).map_err(|_| crate::InvalidMessage::AllocationFailed)?,
++            cipher_suites: crate::msgs::retained::collect_in(
++                outer_hello
++                    .cipher_suites
++                    .iter()
++                    .filter(|cs| **cs != TLS_EMPTY_RENEGOTIATION_INFO_SCSV)
++                    .cloned(),
++                outer_hello.extensions.allocator.clone(),
++            )
++            .map_err(|_| crate::InvalidMessage::AllocationFailed)?,
          };
  
          inner_hello.order_seed = outer_hello.order_seed;
-@@ -635,7 +637,7 @@
+@@ -635,7 +666,13 @@
              if ext == ExtensionType::ServerName {
                  // We may want to replace the outer hello SNI with our own inner hello specific SNI.
                  if let Some(sni_value) = inner_sni {
 -                    inner_hello.server_name = Some(ServerNamePayload::from(sni_value));
-+                    inner_hello.server_name = Some(ServerNamePayload::try_from_dns_in(sni_value, outer_hello.extensions.allocator.clone()).map_err(|_| crate::InvalidMessage::AllocationFailed)?);
++                    inner_hello.server_name = Some(
++                        ServerNamePayload::try_from_dns_in(
++                            sni_value,
++                            outer_hello.extensions.allocator.clone(),
++                        )
++                        .map_err(|_| crate::InvalidMessage::AllocationFailed)?,
++                    );
                  }
                  // We don't want to add, or compress, the SNI from the outer hello.
                  continue;
-@@ -647,12 +649,12 @@
+@@ -647,12 +684,16 @@
                  compressed_exts.push(ext);
              }
  
 -            inner_hello.clone_one(outer_hello, ext);
-+            inner_hello.try_clone_one(outer_hello, ext).map_err(|_| crate::InvalidMessage::AllocationFailed)?;
++            inner_hello
++                .try_clone_one(outer_hello, ext)
++                .map_err(|_| crate::InvalidMessage::AllocationFailed)?;
          }
  
          // We've added all the uncompressed extensions. Now we need to add the contiguous
          // block of to-be-compressed extensions.
 -        inner_hello.contiguous_extensions = compressed_exts.clone();
-+        inner_hello.contiguous_extensions = compressed_exts.try_clone_in(outer_hello.extensions.allocator.clone()).map_err(|_| crate::InvalidMessage::AllocationFailed)?;
++        inner_hello.contiguous_extensions = compressed_exts
++            .try_clone_in(outer_hello.extensions.allocator.clone())
++            .map_err(|_| crate::InvalidMessage::AllocationFailed)?;
  
          // Note which extensions we're sending in the inner hello. This may differ from
          // the outer hello (e.g. the inner hello may omit SNI while the outer hello will
-@@ -668,7 +670,7 @@
+@@ -668,7 +709,7 @@
                  resuming,
                  &self.inner_hello_transcript,
                  &mut chp,
@@ -426,25 +523,39 @@
  
              // fill_in_psk_binder works on an owned HandshakeMessagePayload, so we need to
              // extract our inner hello back out of it to retain ownership.
-@@ -729,13 +731,13 @@
+@@ -728,41 +769,32 @@
+         };
  
          // Update the inner transcript buffer with the inner hello message.
-         self.inner_hello_transcript
+-        self.inner_hello_transcript
 -            .add_message(&inner_hello_msg);
 -
 -        encoded_hello
-+            .add_message(&inner_hello_msg)?;
++        self.inner_hello_transcript.add_message(&inner_hello_msg)?;
 +
 +        Ok(encoded_hello)
      }
  
      // See https://datatracker.ietf.org/doc/html/draft-ietf-tls-esni-18#name-grease-psk
 -    fn grease_psk(&self, psk_offer: &mut PresharedKeyOffer) -> Result<(), Error> {
-+    fn grease_psk(&self, psk_offer: &mut PresharedKeyOffer<crate::RetainedAllocator>) -> Result<(), Error> {
++    fn grease_psk(
++        &self,
++        psk_offer: &mut PresharedKeyOffer<crate::RetainedAllocator>,
++    ) -> Result<(), Error> {
          for ident in psk_offer.identities.iter_mut() {
              // "For each PSK identity advertised in the ClientHelloInner, the
              // client generates a random PSK identity with the same length."
-@@ -751,18 +753,9 @@
+-            self.secure_random
+-                .fill(&mut ident.identity.0)?;
++            self.secure_random.fill(&mut ident.identity.0)?;
+             // "It also generates a random, 32-bit, unsigned integer to use as
+             // the obfuscated_ticket_age."
+             let mut ticket_age = [0_u8; 4];
+-            self.secure_random
+-                .fill(&mut ticket_age)?;
++            self.secure_random.fill(&mut ticket_age)?;
+             ident.obfuscated_ticket_age = u32::from_be_bytes(ticket_age);
+         }
  
          // "Likewise, for each inner PSK binder, the client generates a random string
          // of the same length."
@@ -468,15 +579,38 @@
  
 --- a/src/client/hs.rs
 +++ b/src/client/hs.rs
-@@ -1,7 +1,7 @@
+@@ -1,6 +1,6 @@
++use crate::msgs::retained::{clone_slice_in, collect_in, TryCloneIn};
  use alloc::borrow::ToOwned;
  use alloc::boxed::Box;
 -use alloc::vec;
  use alloc::vec::Vec;
-+use crate::msgs::retained::{TryCloneIn, collect_in, clone_slice_in};
  use core::ops::Deref;
  
- use pki_types::ServerName;
+@@ -9,14 +9,13 @@
+ #[cfg(feature = "tls12")]
+ use super::tls12;
+ use super::{ResolvesClientCert, Tls12Resumption};
+-use crate::SupportedCipherSuite;
+ #[cfg(feature = "logging")]
+ use crate::bs_debug;
+ use crate::check::inappropriate_handshake_message;
+ use crate::client::client_conn::ClientConnectionData;
+ use crate::client::common::ClientHelloDetails;
+ use crate::client::ech::EchState;
+-use crate::client::{ClientConfig, EchMode, EchStatus, tls13};
++use crate::client::{tls13, ClientConfig, EchMode, EchStatus};
+ use crate::common_state::{CommonState, HandshakeKind, KxState, State};
+ use crate::conn::ConnectionRandoms;
+ use crate::crypto::{ActiveKeyExchange, KeyExchangeAlgorithm};
+@@ -40,6 +39,7 @@
+ use crate::sync::Arc;
+ use crate::tls13::key_schedule::KeyScheduleEarly;
+ use crate::verify::ServerCertVerifier;
++use crate::SupportedCipherSuite;
+ 
+ pub(super) type NextState<'a> = Box<dyn State<ClientConnectionData> + 'a>;
+ pub(super) type NextStateOrError<'a> = Result<NextState<'a>, Error>;
 @@ -74,7 +74,7 @@
      pub(super) hello: ClientHelloDetails,
      pub(super) session_id: SessionId,
@@ -509,25 +643,40 @@
          );
  
          Ok(Self {
-@@ -144,7 +146,7 @@
+@@ -144,12 +146,11 @@
          extra_exts: ClientExtensionsInput<'static>,
          cx: &mut ClientContext<'_>,
      ) -> NextStateOrError<'static> {
 -        let mut transcript_buffer = HandshakeHashBuffer::new();
-+        let mut transcript_buffer = HandshakeHashBuffer::new_in(cx.common.message_allocator.clone());
-         if self
-             .config
-             .client_auth_cert_resolver
-@@ -165,7 +167,7 @@
+-        if self
+-            .config
+-            .client_auth_cert_resolver
+-            .has_certs()
+-        {
++        let mut transcript_buffer = HandshakeHashBuffer::new_in(
++            cx.common.message_allocator.clone(),
++            cx.common.message_allocator.clone(),
++        );
++        if self.config.client_auth_cert_resolver.has_certs() {
+             transcript_buffer.set_client_auth_enabled();
+         }
+ 
+@@ -164,9 +165,11 @@
+         };
  
          let ech_state = match self.config.ech_mode.as_ref() {
-             Some(EchMode::Enable(ech_config)) => {
+-            Some(EchMode::Enable(ech_config)) => {
 -                Some(ech_config.state(self.server_name.clone(), &self.config)?)
-+                Some(ech_config.state(self.server_name.clone(), &self.config, cx.common.message_allocator.clone())?)
-             }
+-            }
++            Some(EchMode::Enable(ech_config)) => Some(ech_config.state(
++                self.server_name.clone(),
++                &self.config,
++                cx.common.message_allocator.clone(),
++            )?),
              _ => None,
          };
-@@ -199,6 +201,7 @@
+ 
+@@ -199,6 +202,7 @@
      mut ech_state: Option<EchState>,
  ) -> NextStateOrError<'static> {
      let config = &input.config;
@@ -535,44 +684,72 @@
      // Defense in depth: the ECH state should be None if ECH is disabled based on config
      // builder semantics.
      let forbids_tls12 = cx.common.is_quic() || ech_state.is_some();
-@@ -212,28 +215,27 @@
+@@ -212,28 +216,42 @@
      // should be unreachable thanks to config builder
      assert!(supported_versions.any(|_| true));
  
 -    let mut exts = Box::new(ClientExtensions {
-+    let mut exts = Box::try_new_in(ClientExtensions {
-         // offer groups which are usable for any offered version
+-        // offer groups which are usable for any offered version
 -        named_groups: Some(
-+        named_groups: Some(collect_in(
-             config
-                 .provider
-                 .kx_groups
-                 .iter()
-                 .filter(|skxg| supported_versions.any(|v| skxg.usable_for_version(v)))
+-            config
+-                .provider
+-                .kx_groups
+-                .iter()
+-                .filter(|skxg| supported_versions.any(|v| skxg.usable_for_version(v)))
 -                .map(|skxg| skxg.name())
 -                .collect(),
-+                .map(|skxg| skxg.name()), allocator.clone()).map_err(|_| crate::InvalidMessage::AllocationFailed)?,
-         ),
-         supported_versions: Some(supported_versions),
-         signature_schemes: Some(
-             config
-                 .verifier
+-        ),
+-        supported_versions: Some(supported_versions),
+-        signature_schemes: Some(
+-            config
+-                .verifier
 -                .supported_verify_schemes(),
-+                .supported_verify_schemes().try_clone_in(allocator.clone()).map_err(|_| crate::InvalidMessage::AllocationFailed)?,
-         ),
-         extended_master_secret_request: Some(()),
+-        ),
+-        extended_master_secret_request: Some(()),
 -        certificate_status_request: Some(CertificateStatusRequest::build_ocsp()),
 -        protocols: extra_exts.protocols.clone(),
 -        ..Default::default()
 -    });
-+        certificate_status_request: Some(CertificateStatusRequest::empty_ocsp_in(allocator.clone())),
-+        protocols: extra_exts.protocols.try_clone_in(allocator.clone()).map_err(|_| crate::InvalidMessage::AllocationFailed)?,
-+        ..ClientExtensions::new_in(allocator.clone())
-+    }, allocator.clone()).map_err(|_| crate::InvalidMessage::AllocationFailed)?;
++    let mut exts = Box::try_new_in(
++        ClientExtensions {
++            // offer groups which are usable for any offered version
++            named_groups: Some(
++                collect_in(
++                    config
++                        .provider
++                        .kx_groups
++                        .iter()
++                        .filter(|skxg| supported_versions.any(|v| skxg.usable_for_version(v)))
++                        .map(|skxg| skxg.name()),
++                    allocator.clone(),
++                )
++                .map_err(|_| crate::InvalidMessage::AllocationFailed)?,
++            ),
++            supported_versions: Some(supported_versions),
++            signature_schemes: Some(
++                config
++                    .verifier
++                    .supported_verify_schemes()
++                    .try_clone_in(allocator.clone())
++                    .map_err(|_| crate::InvalidMessage::AllocationFailed)?,
++            ),
++            extended_master_secret_request: Some(()),
++            certificate_status_request: Some(CertificateStatusRequest::empty_ocsp_in(
++                allocator.clone(),
++            )),
++            protocols: extra_exts
++                .protocols
++                .try_clone_in(allocator.clone())
++                .map_err(|_| crate::InvalidMessage::AllocationFailed)?,
++            ..ClientExtensions::new_in(allocator.clone())
++        },
++        allocator.clone(),
++    )
++    .map_err(|_| crate::InvalidMessage::AllocationFailed)?;
  
      if !config
          .crypto_provider()
-@@ -246,15 +248,15 @@
+@@ -246,15 +264,28 @@
          }
      }
  
@@ -580,96 +757,157 @@
 -        Some(TransportParameters::Quic(v)) => exts.transport_parameters = Some(v),
 -        Some(TransportParameters::QuicDraft(v)) => exts.transport_parameters_draft = Some(v),
 +    match &extra_exts.transport_parameters {
-+        Some(TransportParameters::Quic(v)) => exts.transport_parameters = Some(v.try_clone_in(allocator.clone()).map_err(|_| crate::InvalidMessage::AllocationFailed)?),
-+        Some(TransportParameters::QuicDraft(v)) => exts.transport_parameters_draft = Some(v.try_clone_in(allocator.clone()).map_err(|_| crate::InvalidMessage::AllocationFailed)?),
++        Some(TransportParameters::Quic(v)) => {
++            exts.transport_parameters = Some(
++                v.try_clone_in(allocator.clone())
++                    .map_err(|_| crate::InvalidMessage::AllocationFailed)?,
++            )
++        }
++        Some(TransportParameters::QuicDraft(v)) => {
++            exts.transport_parameters_draft = Some(
++                v.try_clone_in(allocator.clone())
++                    .map_err(|_| crate::InvalidMessage::AllocationFailed)?,
++            )
++        }
          None => {}
      };
  
      if supported_versions.tls13 {
          if let Some(cas_extension) = config.verifier.root_hint_subjects() {
 -            exts.certificate_authority_names = Some(cas_extension.to_owned());
-+            exts.certificate_authority_names = Some(clone_slice_in(cas_extension, allocator.clone()).map_err(|_| crate::InvalidMessage::AllocationFailed)?);
++            exts.certificate_authority_names = Some(
++                clone_slice_in(cas_extension, allocator.clone())
++                    .map_err(|_| crate::InvalidMessage::AllocationFailed)?,
++            );
          }
      }
  
-@@ -273,12 +275,12 @@
+@@ -273,12 +304,18 @@
          // as the SNI domain name. This happens unconditionally so we ignore the
          // `enable_sni` value. That will be used later to decide what to do for
          // the protected inner hello's SNI.
 -        (Some(ech_state), _) => Some(ServerNamePayload::from(&ech_state.outer_name)),
-+        (Some(ech_state), _) => Some(ServerNamePayload::try_from_dns_in(&ech_state.outer_name, allocator.clone()).map_err(|_| crate::InvalidMessage::AllocationFailed)?),
++        (Some(ech_state), _) => Some(
++            ServerNamePayload::try_from_dns_in(&ech_state.outer_name, allocator.clone())
++                .map_err(|_| crate::InvalidMessage::AllocationFailed)?,
++        ),
  
          // If we have no ECH state, and SNI is enabled, try to use the input server_name
          // for the SNI domain name.
          (None, true) => match &input.server_name {
 -            ServerName::DnsName(dns_name) => Some(ServerNamePayload::from(dns_name)),
-+            ServerName::DnsName(dns_name) => Some(ServerNamePayload::try_from_dns_in(dns_name, allocator.clone()).map_err(|_| crate::InvalidMessage::AllocationFailed)?),
++            ServerName::DnsName(dns_name) => Some(
++                ServerNamePayload::try_from_dns_in(dns_name, allocator.clone())
++                    .map_err(|_| crate::InvalidMessage::AllocationFailed)?,
++            ),
              _ => None,
          },
  
-@@ -288,7 +290,9 @@
+@@ -288,7 +325,14 @@
  
      if let Some(key_share) = &key_share {
          debug_assert!(supported_versions.tls13);
 -        let mut shares = vec![KeyShareEntry::new(key_share.group(), key_share.pub_key())];
 +        let mut shares = Vec::new_in(allocator.clone());
-+        shares.try_reserve(1).map_err(|_| crate::InvalidMessage::AllocationFailed)?;
-+        shares.push(KeyShareEntry::try_new_in(key_share.group(), key_share.pub_key(), allocator.clone()).map_err(|_| crate::InvalidMessage::AllocationFailed)?);
++        shares
++            .try_reserve(1)
++            .map_err(|_| crate::InvalidMessage::AllocationFailed)?;
++        shares.push(
++            KeyShareEntry::try_new_in(key_share.group(), key_share.pub_key(), allocator.clone())
++                .map_err(|_| crate::InvalidMessage::AllocationFailed)?,
++        );
  
          if !retryreq
              .map(|rr| rr.key_share.is_some())
-@@ -307,7 +311,8 @@
-                             .is_some()
-                     })
+@@ -299,15 +343,19 @@
+             // algorithm is also supported separately by our provider for this version
+             // (`find_kx_group` looks that up).
+             if let Some((component_group, component_share)) =
+-                key_share
+-                    .hybrid_component()
+-                    .filter(|(group, _)| {
+-                        config
+-                            .find_kx_group(*group, ProtocolVersion::TLSv1_3)
+-                            .is_some()
+-                    })
++                key_share.hybrid_component().filter(|(group, _)| {
++                    config
++                        .find_kx_group(*group, ProtocolVersion::TLSv1_3)
++                        .is_some()
++                })
              {
 -                shares.push(KeyShareEntry::new(component_group, component_share));
-+                shares.try_reserve(1).map_err(|_| crate::InvalidMessage::AllocationFailed)?;
-+                shares.push(KeyShareEntry::try_new_in(component_group, component_share, allocator.clone()).map_err(|_| crate::InvalidMessage::AllocationFailed)?);
++                shares
++                    .try_reserve(1)
++                    .map_err(|_| crate::InvalidMessage::AllocationFailed)?;
++                shares.push(
++                    KeyShareEntry::try_new_in(component_group, component_share, allocator.clone())
++                        .map_err(|_| crate::InvalidMessage::AllocationFailed)?,
++                );
              }
          }
  
-@@ -315,7 +320,7 @@
+@@ -315,7 +363,11 @@
      }
  
      if let Some(cookie) = retryreq.and_then(|hrr| hrr.cookie.as_ref()) {
 -        exts.cookie = Some(cookie.clone());
-+        exts.cookie = Some(cookie.try_clone_in(allocator.clone()).map_err(|_| crate::InvalidMessage::AllocationFailed)?);
++        exts.cookie = Some(
++            cookie
++                .try_clone_in(allocator.clone())
++                .map_err(|_| crate::InvalidMessage::AllocationFailed)?,
++        );
      }
  
      if supported_versions.tls13 {
-@@ -336,12 +341,11 @@
- 
+@@ -337,29 +389,29 @@
      input.hello.offered_cert_compression =
          if supported_versions.tls13 && !config.cert_decompressors.is_empty() {
--            exts.certificate_compression_algorithms = Some(
-+            exts.certificate_compression_algorithms = Some(collect_in(
-                 config
-                     .cert_decompressors
-                     .iter()
+             exts.certificate_compression_algorithms = Some(
+-                config
+-                    .cert_decompressors
+-                    .iter()
 -                    .map(|dec| dec.algorithm())
 -                    .collect(),
-+                    .map(|dec| dec.algorithm()), allocator.clone()).map_err(|_| crate::InvalidMessage::AllocationFailed)?,
++                collect_in(
++                    config.cert_decompressors.iter().map(|dec| dec.algorithm()),
++                    allocator.clone(),
++                )
++                .map_err(|_| crate::InvalidMessage::AllocationFailed)?,
              );
              true
          } else {
-@@ -352,14 +356,14 @@
-         .client_auth_cert_resolver
-         .only_raw_public_keys()
-     {
--        exts.client_certificate_types = Some(vec![CertificateType::RawPublicKey]);
-+        exts.client_certificate_types = Some(collect_in([CertificateType::RawPublicKey], allocator.clone()).map_err(|_| crate::InvalidMessage::AllocationFailed)?);
-     }
+             false
+         };
  
-     if config
-         .verifier
-         .requires_raw_public_keys()
-     {
+-    if config
+-        .client_auth_cert_resolver
+-        .only_raw_public_keys()
+-    {
+-        exts.client_certificate_types = Some(vec![CertificateType::RawPublicKey]);
+-    }
+-
+-    if config
+-        .verifier
+-        .requires_raw_public_keys()
+-    {
 -        exts.server_certificate_types = Some(vec![CertificateType::RawPublicKey]);
-+        exts.server_certificate_types = Some(collect_in([CertificateType::RawPublicKey], allocator.clone()).map_err(|_| crate::InvalidMessage::AllocationFailed)?);
++    if config.client_auth_cert_resolver.only_raw_public_keys() {
++        exts.client_certificate_types = Some(
++            collect_in([CertificateType::RawPublicKey], allocator.clone())
++                .map_err(|_| crate::InvalidMessage::AllocationFailed)?,
++        );
++    }
++
++    if config.verifier.requires_raw_public_keys() {
++        exts.server_certificate_types = Some(
++            collect_in([CertificateType::RawPublicKey], allocator.clone())
++                .map_err(|_| crate::InvalidMessage::AllocationFailed)?,
++        );
      }
  
      // If this is a second client hello we're constructing in response to an HRR, and
-@@ -372,13 +376,13 @@
+@@ -372,24 +424,28 @@
      }
  
      // Do we have a SessionID or ticket cached for this host?
@@ -681,62 +919,101 @@
      exts.order_seed = input.hello.extension_order_seed;
  
 -    let mut cipher_suites: Vec<_> = config
-+    let mut cipher_suites = collect_in(config
-         .provider
-         .cipher_suites
-         .iter()
-@@ -386,10 +390,11 @@
-             true => Some(cs.suite()),
-             false => None,
-         })
+-        .provider
+-        .cipher_suites
+-        .iter()
+-        .filter_map(|cs| match cs.usable_for_protocol(cx.common.protocol) {
+-            true => Some(cs.suite()),
+-            false => None,
+-        })
 -        .collect();
-+        , allocator.clone()).map_err(|_| crate::InvalidMessage::AllocationFailed)?;
++    let mut cipher_suites = collect_in(
++        config.provider.cipher_suites.iter().filter_map(|cs| {
++            match cs.usable_for_protocol(cx.common.protocol) {
++                true => Some(cs.suite()),
++                false => None,
++            }
++        }),
++        allocator.clone(),
++    )
++    .map_err(|_| crate::InvalidMessage::AllocationFailed)?;
  
      if supported_versions.tls12 {
          // We don't do renegotiation at all, in fact.
-+        cipher_suites.try_reserve(1).map_err(|_| crate::InvalidMessage::AllocationFailed)?;
++        cipher_suites
++            .try_reserve(1)
++            .map_err(|_| crate::InvalidMessage::AllocationFailed)?;
          cipher_suites.push(CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV);
      }
  
-@@ -398,7 +403,7 @@
+@@ -398,21 +454,19 @@
          random: input.random,
          session_id: input.session_id,
          cipher_suites,
 -        compression_methods: vec![Compression::Null],
-+        compression_methods: collect_in([Compression::Null], allocator.clone()).map_err(|_| crate::InvalidMessage::AllocationFailed)?,
++        compression_methods: collect_in([Compression::Null], allocator.clone())
++            .map_err(|_| crate::InvalidMessage::AllocationFailed)?,
          extensions: exts,
      };
  
-@@ -422,9 +427,7 @@
-             chp_payload = ech_state.ech_hello(chp_payload, retryreq, &tls13_session)?;
-             cx.data.ech_status = EchStatus::Offered;
+-    let ech_grease_ext = config
+-        .ech_mode
+-        .as_ref()
+-        .and_then(|mode| match mode {
+-            EchMode::Grease(cfg) => Some(cfg.grease_ext(
+-                config.provider.secure_random,
+-                input.server_name.clone(),
+-                &chp_payload,
+-            )),
+-            _ => None,
+-        });
++    let ech_grease_ext = config.ech_mode.as_ref().and_then(|mode| match mode {
++        EchMode::Grease(cfg) => Some(cfg.grease_ext(
++            config.provider.secure_random,
++            input.server_name.clone(),
++            &chp_payload,
++        )),
++        _ => None,
++    });
+ 
+     match (cx.data.ech_status, &mut ech_state) {
+         // If we haven't offered ECH, or have offered ECH but got a non-rejecting HRR, then
+@@ -424,7 +478,8 @@
              // Store the ECH extension in case we need to carry it forward in a subsequent hello.
--            input.prev_ech_ext = chp_payload
--                .encrypted_client_hello
+             input.prev_ech_ext = chp_payload
+                 .encrypted_client_hello
 -                .clone();
-+            input.prev_ech_ext = chp_payload.encrypted_client_hello.try_clone_in(allocator.clone()).map_err(|_| crate::InvalidMessage::AllocationFailed)?;
++                .try_clone_in(allocator.clone())
++                .map_err(|_| crate::InvalidMessage::AllocationFailed)?;
          }
          // If we haven't offered ECH, and have no ECH state, then consider whether to use GREASE
          // ECH.
-@@ -432,7 +435,7 @@
+@@ -432,7 +487,11 @@
              if let Some(grease_ext) = ech_grease_ext {
                  // Add the GREASE ECH extension.
                  let grease_ext = grease_ext?;
 -                chp_payload.encrypted_client_hello = Some(grease_ext.clone());
-+                chp_payload.encrypted_client_hello = Some(grease_ext.try_clone_in(allocator.clone()).map_err(|_| crate::InvalidMessage::AllocationFailed)?);
++                chp_payload.encrypted_client_hello = Some(
++                    grease_ext
++                        .try_clone_in(allocator.clone())
++                        .map_err(|_| crate::InvalidMessage::AllocationFailed)?,
++                );
                  cx.data.ech_status = EchStatus::Grease;
                  // Store the GREASE ECH extension in case we need to carry it forward in a
                  // subsequent hello.
-@@ -444,7 +447,7 @@
+@@ -444,7 +503,10 @@
  
      // Note what extensions we sent.
      input.hello.sent_extensions = chp_payload.collect_used();
 -    input.hello.offered_cipher_suites = chp_payload.cipher_suites.clone();
-+    input.hello.offered_cipher_suites = chp_payload.cipher_suites.try_clone_in(allocator.clone()).map_err(|_| crate::InvalidMessage::AllocationFailed)?;
++    input.hello.offered_cipher_suites = chp_payload
++        .cipher_suites
++        .try_clone_in(allocator.clone())
++        .map_err(|_| crate::InvalidMessage::AllocationFailed)?;
  
      let mut chp = HandshakeMessagePayload(HandshakePayload::ClientHello(chp_payload));
  
-@@ -460,7 +463,7 @@
+@@ -460,7 +522,7 @@
          // normal.
          (_, Some(tls13_session)) => Some((
              tls13_session.suite(),
@@ -745,7 +1022,7 @@
          )),
  
          // No early key schedule in other cases.
-@@ -491,7 +494,7 @@
+@@ -491,14 +553,14 @@
  
      trace!("Sending ClientHello {ch:#?}");
  
@@ -754,7 +1031,31 @@
      cx.common.send_msg(ch, false);
  
      // Calculate the hash of ClientHello and use it to derive EarlyTrafficSecret
-@@ -563,7 +566,7 @@
+-    let early_data_key_schedule =
+-        tls13_early_data_key_schedule.map(|(resuming_suite, schedule)| {
++    let early_data_key_schedule = tls13_early_data_key_schedule
++        .map(|(resuming_suite, schedule)| -> Result<_, Error> {
+             if !cx.data.early_data.is_enabled() {
+-                return schedule;
++                return Ok(schedule);
+             }
+ 
+             let (transcript_buffer, random) = match &ech_state {
+@@ -519,9 +581,10 @@
+                 &mut input.sent_tls13_fake_ccs,
+                 transcript_buffer,
+                 random,
+-            );
+-            schedule
+-        });
++            )?;
++            Ok(schedule)
++        })
++        .transpose()?;
+ 
+     let next = ExpectServerHello {
+         input,
+@@ -563,7 +626,7 @@
      suite: Option<SupportedCipherSuite>,
      cx: &mut ClientContext<'_>,
      config: &ClientConfig,
@@ -763,7 +1064,7 @@
      // Check whether we're resuming with a non-empty ticket.
      let resuming = match resuming {
          Some(resuming) if !resuming.ticket().is_empty() => resuming,
-@@ -574,7 +577,7 @@
+@@ -574,7 +637,7 @@
                  // If we don't have a ticket, request one.
                  exts.session_ticket = Some(ClientSessionTicket::Request);
              }
@@ -772,14 +1073,18 @@
          }
      };
  
-@@ -583,42 +586,42 @@
+@@ -583,42 +646,52 @@
          if config.supports_version(ProtocolVersion::TLSv1_2, cx.common.protocol)
              && config.resumption.tls12_resumption == Tls12Resumption::SessionIdOrTickets
          {
 -            exts.session_ticket = Some(ClientSessionTicket::Offer(Payload::new(resuming.ticket())));
 -        }
 -        return None; // TLS 1.2, so nothing to return here
-+            exts.session_ticket = Some(ClientSessionTicket::Offer(Payload::Borrowed(resuming.ticket()).try_into_owned_in(exts.allocator.clone()).map_err(|_| crate::InvalidMessage::AllocationFailed)?));
++            exts.session_ticket = Some(ClientSessionTicket::Offer(
++                Payload::Borrowed(resuming.ticket())
++                    .try_into_owned_in(exts.allocator.clone())
++                    .map_err(|_| crate::InvalidMessage::AllocationFailed)?,
++            ));
 +        }
 +        return Ok(None); // TLS 1.2, so nothing to return here
      };
@@ -805,7 +1110,9 @@
 -
 -    tls13::prepare_resumption(config, cx, &tls13, exts, suite.is_some());
 -    Some(tls13)
-+        if suite.can_resume_from(tls13.suite()).is_none() { return Ok(None); }
++        if suite.can_resume_from(tls13.suite()).is_none() {
++            return Ok(None);
++        }
 +    }
 +
 +    tls13::prepare_resumption(config, cx, &tls13, exts, suite.is_some())?;
@@ -823,25 +1130,72 @@
  
      if let Some(alpn_protocol) = &common.alpn_protocol {
 -        if check_selected_offered && !offered_protocols.contains(alpn_protocol) {
-+        if check_selected_offered && !offered_protocols.iter().any(|offered| offered.as_ref() == alpn_protocol.as_ref()) {
++        if check_selected_offered
++            && !offered_protocols
++                .iter()
++                .any(|offered| offered.as_ref() == alpn_protocol.as_ref())
++        {
              return Err(common.send_fatal_alert(
                  AlertDescription::IllegalParameter,
                  PeerMisbehaved::SelectedUnofferedApplicationProtocol,
-@@ -824,7 +827,7 @@
-         let mut transcript = self
-             .transcript_buffer
-             .start_hash(suite.hash_provider());
+@@ -656,9 +729,7 @@
+ ) -> Result<Option<(ExtensionType, CertificateType)>, Error> {
+     process_cert_type_extension(
+         common,
+-        config
+-            .verifier
+-            .requires_raw_public_keys(),
++        config.verifier.requires_raw_public_keys(),
+         server_cert_extension.copied(),
+         ExtensionType::ServerCertificateType,
+     )
+@@ -671,9 +742,7 @@
+ ) -> Result<Option<(ExtensionType, CertificateType)>, Error> {
+     process_cert_type_extension(
+         common,
+-        config
+-            .client_auth_cert_resolver
+-            .only_raw_public_keys(),
++        config.client_auth_cert_resolver.only_raw_public_keys(),
+         client_cert_extension.copied(),
+         ExtensionType::ClientCertificateType,
+     )
+@@ -763,10 +832,7 @@
+             process_alpn_protocol(
+                 cx.common,
+                 &self.input.hello.alpn_protocols,
+-                server_hello
+-                    .selected_protocol
+-                    .as_ref()
+-                    .map(|s| s.as_ref()),
++                server_hello.selected_protocol.as_ref().map(|s| s.as_ref()),
+                 self.input.config.check_selected_alpn,
+             )?;
+         }
+@@ -821,10 +887,8 @@
+         }
+ 
+         // Start our handshake hash, and input the server-hello.
+-        let mut transcript = self
+-            .transcript_buffer
+-            .start_hash(suite.hash_provider());
 -        transcript.add_message(&m);
++        let mut transcript = self.transcript_buffer.start_hash(suite.hash_provider())?;
 +        transcript.add_message(&m)?;
  
          let randoms = ConnectionRandoms::new(self.input.random, server_hello.random);
          // For TLS1.3, start message encryption using
-@@ -1008,13 +1011,13 @@
-             .next
-             .transcript_buffer
-             .start_hash(cs.hash_provider());
+@@ -1004,17 +1068,14 @@
+         };
+ 
+         // This is the draft19 change where the transcript became a tree
+-        let transcript = self
+-            .next
+-            .transcript_buffer
+-            .start_hash(cs.hash_provider());
 -        let mut transcript_buffer = transcript.into_hrr_buffer();
 -        transcript_buffer.add_message(&m);
++        let transcript = self.next.transcript_buffer.start_hash(cs.hash_provider())?;
 +        let mut transcript_buffer = transcript.into_hrr_buffer()?;
 +        transcript_buffer.add_message(&m)?;
  
@@ -853,7 +1207,18 @@
          }
  
          // Early data is not allowed after HelloRetryrequest
-@@ -1115,7 +1118,7 @@
+@@ -1063,9 +1124,7 @@
+             MessagePayload::Handshake {
+                 parsed: HandshakeMessagePayload(HandshakePayload::ServerHello(..)),
+                 ..
+-            } => self
+-                .into_expect_server_hello()
+-                .handle(cx, m),
++            } => self.into_expect_server_hello().handle(cx, m),
+             MessagePayload::Handshake {
+                 parsed: HandshakeMessagePayload(HandshakePayload::HelloRetryRequest(..)),
+                 ..
+@@ -1115,7 +1174,7 @@
          server_name: &ServerName<'static>,
          config: &ClientConfig,
          cx: &mut ClientContext<'_>,
@@ -862,7 +1227,7 @@
          let found = config
              .resumption
              .store
-@@ -1158,11 +1161,12 @@
+@@ -1158,11 +1217,18 @@
              if cx.common.is_quic() {
                  cx.common.quic.params = resuming
                      .tls13()
@@ -871,8 +1236,14 @@
 -        }
 -
 -        found
-+                    .map(|v| crate::msgs::retained::copy_bytes_in(v.quic_params(), cx.common.message_allocator.clone()))
-+                    .transpose().map_err(|_| crate::InvalidMessage::AllocationFailed)?;
++                    .map(|v| {
++                        crate::msgs::retained::copy_bytes_in(
++                            v.quic_params(),
++                            cx.common.message_allocator.clone(),
++                        )
++                    })
++                    .transpose()
++                    .map_err(|_| crate::InvalidMessage::AllocationFailed)?;
 +            }
 +        }
 +
@@ -1459,7 +1830,7 @@
  use crate::crypto::hash::Hash;
  use crate::crypto::{ActiveKeyExchange, SharedSecret};
  use crate::enums::{
-@@ -29,14 +29,14 @@
+@@ -29,14 +29,13 @@
  use crate::msgs::codec::{Codec, Reader};
  use crate::msgs::enums::{ExtensionType, KeyUpdateRequest};
  use crate::msgs::handshake::{
@@ -1468,9 +1839,8 @@
 -    PresharedKeyBinder, PresharedKeyIdentity, PresharedKeyOffer, ServerExtensions,
 -    ServerHelloPayload,
 +    CertificatePayloadTls13, ClientExtensions, EchConfigPayload, HandshakeMessagePayload,
-+    HandshakePayload, KeyShareEntry, NewSessionTicketPayloadTls13,
-+    PresharedKeyOffer, ServerExtensions, ServerHelloPayload,
-+    CERTIFICATE_MAX_SIZE_LIMIT,
++    HandshakePayload, KeyShareEntry, NewSessionTicketPayloadTls13, PresharedKeyOffer,
++    ServerExtensions, ServerHelloPayload, CERTIFICATE_MAX_SIZE_LIMIT,
  };
  use crate::msgs::message::{Message, MessagePayload};
  use crate::msgs::persist::{self, Retrieved};
@@ -1479,7 +1849,7 @@
  use crate::suites::PartiallyExtractedSecrets;
  use crate::sync::Arc;
  use crate::tls13::key_schedule::{
-@@ -44,10 +44,10 @@
+@@ -44,10 +43,10 @@
      KeyScheduleTraffic,
  };
  use crate::tls13::{
@@ -1492,7 +1862,7 @@
  
  // Extensions we expect in plaintext in the ServerHello.
  static ALLOWED_PLAINTEXT_EXTS: &[ExtensionType] = &[
-@@ -81,15 +81,12 @@
+@@ -81,15 +80,12 @@
  ) -> hs::NextStateOrError<'static> {
      validate_server_hello(cx.common, server_hello)?;
  
@@ -1514,7 +1884,7 @@
  
      let ClientHelloInput {
          config,
-@@ -202,9 +199,7 @@
+@@ -202,9 +198,7 @@
              // server hello message, and switch the relevant state to the copies for the
              // inner client hello.
              Some(mut accepted) => {
@@ -1525,7 +1895,7 @@
                  transcript = accepted.transcript;
                  randoms.client = accepted.random.0;
                  hello.sent_extensions = accepted.sent_extensions;
-@@ -267,9 +262,7 @@
+@@ -267,9 +261,7 @@
              return Ok(Self::Whole(our_key_share));
          }
  
@@ -1536,7 +1906,7 @@
  
          if component_group != their_key_share.group {
              return Err(());
-@@ -337,7 +330,7 @@
+@@ -337,7 +329,7 @@
      resuming: &persist::Tls13ClientSessionValue,
      transcript: &HandshakeHashBuffer,
      hmp: &mut HandshakeMessagePayload<'_>,
@@ -1545,12 +1915,23 @@
      // We need to know the hash function of the suite we're trying to resume into.
      let suite = resuming.suite();
      let suite_hash = suite.common.hash_provider;
-@@ -364,11 +357,11 @@
+@@ -345,7 +337,7 @@
+     // The binder is calculated over the clienthello, but doesn't include itself or its
+     // length, or the length of its container.
+     let binder_plaintext = hmp.encoding_for_binder_signing();
+-    let handshake_hash = transcript.hash_given(suite_hash, &binder_plaintext);
++    let handshake_hash = transcript.hash_given(suite_hash, &binder_plaintext)?;
+ 
+     // Run a fake key_schedule to simulate what the server will do if it chooses
+     // to resume.
+@@ -364,11 +356,13 @@
              debug_assert_eq!(identities.len(), 1);
              debug_assert_eq!(binders.len(), 1);
              debug_assert_eq!(binders[0].as_ref().len(), real_binder.as_ref().len());
 -            binders[0] = PresharedKeyBinder::from(real_binder.as_ref().to_vec());
-+            binders[0].try_replace(real_binder.as_ref()).map_err(|_| InvalidMessage::AllocationFailed)?;
++            binders[0]
++                .try_replace(real_binder.as_ref())
++                .map_err(|_| InvalidMessage::AllocationFailed)?;
          }
      };
  
@@ -1559,7 +1940,7 @@
  }
  
  pub(super) fn prepare_resumption(
-@@ -377,16 +370,14 @@
+@@ -377,16 +371,14 @@
      resuming_session: &Retrieved<&persist::Tls13ClientSessionValue>,
      exts: &mut ClientExtensions<'_>,
      doing_retry: bool,
@@ -1578,7 +1959,7 @@
          exts.early_data_request = Some(());
      }
  
-@@ -397,16 +388,9 @@
+@@ -397,16 +389,17 @@
      // the message it's contained in (!!!).
      let obfuscated_ticket_age = resuming_session.obfuscated_ticket_age();
  
@@ -1593,12 +1974,43 @@
 -    let psk_offer = PresharedKeyOffer::new(psk_identity, binder);
 -    exts.preshared_key_offer = Some(psk_offer);
 +    let binder_len = resuming_suite.common.hash_provider.output_len();
-+    exts.preshared_key_offer = Some(PresharedKeyOffer::try_new_in(resuming_session.ticket(), obfuscated_ticket_age, binder_len, exts.allocator.clone()).map_err(|_| InvalidMessage::AllocationFailed)?);
++    exts.preshared_key_offer = Some(
++        PresharedKeyOffer::try_new_in(
++            resuming_session.ticket(),
++            obfuscated_ticket_age,
++            binder_len,
++            exts.allocator.clone(),
++        )
++        .map_err(|_| InvalidMessage::AllocationFailed)?,
++    );
 +    Ok(())
  }
  
  pub(super) fn derive_early_traffic_secret(
-@@ -498,7 +482,7 @@
+@@ -417,11 +410,10 @@
+     sent_tls13_fake_ccs: &mut bool,
+     transcript_buffer: &HandshakeHashBuffer,
+     client_random: &[u8; 32],
+-) {
+-    // For middlebox compatibility
++) -> Result<(), Error> {
++    let client_hello_hash = transcript_buffer.hash_given(hash_alg, &[])?;
++    // For middlebox compatibility; context admission precedes visible mutation.
+     emit_fake_ccs(sent_tls13_fake_ccs, cx.common);
+-
+-    let client_hello_hash = transcript_buffer.hash_given(hash_alg, &[]);
+     early_key_schedule.client_early_traffic_secret(
+         &client_hello_hash,
+         key_log,
+@@ -432,6 +424,7 @@
+     // Now the client can send encrypted early data
+     cx.common.early_traffic = true;
+     trace!("Starting early data traffic");
++    Ok(())
+ }
+ 
+ pub(super) fn emit_fake_ccs(sent_tls13_fake_ccs: &mut bool, common: &mut CommonState) {
+@@ -498,7 +491,7 @@
              HandshakePayload::EncryptedExtensions
          )?;
          debug!("TLS1.3 encrypted extensions: {exts:?}");
@@ -1607,7 +2019,7 @@
  
          validate_encrypted_extensions(cx.common, &self.hello, exts)?;
          hs::process_alpn_protocol(
-@@ -532,9 +516,7 @@
+@@ -532,9 +525,7 @@
              // If we offered ECH, and it was rejected, store the retry configs (if any) from
              // the server's ECH extension. We will return them in an error produced at the end
              // of the handshake.
@@ -1618,16 +2030,24 @@
              _ => None,
          };
  
-@@ -545,7 +527,7 @@
+@@ -545,7 +536,15 @@
                  .as_ref()
                  .or(exts.transport_parameters_draft.as_ref())
              {
 -                Some(params) => cx.common.quic.params = Some(params.clone().into_vec()),
-+                Some(params) => cx.common.quic.params = Some(crate::msgs::retained::copy_bytes_in(params.bytes(), cx.common.message_allocator.clone()).map_err(|_| InvalidMessage::AllocationFailed)?),
++                Some(params) => {
++                    cx.common.quic.params = Some(
++                        crate::msgs::retained::copy_bytes_in(
++                            params.bytes(),
++                            cx.common.message_allocator.clone(),
++                        )
++                        .map_err(|_| InvalidMessage::AllocationFailed)?,
++                    )
++                }
                  None => {
                      return Err(cx
                          .common
-@@ -569,15 +551,10 @@
+@@ -569,15 +568,10 @@
  
                  if was_early_traffic && !cx.common.early_traffic {
                      // If no early traffic, set the encryption key for handshakes
@@ -1645,7 +2065,7 @@
                  cx.common.handshake_kind = Some(HandshakeKind::Resumed);
  
                  // We *don't* reverify the certificate chain here: resumption is a
-@@ -601,9 +578,7 @@
+@@ -601,9 +595,7 @@
                  if exts.early_data_ack.is_some() {
                      return Err(PeerMisbehaved::EarlyDataExtensionWithoutResumption.into());
                  }
@@ -1656,7 +2076,7 @@
  
                  Ok(if self.hello.offered_cert_compression {
                      Box::new(ExpectCertificateOrCompressedCertificateOrCertReq {
-@@ -874,7 +849,7 @@
+@@ -874,7 +866,7 @@
              HandshakeType::CertificateRequest,
              HandshakePayload::CertificateRequestTls13
          )?;
@@ -1665,7 +2085,7 @@
          debug!("Got CertificateRequest {certreq:?}");
  
          // Fortunately the problems here in TLS1.2 and prior are corrected in
-@@ -919,13 +894,8 @@
+@@ -919,13 +911,8 @@
              .cloned();
  
          let client_auth = ClientAuthDetails::resolve(
@@ -1681,7 +2101,7 @@
              &compat_sigschemes,
              Some(certreq.context.0.clone()),
              compat_compressor,
-@@ -982,7 +952,7 @@
+@@ -982,7 +969,7 @@
      where
          Self: 'm,
      {
@@ -1690,7 +2110,7 @@
          let compressed_cert = require_handshake_msg_move!(
              m,
              HandshakeType::CompressedCertificate,
-@@ -1031,11 +1001,7 @@
+@@ -1031,11 +1018,7 @@
          trace!(
              "Server certificate decompressed using {:?} ({} bytes -> {})",
              compressed_cert.alg,
@@ -1703,7 +2123,7 @@
              compressed_cert.uncompressed_len,
          );
  
-@@ -1087,7 +1053,7 @@
+@@ -1087,7 +1070,7 @@
          Self: 'm,
      {
          if !self.message_already_in_transcript {
@@ -1712,7 +2132,7 @@
          }
          let cert_chain = require_handshake_msg_move!(
              m,
-@@ -1105,9 +1071,7 @@
+@@ -1105,9 +1088,7 @@
  
          let end_entity_ocsp = cert_chain.end_entity_ocsp().to_vec();
          let server_cert = ServerCertDetails::new(
@@ -1723,7 +2143,7 @@
              end_entity_ocsp,
          );
  
-@@ -1178,10 +1142,7 @@
+@@ -1178,10 +1159,7 @@
                  &self.server_cert.ocsp_response,
                  now,
              )
@@ -1735,7 +2155,7 @@
  
          // 2. Verify their signature on the handshake.
          let handshake_hash = self.transcript.current_hash();
-@@ -1193,13 +1154,10 @@
+@@ -1193,13 +1171,10 @@
                  end_entity,
                  cert_verify,
              )
@@ -1751,7 +2171,7 @@
  
          Ok(Box::new(ExpectFinished {
              config: self.config,
-@@ -1236,7 +1194,7 @@
+@@ -1236,7 +1211,7 @@
      auth_context: Option<Vec<u8>>,
      compressor: &dyn compress::CertCompressor,
      config: &ClientConfig,
@@ -1760,7 +2180,7 @@
      let mut cert_payload = CertificatePayloadTls13::new(certkey.cert.iter(), None);
      cert_payload.context = PayloadU8::new(auth_context.clone().unwrap_or_default());
  
-@@ -1249,28 +1207,30 @@
+@@ -1249,28 +1224,30 @@
  
      flight.add(HandshakeMessagePayload(
          HandshakePayload::CompressedCertificate(compressed.compressed_cert_payload()),
@@ -1798,7 +2218,7 @@
  ) -> Result<(), Error> {
      let message = construct_client_verify_message(&flight.transcript.current_hash());
  
-@@ -1280,21 +1240,23 @@
+@@ -1280,21 +1257,29 @@
  
      flight.add(HandshakeMessagePayload(
          HandshakePayload::CertificateVerify(dss),
@@ -1808,7 +2228,10 @@
  }
  
 -fn emit_finished_tls13(flight: &mut HandshakeFlightTls13<'_>, verify_data: &crypto::hmac::Tag) {
-+fn emit_finished_tls13(flight: &mut HandshakeFlightTls13<'_>, verify_data: &crypto::hmac::Tag) -> Result<(), Error> {
++fn emit_finished_tls13(
++    flight: &mut HandshakeFlightTls13<'_>,
++    verify_data: &crypto::hmac::Tag,
++) -> Result<(), Error> {
      let verify_data_payload = Payload::new(verify_data.as_ref());
  
      flight.add(HandshakeMessagePayload(HandshakePayload::Finished(
@@ -1822,14 +2245,17 @@
 +    Ok(())
 +}
 +
-+fn emit_end_of_early_data_tls13(transcript: &mut HandshakeHash, common: &mut CommonState) -> Result<(), Error> {
++fn emit_end_of_early_data_tls13(
++    transcript: &mut HandshakeHash,
++    common: &mut CommonState,
++) -> Result<(), Error> {
      if common.is_quic() {
 -        return;
 +        return Ok(());
      }
  
      let m = Message {
-@@ -1304,8 +1266,10 @@
+@@ -1304,8 +1289,10 @@
          )),
      };
  
@@ -1841,7 +2267,7 @@
  }
  
  struct ExpectFinished {
-@@ -1335,9 +1299,7 @@
+@@ -1335,9 +1322,7 @@
              require_handshake_msg!(m, HandshakeType::Finished, HandshakePayload::Finished)?;
  
          let handshake_hash = st.transcript.current_hash();
@@ -1852,7 +2278,7 @@
  
          let fin = match ConstantTimeEq::ct_eq(expect_verify_data.as_ref(), finished.bytes()).into()
          {
-@@ -1349,17 +1311,16 @@
+@@ -1349,17 +1334,16 @@
              }
          };
  
@@ -1873,7 +2299,7 @@
          }
  
          let mut flight = HandshakeFlightTls13::new(&mut st.transcript);
-@@ -1371,7 +1332,7 @@
+@@ -1371,7 +1355,7 @@
                  ClientAuthDetails::Empty {
                      auth_context_tls13: auth_context,
                  } => {
@@ -1882,7 +2308,7 @@
                  }
                  ClientAuthDetails::Verify {
                      auth_context_tls13: auth_context,
-@@ -1379,7 +1340,7 @@
+@@ -1379,7 +1363,7 @@
                  } if cx.data.ech_status == EchStatus::Rejected => {
                      // If ECH was offered, and rejected, we MUST respond with
                      // an empty certificate message.
@@ -1891,7 +2317,7 @@
                  }
                  ClientAuthDetails::Verify {
                      certkey,
-@@ -1394,25 +1355,24 @@
+@@ -1394,25 +1378,24 @@
                              auth_context,
                              compressor,
                              &st.config,
@@ -1923,7 +2349,7 @@
          flight.finish(cx.common);
  
          /* We're now sure this server supports TLS1.3.  But if we run out of TLS1.3 tickets
-@@ -1426,8 +1386,7 @@
+@@ -1426,8 +1409,7 @@
          cx.common.check_aligned_handshake()?;
          let (key_schedule, resumption) =
              key_schedule_pre_finished.into_traffic(cx.common, st.transcript.current_hash());
@@ -1933,7 +2359,7 @@
  
          // Now that we've reached the end of the normal handshake we must enforce ECH acceptance by
          // sending an alert and returning an error (potentially with retry configs) if the server
-@@ -1480,9 +1439,7 @@
+@@ -1480,9 +1462,7 @@
          cx: &mut KernelContext<'_>,
          nst: &NewSessionTicketPayloadTls13,
      ) -> Result<(), Error> {
@@ -1944,7 +2370,7 @@
  
          let now = self.config.current_time()?;
  
-@@ -1491,17 +1448,13 @@
+@@ -1491,17 +1471,13 @@
              self.suite,
              nst.ticket.clone(),
              secret.as_ref(),
@@ -1964,16 +2390,18 @@
          );
  
          if cx.is_quic() {
-@@ -1512,7 +1465,7 @@
+@@ -1512,7 +1488,9 @@
              }
  
              if let Some(quic_params) = &cx.quic.params {
 -                value.set_quic_params(quic_params);
-+                value.set_quic_params(quic_params, quic_params.allocator().clone()).map_err(|_| InvalidMessage::AllocationFailed)?;
++                value
++                    .set_quic_params(quic_params, quic_params.allocator().clone())
++                    .map_err(|_| InvalidMessage::AllocationFailed)?;
              }
          }
  
-@@ -1531,10 +1484,7 @@
+@@ -1531,10 +1509,7 @@
              protocol: cx.common.protocol,
              quic: &cx.common.quic,
          };
@@ -1985,7 +2413,7 @@
          self.handle_new_ticket_impl(&mut kcx, nst)
      }
  
-@@ -1554,13 +1504,11 @@
+@@ -1554,13 +1529,11 @@
          common.check_aligned_handshake()?;
  
          if common.should_update_key(key_update_request)? {
@@ -2001,7 +2429,7 @@
          Ok(())
      }
  }
-@@ -1575,9 +1523,7 @@
+@@ -1575,9 +1548,7 @@
          Self: 'm,
      {
          match m.payload {
@@ -2012,7 +2440,7 @@
              MessagePayload::Handshake {
                  parsed: HandshakeMessagePayload(HandshakePayload::NewSessionTicketTls13(new_ticket)),
                  ..
-@@ -1614,8 +1560,7 @@
+@@ -1614,8 +1585,7 @@
      }
  
      fn extract_secrets(&self) -> Result<PartiallyExtractedSecrets, Error> {
@@ -2022,7 +2450,7 @@
      }
  
      fn into_external_state(self: Box<Self>) -> Result<Box<dyn KernelState + 'static>, Error> {
-@@ -1629,11 +1574,10 @@
+@@ -1629,11 +1599,10 @@
  
  impl KernelState for ExpectTraffic {
      fn update_secrets(&mut self, dir: Direction) -> Result<ConnectionTrafficSecrets, Error> {
@@ -2038,7 +2466,7 @@
      }
  
      fn handle_new_session_ticket(
-@@ -1661,8 +1605,7 @@
+@@ -1661,8 +1630,7 @@
              HandshakeType::NewSessionTicket,
              HandshakePayload::NewSessionTicketTls13
          )?;
@@ -2048,7 +2476,7 @@
          Ok(self)
      }
  
-@@ -1672,8 +1615,7 @@
+@@ -1672,8 +1640,7 @@
          label: &[u8],
          context: Option<&[u8]>,
      ) -> Result<(), Error> {
@@ -3283,6 +3711,144 @@
  
          Self(seq)
      }
+--- a/src/crypto/hash.rs
++++ b/src/crypto/hash.rs
+@@ -1,4 +1,5 @@
+-use alloc::boxed::Box;
++use crate::retained_box::{try_box_in, RetainedBox};
++use crate::{Error, RetainedAllocator};
+ 
+ pub use crate::msgs::enums::HashAlgorithm;
+ 
+@@ -8,7 +9,7 @@
+ /// [`Hash::hash()`] and [`Hash::start()`] respectively.
+ pub trait Hash: Send + Sync {
+     /// Start an incremental hash computation.
+-    fn start(&self) -> Box<dyn Context>;
++    fn start(&self, allocator: RetainedAllocator) -> Result<ContextBox, Error>;
+ 
+     /// Return the output of this hash function with input `data`.
+     fn hash(&self, data: &[u8]) -> Output;
+@@ -60,7 +61,7 @@
+     /// The computation remains valid, and more data can be added later with
+     /// [`Context::update()`].
+     ///
+-    /// Compare with [`Context::finish()`] which consumes the computation
++    /// Compare with [`ContextBox::finish()`] which consumes the computation
+     /// and prevents any further data being added.  This can be more efficient
+     /// because it avoids a hash context copy to apply Merkle-Damgård padding
+     /// (if required).
+@@ -68,14 +69,52 @@
+ 
+     /// Fork the computation, producing another context that has the
+     /// same prefix as this one.
+-    fn fork(&self) -> Box<dyn Context>;
++    fn fork(&self, allocator: RetainedAllocator) -> Result<ContextBox, Error>;
+ 
+     /// Terminate and finish the computation, returning the resulting output.
+     ///
+-    /// Further data cannot be added after this, because the context is consumed.
++    /// Called once by the consuming [`ContextBox::finish()`]. The carrier
++    /// exposes no mutable context escape after this terminal operation.
+     /// Compare [`Context::fork_finish()`].
+-    fn finish(self: Box<Self>) -> Output;
++    fn take_output(&mut self) -> Output;
+ 
+     /// Add `data` to computation.
+     fn update(&mut self, data: &[u8]);
+ }
++
++/// One current incremental context and its original physical allocator.
++/// The provider is borrowed only internally; finalization consumes this carrier.
++pub struct ContextBox {
++    inner: RetainedBox<dyn Context>,
++}
++impl ContextBox {
++    /// Physically admit the exact concrete provider context before publishing it.
++    pub fn try_new_in<C: Context + 'static>(
++        context: C,
++        allocator: RetainedAllocator,
++    ) -> Result<Self, Error> {
++        let inner: RetainedBox<dyn Context> =
++            try_box_in(context, allocator).map_err(|_| Error::AllocationFailed)?;
++        Ok(Self { inner })
++    }
++    /// The exact dynamic allocation Layout, excluding allocator backend metadata.
++    pub fn allocation_layout(&self) -> core::alloc::Layout {
++        core::alloc::Layout::for_value(&*self.inner)
++    }
++    /// Read the current prefix without allocating another context Box.
++    pub fn fork_finish(&self) -> Output {
++        self.inner.fork_finish()
++    }
++    /// Allocate one independent prefix copy under the explicit origin.
++    pub fn fork(&self, allocator: RetainedAllocator) -> Result<Self, Error> {
++        self.inner.fork(allocator)
++    }
++    /// Finalize once, retaining the backing and payer through provider completion.
++    pub fn finish(mut self) -> Output {
++        self.inner.take_output()
++    }
++    /// Add input to this live context.
++    pub fn update(&mut self, data: &[u8]) {
++        self.inner.update(data);
++    }
++}
+--- a/src/crypto/ring/hash.rs
++++ b/src/crypto/ring/hash.rs
+@@ -1,6 +1,6 @@
+ #![allow(clippy::duplicate_mod)]
+ 
+-use alloc::boxed::Box;
++use crate::{Error, RetainedAllocator};
+ 
+ use super::ring_like::digest;
+ use crate::crypto;
+@@ -12,8 +12,8 @@
+ pub(crate) struct Hash(&'static digest::Algorithm, HashAlgorithm);
+ 
+ impl crypto::hash::Hash for Hash {
+-    fn start(&self) -> Box<dyn crypto::hash::Context> {
+-        Box::new(Context(digest::Context::new(self.0)))
++    fn start(&self, allocator: RetainedAllocator) -> Result<crypto::hash::ContextBox, Error> {
++        crypto::hash::ContextBox::try_new_in(Context(Some(digest::Context::new(self.0))), allocator)
+     }
+ 
+     fn hash(&self, bytes: &[u8]) -> crypto::hash::Output {
+@@ -35,23 +35,26 @@
+     }
+ }
+ 
+-struct Context(digest::Context);
++struct Context(Option<digest::Context>);
+ 
+ impl crypto::hash::Context for Context {
+     fn fork_finish(&self) -> crypto::hash::Output {
+-        convert(self.0.clone().finish())
++        convert(self.0.as_ref().expect("live hash context").clone().finish())
+     }
+ 
+-    fn fork(&self) -> Box<dyn crypto::hash::Context> {
+-        Box::new(Self(self.0.clone()))
++    fn fork(&self, allocator: RetainedAllocator) -> Result<crypto::hash::ContextBox, Error> {
++        crypto::hash::ContextBox::try_new_in(
++            Self(Some(self.0.as_ref().expect("live hash context").clone())),
++            allocator,
++        )
+     }
+ 
+-    fn finish(self: Box<Self>) -> crypto::hash::Output {
+-        convert(self.0.finish())
++    fn take_output(&mut self) -> crypto::hash::Output {
++        convert(self.0.take().expect("live hash context").finish())
+     }
+ 
+     fn update(&mut self, data: &[u8]) {
+-        self.0.update(data);
++        self.0.as_mut().expect("live hash context").update(data);
+     }
+ }
+ 
 --- a/src/crypto/ring/mod.rs
 +++ b/src/crypto/ring/mod.rs
 @@ -3,7 +3,6 @@
@@ -4050,17 +4616,20 @@
  
 --- a/src/error.rs
 +++ b/src/error.rs
-@@ -80,6 +80,9 @@
+@@ -80,6 +80,12 @@
      /// A catch-all error for unlikely errors.
      General(String),
  
 +    /// The selected signing primitive refused without allocating an error payload.
 +    SigningFailed,
 +
++    /// The original allocator refused a TLS-owned allocation.
++    AllocationFailed,
++
      /// We failed to figure out what time it currently is.
      FailedToGetCurrentTime,
  
-@@ -143,6 +146,8 @@
+@@ -143,6 +149,8 @@
  #[non_exhaustive]
  #[derive(Debug, Clone, Copy, PartialEq)]
  pub enum InvalidMessage {
@@ -4069,7 +4638,7 @@
      /// A certificate payload exceeded rustls's 64KB limit
      CertificatePayloadTooLarge,
      /// An advertised message was larger then expected.
-@@ -213,6 +218,7 @@
+@@ -213,6 +221,7 @@
  impl From<InvalidMessage> for AlertDescription {
      fn from(e: InvalidMessage) -> Self {
          match e {
@@ -4077,7 +4646,7 @@
              InvalidMessage::PreSharedKeyIsNotFinalExtension => Self::IllegalParameter,
              InvalidMessage::DuplicateExtension(_) => Self::IllegalParameter,
              InvalidMessage::UnknownHelloRetryRequestExtension => Self::UnsupportedExtension,
-@@ -704,8 +710,7 @@
+@@ -704,8 +713,7 @@
                   ({} seconds ago)",
                  time.as_secs(),
                  not_after.as_secs(),
@@ -4087,7 +4656,7 @@
              ),
  
              Self::NotValidYetContext { time, not_before } => write!(
-@@ -715,9 +720,7 @@
+@@ -715,9 +723,7 @@
                   ({} seconds in future)",
                  time.as_secs(),
                  not_before.as_secs(),
@@ -4098,7 +4667,7 @@
              ),
  
              Self::ExpiredRevocationListContext { time, next_update } => write!(
-@@ -728,8 +731,7 @@
+@@ -728,8 +734,7 @@
                   ({} seconds ago)",
                  time.as_secs(),
                  next_update.as_secs(),
@@ -4108,15 +4677,16 @@
              ),
  
              Self::InvalidPurposeContext {
-@@ -1007,6 +1009,7 @@
+@@ -1007,6 +1012,8 @@
                  write!(f, "keys may not be consistent: {why:?}")
              }
              Self::General(err) => write!(f, "unexpected error: {err}"),
 +            Self::SigningFailed => write!(f, "unexpected error: signing failed"),
++            Self::AllocationFailed => write!(f, "TLS allocation refused"),
              Self::Other(err) => write!(f, "other error: {err}"),
          }
      }
-@@ -1191,27 +1194,21 @@
+@@ -1191,27 +1198,21 @@
          );
          assert_eq!(NotValidForName, NotValidForName);
          let context = NotValidForNameContext {
@@ -4147,7 +4717,7 @@
                  presented: vec!["other.com".into()],
              }
          );
-@@ -1307,23 +1304,17 @@
+@@ -1307,23 +1308,17 @@
              Error::AlertReceived(AlertDescription::ExportRestriction),
              super::CertificateError::Expired.into(),
              super::CertificateError::NotValidForNameContext {
@@ -4176,8 +4746,8 @@
                      "DnsName(\"goodbye.com\")".into(),
 --- a/src/hash_hs.rs
 +++ b/src/hash_hs.rs
-@@ -1,186 +1,187 @@
- use alloc::boxed::Box;
+@@ -1,186 +1,200 @@
+-use alloc::boxed::Box;
  use alloc::vec::Vec;
 +use core::alloc::Allocator;
  use core::mem;
@@ -4203,16 +4773,19 @@
 +pub(crate) struct HandshakeHashBuffer<A: Allocator + Clone = crate::RetainedAllocator> {
 +    buffer: Vec<u8, A>,
      client_auth_enabled: bool,
- }
+-}
 -
 -impl HandshakeHashBuffer {
 -    pub(crate) fn new() -> Self {
++    context_allocator: crate::RetainedAllocator,
++}
 +impl<A: Allocator + Clone> HandshakeHashBuffer<A> {
-+    pub(crate) fn new_in(allocator: A) -> Self {
++    pub(crate) fn new_in(allocator: A, context_allocator: crate::RetainedAllocator) -> Self {
          Self {
 -            buffer: Vec::new(),
 +            buffer: Vec::new_in(allocator),
              client_auth_enabled: false,
++            context_allocator,
          }
      }
 -
@@ -4256,13 +4829,14 @@
 +                .try_clone_in(self.buffer.allocator().clone())
 +                .map_err(allocation_failed)?,
 +            client_auth_enabled: self.client_auth_enabled,
++            context_allocator: self.context_allocator.clone(),
 +        })
 +    }
      pub(crate) fn hash_given(
          &self,
          provider: &'static dyn hash::Hash,
          extra: &[u8],
-     ) -> hash::Output {
+-    ) -> hash::Output {
 -        let mut ctx = provider.start();
 -        ctx.update(&self.buffer);
 -        ctx.update(extra);
@@ -4273,15 +4847,21 @@
 -    pub(crate) fn start_hash(self, provider: &'static dyn hash::Hash) -> HandshakeHash {
 -        let mut ctx = provider.start();
 -        ctx.update(&self.buffer);
-+        let mut context = provider.start();
+-        HandshakeHash {
++    ) -> Result<hash::Output, Error> {
++        let mut context = provider.start(self.context_allocator.clone())?;
 +        context.update(&self.buffer);
 +        context.update(extra);
-+        context.finish()
++        Ok(context.finish())
 +    }
-+    pub(crate) fn start_hash(self, provider: &'static dyn hash::Hash) -> HandshakeHash<A> {
-+        let mut context = provider.start();
++    pub(crate) fn start_hash(
++        self,
++        provider: &'static dyn hash::Hash,
++    ) -> Result<HandshakeHash<A>, Error> {
++        let mut context = provider.start(self.context_allocator.clone())?;
 +        context.update(&self.buffer);
-         HandshakeHash {
++        Ok(HandshakeHash {
++            context_allocator: self.context_allocator,
 +            allocator: self.buffer.allocator().clone(),
              provider,
 -            ctx,
@@ -4294,9 +4874,9 @@
 +            } else {
 +                None
              },
-         }
-     }
- }
+-        }
+-    }
+-}
 -
 -/// This deals with keeping a running hash of the handshake
 -/// payloads.  This is computed by buffering initially.  Once
@@ -4306,18 +4886,24 @@
 -/// For client auth, we also need to buffer all the messages.
 -/// This is disabled in cases where client auth is not possible.
 -pub(crate) struct HandshakeHash {
++        })
++    }
++}
 +#[cfg(test)]
 +impl HandshakeHashBuffer {
 +    pub(crate) fn new() -> Self {
-+        Self::new_in(crate::limited_cache::default_allocator())
++        Self::new_in(
++            crate::limited_cache::default_allocator(),
++            crate::limited_cache::default_allocator(),
++        )
 +    }
 +}
 +
 +/// Running hash plus the optional original-pool client-auth transcript.
-+/// The crypto provider's Context allocation is a separate existing owner.
++/// Crypto contexts retain the explicitly supplied original connection origin.
 +pub(crate) struct HandshakeHash<A: Allocator + Clone = crate::RetainedAllocator> {
      provider: &'static dyn hash::Hash,
-     ctx: Box<dyn hash::Context>,
+-    ctx: Box<dyn hash::Context>,
 -
 -    /// buffer for client-auth.
 -    client_auth: Option<Vec<u8>>,
@@ -4326,6 +4912,8 @@
 -impl HandshakeHash {
 -    /// We decided not to do client auth after all, so discard
 -    /// the transcript.
++    ctx: hash::ContextBox,
++    context_allocator: crate::RetainedAllocator,
 +    client_auth: Option<Vec<u8, A>>,
 +    allocator: A,
 +}
@@ -4342,8 +4930,9 @@
              MessagePayload::Handshake { encoded, .. } => self.add_raw(encoded.bytes()),
              MessagePayload::HandshakeFlight(payload) => self.add_raw(payload.bytes()),
 -            _ => self,
--        }
--    }
++            _ => Ok(self),
+         }
+     }
 -
 -    /// Hash/buffer an encoded handshake message.
 -    pub(crate) fn add(&mut self, bytes: &[u8]) {
@@ -4354,9 +4943,6 @@
 -    fn add_raw(&mut self, buf: &[u8]) -> &mut Self {
 -        self.ctx.update(buf);
 -
-+            _ => Ok(self),
-+        }
-+    }
 +    pub(crate) fn add(&mut self, bytes: &[u8]) -> Result<(), Error> {
 +        self.add_raw(bytes)?;
 +        Ok(())
@@ -4364,15 +4950,21 @@
 +    fn reserve(&mut self, bytes: usize) -> Result<(), Error> {
          if let Some(buffer) = &mut self.client_auth {
 -            buffer.extend_from_slice(buf);
--        }
++            buffer.try_reserve(bytes).map_err(allocation_failed)?;
+         }
 -
 -        self
 -    }
 -
 -    /// Get the hash value if we were to hash `extra` too,
 -    /// using hash function `hash`.
-+            buffer.try_reserve(bytes).map_err(allocation_failed)?;
-+        }
+-    pub(crate) fn hash_given(&self, extra: &[u8]) -> hash::Output {
+-        let mut ctx = self.ctx.fork();
+-        ctx.update(extra);
+-        ctx.finish()
+-    }
+-
+-    pub(crate) fn into_hrr_buffer(self) -> HandshakeHashBuffer {
 +        Ok(())
 +    }
 +    fn add_raw(&mut self, bytes: &[u8]) -> Result<&mut Self, Error> {
@@ -4384,16 +4976,10 @@
 +        }
 +        Ok(self)
 +    }
-     pub(crate) fn hash_given(&self, extra: &[u8]) -> hash::Output {
--        let mut ctx = self.ctx.fork();
--        ctx.update(extra);
--        ctx.finish()
--    }
--
--    pub(crate) fn into_hrr_buffer(self) -> HandshakeHashBuffer {
-+        let mut context = self.ctx.fork();
++    pub(crate) fn hash_given(&self, extra: &[u8]) -> Result<hash::Output, Error> {
++        let mut context = self.ctx.fork(self.context_allocator.clone())?;
 +        context.update(extra);
-+        context.finish()
++        Ok(context.finish())
 +    }
 +    pub(crate) fn into_hrr_buffer(self) -> Result<HandshakeHashBuffer<A>, Error> {
 +        let mut buffer = Vec::new_in(self.allocator);
@@ -4434,16 +5020,18 @@
 -    }
 -
 -    /// Get the current hash value.
++            context_allocator: self.context_allocator,
 +            buffer,
 +        })
 +    }
 +    pub(crate) fn rollup_for_hrr(&mut self) -> Result<(), Error> {
++        let next_context = self.provider.start(self.context_allocator.clone())?;
 +        self.reserve(
 +            HandshakeMessagePayload::HEADER_LEN
 +                .checked_add(self.provider.output_len())
 +                .ok_or(InvalidMessage::AllocationFailed)?,
 +        )?;
-+        let previous = mem::replace(&mut self.ctx, self.provider.start());
++        let previous = mem::replace(&mut self.ctx, next_context);
 +        let old_hash = previous.finish();
 +        let message = HandshakeMessagePayload::build_handshake_hash(old_hash.as_ref());
 +        let (header, body) = message.message_hash_parts();
@@ -4481,10 +5069,12 @@
 +            .map_err(allocation_failed)?;
 +        Ok(Self {
              provider: self.provider,
-             ctx: self.ctx.fork(),
+-            ctx: self.ctx.fork(),
 -            client_auth: self.client_auth.clone(),
 -        }
 -    }
++            ctx: self.ctx.fork(self.context_allocator.clone())?,
++            context_allocator: self.context_allocator.clone(),
 +            client_auth,
 +            allocator: self.allocator.clone(),
 +        })
@@ -4495,21 +5085,22 @@
  }
  
  #[cfg(test)]
-@@ -196,11 +197,11 @@
+@@ -196,11 +210,11 @@
      #[test]
      fn hashes_correctly() {
          let mut hhb = HandshakeHashBuffer::new();
 -        hhb.add_raw(b"hello");
 +        hhb.add_raw(b"hello").unwrap();
          assert_eq!(hhb.buffer.len(), 5);
-         let mut hh = hhb.start_hash(&SHA256);
+-        let mut hh = hhb.start_hash(&SHA256);
++        let mut hh = hhb.start_hash(&SHA256).unwrap();
          assert!(hh.client_auth.is_none());
 -        hh.add_raw(b"world");
 +        hh.add_raw(b"world").unwrap();
          let h = hh.current_hash();
          let h = h.as_ref();
          assert_eq!(h[0], 0x93);
-@@ -231,28 +232,22 @@
+@@ -231,28 +245,22 @@
  
          // buffered mode
          let mut hhb = HandshakeHashBuffer::new();
@@ -4526,15 +5117,16 @@
 -            SHA256
 -                .hash(b"\x0e\x00\x00\x00\x05\x00\x00\x00")
 -                .as_ref()
-+            hhb.start_hash(&SHA256).current_hash().as_ref(),
++            hhb.start_hash(&SHA256).unwrap().current_hash().as_ref(),
 +            SHA256.hash(b"\x0e\x00\x00\x00\x05\x00\x00\x00").as_ref()
          );
  
          // non-buffered mode
-         let mut hh = HandshakeHashBuffer::new().start_hash(&SHA256);
+-        let mut hh = HandshakeHashBuffer::new().start_hash(&SHA256);
 -        hh.add_message(&server_hello_done_message);
 -        hh.add_message(&app_data_ignored);
 -        hh.add_message(&end_of_early_data_flight);
++        let mut hh = HandshakeHashBuffer::new().start_hash(&SHA256).unwrap();
 +        hh.add_message(&server_hello_done_message).unwrap();
 +        hh.add_message(&app_data_ignored).unwrap();
 +        hh.add_message(&end_of_early_data_flight).unwrap();
@@ -4547,14 +5139,14 @@
          );
      }
  
-@@ -261,22 +256,12 @@
+@@ -261,22 +269,12 @@
      fn buffers_correctly() {
          let mut hhb = HandshakeHashBuffer::new();
          hhb.set_client_auth_enabled();
 -        hhb.add_raw(b"hello");
 +        hhb.add_raw(b"hello").unwrap();
          assert_eq!(hhb.buffer.len(), 5);
-         let mut hh = hhb.start_hash(&SHA256);
+-        let mut hh = hhb.start_hash(&SHA256);
 -        assert_eq!(
 -            hh.client_auth
 -                .as_ref()
@@ -4568,13 +5160,14 @@
 -                .map(|buf| buf.len()),
 -            Some(10)
 -        );
++        let mut hh = hhb.start_hash(&SHA256).unwrap();
 +        assert_eq!(hh.client_auth.as_ref().map(|buf| buf.len()), Some(5));
 +        hh.add_raw(b"world").unwrap();
 +        assert_eq!(hh.client_auth.as_ref().map(|buf| buf.len()), Some(10));
          let h = hh.current_hash();
          let h = h.as_ref();
          assert_eq!(h[0], 0x93);
-@@ -284,25 +269,20 @@
+@@ -284,25 +282,20 @@
          assert_eq!(h[2], 0x18);
          assert_eq!(h[3], 0x5c);
          let buf = hh.take_handshake_buf();
@@ -4589,13 +5182,14 @@
 -        hhb.add_raw(b"hello");
 +        hhb.add_raw(b"hello").unwrap();
          assert_eq!(hhb.buffer.len(), 5);
-         let mut hh = hhb.start_hash(&SHA256);
+-        let mut hh = hhb.start_hash(&SHA256);
 -        assert_eq!(
 -            hh.client_auth
 -                .as_ref()
 -                .map(|buf| buf.len()),
 -            Some(5)
 -        );
++        let mut hh = hhb.start_hash(&SHA256).unwrap();
 +        assert_eq!(hh.client_auth.as_ref().map(|buf| buf.len()), Some(5));
          hh.abandon_client_auth();
          assert_eq!(hh.client_auth, None);
@@ -4604,7 +5198,7 @@
          assert_eq!(hh.client_auth, None);
          let h = hh.current_hash();
          let h = h.as_ref();
-@@ -316,16 +296,16 @@
+@@ -316,32 +309,105 @@
      fn clones_correctly() {
          let mut hhb = HandshakeHashBuffer::new();
          hhb.set_client_auth_enabled();
@@ -4624,7 +5218,9 @@
          assert_eq!(hhb_prime.buffer.len(), 10);
          assert_ne!(hhb.buffer, hhb_prime.buffer);
  
-@@ -334,14 +314,84 @@
+-        let hh = hhb.start_hash(&SHA256);
++        let hh = hhb.start_hash(&SHA256).unwrap();
+         let hh_hash = hh.current_hash();
          let hh_hash = hh_hash.as_ref();
  
          // Cloning the HH should result in the same current hash.
@@ -4653,8 +5249,8 @@
 +}
 +impl<A: Allocator + Clone> RetainedHandshakeBuffer<A> {
 +    /// Start the same buffer with the explicit retained origin.
-+    pub fn new_in(allocator: A) -> Self {
-+        Self(HandshakeHashBuffer::new_in(allocator))
++    pub fn new_in(allocator: A, context_allocator: crate::RetainedAllocator) -> Self {
++        Self(HandshakeHashBuffer::new_in(allocator, context_allocator))
 +    }
 +    /// Retain all later client-auth transcript bytes.
 +    pub fn retain_client_auth(&mut self) {
@@ -4673,8 +5269,11 @@
 +        self.0.try_clone().map(Self)
 +    }
 +    /// Move the retained bytes into the existing selected hash state.
-+    pub fn start_hash(self, provider: &'static dyn hash::Hash) -> RetainedHandshakeHash<A> {
-+        RetainedHandshakeHash(self.0.start_hash(provider))
++    pub fn start_hash(
++        self,
++        provider: &'static dyn hash::Hash,
++    ) -> Result<RetainedHandshakeHash<A>, Error> {
++        self.0.start_hash(provider).map(RetainedHandshakeHash)
 +    }
 +}
 +/// Opaque access to the live running transcript and retained auth bytes.
@@ -4690,7 +5289,7 @@
 +    pub fn try_add(&mut self, bytes: &[u8]) -> Result<(), Error> {
 +        self.0.add(bytes)
 +    }
-+    /// Read the selected provider's hash; provider context allocation is separate.
++    /// Read the selected provider's hash without allocating a context copy.
 +    pub fn current_hash(&self) -> hash::Output {
 +        self.0.current_hash()
 +    }
@@ -4723,7 +5322,7 @@
  #![warn(
      clippy::alloc_instead_of_core,
      clippy::manual_let_else,
-@@ -438,6 +439,8 @@
+@@ -438,8 +439,11 @@
  mod hash_hs;
  #[cfg(any(feature = "std", feature = "hashbrown"))]
  mod limited_cache;
@@ -4731,8 +5330,11 @@
 +pub use limited_cache::RetainedAllocator;
  mod rand;
  mod record_layer;
++mod retained_box;
  #[cfg(feature = "std")]
-@@ -485,8 +488,9 @@
+ mod stream;
+ #[cfg(feature = "tls12")]
+@@ -485,8 +489,9 @@
              pub use crate::msgs::fragmenter::MessageFragmenter;
          }
          pub mod handshake {
@@ -4743,7 +5345,7 @@
              };
          }
          pub mod message {
-@@ -533,20 +537,20 @@
+@@ -533,20 +538,20 @@
  /// [`unbuffered-client`]: https://github.com/rustls/rustls/blob/main/examples/src/bin/unbuffered-client.rs
  /// [`unbuffered-server`]: https://github.com/rustls/rustls/blob/main/examples/src/bin/unbuffered-server.rs
  pub mod unbuffered {
@@ -4766,7 +5368,7 @@
  pub use crate::enums::{
      AlertDescription, CertificateCompressionAlgorithm, CipherSuite, ContentType, HandshakeType,
      ProtocolVersion, SignatureAlgorithm, SignatureScheme,
-@@ -575,7 +579,7 @@
+@@ -575,7 +580,7 @@
  pub use crate::tls12::Tls12CipherSuite;
  pub use crate::tls13::Tls13CipherSuite;
  pub use crate::verify::DigitallySignedStruct;
@@ -4775,7 +5377,7 @@
  pub use crate::webpki::RootCertStore;
  
  /// Items for use in a client.
-@@ -613,8 +617,8 @@
+@@ -613,8 +618,8 @@
  
      pub use crate::msgs::persist::{Tls12ClientSessionValue, Tls13ClientSessionValue};
      pub use crate::webpki::{
@@ -4786,7 +5388,7 @@
      };
  }
  
-@@ -635,7 +639,11 @@
+@@ -635,7 +640,11 @@
      mod tls12;
      mod tls13;
  
@@ -4799,7 +5401,7 @@
      #[cfg(any(feature = "std", feature = "hashbrown"))]
      pub use handy::ResolvesServerCertUsingSni;
      #[cfg(any(feature = "std", feature = "hashbrown"))]
-@@ -682,7 +690,8 @@
+@@ -682,7 +691,8 @@
  /// Message signing interfaces.
  pub mod sign {
      pub use crate::crypto::signer::{
@@ -4809,7 +5411,7 @@
      };
  }
  
-@@ -706,13 +715,13 @@
+@@ -706,13 +716,13 @@
  
  #[cfg(any(feature = "std", feature = "hashbrown"))]
  mod hash_map {
@@ -7498,6 +8100,17 @@
          assert!(matches!(record_layer.decrypt_state, DirectionState::Active));
          assert_eq!(record_layer.read_seq, 0);
          assert!(record_layer.has_decrypted());
+--- /dev/null
++++ b/src/retained_box.rs
+@@ -0,0 +1,8 @@
++use alloc::boxed::Box;
++use core::alloc::{AllocError, Allocator};
++
++pub(crate) type RetainedBox<T> = Box<T, crate::RetainedAllocator>;
++
++pub(crate) fn try_box_in<T, A: Allocator>(value: T, allocator: A) -> Result<Box<T, A>, AllocError> {
++    Box::try_new_in(value, allocator)
++}
 --- a/src/server/builder.rs
 +++ b/src/server/builder.rs
 @@ -3,13 +3,13 @@
@@ -7921,58 +8534,305 @@
  }
 --- a/src/server/hs.rs
 +++ b/src/server/hs.rs
-@@ -1,6 +1,7 @@
+@@ -1,3 +1,4 @@
++use crate::msgs::retained::TryCloneIn;
  use alloc::borrow::ToOwned;
  use alloc::boxed::Box;
  use alloc::vec::Vec;
-+use crate::msgs::retained::TryCloneIn;
+@@ -28,9 +29,9 @@
+ use crate::msgs::message::{Message, MessagePayload};
+ use crate::msgs::persist;
+ use crate::server::common::ActiveCertifiedKey;
+-use crate::server::{ClientHello, ServerConfig, tls13};
++use crate::server::{tls13, ClientHello, ServerConfig};
+ use crate::sync::Arc;
+-use crate::{SupportedCipherSuite, suites};
++use crate::{suites, SupportedCipherSuite};
  
- use pki_types::DnsName;
- 
-@@ -143,7 +144,7 @@
-                     .transport_parameters_draft
-                     .as_ref());
+ pub(super) type NextState<'a> = Box<dyn State<ServerConnectionData> + 'a>;
+ pub(super) type NextStateOrError<'a> = Result<NextState<'a>, Error>;
+@@ -139,11 +140,17 @@
+             let transport_params = hello
+                 .transport_parameters
+                 .as_ref()
+-                .or(hello
+-                    .transport_parameters_draft
+-                    .as_ref());
++                .or(hello.transport_parameters_draft.as_ref());
              match transport_params {
 -                Some(params) => cx.common.quic.params = Some(params.to_owned().into_vec()),
-+                Some(params) => cx.common.quic.params = Some(crate::msgs::retained::copy_bytes_in(params.bytes(), cx.common.message_allocator.clone()).map_err(|_| crate::InvalidMessage::AllocationFailed)?),
++                Some(params) => {
++                    cx.common.quic.params = Some(
++                        crate::msgs::retained::copy_bytes_in(
++                            params.bytes(),
++                            cx.common.message_allocator.clone(),
++                        )
++                        .map_err(|_| crate::InvalidMessage::AllocationFailed)?,
++                    )
++                }
                  None => {
                      return Err(cx
                          .common
-@@ -321,8 +322,9 @@
+@@ -162,15 +169,10 @@
+         // Send status_request response if we have one.  This is not allowed
+         // if we're resuming, and is only triggered if we have an OCSP response
+         // to send.
+-        if !for_resume
+-            && hello
+-                .certificate_status_request
+-                .is_some()
+-        {
++        if !for_resume && hello.certificate_status_request.is_some() {
+             if ocsp_response.is_some() && !cx.common.is_tls13() {
+                 // Only TLS1.2 sends confirmation in ServerHello
+-                self.extensions
+-                    .certificate_status_request_ack = Some(());
++                self.extensions.certificate_status_request_ack = Some(());
+             }
+         } else {
+             // Throw away any OCSP response so we don't try to send it later.
+@@ -213,8 +215,7 @@
+ 
+         // Confirm use of EMS if offered.
+         if using_ems {
+-            self.extensions
+-                .extended_master_secret_ack = Some(());
++            self.extensions.extended_master_secret_ack = Some(());
+         }
+     }
+ 
+@@ -231,9 +232,7 @@
+ 
+         self.process_cert_type_extension(
+             client_supports,
+-            config
+-                .cert_resolver
+-                .only_raw_public_keys(),
++            config.cert_resolver.only_raw_public_keys(),
+             ExtensionType::ServerCertificateType,
+             cx,
+         )
+@@ -252,9 +251,7 @@
+ 
+         self.process_cert_type_extension(
+             client_supports,
+-            config
+-                .verifier
+-                .requires_raw_public_keys(),
++            config.verifier.requires_raw_public_keys(),
+             ExtensionType::ClientCertificateType,
+             cx,
+         )
+@@ -321,8 +318,9 @@
      pub(super) fn new(
          config: Arc<ServerConfig>,
          extra_exts: ServerExtensionsInput<'static>,
 +        allocator: crate::RetainedAllocator,
      ) -> Self {
 -        let mut transcript_buffer = HandshakeHashBuffer::new();
-+        let mut transcript_buffer = HandshakeHashBuffer::new_in(allocator);
++        let mut transcript_buffer = HandshakeHashBuffer::new_in(allocator.clone(), allocator);
  
          if config.verifier.offer_client_auth() {
              transcript_buffer.set_client_auth_enabled();
-@@ -428,7 +430,7 @@
+@@ -406,11 +404,7 @@
+             .cipher_suites
+             .iter()
+             .copied()
+-            .filter(|scs| {
+-                client_hello
+-                    .cipher_suites
+-                    .contains(&scs.suite())
+-            })
++            .filter(|scs| client_hello.cipher_suites.contains(&scs.suite()))
+             .collect::<Vec<_>>();
+ 
+         sig_schemes
+@@ -419,32 +413,23 @@
+         // We adhere to the TLS 1.2 RFC by not exposing this to the cert resolver if TLS version is 1.2
+         let certificate_authorities = match version {
+             ProtocolVersion::TLSv1_2 => None,
+-            _ => client_hello
+-                .certificate_authority_names
+-                .as_deref(),
++            _ => client_hello.certificate_authority_names.as_deref(),
+         };
+         // Choose a certificate.
+         let certkey = {
              let client_hello = ClientHello {
                  server_name: &cx.data.sni,
                  signature_schemes: &sig_schemes,
 -                alpn: client_hello.protocols.as_ref(),
+-                client_cert_types: client_hello
+-                    .client_certificate_types
+-                    .as_deref(),
+-                server_cert_types: client_hello
+-                    .server_certificate_types
+-                    .as_deref(),
 +                alpn: client_hello.protocols.as_deref(),
-                 client_cert_types: client_hello
-                     .client_certificate_types
-                     .as_deref(),
-@@ -745,7 +747,7 @@
++                client_cert_types: client_hello.client_certificate_types.as_deref(),
++                server_cert_types: client_hello.server_certificate_types.as_deref(),
+                 cipher_suites: &client_hello.cipher_suites,
+                 certificate_authorities,
+                 named_groups: client_hello.named_groups.as_deref(),
+             };
+             trace!("Resolving server certificate: {client_hello:#?}");
+ 
+-            let certkey = self
+-                .config
+-                .cert_resolver
+-                .resolve(client_hello);
++            let certkey = self.config.cert_resolver.resolve(client_hello);
+ 
+             certkey.ok_or_else(|| {
+                 cx.common.send_fatal_alert(
+@@ -460,10 +445,7 @@
+                 version,
+                 certkey.get_key().algorithm(),
+                 cx.common.protocol,
+-                client_hello
+-                    .named_groups
+-                    .as_deref()
+-                    .unwrap_or_default(),
++                client_hello.named_groups.as_deref().unwrap_or_default(),
+                 &client_hello.cipher_suites,
+             )
+             .map_err(|incompat| {
+@@ -493,7 +475,7 @@
+         // Start handshake hash.
+         let starting_hash = suite.hash_provider();
+         let transcript = match self.transcript {
+-            HandshakeHashOrBuffer::Buffer(inner) => inner.start_hash(starting_hash),
++            HandshakeHashOrBuffer::Buffer(inner) => inner.start_hash(starting_hash)?,
+             HandshakeHashOrBuffer::Hash(inner)
+                 if inner.algorithm() == starting_hash.algorithm() =>
+             {
+@@ -562,14 +544,9 @@
+         let mut supported_groups = Vec::with_capacity(client_groups.len());
+ 
+         for offered_group in client_groups {
+-            let supported = self
+-                .config
+-                .provider
+-                .kx_groups
+-                .iter()
+-                .find(|skxg| {
+-                    skxg.usable_for_version(selected_version) && skxg.name() == *offered_group
+-                });
++            let supported = self.config.provider.kx_groups.iter().find(|skxg| {
++                skxg.usable_for_version(selected_version) && skxg.name() == *offered_group
++            });
+ 
+             match offered_group.key_exchange_algorithm() {
+                 KeyExchangeAlgorithm::DHE => {
+@@ -584,33 +561,27 @@
+             supported_groups.push(supported);
+         }
+ 
+-        let first_supported_dhe_kxg = if selected_version == ProtocolVersion::TLSv1_2 {
+-            // https://datatracker.ietf.org/doc/html/rfc7919#section-4 (paragraph 2)
+-            let first_supported_dhe_kxg = self
+-                .config
+-                .provider
+-                .kx_groups
+-                .iter()
+-                .find(|skxg| skxg.name().key_exchange_algorithm() == KeyExchangeAlgorithm::DHE);
+-            ffdhe_possible |= !ffdhe_offered && first_supported_dhe_kxg.is_some();
+-            first_supported_dhe_kxg
+-        } else {
+-            // In TLS1.3, the server may only directly negotiate a group.
+-            None
+-        };
++        let first_supported_dhe_kxg =
++            if selected_version == ProtocolVersion::TLSv1_2 {
++                // https://datatracker.ietf.org/doc/html/rfc7919#section-4 (paragraph 2)
++                let first_supported_dhe_kxg =
++                    self.config.provider.kx_groups.iter().find(|skxg| {
++                        skxg.name().key_exchange_algorithm() == KeyExchangeAlgorithm::DHE
++                    });
++                ffdhe_possible |= !ffdhe_offered && first_supported_dhe_kxg.is_some();
++                first_supported_dhe_kxg
++            } else {
++                // In TLS1.3, the server may only directly negotiate a group.
++                None
++            };
+ 
+         if !ecdhe_possible && !ffdhe_possible {
+             return Err(PeerIncompatible::NoKxGroupsInCommon);
+         }
+ 
+-        let mut suitable_suites_iter = self
+-            .config
+-            .provider
+-            .cipher_suites
+-            .iter()
+-            .filter(|suite| {
+-                // Reduce our supported ciphersuites by the certified key's algorithm.
+-                suite.usable_for_signature_algorithm(sig_key_algorithm)
++        let mut suitable_suites_iter = self.config.provider.cipher_suites.iter().filter(|suite| {
++            // Reduce our supported ciphersuites by the certified key's algorithm.
++            suite.usable_for_signature_algorithm(sig_key_algorithm)
+                 // And version
+                 && suite.version().version == selected_version
+                 // And protocol
+@@ -618,7 +589,7 @@
+                 // And support one of key exchange groups
+                 && (ecdhe_possible && suite.usable_for_kx_algorithm(KeyExchangeAlgorithm::ECDHE)
+                 || ffdhe_possible && suite.usable_for_kx_algorithm(KeyExchangeAlgorithm::DHE))
+-            });
++        });
+ 
+         // RFC 7919 (https://datatracker.ietf.org/doc/html/rfc7919#section-4) requires us to send
+         // the InsufficientSecurity alert in case we don't recognize client's FFDHE groups (i.e.,
+@@ -633,9 +604,7 @@
+             client_suites
+                 .iter()
+                 .find_map(|client_suite| {
+-                    suitable_suites
+-                        .iter()
+-                        .find(|x| *client_suite == x.suite())
++                    suitable_suites.iter().find(|x| *client_suite == x.suite())
+                 })
+                 .copied()
+         }
+@@ -745,7 +714,9 @@
      //
      // [RFC6066]: https://datatracker.ietf.org/doc/html/rfc6066#section-3
      let sni = match &client_hello.server_name {
 -        Some(ServerNamePayload::SingleDnsName(dns_name)) => Some(dns_name.to_lowercase_owned()),
-+        Some(ServerNamePayload::SingleDnsName(dns_name)) => Some(dns_name.borrowed().to_lowercase_owned()),
++        Some(ServerNamePayload::SingleDnsName(dns_name)) => {
++            Some(dns_name.borrowed().to_lowercase_owned())
++        }
          Some(ServerNamePayload::IpAddress) => None,
          Some(ServerNamePayload::Invalid) => {
              return Err(cx.common.send_fatal_alert(
-@@ -776,7 +778,7 @@
-             )
-         })?;
+@@ -766,17 +737,19 @@
+         return Err(PeerMisbehaved::ServerNameDifferedOnRetry.into());
+     }
  
+-    let sig_schemes = client_hello
+-        .signature_schemes
+-        .as_ref()
+-        .ok_or_else(|| {
+-            cx.common.send_fatal_alert(
+-                AlertDescription::HandshakeFailure,
+-                PeerIncompatible::SignatureAlgorithmsExtensionRequired,
+-            )
+-        })?;
+-
 -    Ok((client_hello, sig_schemes.to_owned()))
-+    Ok((client_hello, sig_schemes.try_clone_in(alloc::alloc::Global).map_err(|_| crate::InvalidMessage::AllocationFailed)?))
++    let sig_schemes = client_hello.signature_schemes.as_ref().ok_or_else(|| {
++        cx.common.send_fatal_alert(
++            AlertDescription::HandshakeFailure,
++            PeerIncompatible::SignatureAlgorithmsExtensionRequired,
++        )
++    })?;
++
++    Ok((
++        client_hello,
++        sig_schemes
++            .try_clone_in(alloc::alloc::Global)
++            .map_err(|_| crate::InvalidMessage::AllocationFailed)?,
++    ))
  }
  
  pub(crate) enum HandshakeHashOrBuffer {
@@ -8595,17 +9455,33 @@
  
  mod client_hello {
      use super::*;
-@@ -107,9 +107,7 @@
+@@ -98,7 +98,7 @@
+             client_hello: &Message<'_>,
+             psk: &[u8],
+             binder: &[u8],
+-        ) -> bool {
++        ) -> Result<bool, Error> {
+             let binder_plaintext = match &client_hello.payload {
+                 MessagePayload::Handshake { parsed, encoded } => &encoded.bytes()[..encoded
+                     .bytes()
+@@ -107,15 +107,13 @@
                  _ => unreachable!(),
              };
  
 -            let handshake_hash = self
 -                .transcript
 -                .hash_given(binder_plaintext);
-+            let handshake_hash = self.transcript.hash_given(binder_plaintext);
++            let handshake_hash = self.transcript.hash_given(binder_plaintext)?;
  
              let key_schedule = KeyScheduleEarly::new(suite, psk);
              let real_binder =
+                 key_schedule.resumption_psk_binder_key_and_sign_verify_data(&handshake_hash);
+ 
+-            ConstantTimeEq::ct_eq(real_binder.as_ref(), binder).into()
++            Ok(ConstantTimeEq::ct_eq(real_binder.as_ref(), binder).into())
+         }
+ 
+         fn attempt_tls13_ticket_decryption(
 @@ -131,7 +129,7 @@
                  self.config
                      .session_storage
@@ -8702,6 +9578,15 @@
                      return Err(cx.common.send_fatal_alert(
                          AlertDescription::MissingExtension,
                          PeerMisbehaved::MissingPskModesExtension,
+@@ -326,7 +310,7 @@
+                         chm,
+                         &resume.master_secret.0,
+                         psk_offer.binders[i].as_ref(),
+-                    ) {
++                    )? {
+                         return Err(cx.common.send_fatal_alert(
+                             AlertDescription::DecryptError,
+                             PeerMisbehaved::IncorrectBinder,
 @@ -376,7 +360,7 @@
              }
  
@@ -8771,17 +9656,24 @@
                      Ok(Box::new(ExpectCertificate {
                          config: self.config,
                          transcript: self.transcript,
-@@ -529,7 +504,7 @@
+@@ -529,7 +504,10 @@
          suite: &'static Tls13CipherSuite,
          cx: &mut ServerContext<'_>,
          session_id: &SessionId,
 -        share_and_kxgroup: (&KeyShareEntry, &'static dyn SupportedKxGroup),
-+        share_and_kxgroup: (&KeyShareEntry<crate::RetainedAllocator>, &'static dyn SupportedKxGroup),
++        share_and_kxgroup: (
++            &KeyShareEntry<crate::RetainedAllocator>,
++            &'static dyn SupportedKxGroup,
++        ),
          chosen_psk_idx: Option<usize>,
          resuming_psk: Option<&[u8]>,
          config: &ServerConfig,
-@@ -571,7 +546,7 @@
-         let client_hello_hash = transcript.hash_given(&[]);
+@@ -568,10 +546,10 @@
+ 
+         cx.common.check_aligned_handshake()?;
+ 
+-        let client_hello_hash = transcript.hash_given(&[]);
++        let client_hello_hash = transcript.hash_given(&[])?;
  
          trace!("sending server hello {sh:?}");
 -        transcript.add_message(&sh);
@@ -8789,7 +9681,7 @@
          cx.common.send_msg(sh, false);
  
          // Start key schedule
-@@ -620,7 +595,7 @@
+@@ -620,7 +598,7 @@
          session_id: SessionId,
          common: &mut CommonState,
          group: NamedGroup,
@@ -8798,7 +9690,7 @@
          let req = HelloRetryRequest {
              legacy_version: ProtocolVersion::TLSv1_2,
              session_id,
-@@ -640,11 +615,13 @@
+@@ -640,10 +618,12 @@
          };
  
          trace!("Requesting retry {m:?}");
@@ -8808,14 +9700,12 @@
 +        transcript.add_message(&m)?;
          common.send_msg(m, false);
          common.handshake_kind = Some(HandshakeKind::FullWithHelloRetryRequest);
--    }
-+    
-+    Ok(())
-+}
++
++        Ok(())
+     }
  
      fn decide_if_early_data_allowed(
-         cx: &mut ServerContext<'_>,
-@@ -653,9 +630,7 @@
+@@ -653,9 +633,7 @@
          suite: &'static Tls13CipherSuite,
          config: &ServerConfig,
      ) -> EarlyDataDecision {
@@ -8826,7 +9716,7 @@
          let rejected_or_disabled = match early_data_requested {
              true => EarlyDataDecision::RequestedButRejected,
              false => EarlyDataDecision::Disabled,
-@@ -733,7 +708,7 @@
+@@ -733,7 +711,7 @@
          let ee = HandshakeMessagePayload(HandshakePayload::EncryptedExtensions(ep.extensions));
  
          trace!("sending encrypted extensions {ee:?}");
@@ -8835,7 +9725,7 @@
          Ok(early_data)
      }
  
-@@ -748,19 +723,10 @@
+@@ -748,19 +726,10 @@
          let cr = CertificateRequestPayloadTls13 {
              context: PayloadU8::empty(),
              extensions: CertificateRequestExtensions {
@@ -8857,7 +9747,7 @@
                  },
                  authority_names: match config.verifier.root_hint_subjects() {
                      &[] => None,
-@@ -772,7 +738,7 @@
+@@ -772,7 +741,7 @@
          let creq = HandshakeMessagePayload(HandshakePayload::CertificateRequestTls13(cr));
  
          trace!("Sending CertificateRequest {creq:?}");
@@ -8866,7 +9756,7 @@
          Ok(true)
      }
  
-@@ -780,14 +746,16 @@
+@@ -780,13 +749,15 @@
          flight: &mut HandshakeFlightTls13<'_>,
          cert_chain: &[CertificateDer<'static>],
          ocsp_response: Option<&[u8]>,
@@ -8878,15 +9768,13 @@
  
          trace!("sending certificate {cert:?}");
 -        flight.add(cert);
--    }
 +        flight.add(cert)?;
-+    
-+    Ok(())
-+}
++
++        Ok(())
+     }
  
      fn emit_compressed_certificate_tls13(
-         flight: &mut HandshakeFlightTls13<'_>,
-@@ -795,7 +763,7 @@
+@@ -795,7 +766,7 @@
          cert_chain: &[CertificateDer<'static>],
          ocsp_response: Option<&[u8]>,
          cert_compressor: &'static dyn CertCompressor,
@@ -8895,20 +9783,18 @@
          let payload = CertificatePayloadTls13::new(cert_chain.iter(), ocsp_response);
  
          let Ok(entry) = config
-@@ -810,8 +778,10 @@
+@@ -810,7 +781,9 @@
          ));
  
          trace!("sending compressed certificate {c:?}");
 -        flight.add(c);
--    }
 +        flight.add(c)?;
-+    
-+    Ok(())
-+}
++
++        Ok(())
+     }
  
      fn emit_certificate_verify_tls13(
-         flight: &mut HandshakeFlightTls13<'_>,
-@@ -821,14 +791,12 @@
+@@ -821,14 +794,12 @@
      ) -> Result<(), Error> {
          let message = construct_server_verify_message(&flight.transcript.current_hash());
  
@@ -8929,7 +9815,7 @@
  
          let scheme = signer.scheme();
          let sig = signer.sign(message.as_ref())?;
-@@ -838,7 +806,7 @@
+@@ -838,7 +809,7 @@
          let cv = HandshakeMessagePayload(HandshakePayload::CertificateVerify(cv));
  
          trace!("sending certificate-verify {cv:?}");
@@ -8938,7 +9824,7 @@
          Ok(())
      }
  
-@@ -848,7 +816,7 @@
+@@ -848,7 +819,7 @@
          cx: &mut ServerContext<'_>,
          key_schedule: KeyScheduleHandshake,
          config: &ServerConfig,
@@ -8947,7 +9833,7 @@
          let handshake_hash = flight.transcript.current_hash();
          let verify_data = key_schedule.sign_server_finish(&handshake_hash);
          let verify_data_payload = Payload::new(verify_data.as_ref());
-@@ -856,18 +824,18 @@
+@@ -856,18 +827,18 @@
          let fin = HandshakeMessagePayload(HandshakePayload::Finished(verify_data_payload));
  
          trace!("sending finished {fin:?}");
@@ -8969,7 +9855,7 @@
      }
  }
  
-@@ -980,7 +948,7 @@
+@@ -980,7 +951,7 @@
      where
          Self: 'm,
      {
@@ -8978,7 +9864,7 @@
          let compressed_cert = require_handshake_msg_move!(
              m,
              HandshakeType::CompressedCertificate,
-@@ -1029,11 +997,7 @@
+@@ -1029,11 +1000,7 @@
          trace!(
              "Client certificate decompressed using {:?} ({} bytes -> {})",
              compressed_cert.alg,
@@ -8991,7 +9877,7 @@
              compressed_cert.uncompressed_len,
          );
  
-@@ -1079,7 +1043,7 @@
+@@ -1079,7 +1046,7 @@
          Self: 'm,
      {
          if !self.message_already_in_transcript {
@@ -9000,7 +9886,7 @@
          }
          let certp = require_handshake_msg_move!(
              m,
-@@ -1099,10 +1063,7 @@
+@@ -1099,10 +1066,7 @@
  
          let client_cert = certp.into_certificate_chain();
  
@@ -9012,7 +9898,7 @@
  
          let Some((end_entity, intermediates)) = client_cert.split_first() else {
              if !mandatory {
-@@ -1128,10 +1089,7 @@
+@@ -1128,10 +1092,7 @@
          self.config
              .verifier
              .verify_client_cert(end_entity, intermediates, now)
@@ -9024,7 +9910,7 @@
  
          Ok(Box::new(ExpectCertificateVerify {
              config: self.config,
-@@ -1183,15 +1141,13 @@
+@@ -1183,15 +1144,13 @@
          };
  
          if let Err(e) = rc {
@@ -9042,7 +9928,7 @@
          Ok(Box::new(ExpectFinished {
              config: self.config,
              suite: self.suite,
-@@ -1228,11 +1184,7 @@
+@@ -1228,11 +1187,7 @@
      {
          match m.payload {
              MessagePayload::ApplicationData(payload) => {
@@ -9055,7 +9941,7 @@
                      true => Ok(self),
                      false => Err(cx.common.send_fatal_alert(
                          AlertDescription::UnexpectedMessage,
-@@ -1244,9 +1196,8 @@
+@@ -1244,9 +1199,8 @@
                  parsed: HandshakeMessagePayload(HandshakePayload::EndOfEarlyData),
                  ..
              } => {
@@ -9067,7 +9953,7 @@
                  Ok(Box::new(ExpectFinished {
                      config: self.config,
                      suite: self.suite,
-@@ -1327,9 +1278,7 @@
+@@ -1327,9 +1281,7 @@
              (ticket, config.ticketer.lifetime())
          } else {
              let id = rand::random_vec(secure_random, 32)?;
@@ -9078,7 +9964,7 @@
              if !stored {
                  trace!("resumption not available; not issuing ticket");
                  return Ok(());
-@@ -1352,7 +1301,7 @@
+@@ -1352,7 +1304,7 @@
  
          let t = HandshakeMessagePayload(HandshakePayload::NewSessionTicketTls13(payload));
          trace!("sending new ticket {t:?} (stateless: {stateless})");
@@ -9087,7 +9973,7 @@
  
          Ok(())
      }
-@@ -1387,7 +1336,7 @@
+@@ -1387,7 +1339,7 @@
  
          // Note: future derivations include Client Finished, but not the
          // main application data keying.
@@ -9096,7 +9982,7 @@
  
          cx.common.check_aligned_handshake()?;
  
-@@ -1401,8 +1350,7 @@
+@@ -1401,8 +1353,7 @@
          flight.finish(cx.common);
  
          // Application data may now flow, even if we have client auth enabled.
@@ -9106,7 +9992,7 @@
  
          Ok(match cx.common.is_quic() {
              true => Box::new(ExpectQuicTraffic {
-@@ -1443,13 +1391,11 @@
+@@ -1443,13 +1394,11 @@
          common.check_aligned_handshake()?;
  
          if common.should_update_key(key_update_request)? {
@@ -9122,7 +10008,7 @@
          Ok(())
      }
  }
-@@ -1464,9 +1410,7 @@
+@@ -1464,9 +1413,7 @@
          Self: 'm,
      {
          match m.payload {
@@ -9133,7 +10019,7 @@
              MessagePayload::Handshake {
                  parsed: HandshakeMessagePayload(HandshakePayload::KeyUpdate(key_update)),
                  ..
-@@ -1494,8 +1438,7 @@
+@@ -1494,8 +1441,7 @@
      }
  
      fn extract_secrets(&self) -> Result<PartiallyExtractedSecrets, Error> {
@@ -9143,7 +10029,7 @@
      }
  
      fn send_key_update_request(&mut self, common: &mut CommonState) -> Result<(), Error> {
-@@ -1514,11 +1457,10 @@
+@@ -1514,11 +1460,10 @@
  
  impl KernelState for ExpectTraffic {
      fn update_secrets(&mut self, dir: Direction) -> Result<ConnectionTrafficSecrets, Error> {
@@ -9413,6 +10299,15 @@
          if key_log.will_log(log_label) {
              key_log.log(log_label, client_random, output.as_ref());
          }
+@@ -727,7 +698,7 @@
+         let empty_hash = hp
+             .algorithm()
+             .hash_for_empty_input()
+-            .unwrap_or_else(|| hp.start().finish());
++            .unwrap_or_else(|| hp.hash(&[]));
+         self.derive(kind, empty_hash.as_ref())
+     }
+ }
 @@ -749,19 +720,14 @@
  
  impl KeyScheduleSuite {
@@ -9532,6 +10427,23 @@
  
      #[test]
      fn empty_hash() {
+@@ -1064,14 +1007,14 @@
+             .hash_provider;
+ 
+         assert!(
+-            sha256.start().finish().as_ref()
++            sha256.hash(&[]).as_ref()
+                 == HashAlgorithm::SHA256
+                     .hash_for_empty_input()
+                     .unwrap()
+                     .as_ref()
+         );
+         assert!(
+-            sha384.start().finish().as_ref()
++            sha384.hash(&[]).as_ref()
+                 == HashAlgorithm::SHA384
+                     .hash_for_empty_input()
+                     .unwrap()
 @@ -1079,11 +1022,7 @@
          );
  
