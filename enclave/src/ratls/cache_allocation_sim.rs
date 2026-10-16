@@ -78,6 +78,7 @@ pub fn check_paid_session_cache(pool: &Arc<AllocationPoolV1>) -> Result<(), &'st
         return Err("cache owning pool not refunded");
     }
     check_p256(pool)?;
+    check_input_buffer(pool)?;
     std::println!("TLS-SESSION-CACHE-SIM: actual-SDK backing entry get take exact-minus-one exact plus-one aliases returned-origin final-refund PASS");
     Ok(())
 }
@@ -183,5 +184,56 @@ fn check_p256(pool: &Arc<AllocationPoolV1>) -> Result<(), &'static str> {
         return Err("P256 original owning pool changed");
     }
     std::println!("TLS-P256-CONSTRUCTOR-SIM: actual-SDK metadata SPKI exact-minus-one exact plus-one aliases original-origin final-refund PASS\nTLS-P256-SIGNER-SIM: actual-SDK inline signer signature clone same-backing same-bytes after-key-origin-refund PASS");
+    Ok(())
+}
+
+fn input_buffer_once(pool: &Arc<AllocationPoolV1>) -> Result<(), &'static str> {
+    let before = pool.used();
+    let origin = LoanAllocator::from_pool_unpublished(pool).map_err(|_| "TLS input origin")?;
+    let mut acceptor = rustls::server::Acceptor::new_in(origin.owned_allocator());
+    let read = acceptor.read_tls(&mut std::io::Cursor::new([7]));
+    if read.as_ref().is_ok_and(|n| *n != 1) {
+        return Err("TLS input byte count");
+    }
+    if read.is_ok() {
+        origin.activate_release_notification();
+    }
+    drop(origin);
+    if read.is_ok() && pool.used() <= before {
+        return Err("TLS input lost original origin");
+    }
+    drop(acceptor);
+    if pool.used() != before {
+        return Err("TLS input backing/origin final refund");
+    }
+    read.map(|_| ()).map_err(|_| "TLS input backing refused")
+}
+fn check_input_buffer(pool: &Arc<AllocationPoolV1>) -> Result<(), &'static str> {
+    input_buffer_once(pool)?;
+    let root = enclave_os_common::allocation::shared_allocation_bytes::<AllocationPoolV1>()
+        .ok_or("TLS input root layout")?;
+    let backend =
+        LoanAllocator::required_backend_bytes(rustls::server::Acceptor::initial_read_layout())
+            .map_err(|_| "TLS input exact backend")?;
+    let bytes = LoanAllocator::required_origin_bytes()
+        .and_then(|n| n.checked_add(backend))
+        .ok_or("TLS input complete layout")?;
+    for extra in [-1_isize, 0, 1] {
+        let isolated = AllocationPoolV1::try_new_with_release(
+            root.checked_add(bytes)
+                .and_then(|n| n.checked_add_signed(extra))
+                .ok_or("TLS input exact bound")?,
+            None,
+        )
+        .ok_or("TLS input pool")?;
+        let result = input_buffer_once(&isolated);
+        if (extra < 0 && result.is_ok()) || (extra >= 0 && result.is_err()) {
+            return Err("TLS input exact boundary");
+        }
+        if isolated.used() != 0 {
+            return Err("TLS input leaked on success/refusal");
+        }
+    }
+    std::println!("TLS-INPUT-BUFFER-SIM: actual-SDK original-pool first-read minus-one exact plus-one allocator-lifetime final-refund PASS");
     Ok(())
 }

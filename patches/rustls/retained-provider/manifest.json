@@ -2,7 +2,7 @@
   "schema": 1,
   "profile": "retained-provider",
   "routing": "build-owned Cargo paths override; same package manifests, lock and dependency graph",
-  "patch_sha256": "2b116ff13361a9275051c1c65084c67cc4ac1cf2b00f6f5f1bc3536eebf190e8",
+  "patch_sha256": "9dc292b520c26abdfc978a6f25068f7273e772d9c09d5f8ee8f013c4c4f2bf27",
   "suppliers": [
     {
       "package": "rustls",
@@ -13,7 +13,7 @@
         {
           "path": "src/lib.rs",
           "before_sha256": "7bd4855fe9628a0d596e89edf8130a6c099a14a0b7f7bbb28953b53c01810502",
-          "after_sha256": "9389489a9625a8f14a36af8707b4f1d9e84701d0bf5a97e528f59a4ef1b8c083"
+          "after_sha256": "19f84ecfe071ca6b2ee22c9ad9d2d9e58bbb9c56e545735037f204adee964e7f"
         },
         {
           "path": "src/limited_cache.rs",
@@ -33,7 +33,7 @@
         {
           "path": "src/server/server_conn.rs",
           "before_sha256": "603cddb8a3a415737b7e047deedd32a2a6e4f918c2372af0bfb50ebb04de2163",
-          "after_sha256": "090fa799d922dbb1c9db51c126d02e1f4afd254549dd8c6b5350c23c83304caf"
+          "after_sha256": "7426eb69631af7579b28a52d340154cbbe96bde061012cf27f5c003ba54900dd"
         },
         {
           "path": "src/server/tls12.rs",
@@ -104,6 +104,16 @@
           "path": "src/error.rs",
           "before_sha256": "d15fad2553069e2a628b16c944e173fb12aacf8400bd4e2eef45702bb70637f8",
           "after_sha256": "105f2c7e3dc9abd21dc6e8a5bab5080f9c018ba951511959c70dcf3fb5876385"
+        },
+        {
+          "path": "src/msgs/deframer/buffers.rs",
+          "before_sha256": "48bb18eff4e5859ec56aba8910488a791457afabc79feba0b09375e11bcca459",
+          "after_sha256": "8ed7c8f612294d0d2ee2080881dba8c9447f6e82b5244657944ceedcd2b8e103"
+        },
+        {
+          "path": "src/conn.rs",
+          "before_sha256": "a8866f067c993bc5591b36c1428ee529764eda77ec486b9740f4b3d811fc18cd",
+          "after_sha256": "93a7e6886f015cf482da06088eaa1b4624f91ec0a68b5bea1f73dfa5303e3ed0"
         }
       ]
     }

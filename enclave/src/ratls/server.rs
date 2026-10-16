@@ -1288,6 +1288,15 @@ impl IngressServer {
         // Feed the bytes into a rustls Acceptor and confirm the
         // ClientHello is complete BEFORE parsing it: a partial hello would
         // yield a truncated challenge nonce / SNI.
+        #[cfg(feature = "fallible-allocation-v1")]
+        let input_origin = {
+            let pool = crate::local_allocation_pool().ok_or_else(String::new)?;
+            enclave_os_common::allocation::LoanAllocator::from_pool_unpublished(&pool)
+                .map_err(|_| String::new())?
+        };
+        #[cfg(feature = "fallible-allocation-v1")]
+        let mut acceptor = Acceptor::new_in(input_origin.owned_allocator());
+        #[cfg(not(feature = "fallible-allocation-v1"))]
         let mut acceptor = Acceptor::default();
         {
             let mut cursor = std::io::Cursor::new(raw);
@@ -1342,6 +1351,8 @@ impl IngressServer {
             self.send_to_proxy(conn_id, &output);
         }
 
+        #[cfg(feature = "fallible-allocation-v1")]
+        input_origin.activate_release_notification();
         Ok(Some(session))
     }
 

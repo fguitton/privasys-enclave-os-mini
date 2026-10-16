@@ -394,7 +394,51 @@ mod provider_refusal {
         }
         check_default_arcs();
         check_p256_constructor();
+        check_input_buffer();
     }
+    fn check_input_buffer() {
+        use rustls::server::Acceptor;
+        use std::io::{Cursor, ErrorKind};
+        let first = Acceptor::initial_read_layout();
+        let input = vec![7; first.size()];
+        for growth in [false, true] {
+            ARM.with(|cell| {
+                cell.set(Some(Arm {
+                    expected: first,
+                    refused: false,
+                    live: 0,
+                    allocations: 0,
+                    skip_matching: if growth { usize::MAX } else { 0 },
+                }))
+            });
+            let mut acceptor = Acceptor::new_in(std::alloc::Global);
+            if growth {
+                assert_eq!(
+                    acceptor
+                        .read_tls(&mut Cursor::new(input.as_slice()))
+                        .unwrap(),
+                    first.size()
+                );
+                ARM.with(|cell| {
+                    let mut arm = cell.get().unwrap();
+                    arm.expected =
+                        Layout::array::<u8>(first.size().checked_mul(2).unwrap()).unwrap();
+                    arm.skip_matching = 0;
+                    cell.set(Some(arm));
+                });
+            }
+            let mut cursor = Cursor::new([8]);
+            let error = acceptor.read_tls(&mut cursor).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::OutOfMemory);
+            drop(error);
+            assert_eq!(cursor.position(), 0);
+            drop(acceptor);
+            let arm = ARM.with(|cell| cell.take()).unwrap();
+            assert!(arm.refused);
+            assert_eq!(arm.live, 0);
+        }
+    }
+
     fn check_p256_constructor() {
         use rustls::crypto::ring::sign::{any_ecdsa_type, try_p256_signing_key_in};
         use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};

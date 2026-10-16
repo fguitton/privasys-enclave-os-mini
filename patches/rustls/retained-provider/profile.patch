@@ -6,7 +6,7 @@
  #![forbid(unsafe_code, unused_must_use)]
 -#![cfg_attr(not(any(read_buf, bench, coverage_nightly)), forbid(unstable_features))]
 +// This verified generated profile uses the already pinned nightly allocator API.
-+#![feature(allocator_api)]
++#![feature(allocator_api, vec_fallible_shrink)]
  #![warn(
      clippy::alloc_instead_of_core,
      clippy::manual_let_else,
@@ -782,7 +782,40 @@
          }
      }
  
-@@ -987,9 +985,7 @@
+@@ -831,16 +829,29 @@
+     impl Default for Acceptor {
+         /// Return an empty Acceptor, ready to receive bytes from a new client connection.
+         fn default() -> Self {
++            Self::new_in(crate::limited_cache::default_allocator())
++        }
++    }
++
++    impl Acceptor {
++        /// Create an empty acceptor retaining the allocator for its inbound buffer.
++        /// No input buffer is allocated until the first read.
++        pub fn new_in(allocator: crate::RetainedAllocator) -> Self {
+             Self {
+                 inner: Some(
+-                    ConnectionCore::new(
++                    ConnectionCommon::from(ConnectionCore::new(
+                         Box::new(Accepting),
+                         ServerConnectionData::default(),
+                         CommonState::new(Side::Server),
+-                    )
+-                    .into(),
++                    ))
++                    .with_input_allocator(allocator),
+                 ),
+             }
++        }
++
++        /// Exact first read backing layout from the buffer policy owner.
++        pub fn initial_read_layout() -> core::alloc::Layout {
++            crate::msgs::deframer::buffers::DeframerVecBuffer::initial_read_layout()
+         }
+     }
+ 
+@@ -987,9 +998,7 @@
      pub fn dangerous_into_kernel_connection(
          self,
      ) -> Result<(ExtractedSecrets, KernelConnection<ServerConnectionData>), Error> {
@@ -793,7 +826,7 @@
      }
  }
  
-@@ -1034,16 +1030,10 @@
+@@ -1034,16 +1043,10 @@
              server_name: &self.connection.core.data.sni,
              signature_schemes: &self.sig_schemes,
              alpn: payload.protocols.as_ref(),
@@ -3445,3 +3478,363 @@
                  presented: vec![
                      "DnsName(\"hello.com\")".into(),
                      "DnsName(\"goodbye.com\")".into(),
+--- a/src/msgs/deframer/buffers.rs
++++ b/src/msgs/deframer/buffers.rs
+@@ -1,3 +1,4 @@
++use crate::RetainedAllocator;
+ use alloc::vec::Vec;
+ use core::mem;
+ use core::ops::Range;
+@@ -135,9 +136,7 @@
+         // the caller is about to discard `discard` bytes
+         // from the front of the buffer.  adjust `processed`
+         // down by the same amount.
+-        self.processed = self
+-            .processed
+-            .saturating_sub(self.discard);
++        self.processed = self.processed.saturating_sub(self.discard);
+         mem::take(&mut self.discard)
+     }
+ 
+@@ -147,18 +146,35 @@
+     }
+ }
+ 
+-#[derive(Default, Debug)]
++#[derive(Debug)]
+ pub(crate) struct DeframerVecBuffer {
+     /// Buffer of data read from the socket, in the process of being parsed into messages.
+     ///
+     /// For buffer size management, checkout out the [`DeframerVecBuffer::prepare_read()`] method.
+-    buf: Vec<u8>,
++    buf: Vec<u8, RetainedAllocator>,
+ 
+     /// What size prefix of `buf` is used.
+     used: usize,
+ }
+ 
++impl Default for DeframerVecBuffer {
++    fn default() -> Self {
++        Self::new_in(crate::limited_cache::default_allocator())
++    }
++}
++
+ impl DeframerVecBuffer {
++    pub(crate) fn new_in(allocator: RetainedAllocator) -> Self {
++        Self {
++            buf: Vec::new_in(allocator),
++            used: 0,
++        }
++    }
++
++    #[cfg(feature = "std")]
++    pub(crate) fn initial_read_layout() -> core::alloc::Layout {
++        core::alloc::Layout::array::<u8>(READ_SIZE).expect("fixed TLS read layout")
++    }
+     /// Discard `taken` bytes from the start of our buffer.
+     pub(crate) fn discard(&mut self, taken: usize) {
+         #[allow(clippy::comparison_chain)]
+@@ -176,8 +192,7 @@
+              * 0          ^ self.used
+              */
+ 
+-            self.buf
+-                .copy_within(taken..self.used, 0);
++            self.buf.copy_within(taken..self.used, 0);
+             self.used -= taken;
+         } else if taken >= self.used {
+             self.used = 0;
+@@ -192,14 +207,15 @@
+         &self.buf[..self.used]
+     }
+ }
++
++#[cfg(feature = "std")]
++const READ_SIZE: usize = 4096;
+ 
+ #[cfg(feature = "std")]
+ impl DeframerVecBuffer {
+     /// Read some bytes from `rd`, and add them to the buffer.
+     pub(crate) fn read(&mut self, rd: &mut dyn io::Read, in_handshake: bool) -> io::Result<usize> {
+-        if let Err(err) = self.prepare_read(in_handshake) {
+-            return Err(io::Error::new(io::ErrorKind::InvalidData, err));
+-        }
++        self.prepare_read(in_handshake)?;
+ 
+         // Try to do the largest reads possible. Note that if
+         // we get a message with a length field out of range here,
+@@ -211,13 +227,11 @@
+     }
+ 
+     /// Resize the internal `buf` if necessary for reading more bytes.
+-    fn prepare_read(&mut self, is_joining_hs: bool) -> Result<(), &'static str> {
++    fn prepare_read(&mut self, is_joining_hs: bool) -> io::Result<()> {
+         /// TLS allows for handshake messages of up to 16MB.  We
+         /// restrict that to 64KB to limit potential for denial-of-
+         /// service.
+         const MAX_HANDSHAKE_SIZE: u32 = 0xffff;
+-
+-        const READ_SIZE: usize = 4096;
+ 
+         // We allow a maximum of 64k of buffered data for handshake messages only. Enforce this
+         // by varying the maximum allowed buffer size here based on whether a prefix of a
+@@ -232,7 +246,10 @@
+         };
+ 
+         if self.used >= allow_max {
+-            return Err("message buffer full");
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidData,
++                "message buffer full",
++            ));
+         }
+ 
+         // If we can and need to increase the buffer size to allow a 4k read, do so. After
+@@ -242,10 +259,15 @@
+         // which usually means that the other side suspended sending data.
+         let need_capacity = Ord::min(allow_max, self.used + READ_SIZE);
+         if need_capacity > self.buf.len() {
++            self.buf
++                .try_reserve(need_capacity - self.buf.len())
++                .map_err(|_| io::ErrorKind::OutOfMemory)?;
+             self.buf.resize(need_capacity, 0);
+         } else if self.used == 0 || self.buf.len() > allow_max {
+             self.buf.resize(need_capacity, 0);
+-            self.buf.shrink_to(need_capacity);
++            self.buf
++                .try_shrink_to(need_capacity)
++                .map_err(|_| io::ErrorKind::OutOfMemory)?;
+         }
+ 
+         Ok(())
+--- a/src/conn.rs
++++ b/src/conn.rs
+@@ -7,13 +7,13 @@
+ 
+ use kernel::KernelConnection;
+ 
+-use crate::common_state::{CommonState, Context, DEFAULT_BUFFER_LIMIT, IoState, State};
++use crate::common_state::{CommonState, Context, IoState, State, DEFAULT_BUFFER_LIMIT};
+ use crate::enums::{AlertDescription, ContentType, ProtocolVersion};
+ use crate::error::{Error, PeerMisbehaved};
+ use crate::log::trace;
+-use crate::msgs::deframer::DeframerIter;
+ use crate::msgs::deframer::buffers::{BufferProgress, DeframerVecBuffer, Delocator, Locator};
+ use crate::msgs::deframer::handshake::HandshakeDeframer;
++use crate::msgs::deframer::DeframerIter;
+ use crate::msgs::handshake::Random;
+ use crate::msgs::message::{InboundPlainMessage, Message, MessagePayload};
+ use crate::record_layer::Decrypted;
+@@ -31,12 +31,12 @@
+     use core::ops::{Deref, DerefMut};
+     use std::io::{self, BufRead, Read};
+ 
+-    use crate::ConnectionCommon;
+     use crate::common_state::{CommonState, IoState};
+     use crate::error::Error;
+     use crate::msgs::message::OutboundChunks;
+     use crate::suites::ExtractedSecrets;
+     use crate::vecbuf::ChunkVecBuffer;
++    use crate::ConnectionCommon;
+ 
+     /// A client or server connection.
+     #[derive(Debug)]
+@@ -236,8 +236,7 @@
+                 return Ok(len);
+             }
+ 
+-            self.check_no_bytes_state()
+-                .map(|()| len)
++            self.check_no_bytes_state().map(|()| len)
+         }
+ 
+         /// Obtain plaintext data received from the peer over this TLS connection.
+@@ -264,8 +263,7 @@
+         #[cfg(read_buf)]
+         fn read_buf(&mut self, mut cursor: core::io::BorrowedCursor<'_, u8>) -> io::Result<()> {
+             let before = cursor.written();
+-            self.received_plaintext
+-                .read_buf(cursor.reborrow())?;
++            self.received_plaintext.read_buf(cursor.reborrow())?;
+             let len = cursor.written() - before;
+             if len > 0 || cursor.capacity() == 0 {
+                 return Ok(());
+@@ -294,12 +292,12 @@
+         }
+ 
+         fn consume(&mut self, amt: usize) {
+-            self.received_plaintext
+-                .consume_first_chunk(amt)
+-        }
+-    }
+-
+-    const UNEXPECTED_EOF_MESSAGE: &str = "peer closed connection without sending TLS close_notify: \
++            self.received_plaintext.consume_first_chunk(amt)
++        }
++    }
++
++    const UNEXPECTED_EOF_MESSAGE: &str =
++        "peer closed connection without sending TLS close_notify: \
+ https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof";
+ 
+     /// A structure that implements [`std::io::Write`] for writing plaintext.
+@@ -367,10 +365,7 @@
+                 0 => return Ok(0),
+                 1 => OutboundChunks::Single(bufs[0].deref()),
+                 _ => {
+-                    payload_owner = bufs
+-                        .iter()
+-                        .map(|io_slice| io_slice.deref())
+-                        .collect();
++                    payload_owner = bufs.iter().map(|io_slice| io_slice.deref()).collect();
+ 
+                     OutboundChunks::new(&payload_owner)
+                 }
+@@ -415,6 +410,11 @@
+ }
+ 
+ impl<Data> ConnectionCommon<Data> {
++    pub(crate) fn with_input_allocator(mut self, allocator: crate::RetainedAllocator) -> Self {
++        self.deframer_buffer = DeframerVecBuffer::new_in(allocator);
++        self
++    }
++
+     /// Processes any new packets read by a previous call to
+     /// [`Connection::read_tls`].
+     ///
+@@ -463,8 +463,7 @@
+         label: &[u8],
+         context: Option<&[u8]>,
+     ) -> Result<T, Error> {
+-        self.core
+-            .export_keying_material(output, label, context)
++        self.core.export_keying_material(output, label, context)
+     }
+ 
+     /// Extract secrets, so they can be used when configuring kTLS, for example.
+@@ -722,8 +721,7 @@
+ 
+         match res? {
+             Some(Ok(msg)) => {
+-                self.deframer_buffer
+-                    .discard(buffer_progress.take_discard());
++                self.deframer_buffer.discard(buffer_progress.take_discard());
+                 Ok(Some(msg))
+             }
+             Some(Err(err)) => Err(self.send_fatal_alert(AlertDescription::DecodeError, err)),
+@@ -923,10 +921,7 @@
+                 }
+             }
+ 
+-            if self
+-                .common_state
+-                .has_received_close_notify
+-            {
++            if self.common_state.has_received_close_notify {
+                 // "Any data received after a closure alert has been received MUST be ignored."
+                 // -- <https://datatracker.ietf.org/doc/html/rfc8446#section-6.1>
+                 // This is data that has already been accepted in `read_tls`.
+@@ -1008,10 +1003,7 @@
+                     // * The payload size is indicative of a plaintext alert message.
+                     ContentType::Alert
+                         if version_is_tls13
+-                            && !self
+-                                .common_state
+-                                .record_layer
+-                                .has_decrypted()
++                            && !self.common_state.record_layer.has_decrypted()
+                             && message.payload.len() <= 2 =>
+                     {
+                         true
+@@ -1024,11 +1016,7 @@
+                     break (message.into_plain_message(), iter.bytes_consumed());
+                 }
+ 
+-                let message = match self
+-                    .common_state
+-                    .record_layer
+-                    .decrypt_incoming(message)
+-                {
++                let message = match self.common_state.record_layer.decrypt_incoming(message) {
+                     // failed decryption during trial decryption is not allowed to be
+                     // interleaved with partial handshake data.
+                     Ok(None) if !self.hs_deframer.is_aligned() => {
+@@ -1105,9 +1093,7 @@
+ 
+             if self.hs_deframer.has_message_ready() {
+                 // trial decryption finishes with the first handshake message after it started.
+-                self.common_state
+-                    .record_layer
+-                    .finish_trial_decryption();
++                self.common_state.record_layer.finish_trial_decryption();
+ 
+                 return Ok(self.take_handshake_message(buffer, buffer_progress));
+             }
+@@ -1148,9 +1134,7 @@
+     ) -> Result<Box<dyn State<Data>>, Error> {
+         // Drop CCS messages during handshake in TLS1.3
+         if msg.typ == ContentType::ChangeCipherSpec
+-            && !self
+-                .common_state
+-                .may_receive_application_data
++            && !self.common_state.may_receive_application_data
+             && self.common_state.is_tls13()
+         {
+             if !msg.is_valid_ccs() {
+@@ -1163,8 +1147,7 @@
+                 ));
+             }
+ 
+-            self.common_state
+-                .received_tls13_change_cipher_spec()?;
++            self.common_state.received_tls13_change_cipher_spec()?;
+             trace!("Dropping CCS");
+             return Ok(state);
+         }
+@@ -1190,18 +1173,13 @@
+     }
+ 
+     pub(crate) fn dangerous_extract_secrets(self) -> Result<ExtractedSecrets, Error> {
+-        Ok(self
+-            .dangerous_into_kernel_connection()?
+-            .0)
++        Ok(self.dangerous_into_kernel_connection()?.0)
+     }
+ 
+     pub(crate) fn dangerous_into_kernel_connection(
+         self,
+     ) -> Result<(ExtractedSecrets, KernelConnection<Data>), Error> {
+-        if !self
+-            .common_state
+-            .enable_secret_extraction
+-        {
++        if !self.common_state.enable_secret_extraction {
+             return Err(Error::General("Secret extraction is disabled".into()));
+         }
+ 
+@@ -1209,11 +1187,7 @@
+             return Err(Error::HandshakeNotComplete);
+         }
+ 
+-        if !self
+-            .common_state
+-            .sendable_tls
+-            .is_empty()
+-        {
++        if !self.common_state.sendable_tls.is_empty() {
+             return Err(Error::General(
+                 "cannot convert into an KernelConnection while there are still buffered TLS records to send"
+                     .into()
+@@ -1257,11 +1231,7 @@
+ 
+     /// Trigger a `refresh_traffic_keys` if required by `CommonState`.
+     fn maybe_refresh_traffic_keys(&mut self) {
+-        if mem::take(
+-            &mut self
+-                .common_state
+-                .refresh_traffic_keys_pending,
+-        ) {
++        if mem::take(&mut self.common_state.refresh_traffic_keys_pending) {
+             let _ = self.refresh_traffic_keys();
+         }
+     }
