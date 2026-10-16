@@ -43,3 +43,7 @@ base64 = "0.21"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_vendor, values("teaclave"))', 'cfg(feature, values("mock", "sgx-sim-attestation"))'] }
+
+[[test]]
+name = "btree_node_allocation"
+required-features = ["fallible-allocation-v1"]

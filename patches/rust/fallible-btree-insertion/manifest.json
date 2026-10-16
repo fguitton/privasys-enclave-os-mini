@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "profile": "fallible-btree-insertion",
+  "files": [
+    {
+      "path": "alloc/src/collections/btree/node.rs",
+      "before_sha256": "2200ca0a4fe38592c314dc7f5f40bbb160e06b6f9e4abd1eb5bc40701540ab25",
+      "after_sha256": "d3529da5fa04ae17f84a9a8d2ef22ada68656f1f8f0087ad77f0c0f35ea602e3"
+    },
+    {
+      "path": "alloc/src/collections/btree/map.rs",
+      "before_sha256": "2ce3f3468c9686421c216a74b38211fefdfe506c794b3c350bbf69ce3fb71a19",
+      "after_sha256": "57d4a20c555ae8487fc989e164a36387df43add6286731a11b6f7ae3b9536f3e"
+    },
+    {
+      "path": "alloc/src/collections/btree/map/entry.rs",
+      "before_sha256": "7b312d09e6d1b8321c2c1e4273f8dcd095de7f2e39b1f8245d663bc3fc7dad79",
+      "after_sha256": "8368eab7dc4f8637e607d85ea1e205ad01076543be02f3652fd167aabd627f7c"
+    }
+  ],
+  "patch_sha256": "a08dfe64aee8acd2cff5132de4d23762bdbd668b54955f1f2d2ca2f38415e223",
+  "scope": "Physical allocation before vacant insertion; no decoded children, authority, or global allocator claim"
+}

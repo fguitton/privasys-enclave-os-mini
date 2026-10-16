@@ -1,0 +1,205 @@
+--- a/alloc/src/collections/btree/node.rs
++++ b/alloc/src/collections/btree/node.rs
+@@ -37,7 +37,8 @@
+ use core::ptr::{self, NonNull};
+ use core::slice::SliceIndex;
+ 
+-use crate::alloc::{Allocator, Layout};
++use crate::alloc::{AllocError, Allocator, Layout};
++use core::cell::Cell;
+ use crate::boxed::Box;
+ 
+ const B: usize = 6;
+@@ -1881,3 +1882,111 @@
+ 
+ #[cfg(test)]
+ mod tests;
++
++
++// One insertion can split at most one node per existing level, then add one
++// root. Every internal node has at least two children, so even the smallest
++// legal tree of height h has at least 2^(h+1)-1 keys. This pointer-width bound
++// therefore covers every representable tree without heap metadata.
++const INSERT_ALLOCATION_SLOTS: usize = usize::BITS as usize + 1;
++
++#[derive(Clone, Copy)]
++struct InsertBlock {
++    pointer: NonNull<[u8]>,
++    layout: Layout,
++}
++
++/// Actual backend blocks reserved before a vacant insertion mutates its tree.
++/// Nodes retain the map's original allocator; the borrowed facade never escapes.
++pub(super) struct InsertAllocation<A: Allocator> {
++    alloc: A,
++    blocks: [Cell<Option<InsertBlock>>; INSERT_ALLOCATION_SLOTS],
++    count: usize,
++}
++
++impl<A: Allocator> InsertAllocation<A> {
++    fn new(alloc: A) -> Self {
++        Self { alloc, blocks: [const { Cell::new(None) }; INSERT_ALLOCATION_SLOTS], count: 0 }
++    }
++
++    pub(super) fn assert_consumed(&self) {
++        // The exact layout multiset was taken once by the existing insertion.
++        // A reservation miss cannot turn into an unadmitted backend allocation;
++        // an excess reservation is an implementation error, not successful proof.
++        assert!(self.blocks[..self.count].iter().all(|slot| slot.get().is_none()));
++    }
++
++    fn reserve(&mut self, layout: Layout) -> Result<(), AllocError> {
++        let slot = self.blocks.get(self.count).ok_or(AllocError)?;
++        let pointer = self.alloc.allocate(layout)?;
++        slot.set(Some(InsertBlock { pointer, layout }));
++        self.count += 1;
++        Ok(())
++    }
++}
++
++impl<A: Allocator> Drop for InsertAllocation<A> {
++    fn drop(&mut self) {
++        for slot in &self.blocks[..self.count] {
++            if let Some(block) = slot.take() {
++                // SAFETY: this is an unused original allocation with its exact layout.
++                unsafe { self.alloc.deallocate(block.pointer.cast(), block.layout) };
++            }
++        }
++    }
++}
++
++// SAFETY: every returned block came from this same allocator with this exact
++// layout. Only the exclusive insertion borrows the facade, and takes each block
++// once. Node destruction continues using the map's original allocator.
++#[unstable(feature = "allocator_api", issue = "32838")]
++unsafe impl<A: Allocator> Allocator for &InsertAllocation<A> {
++    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
++        for slot in &self.blocks[..self.count] {
++            if let Some(block) = slot.get() {
++                if block.layout == layout {
++                    slot.set(None);
++                    return Ok(block.pointer);
++                }
++            }
++        }
++        // No backend allocation can occur after mutation begins.
++        Err(AllocError)
++    }
++
++    unsafe fn deallocate(&self, pointer: NonNull<u8>, layout: Layout) {
++        // SAFETY: the caller provides the original pointer and allocation layout.
++        unsafe { self.alloc.deallocate(pointer, layout) };
++    }
++}
++
++/// Follow the actual vacant leaf's full ancestor chain before modifying it.
++pub(super) fn reserve_insert<K, V, A: Allocator>(
++    handle: Option<&Handle<NodeRef<marker::Mut<'_>, K, V, marker::Leaf>, marker::Edge>>,
++    alloc: A,
++) -> Result<InsertAllocation<A>, AllocError> {
++    let mut reserved = InsertAllocation::new(alloc);
++    let Some(handle) = handle else {
++        reserved.reserve(Layout::new::<LeafNode<K, V>>())?;
++        return Ok(reserved);
++    };
++    let mut node = handle.reborrow().into_node().forget_type();
++    loop {
++        if node.len() < CAPACITY {
++            return Ok(reserved);
++        }
++        let layout = if node.height() == 0 {
++            Layout::new::<LeafNode<K, V>>()
++        } else {
++            Layout::new::<InternalNode<K, V>>()
++        };
++        reserved.reserve(layout)?;
++        match node.ascend() {
++            Ok(parent) => node = parent.into_node().forget_type(),
++            Err(_) => {
++                reserved.reserve(Layout::new::<InternalNode<K, V>>())?;
++                return Ok(reserved);
++            }
++        }
++    }
++}
+--- a/alloc/src/collections/btree/map.rs
++++ b/alloc/src/collections/btree/map.rs
+@@ -1052,6 +1052,21 @@
+                 entry.insert(value);
+                 None
+             }
++        }
++    }
++
++    /// Insert or replace, reserving every required physical node before mutation.
++    /// On allocation refusal the map is unchanged and the uninserted key/value
++    /// are returned. Occupied replacement requires no node allocation.
++    #[unstable(feature = "allocator_api", issue = "32838")]
++    pub fn try_insert_alloc(
++        &mut self, key: K, value: V,
++    ) -> Result<Option<V>, (crate::alloc::AllocError, K, V)>
++    where K: Ord,
++    {
++        match self.entry(key) {
++            Occupied(mut entry) => Ok(Some(entry.insert(value))),
++            Vacant(entry) => entry.try_insert_alloc(value).map(|_| None),
+         }
+     }
+ 
+--- a/alloc/src/collections/btree/map/entry.rs
++++ b/alloc/src/collections/btree/map/entry.rs
+@@ -444,12 +444,18 @@
+     /// assert_eq!(map["poneyland"], 37);
+     /// ```
+     #[stable(feature = "btree_entry_insert", since = "1.92.0")]
+-    pub fn insert_entry(mut self, value: V) -> OccupiedEntry<'a, K, V, A> {
++    pub fn insert_entry(self, value: V) -> OccupiedEntry<'a, K, V, A> {
++        self.insert_entry_with(value, A::clone)
++    }
++
++    fn insert_entry_with<B: Allocator + Clone>(
++        mut self, value: V, mut allocator: impl FnMut(&A) -> B,
++    ) -> OccupiedEntry<'a, K, V, A> {
+         let handle = match self.handle {
+             None => {
+                 // SAFETY: There is no tree yet so no reference to it exists.
+                 let map = unsafe { self.dormant_map.reborrow() };
+-                let root = map.root.insert(NodeRef::new_leaf(self.alloc.clone()).forget_type());
++                let root = map.root.insert(NodeRef::new_leaf(allocator(&self.alloc)).forget_type());
+                 // SAFETY: We *just* created the root as a leaf, and we're
+                 // stacking the new handle on the original borrow lifetime.
+                 unsafe {
+@@ -457,13 +463,13 @@
+                     leaf.push_with_handle(self.key, value)
+                 }
+             }
+-            Some(handle) => handle.insert_recursing(self.key, value, self.alloc.clone(), |ins| {
++            Some(handle) => handle.insert_recursing(self.key, value, allocator(&self.alloc), |ins| {
+                 drop(ins.left);
+                 // SAFETY: Pushing a new root node doesn't invalidate
+                 // handles to existing nodes.
+                 let map = unsafe { self.dormant_map.reborrow() };
+                 let root = map.root.as_mut().unwrap(); // same as ins.left
+-                root.push_internal_level(self.alloc.clone()).push(ins.kv.0, ins.kv.1, ins.right)
++                root.push_internal_level(allocator(&self.alloc)).push(ins.kv.0, ins.kv.1, ins.right)
+             }),
+         };
+ 
+@@ -477,6 +483,17 @@
+             _marker: PhantomData,
+         }
+     }
++
++    pub(super) fn try_insert_alloc(self, value: V) -> Result<&'a mut V, (crate::alloc::AllocError, K, V)> {
++        let reservation = match super::super::node::reserve_insert(self.handle.as_ref(), self.alloc.clone()) {
++            Ok(reservation) => reservation,
++            Err(error) => return Err((error, self.key, value)),
++        };
++        let entry = self.insert_entry_with(value, |_| &reservation);
++        reservation.assert_consumed();
++        Ok(entry.into_mut())
++    }
++
+ }
+ 
+ impl<'a, K: Ord, V, A: Allocator + Clone> OccupiedEntry<'a, K, V, A> {

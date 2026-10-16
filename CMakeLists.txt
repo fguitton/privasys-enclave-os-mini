@@ -244,6 +244,7 @@ if(BUILD_ENCLAVE)
             "RUSTFLAGS=${SGX_SYSROOT_REPRODUCIBLE_RUSTFLAGS}"
             "CC=${CMAKE_C_COMPILER}"
             "CXX=${CMAKE_CXX_COMPILER}"
+            ${_btree_std_environment}
             ${CMAKE_COMMAND}
             -S "${TEACLAVE_CHECKOUT}"
             -B "${SYSROOT_BUILD_DIR}"
@@ -267,6 +268,7 @@ if(BUILD_ENCLAVE)
             "RUSTFLAGS=${SGX_SYSROOT_REPRODUCIBLE_RUSTFLAGS}"
             "CC=${CMAKE_C_COMPILER}"
             "CXX=${CMAKE_CXX_COMPILER}"
+            ${_btree_std_environment}
             ${CMAKE_COMMAND}
             --build "${SYSROOT_BUILD_DIR}"
             --target sgx_sysroot

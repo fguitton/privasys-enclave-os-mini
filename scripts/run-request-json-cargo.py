@@ -192,6 +192,20 @@ def native_run(cargo, build_root, arguments):
     manifest = command_manifest(arguments)
     resolved = metadata(cargo, manifest, feature_selectors(arguments))
     packages = {row['id']: row for row in resolved['packages']}
+    paid_tree = any(packages[node['id']]['name'] == 'honest-layer-1-core'
+                    and 'fallible-state-allocation-v1' in node['features']
+                    for node in resolved['resolve']['nodes'])
+    if paid_tree:
+        source = runpy.run_path(str(Path(__file__).with_name('run-fallible-btree-cargo.py')))
+        output = (build_root if build_root is not None else Path(resolved['target_directory'])) / 'fallible-btree-source'
+        with source['source_context'](manifest, output.absolute(), arguments) as admitted:
+            return native_json_run(cargo, build_root, admitted, resolved)
+    return native_json_run(cargo, build_root, arguments, resolved)
+
+
+def native_json_run(cargo, build_root, arguments, resolved):
+    packages = {row['id']: row for row in resolved['packages']}
+    manifest = command_manifest(arguments)
     required = any(packages[node['id']]['name'] == 'enclave-os-common'
                    and 'request-json-parser' in node['features']
                    for node in resolved['resolve']['nodes'])

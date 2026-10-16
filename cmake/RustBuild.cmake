@@ -225,6 +225,7 @@ function(rust_build_enclave CRATE_DIR OUTPUT_NAME FEATURES)
 
     add_custom_target(${OUTPUT_NAME} ALL
         COMMAND ${CMAKE_COMMAND} -E env
+            "HONEST_BTREE_SOURCE_RECEIPT=${HONEST_BTREE_SOURCE_RECEIPT}"
             "SGX_SDK_PATH=${SGX_SDK_PATH}"
             "SGX_MODE=${SGX_MODE}"
             "SGX_CRYPTO_BACKEND=${SGX_CRYPTO_BACKEND}"

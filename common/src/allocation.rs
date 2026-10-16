@@ -1,8 +1,12 @@
 //! Shared transient allocation admission. Numeric capacity grants no authority.
+#[cfg(feature = "fallible-allocation-v1")]
+mod map_allocator;
 /// Pool-bound fallible ordered metadata backing; child admission remains separate.
 pub mod ordered_map;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(feature = "fallible-allocation-v1")]
+pub use map_allocator::PoolMapAllocator;
 
 #[derive(Debug)]
 pub struct AllocationPoolV1 {

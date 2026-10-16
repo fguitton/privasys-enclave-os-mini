@@ -162,6 +162,7 @@ pub(crate) fn required_text(value: Option<Value<'_>>) -> Result<Text<'_>, Refusa
         _ => Err(Refusal::Malformed),
     }
 }
+#[cfg(feature = "crypto")]
 pub(crate) fn optional_text(value: Option<Value<'_>>) -> Result<Option<Text<'_>>, Refusal> {
     match value {
         None | Some(Value::Null) => Ok(None),
