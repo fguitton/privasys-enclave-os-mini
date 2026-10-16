@@ -68,6 +68,8 @@ mod tests {
         }
     }
     fn sequence(keys: Vec<u64>) {
+        let ascending = keys.windows(2).all(|pair| pair[0] < pair[1]);
+        let mut allocated_layouts = BTreeMap::new();
         let owner = Owner::new();
         let reference_owner = Owner::new();
         let mut map = BTreeMap::new_in(owner.clone());
@@ -118,6 +120,13 @@ mod tests {
             }
             owner.reset(None);
             assert_eq!(map.try_insert_alloc(key, value).unwrap(), None);
+            if ascending {
+                for layout in &expected {
+                    *allocated_layouts.entry(*layout).or_insert(0usize) += 1;
+                }
+                check_sorted_quote(i + 1, &allocated_layouts);
+                assert_eq!(owner.requests(), expected, "query made no backend requests");
+            }
             let mut actual = owner.requests();
             let mut wanted = expected;
             actual.sort_unstable();
@@ -146,8 +155,54 @@ mod tests {
         assert_eq!(reference_owner.live(), 0);
         eprintln!("exact-layout sequence max_reserved={maximum} forced_failures={failures}");
     }
+    fn check_sorted_quote(count: usize, actual: &BTreeMap<(usize, usize), usize>) {
+        let mut quoted = BTreeMap::new();
+        BTreeMap::<u64, u64, Owner>::try_visit_sorted_build_layouts(count, |layout, number| {
+            *quoted
+                .entry((layout.size(), layout.align()))
+                .or_insert(0usize) += number;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(&quoted, actual, "fresh sorted build prefix {count}");
+        if count == 256 {
+            assert_eq!(quoted.values().copied().sum::<usize>(), 42);
+            assert!(quoted.values().any(|count| *count == 36));
+            assert!(quoted.values().any(|count| *count == 6));
+        }
+        let mut calls = 0;
+        assert!(
+            BTreeMap::<u64, u64, Owner>::try_visit_sorted_build_layouts(count, |_, _| {
+                calls += 1;
+                Err(AllocError)
+            })
+            .is_err()
+        );
+        assert_eq!(calls, 1, "visitor refusal stops without another layout");
+    }
     #[test]
     fn ordered_all_split_levels_and_each_reservation_failure() {
+        let mut called = false;
+        BTreeMap::<u64, u64, Owner>::try_visit_sorted_build_layouts(0, |_, _| {
+            called = true;
+            Err(AllocError)
+        })
+        .unwrap();
+        assert!(!called);
+        assert!(
+            BTreeMap::<u64, u64, Owner>::try_visit_sorted_build_layouts(
+                usize::MAX,
+                |layout, count| {
+                    layout
+                        .size()
+                        .checked_mul(count)
+                        .ok_or(AllocError)
+                        .map(|_| ())
+                }
+            )
+            .is_err(),
+            "unsupported full-byte extent refuses with checked arithmetic"
+        );
         sequence((0..8000).collect())
     }
     #[test]

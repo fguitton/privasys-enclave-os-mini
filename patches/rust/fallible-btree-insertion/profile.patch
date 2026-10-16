@@ -10,7 +10,7 @@
  use crate::boxed::Box;
  
  const B: usize = 6;
-@@ -1881,3 +1882,119 @@
+@@ -1881,3 +1882,156 @@
  
  #[cfg(test)]
  mod tests;
@@ -118,6 +118,43 @@
 +    }
 +}
 +
++/// Exact retained nodes after inserting `count` distinct ascending keys into an
++/// empty tree. This is fresh sorted-insertion geometry, not Clone or an arbitrary
++/// existing tree's geometry. No keys, shadow tree or allocations are constructed.
++pub(super) fn visit_sorted_build_layouts<K, V>(
++    count: usize,
++    mut visit: impl FnMut(Layout, usize) -> Result<(), AllocError>,
++) -> Result<(), AllocError> {
++    if count == 0 {
++        return Ok(());
++    }
++    // Appending to a full node promotes this actual splitpoint. The right node
++    // contains CAPACITY - promoted keys after insertion; each subsequent split
++    // therefore occurs after promoted + 1 more incoming keys.
++    let stride = splitpoint(CAPACITY).0.checked_add(1).ok_or(AllocError)?;
++    let nodes = |incoming: usize| {
++        if incoming <= CAPACITY {
++            Ok(1)
++        } else {
++            // ceil((incoming - CAPACITY) / stride), without overflowing an add.
++            ((incoming - CAPACITY - 1) / stride).checked_add(2).ok_or(AllocError)
++        }
++    };
++    let leaves = nodes(count)?;
++    let mut incoming = leaves - 1;
++    let mut internal = 0usize;
++    while incoming != 0 {
++        let level = nodes(incoming)?;
++        internal = internal.checked_add(level).ok_or(AllocError)?;
++        incoming = level - 1;
++    }
++    visit(Layout::new::<LeafNode<K, V>>(), leaves)?;
++    if internal != 0 {
++        visit(Layout::new::<InternalNode<K, V>>(), internal)?;
++    }
++    Ok(())
++}
++
 +/// Reserve the shared exact plan before the first tree mutation.
 +pub(super) fn reserve_insert<K, V, A: Allocator>(
 +    handle: Option<&Handle<NodeRef<marker::Mut<'_>, K, V, marker::Leaf>, marker::Edge>>,
@@ -132,11 +169,23 @@
 +}
 --- a/alloc/src/collections/btree/map.rs
 +++ b/alloc/src/collections/btree/map.rs
-@@ -1052,6 +1052,41 @@
+@@ -1052,6 +1052,53 @@
                  entry.insert(value);
                  None
              }
 +        }
++    }
++
++    /// Visit the exact node layouts and multiplicities for a fresh map built by
++    /// inserting `count` distinct keys in ascending order. This query does not
++    /// allocate or mutate a map. It does not describe arbitrary retained trees or
++    /// the standard Clone algorithm. Visitor errors are returned unchanged.
++    #[unstable(feature = "allocator_api", issue = "32838")]
++    pub fn try_visit_sorted_build_layouts(
++        count: usize,
++        visitor: impl FnMut(crate::alloc::Layout, usize) -> Result<(), crate::alloc::AllocError>,
++    ) -> Result<(), crate::alloc::AllocError> {
++        super::node::visit_sorted_build_layouts::<K, V>(count, visitor)
 +    }
 +
 +    /// Visit the exact physical node layouts a vacant insertion would allocate.
