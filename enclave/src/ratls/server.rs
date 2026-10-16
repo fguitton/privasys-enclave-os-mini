@@ -2166,60 +2166,13 @@ fn handle_fido2_request(
     // "/fido2/register/begin" → type = "register/begin"
     let route = &base_path["/fido2/".len()..]; // "register/begin" etc.
 
-    // Helper: inject query-string parameters into a serde_json::Map.
-    // Maps known snake_case query param names to the camelCase field
-    // names expected by `Fido2Request` serde renames.
-    let inject_query_params = |map: &mut serde_json::Map<String, serde_json::Value>| {
-        if let Some(qs) = query_string {
-            for pair in qs.split('&') {
-                if let Some((key, value)) = pair.split_once('=') {
-                    // Simple percent-decode: only `%XX` sequences used by
-                    // encodeURIComponent on base64url / UUID values.
-                    let decoded: String = {
-                        let mut out = String::with_capacity(value.len());
-                        let mut chars = value.as_bytes().iter();
-                        while let Some(&b) = chars.next() {
-                            if b == b'%' {
-                                if let (Some(&h), Some(&l)) = (chars.next(), chars.next()) {
-                                    let hi = (h as char).to_digit(16).unwrap_or(0) as u8;
-                                    let lo = (l as char).to_digit(16).unwrap_or(0) as u8;
-                                    out.push((hi << 4 | lo) as char);
-                                }
-                            } else {
-                                out.push(b as char);
-                            }
-                        }
-                        out
-                    };
-                    // Map snake_case query params → camelCase JSON field names
-                    let json_key = match key {
-                        "session_id" => "sessionId",
-                        _ => key,
-                    };
-                    // Don't overwrite values already present in the body.
-                    map.entry(json_key)
-                        .or_insert(serde_json::Value::String(decoded));
-                }
-            }
-        }
+    let Some(pool) = crate::local_allocation_pool() else {
+        return HttpHandleResult::err(503, "request resources unavailable");
     };
-
-    let body = match serde_json::from_slice::<serde_json::Value>(&http_req.body) {
-        Ok(serde_json::Value::Object(mut map)) => {
-            map.insert("type".into(), serde_json::Value::String(route.into()));
-            inject_query_params(&mut map);
-            serde_json::to_vec(&map).unwrap_or_else(|_| http_req.body.clone())
-        }
-        _ => {
-            // Empty body (e.g. authenticate/begin with no args) — create
-            // a minimal JSON object with just the type discriminator.
-            let mut map = serde_json::Map::new();
-            map.insert("type".into(), serde_json::Value::String(route.into()));
-            inject_query_params(&mut map);
-            serde_json::to_vec(&map).unwrap_or_else(|_| http_req.body.clone())
-        }
+    let body = match super::request_json::fido(&pool, &http_req.body, route, query_string) {
+        Ok(body) => body,
+        Err(_) => return HttpHandleResult::err(503, "request resources unavailable"),
     };
-
     let req = Request::Data(body);
     dispatch_and_respond(req, &ctx)
 }
@@ -2503,64 +2456,17 @@ fn handle_mcp_tools_request(
 ///
 /// On error or non-OK statuses, returns a 400 with `{"error": "<msg>"}`.
 fn transform_mcp_tools_response(result: HttpHandleResult) -> HttpHandleResult {
-    if result.status != 200 {
-        return result;
-    }
-    let Some(body) = result.body.contiguous() else {
-        return result;
+    if result.status != 200 { return result; }
+    let Some(body) = result.body.contiguous() else { return result; };
+    let Some(pool) = crate::local_allocation_pool() else { return HttpHandleResult::err(503, "request resources unavailable"); };
+    let transformed = match super::request_json::mcp_tools_response(&pool, body) {
+        Ok(value) => value,
+        Err(super::request_json::ValueError::Refused(enclave_os_common::request_json::Refusal::Unavailable)) => return HttpHandleResult::err(503, "request resources unavailable"),
+        Err(_) => None,
     };
-    let parsed: serde_json::Value = match serde_json::from_slice(body) {
-        Ok(v) => v,
-        Err(_) => return result,
-    };
-    match parsed.get("status").and_then(|s| s.as_str()) {
-        Some("mcp_tools") => {
-            let tools = parsed
-                .get("manifest")
-                .and_then(|m| m.get("tools"))
-                .and_then(|t| t.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let transformed: Vec<serde_json::Value> = tools
-                .into_iter()
-                .map(|t| {
-                    let mut obj = serde_json::Map::new();
-                    if let Some(name) = t.get("name") {
-                        obj.insert("name".to_string(), name.clone());
-                    }
-                    if let Some(desc) = t.get("description") {
-                        if !desc.is_null() {
-                            obj.insert("description".to_string(), desc.clone());
-                        }
-                    }
-                    // McpTool serialises `input_schema` as `inputSchema`
-                    // (MCP-spec). Rewrite to snake-case for the HTTP contract.
-                    if let Some(schema) = t.get("inputSchema").or_else(|| t.get("input_schema")) {
-                        obj.insert("input_schema".to_string(), schema.clone());
-                    }
-                    serde_json::Value::Object(obj)
-                })
-                .collect();
-            let out = serde_json::json!({ "tools": transformed });
-            HttpHandleResult::ok(serde_json::to_vec(&out).unwrap_or_default())
-        }
-        Some("error") | Some("not_found") => {
-            let msg = parsed
-                .get("message")
-                .and_then(|s| s.as_str())
-                .or_else(|| parsed.get("name").and_then(|s| s.as_str()))
-                .unwrap_or("error");
-            HttpHandleResult {
-                status: 400,
-                body: serde_json::to_vec(&serde_json::json!({"error": msg}))
-                    .unwrap_or_default()
-                    .into(),
-                shutdown: false,
-                content_type: None,
-                extra_headers: Vec::new(),
-            }
-        }
-        _ => result,
+    match transformed {
+        Some((status, body)) => HttpHandleResult { status, body: body.into(), shutdown: false, content_type: None, extra_headers: Vec::new() },
+        None => result,
     }
 }
 
@@ -2572,54 +2478,17 @@ fn transform_mcp_tools_response(result: HttpHandleResult) -> HttpHandleResult {
 /// - Multiple returns → array of `value` fields.
 /// - `{"status":"error","message": M}` → 400 with `{"error": M}`.
 fn transform_mcp_call_response(result: HttpHandleResult) -> HttpHandleResult {
-    if result.status != 200 {
-        return result;
-    }
-    let Some(body) = result.body.contiguous() else {
-        return result;
+    if result.status != 200 { return result; }
+    let Some(body) = result.body.contiguous() else { return result; };
+    let Some(pool) = crate::local_allocation_pool() else { return HttpHandleResult::err(503, "request resources unavailable"); };
+    let transformed = match super::request_json::mcp_call_response(&pool, body) {
+        Ok(value) => value,
+        Err(super::request_json::ValueError::Refused(enclave_os_common::request_json::Refusal::Unavailable)) => return HttpHandleResult::err(503, "request resources unavailable"),
+        Err(_) => None,
     };
-    let parsed: serde_json::Value = match serde_json::from_slice(body) {
-        Ok(v) => v,
-        Err(_) => return result,
-    };
-    match parsed.get("status").and_then(|s| s.as_str()) {
-        Some("ok") => {
-            let returns = parsed
-                .get("returns")
-                .and_then(|r| r.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let value = match returns.len() {
-                0 => serde_json::json!({}),
-                1 => returns[0]
-                    .get("value")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null),
-                _ => serde_json::Value::Array(
-                    returns
-                        .into_iter()
-                        .map(|r| r.get("value").cloned().unwrap_or(serde_json::Value::Null))
-                        .collect(),
-                ),
-            };
-            HttpHandleResult::ok(serde_json::to_vec(&value).unwrap_or_default())
-        }
-        Some("error") => {
-            let msg = parsed
-                .get("message")
-                .and_then(|s| s.as_str())
-                .unwrap_or("error");
-            HttpHandleResult {
-                status: 400,
-                body: serde_json::to_vec(&serde_json::json!({"error": msg}))
-                    .unwrap_or_default()
-                    .into(),
-                shutdown: false,
-                content_type: None,
-                extra_headers: Vec::new(),
-            }
-        }
-        _ => result,
+    match transformed {
+        Some((status, body)) => HttpHandleResult { status, body: body.into(), shutdown: false, content_type: None, extra_headers: Vec::new() },
+        None => result,
     }
 }
 

@@ -572,4 +572,160 @@ mod tests {
         ));
         assert_eq!(pool.used(), 0);
     }
+    #[test]
+    fn mcp_tools_projection_keeps_exact_null_schema_fallback_and_error_bytes() {
+        for (input, expected) in [
+            (
+                r#"{"status":"mcp_tools","manifest":{"tools":[{"name":"n","description":null,"inputSchema":{"type":"object"},"input_schema":7},{"name":null,"description":"d","input_schema":null},42]}}"#,
+                Some((
+                    200,
+                    r#"{"tools":[{"input_schema":{"type":"object"},"name":"n"},{"description":"d","input_schema":null,"name":null},{}]}"#,
+                )),
+            ),
+            (
+                r#"{"status":"mcp_tools","manifest":{"tools":null}}"#,
+                Some((200, r#"{"tools":[]}"#)),
+            ),
+            (
+                r#"{"status":"error","message":"bad\nquote\""}"#,
+                Some((400, r#"{"error":"bad\nquote\""}"#)),
+            ),
+            (
+                r#"{"status":"not_found","name":"missing"}"#,
+                Some((400, r#"{"error":"missing"}"#)),
+            ),
+            (
+                r#"{"status":"error","message":4,"name":null}"#,
+                Some((400, r#"{"error":"error"}"#)),
+            ),
+            (r#"{"status":"other"}"#, None),
+        ] {
+            let pool = AllocationPoolV1::new(1 << 20).unwrap();
+            let result = endpoint::mcp_tools_response(&pool, input.as_bytes()).unwrap();
+            assert_eq!(
+                result
+                    .as_ref()
+                    .map(|(status, bytes)| (*status, bytes.as_slice())),
+                expected.map(|(status, bytes)| (status, bytes.as_bytes()))
+            );
+            assert_eq!(pool.used(), 0);
+        }
+    }
+    #[test]
+    fn mcp_call_projection_keeps_exact_empty_single_multiple_and_error_bytes() {
+        for (input, expected) in [
+            (r#"{"status":"ok","returns":[]}"#, Some((200, r#"{}"#))),
+            (r#"{"status":"ok","returns":null}"#, Some((200, r#"{}"#))),
+            (
+                r#"{"status":"ok","returns":[{"value":{"z":1,"a":"\u0061"}}]}"#,
+                Some((200, r#"{"a":"a","z":1}"#)),
+            ),
+            (r#"{"status":"ok","returns":[{}]}"#, Some((200, r#"null"#))),
+            (
+                r#"{"status":"ok","returns":[{"value":1},true,{"value":null}]}"#,
+                Some((200, r#"[1,null,null]"#)),
+            ),
+            (
+                r#"{"status":"error","message":"bad\tthing"}"#,
+                Some((400, r#"{"error":"bad\tthing"}"#)),
+            ),
+            (
+                r#"{"status":"error","message":null}"#,
+                Some((400, r#"{"error":"error"}"#)),
+            ),
+            (r#"{"status":"not_found"}"#, None),
+        ] {
+            let pool = AllocationPoolV1::new(1 << 20).unwrap();
+            let result = endpoint::mcp_call_response(&pool, input.as_bytes()).unwrap();
+            assert_eq!(
+                result
+                    .as_ref()
+                    .map(|(status, bytes)| (*status, bytes.as_slice())),
+                expected.map(|(status, bytes)| (status, bytes.as_bytes()))
+            );
+            assert_eq!(pool.used(), 0);
+        }
+        let pool = AllocationPoolV1::new(1 << 20).unwrap();
+        assert!(matches!(
+            endpoint::mcp_tools_response(&pool, b"{"),
+            Err(endpoint::ValueError::Syntax(_))
+        ));
+        assert_eq!(pool.used(), 0);
+        let pool = AllocationPoolV1::new(1).unwrap();
+        assert!(matches!(
+            endpoint::mcp_call_response(&pool, b"{}"),
+            Err(endpoint::ValueError::Refused(Refusal::Unavailable))
+        ));
+        assert_eq!(pool.used(), 0);
+    }
+    #[test]
+    fn fido_route_query_and_malformed_body_projection_preserve_exact_existing_bytes() {
+        for (body, query, expected) in [
+            (r#"{}"#, None, r#"{"type":"register/begin"}"#),
+            (
+                r#"{"type":"old","sessionId":"body","z":null}"#,
+                Some("session_id=query&unknown=x%20y"),
+                r#"{"sessionId":"body","type":"register/begin","unknown":"x y","z":null}"#,
+            ),
+            (
+                r#"{"sessionId":null}"#,
+                Some("session_id=query"),
+                r#"{"sessionId":null,"type":"register/begin"}"#,
+            ),
+            (
+                r#"{"#,
+                Some("empty="),
+                r#"{"empty":"","type":"register/begin"}"#,
+            ),
+            (
+                r#"null"#,
+                Some("truncated=%A&bad=%GG&plus=+&byte=%FF"),
+                r#"{"bad":"\u0000","byte":"ÿ","plus":"+","truncated":"","type":"register/begin"}"#,
+            ),
+            (
+                r#"[1]"#,
+                Some("ignored&session_id=first&session_id=second"),
+                r#"{"sessionId":"first","type":"register/begin"}"#,
+            ),
+        ] {
+            let pool = AllocationPoolV1::new(1 << 20).unwrap();
+            assert_eq!(
+                endpoint::fido(&pool, body.as_bytes(), "register/begin", query).unwrap(),
+                expected.as_bytes()
+            );
+            assert_eq!(pool.used(), 0);
+        }
+        let pool = AllocationPoolV1::new(1).unwrap();
+        assert!(endpoint::fido(&pool, b"{}", "register/begin", None).is_err());
+        assert_eq!(pool.used(), 0);
+    }
+    #[test]
+    fn formatted_text_admits_exact_utf8_and_refuses_changed_length_without_growth() {
+        use enclave_os_common::request_json::Text;
+        for capacity in [1, 2] {
+            let pool = AllocationPoolV1::new(capacity).unwrap();
+            let (result, count) = measured(|| Text::display(&pool, "ÿ"));
+            if capacity == 2 {
+                assert_eq!(result.as_ref().unwrap().as_str(), "ÿ");
+                assert_eq!(count, (1, 2));
+                assert_eq!(pool.used(), 2);
+            } else {
+                assert_eq!(*result.as_ref().unwrap_err(), Refusal::Unavailable);
+                assert_eq!(count, (0, 0));
+            }
+            drop(result);
+            assert_eq!(pool.used(), 0);
+        }
+        struct Changed(Cell<bool>);
+        impl core::fmt::Display for Changed {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str(if self.0.replace(true) { "ab" } else { "a" })
+            }
+        }
+        let pool = AllocationPoolV1::new(2).unwrap();
+        let (result, count) = measured(|| Text::display(&pool, &Changed(Cell::new(false))));
+        assert_eq!(*result.as_ref().unwrap_err(), Refusal::Unavailable);
+        assert_eq!(count, (1, 1));
+        assert_eq!(pool.used(), 0);
+    }
 }

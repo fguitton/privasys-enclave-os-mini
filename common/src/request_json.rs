@@ -164,3 +164,61 @@ impl serde::Serialize for Text<'_> {
         serializer.serialize_str(self.as_str())
     }
 }
+
+struct DisplayLength(usize);
+impl fmt::Write for DisplayLength {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        self.0 = self.0.checked_add(value.len()).ok_or(fmt::Error)?;
+        Ok(())
+    }
+}
+struct DisplayBacking<'a> {
+    text: &'a mut String,
+    length: usize,
+}
+impl fmt::Write for DisplayBacking<'_> {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        let length = self.text.len().checked_add(value.len()).ok_or(fmt::Error)?;
+        if length > self.length {
+            return Err(fmt::Error);
+        }
+        self.text.push_str(value);
+        Ok(())
+    }
+}
+impl Text<'_> {
+    /// Format deterministic allocation-free input into exactly admitted backing.
+    /// The display implementation itself remains responsible for its own work.
+    /// # Errors
+    /// Refuses overflow, admission/allocation failure or a changed second rendered length.
+    pub fn display(
+        pool: &Arc<AllocationPoolV1>,
+        value: &(impl fmt::Display + ?Sized),
+    ) -> Result<Self, Refusal> {
+        let mut length = DisplayLength(0);
+        fmt::write(&mut length, format_args!("{value}")).map_err(|_| Refusal::Unavailable)?;
+        let allocation = reserve(pool, length.0)?;
+        let mut text = String::new();
+        text.try_reserve_exact(length.0)
+            .map_err(|_| Refusal::Unavailable)?;
+        if text.capacity() != length.0 {
+            return Err(Refusal::Unavailable);
+        }
+        fmt::write(
+            &mut DisplayBacking {
+                text: &mut text,
+                length: length.0,
+            },
+            format_args!("{value}"),
+        )
+        .map_err(|_| Refusal::Unavailable)?;
+        if text.len() != length.0 {
+            return Err(Refusal::Unavailable);
+        }
+        publish(allocation.as_ref());
+        Ok(Self {
+            backing: TextBacking::Owned(text),
+            _allocation: allocation,
+        })
+    }
+}
