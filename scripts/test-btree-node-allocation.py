@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import runpy
+import shutil
 import subprocess
 import time
 
@@ -52,8 +53,17 @@ def main():
               '--test', 'btree_node_allocation']
     record = {'scope': 'native liballoc physical node reservation; no trusted target claim',
               'status': 'FAIL', 'rows': [], 'tests': sorted(EXPECTED)}
+    target = os.environ.get('CARGO_TARGET_DIR')
+    if target is None:
+        metadata = subprocess.check_output([str(args.cargo), 'metadata', '--locked', '--offline',
+                                           '--no-deps', '--format-version', '1',
+                                           '--manifest-path', str(manifest)], text=True)
+        target = json.loads(metadata)['target_directory']
+    # Reuse the existing target-owned compiler source across focused runs.
+    # Each output still retains the exact source/producer receipts and logs.
+    source_root = Path(target).absolute() / 'fallible-btree-source'
     try:
-        with functions['source_context'](manifest, args.output / 'source', common) as admitted:
+        with functions['source_context'](manifest, source_root, common) as admitted:
             for name, suffix in [('discovery', ['--', '--list', '--format=json', '-Z', 'unstable-options']),
                                  ('body', ['--', '--format=json', '-Z', 'unstable-options', '--nocapture', '--test-threads=1'])]:
                 command = [str(args.cargo), *admitted, *suffix]
@@ -72,6 +82,9 @@ def main():
                     raise RuntimeError('node owner discovery/execution differs; retained log: ' + str(log))
             record['source_receipt'] = os.environ['HONEST_BTREE_SOURCE_RECEIPT']
             record['source_receipt_sha256'] = digest(Path(record['source_receipt']))
+        source_receipt = Path(record['source_receipt'])
+        shutil.copy2(source_receipt, args.output / 'source-receipt.json')
+        shutil.copy2(source_receipt.parent / 'producer.json', args.output / 'producer.json')
         record['status'] = 'PASS'
     finally:
         (args.output / 'receipt.json').write_text(json.dumps(record, indent=2) + '\n')

@@ -93,17 +93,21 @@ class Controls(unittest.TestCase):
         cargo.chmod(0o755)
         receipt = self.root / 'source-receipt.json'
         receipt.write_text('{}')
+        selected_roots = []
         @contextmanager
-        def refused_audit(*_args):
+        def refused_audit(_manifest, source_root, _arguments):
+            selected_roots.append(source_root)
             yield []
             raise ValueError('actual final source audit refused')
         output = self.root / 'runner-output'
         with patch.object(sys, 'argv', ['runner', '--cargo', str(cargo), '--output', str(output)]), \
-             patch.dict(os.environ, HONEST_BTREE_SOURCE_RECEIPT=str(receipt)), \
+             patch.dict(os.environ, HONEST_BTREE_SOURCE_RECEIPT=str(receipt),
+                        CARGO_TARGET_DIR=str(self.root / 'target')), \
              patch.object(runpy, 'run_path', return_value={'source_context': refused_audit}):
             with self.assertRaisesRegex(ValueError, 'final source audit refused'):
                 runner()
         self.assertEqual(json.loads((output / 'receipt.json').read_text())['status'], 'FAIL')
+        self.assertEqual(selected_roots, [self.root / 'target/fallible-btree-source'])
 
     def test_existing_destination_refuses(self):
         self.destination.mkdir()
@@ -121,7 +125,7 @@ if __name__ == '__main__':
     if not names:
         raise SystemExit('empty source controls')
     result = unittest.TextTestRunner(verbosity=2).run(suite)
-    if not result.wasSuccessful() or result.testsRun != len(names):
+    if not result.wasSuccessful() or result.testsRun != len(names) or result.skipped:
         raise SystemExit(1)
     print(json.dumps({'status': 'PASS', 'scope': 'source controls only',
                       'collected': len(names), 'executed': result.testsRun,
