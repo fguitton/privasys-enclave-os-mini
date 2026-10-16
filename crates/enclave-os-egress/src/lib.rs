@@ -234,8 +234,8 @@ impl EnclaveModule for EgressModule {
 
     fn custom_oids(
         &self,
-        visit: &mut dyn FnMut(&'static [u64], &[u8]) -> Result<(), ()>,
-    ) -> Result<(), ()> {
+        visit: &mut enclave_os_common::modules::ModuleOidVisitor<'_>,
+    ) -> Result<(), enclave_os_common::modules::ModuleOidError> {
         if let Some(hash) = self.ca_hash {
             visit(EGRESS_CA_HASH_OID, &hash)?;
         }

@@ -299,8 +299,8 @@ impl<B: KvBackend + Send> EnclaveModule for MerkleModule<B> {
 
     fn custom_oids(
         &self,
-        visit: &mut dyn FnMut(&'static [u64], &[u8]) -> Result<(), ()>,
-    ) -> Result<(), ()> {
+        visit: &mut enclave_os_common::modules::ModuleOidVisitor<'_>,
+    ) -> Result<(), enclave_os_common::modules::ModuleOidError> {
         let store = self.store.lock().expect("merkle store lock poisoned");
         let (root, version) = store.root();
         let mut value = [0u8; core::mem::size_of::<crate::Hash>() + core::mem::size_of::<u64>()];

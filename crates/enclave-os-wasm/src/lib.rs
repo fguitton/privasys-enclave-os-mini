@@ -1463,8 +1463,8 @@ impl EnclaveModule for WasmModuleHandle {
     }
     fn custom_oids(
         &self,
-        visit: &mut dyn FnMut(&'static [u64], &[u8]) -> Result<(), ()>,
-    ) -> Result<(), ()> {
+        visit: &mut enclave_os_common::modules::ModuleOidVisitor<'_>,
+    ) -> Result<(), enclave_os_common::modules::ModuleOidError> {
         self.0.custom_oids(visit)
     }
     fn app_identities(&self) -> Vec<AppIdentity> {
@@ -2076,8 +2076,8 @@ impl EnclaveModule for WasmModule {
     /// Embeds the combined apps hash as OID `1.3.6.1.4.1.65230.2.5`.
     fn custom_oids(
         &self,
-        visit: &mut dyn FnMut(&'static [u64], &[u8]) -> Result<(), ()>,
-    ) -> Result<(), ()> {
+        visit: &mut enclave_os_common::modules::ModuleOidVisitor<'_>,
+    ) -> Result<(), enclave_os_common::modules::ModuleOidError> {
         let combined = self.combined_apps_hash();
         if combined != [0u8; 32] {
             visit(COMBINED_WORKLOADS_HASH_OID, &combined)?;

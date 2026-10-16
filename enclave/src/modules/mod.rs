@@ -54,8 +54,8 @@ pub fn collect_module_config_leaves() -> Vec<ConfigLeaf> {
 
 /// Visit current module OID values without an owned intermediate graph.
 pub fn visit_module_oids(
-    visit: &mut dyn FnMut(&'static [u64], &[u8]) -> Result<(), ()>,
-) -> Result<(), ()> {
+    visit: &mut enclave_os_common::modules::ModuleOidVisitor<'_>,
+) -> Result<(), enclave_os_common::modules::ModuleOidError> {
     for module in MODULES.lock().unwrap().iter() {
         module.custom_oids(visit)?;
     }

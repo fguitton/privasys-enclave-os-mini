@@ -101,7 +101,9 @@ pub fn generate_ratls_certificate(
             .map_err(String::from)?;
     }
     crate::modules::visit_module_oids(&mut |oid, value| {
-        extensions.push(pool, oid, value).map_err(|_| ())
+        extensions
+            .push(pool, oid, value)
+            .map_err(|_| enclave_os_common::modules::ModuleOidError)
     })
     .map_err(|_| String::new())?;
     let (nb, na) = leaf_validity(key, now)?;

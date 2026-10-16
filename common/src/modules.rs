@@ -14,6 +14,13 @@
 use crate::protocol::{HttpMethod, Request, Response};
 use alloc::{string::String, vec::Vec};
 
+/// A module OID consumer refused a value; no remaining values are visited.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ModuleOidError;
+
+/// Borrowed current OID consumer with explicit refusal propagation.
+pub type ModuleOidVisitor<'a> = dyn FnMut(&'static [u64], &[u8]) -> Result<(), ModuleOidError> + 'a;
+
 pub const HONEST_PEER_SNI: &str = "peer.s1.invalid";
 pub const HONEST_PEER_ROUTE: &str = "/honest/v1/peer";
 pub const HONEST_BOOTSTRAP_ROUTE: &str = "/honest/v1/bootstrap";
@@ -295,10 +302,7 @@ pub trait EnclaveModule: Send + Sync {
     }
 
     /// Custom X.509 OIDs to embed in RA-TLS certificates.
-    fn custom_oids(
-        &self,
-        _visit: &mut dyn FnMut(&'static [u64], &[u8]) -> Result<(), ()>,
-    ) -> Result<(), ()> {
+    fn custom_oids(&self, _visit: &mut ModuleOidVisitor<'_>) -> Result<(), ModuleOidError> {
         Ok(())
     }
 
