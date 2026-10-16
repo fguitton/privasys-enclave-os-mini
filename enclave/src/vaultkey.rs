@@ -15,13 +15,14 @@
 //! egress's global signer registration: no direct dependency in either
 //! direction, and the CA never crosses the egress boundary.
 
-use std::boxed::Box;
 use std::vec::Vec;
 
 use enclave_os_egress::{ClientCertIdentity, EnclaveAttestationProvider, EnclaveClientCertSigner};
 
+use crate::ratls::session::ca_context::CaContextRegistration;
+
 use crate::ratls::attestation::{
-    mint_client_identity, quote_binding_nonce, self_mrenclave, sgx_quote, CaContext,
+    mint_client_identity, quote_binding_nonce, self_mrenclave, sgx_quote, RetainedCaContext,
 };
 
 /// The OS's RA-TLS client-identity signer: holds the enclave intermediary CA
@@ -30,15 +31,22 @@ use crate::ratls::attestation::{
 /// registered [`EnclaveClientCertSigner`] hook; the CA never leaves the OS and
 /// the measurement comes from the policy the OS built, not from a caller.
 struct OsClientCertSigner {
-    ca_cert_der: Vec<u8>,
-    ca_key_pkcs8: Vec<u8>,
+    ca: CaContextRegistration,
 }
+static CLIENT_CERT_SIGNER: OsClientCertSigner = OsClientCertSigner {
+    ca: CaContextRegistration::new(),
+};
 
 impl EnclaveClientCertSigner for OsClientCertSigner {
     fn identity(&self, identity: &ClientCertIdentity, now: u64) -> Option<(Vec<Vec<u8>>, Vec<u8>)> {
-        let ca = CaContext::from_parts(self.ca_cert_der.clone(), self.ca_key_pkcs8.clone()).ok()?;
-        let (chain, pkcs8, _) =
-            mint_client_identity(&ca, &identity.code_hash, identity.app_id.as_deref(), now).ok()?;
+        let ca = self.ca.get()?;
+        let (chain, pkcs8, _) = mint_client_identity(
+            ca.context(),
+            &identity.code_hash,
+            identity.app_id.as_deref(),
+            now,
+        )
+        .ok()?;
         Some((chain, pkcs8))
     }
 
@@ -48,15 +56,11 @@ impl EnclaveClientCertSigner for OsClientCertSigner {
 }
 
 /// Register the OS client-identity signer once, at enclave init, from the
-/// enclave CA (`SealedConfig.ca_cert_der` / `ca_key_pkcs8`). The signer is
-/// leaked to obtain the `'static` egress requires; it lives for the enclave's
-/// lifetime.
-pub fn register_client_cert_signer(ca_cert_der: Vec<u8>, ca_key_pkcs8: Vec<u8>) {
-    let signer: &'static OsClientCertSigner = Box::leak(Box::new(OsClientCertSigner {
-        ca_cert_der,
-        ca_key_pkcs8,
-    }));
-    enclave_os_egress::register_enclave_client_cert_signer(signer);
+/// enclave CA. Its inline first-registration owner follows egress's existing
+/// first-wins registration and retains the paid CA for the enclave lifetime.
+pub fn register_client_cert_signer(ca: RetainedCaContext) {
+    CLIENT_CERT_SIGNER.ca.install(ca);
+    enclave_os_egress::register_enclave_client_cert_signer(&CLIENT_CERT_SIGNER);
 }
 
 /// The OS's attestation provider: produces challenge-bound quotes (to
@@ -77,6 +81,6 @@ impl EnclaveAttestationProvider for OsAttestationProvider {
 
 /// Register the OS attestation provider once, at enclave init.
 pub fn register_attestation_provider() {
-    let provider: &'static OsAttestationProvider = Box::leak(Box::new(OsAttestationProvider));
-    enclave_os_egress::register_enclave_attestation_provider(provider);
+    static PROVIDER: OsAttestationProvider = OsAttestationProvider;
+    enclave_os_egress::register_enclave_attestation_provider(&PROVIDER);
 }

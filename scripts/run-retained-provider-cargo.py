@@ -67,6 +67,12 @@ def verify(source, destination, functions):
         functions['verified'](destination / relative, expected[name])
         if (source / relative).stat().st_mode & 0o777 != (destination / relative).stat().st_mode & 0o777:
             raise ValueError('generated rustls mode differs')
+    for row in supplier['files']:
+        if row['before_sha256'] is None:
+            path = destination / functions['relative'](row['path'])
+            functions['verified'](path, row['after_sha256'])
+            if path.stat().st_mode & 0o777 != row['mode']:
+                raise ValueError('new generated rustls mode differs')
     for name in ('Cargo.toml', 'Cargo.toml.orig'):
         if digest(source / name) != digest(destination / name):
             raise ValueError('rustls dependency declarations changed')

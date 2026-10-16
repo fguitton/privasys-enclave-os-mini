@@ -47,6 +47,18 @@ def run(source, output):
     (wrong_source / target).write_bytes((wrong_source / target).read_bytes() + b'\n')
     refused('acquired-source-mutation',
             lambda: functions['prepare'](wrong_source, output / 'must-not-publish-mutation'))
+    new_path_source = output / 'new-path-already-present'
+    shutil.copytree(source, new_path_source, symlinks=True)
+    additions = [row['path'] for row in json.loads(
+        (functions['PROFILE'] / 'manifest.json').read_text())['suppliers'][0]['files']
+        if row['before_sha256'] is None]
+    if not additions:
+        raise AssertionError('current ClientHello source addition must be declared')
+    inserted = new_path_source / functions['relative'](additions[0])
+    inserted.parent.mkdir(parents=True, exist_ok=True)
+    inserted.write_bytes(b'not the acquired source\n')
+    refused('new-source-path-already-present', lambda: functions['prepare'](
+        new_path_source, output / 'must-not-publish-added-source'))
     wrong_identity = output / 'wrong-identity'
     wrong_identity.mkdir()
     (wrong_identity / '.cargo-checksum.json').write_text('{}\n')
@@ -64,6 +76,20 @@ def run(source, output):
                 lambda: functions['prepare'](source, output / 'must-not-publish-profile'))
     finally:
         globals_['PROFILE'] = original_profile
+    generated_new = destination / functions['relative'](additions[0])
+    new_bytes = generated_new.read_bytes()
+    generated_new.write_bytes(new_bytes + b'\n')
+    refused('generated-new-source-mutation', lambda: runner['verify'](source, destination, functions))
+    generated_new.write_bytes(new_bytes)
+    new_mode = generated_new.stat().st_mode & 0o777
+    generated_new.chmod(new_mode ^ 0o100)
+    refused('generated-new-source-mode', lambda: runner['verify'](source, destination, functions))
+    generated_new.chmod(new_mode)
+    extra = destination / 'src/unlisted-clienthello-cache.rs'
+    extra.write_bytes(b'not declared by the profile\n')
+    refused('generated-cache-extra-path', lambda: runner['verify'](
+        source, destination, functions))
+    extra.unlink()
     valid = (destination / target).read_bytes()
     (destination / target).write_bytes(valid + b'\n')
     refused('generated-cache-mutation', lambda: runner['verify'](source, destination, functions))

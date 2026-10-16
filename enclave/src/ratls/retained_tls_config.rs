@@ -261,6 +261,13 @@ pub(crate) fn check_provider_allocation_refusals() {
     provider_refusal::check();
 }
 
+/// Native-only observation: the supplied action must use its explicit allocator.
+/// This arm never refuses an allocation or substitutes an allocator.
+#[cfg(all(test, feature = "fallible-allocation-v1"))]
+pub(crate) fn check_no_global_children<T>(action: impl FnOnce() -> T) -> T {
+    provider_refusal::without_global_children(action)
+}
+
 // This native fixture changes no production allocator. A thread-local arm
 // refuses one exact provider request and counts only that constructor's scope.
 #[cfg(all(test, feature = "fallible-allocation-v1"))]
@@ -328,6 +335,22 @@ mod provider_refusal {
                 }
             });
         }
+    }
+
+    pub(super) fn without_global_children<T>(action: impl FnOnce() -> T) -> T {
+        ARM.with(|cell| {
+            assert!(cell.get().is_none());
+            cell.set(Some(Arm {
+                expected: Layout::new::<u8>(), refused: false, live: 0,
+                allocations: 0, skip_matching: usize::MAX,
+            }));
+        });
+        let result = action();
+        let arm = ARM.with(|cell| cell.take()).unwrap();
+        assert!(!arm.refused);
+        assert_eq!(arm.allocations, 0, "parsed children must use the supplied origin");
+        assert_eq!(arm.live, 0);
+        result
     }
 
     #[repr(C, align(2))]

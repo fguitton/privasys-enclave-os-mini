@@ -271,13 +271,14 @@ pub extern "C" fn ecall_init_data_channel(
 /// Initialise the enclave core: parse configuration, set up CPUID caching,
 /// run cryptographic self-tests, and resolve the sealed configuration.
 ///
-/// Returns the parsed [`EnclaveConfig`] and a mutable [`SealedConfig`].
+/// Returns the parsed [`EnclaveConfig`], mutable [`SealedConfig`] and its
+/// single paid immutable runtime CA owner. The caller moves that owner into ingress.
 /// The caller (either the default `ecall_run` or an adopter's custom one)
 /// is responsible for registering modules and calling [`finalize_and_run()`].
 pub fn init_enclave(
     config_json: *const u8,
     config_len: u64,
-) -> Result<(EnclaveConfig, SealedConfig), i32> {
+) -> Result<(EnclaveConfig, SealedConfig, RetainedCaContext), i32> {
     // Parse config
     let config_bytes = if config_len == 0 {
         b"{}" as &[u8]
@@ -335,6 +336,15 @@ pub fn init_enclave(
         }
     };
     enclave_log_info!("Sealed config resolved");
+    let ca = RetainedCaContext::copy_from_parts(
+        &pool,
+        &sealed_cfg.ca_cert_der,
+        &sealed_cfg.ca_key_pkcs8,
+    )
+    .map_err(|error| {
+        enclave_log_error!("CA context setup failed: {}", error);
+        -20
+    })?;
 
     // Register the OS RA-TLS client-certificate signer so outbound mutually-
     // attested connections (e.g. fetching a vault-backed KEK) can present a
@@ -345,10 +355,7 @@ pub fn init_enclave(
     // (no egress, no vault-key path).
     #[cfg(feature = "egress")]
     {
-        crate::vaultkey::register_client_cert_signer(
-            sealed_cfg.ca_cert_der.clone(),
-            sealed_cfg.ca_key_pkcs8.clone(),
-        );
+        crate::vaultkey::register_client_cert_signer(ca.clone());
         // Attestation provider: challenge-bound quotes (to authenticate this enclave
         // to the management-service vault directory over plain TLS) + self-MRENCLAVE
         // (so the wasm crate can pin the running runtime when self-authoring a vault
@@ -356,7 +363,7 @@ pub fn init_enclave(
         crate::vaultkey::register_attestation_provider();
     }
 
-    Ok((config, sealed_cfg))
+    Ok((config, sealed_cfg, ca))
 }
 
 // ==========================================================================
@@ -370,6 +377,7 @@ pub fn init_enclave(
 pub fn initialise_runtime_and_ingress(
     _config: &EnclaveConfig,
     sealed_cfg: &SealedConfig,
+    ca: RetainedCaContext,
 ) -> Result<(), i32> {
     let _initialisation_guard = crate::CoreInitialisationGuard::new();
 
@@ -414,19 +422,6 @@ pub fn initialise_runtime_and_ingress(
         return Err(code);
     }
     enclave_log_info!("Enclave state initialised");
-
-    // Build CA context from sealed config
-    let ca = match RetainedCaContext::copy_from_parts(
-        &crate::local_allocation_pool().ok_or(-20)?,
-        &sealed_cfg.ca_cert_der,
-        &sealed_cfg.ca_key_pkcs8,
-    ) {
-        Ok(ca) => ca,
-        Err(e) => {
-            enclave_log_error!("CA validation failed: {}", e);
-            return Err(-20);
-        }
-    };
 
     // ── Per-app certificate store ──────────────────────────────────
     // Initialise the global CertStore and register initial app
@@ -954,8 +949,12 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
 /// This function blocks until shutdown. Honest compositions call
 /// [`initialise_runtime_and_ingress`] and [`run_control_loop`] separately so
 /// they can install their bounded control hook without copying bootstrap code.
-pub fn finalize_and_run(config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i32 {
-    if let Err(code) = initialise_runtime_and_ingress(config, sealed_cfg) {
+pub fn finalize_and_run(
+    config: &EnclaveConfig,
+    sealed_cfg: &SealedConfig,
+    ca: RetainedCaContext,
+) -> i32 {
+    if let Err(code) = initialise_runtime_and_ingress(config, sealed_cfg, ca) {
         return code;
     }
     run_control_loop(&mut NoopControlLoopHook)
@@ -1077,7 +1076,7 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
 
     register_ocall_vtable();
 
-    let (mut config, sealed_cfg) = match init_enclave(config_json, config_len) {
+    let (mut config, sealed_cfg, ca) = match init_enclave(config_json, config_len) {
         Ok(pair) => pair,
         Err(code) => return code,
     };
@@ -1224,7 +1223,7 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
 
     enclave_log_info!("All modules registered ({} module(s))", _module_count);
 
-    finalize_and_run(&config, &sealed_cfg)
+    finalize_and_run(&config, &sealed_cfg, ca)
 }
 
 // ==========================================================================
@@ -1267,56 +1266,32 @@ pub use enclave_os_common::request_json::configuration::EnclaveConfig;
 /// - Subsequent restarts unseal everything automatically.
 /// - Passing new config params on restart updates the sealed blob.
 fn resolve_sealed_config(_config: &EnclaveConfig) -> Result<SealedConfig, String> {
-    // Try to unseal existing config from disk
-    let existing = SealedConfig::unseal_from_disk().ok();
-    let is_fresh = existing.is_none();
-
-    // ── Enclave-owned CA material ────────────────────────────────────
-    let (ca_cert_der, ca_key_pkcs8) = if let Some(ref ex) = existing {
+    // Preserve the original unseal-or-fresh branch. Reuse its actual owned
+    // value instead of allocating duplicate CA/key/module-data backings.
+    if let Some(existing) = SealedConfig::unseal_from_disk().ok() {
         enclave_log_info!("CA loaded from sealed config");
-        (ex.ca_cert_der.clone(), ex.ca_key_pkcs8.clone())
-    } else {
-        let ca = CaContext::generate()?;
-        enclave_log_info!("Generated fresh enclave-owned local CA");
-        (ca.ca_cert_der, ca.ca_key_pkcs8)
-    };
-
-    // ── Module data: preserve from existing sealed config ────────────
-    let module_data = if let Some(ref ex) = existing {
         enclave_log_info!(
             "Loaded {} module data entries from sealed config",
-            ex.module_data.len()
+            existing.module_data.len()
         );
-        ex.module_data.clone()
-    } else {
-        BTreeMap::new()
-    };
-
-    //  Master encryption key: reuse existing or generate fresh
-    let master_key: [u8; AEAD_KEY_SIZE] = if let Some(ref ex) = existing {
         enclave_log_info!("Master key loaded from sealed config");
-        ex.master_key
-    } else {
-        let rng = ring::rand::SystemRandom::new();
-        let mut key = [0u8; AEAD_KEY_SIZE];
-        ring::rand::SecureRandom::fill(&rng, &mut key)
-            .map_err(|_| String::from("Failed to generate master key"))?;
-        enclave_log_info!("Generated fresh master encryption key");
-        key
-    };
-
-    let cfg = SealedConfig {
-        master_key,
-        ca_cert_der,
-        ca_key_pkcs8,
-        module_data,
-    };
-
-    if is_fresh {
-        enclave_log_info!("First run: sealed config created");
-    } else {
         enclave_log_info!("Sealed config loaded from disk");
+        return Ok(existing);
     }
 
+    let ca = CaContext::generate()?;
+    enclave_log_info!("Generated fresh enclave-owned local CA");
+    let rng = ring::rand::SystemRandom::new();
+    let mut master_key = [0u8; AEAD_KEY_SIZE];
+    ring::rand::SecureRandom::fill(&rng, &mut master_key)
+        .map_err(|_| String::from("Failed to generate master key"))?;
+    enclave_log_info!("Generated fresh master encryption key");
+    let cfg = SealedConfig {
+        master_key,
+        ca_cert_der: ca.ca_cert_der,
+        ca_key_pkcs8: ca.ca_key_pkcs8,
+        module_data: BTreeMap::new(),
+    };
+    enclave_log_info!("First run: sealed config created");
     Ok(cfg)
 }

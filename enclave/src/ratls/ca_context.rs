@@ -110,6 +110,31 @@ impl RetainedCaContext {
         &self.0
     }
 }
+/// Inline first-registration storage for the existing process-lifetime signer.
+/// It owns no additional heap request and retains the original paired CA owner.
+#[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
+#[cfg_attr(
+    any(target_env = "sgx", target_vendor = "teaclave"),
+    cfg(feature = "egress")
+)]
+pub(crate) struct CaContextRegistration(std::sync::OnceLock<RetainedCaContext>);
+#[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
+#[cfg_attr(
+    any(target_env = "sgx", target_vendor = "teaclave"),
+    cfg(feature = "egress")
+)]
+impl CaContextRegistration {
+    pub(crate) const fn new() -> Self {
+        Self(std::sync::OnceLock::new())
+    }
+    pub(crate) fn install(&self, ca: RetainedCaContext) -> &RetainedCaContext {
+        self.0.get_or_init(|| ca)
+    }
+    pub(crate) fn get(&self) -> Option<&RetainedCaContext> {
+        self.0.get()
+    }
+}
+
 fn copy_exact(bytes: &[u8]) -> Result<Vec<u8>, CaRetentionError> {
     let mut owned = Vec::new();
     owned
@@ -156,4 +181,31 @@ pub(crate) fn check_runtime_ca_ownership(cert: &[u8], key: &[u8]) {
     assert_eq!(pool.used(), 0);
     assert!(RetainedCaContext::required_bytes(usize::MAX, key.len()).is_none());
     assert!(CaContext::from_parts(cert.to_vec(), vec![0; 32]).is_err());
+    check_runtime_ca_registration(cert, key);
+}
+
+#[cfg(test)]
+fn check_runtime_ca_registration(cert: &[u8], key: &[u8]) {
+    let required = RetainedCaContext::required_bytes(cert.len(), key.len()).unwrap();
+    let pool = AllocationPoolV1::new(required.checked_mul(2).unwrap()).unwrap();
+    let registration = CaContextRegistration::new();
+    assert!(registration.get().is_none());
+    let first = RetainedCaContext::copy_from_parts(&pool, cert, key).unwrap();
+    let pointer = first.context() as *const CaContext;
+    assert!(std::ptr::eq(registration.install(first).context(), pointer));
+    assert_eq!(pool.used(), required);
+    let redundant = RetainedCaContext::copy_from_parts(&pool, cert, key).unwrap();
+    assert_eq!(pool.used(), required.checked_mul(2).unwrap());
+    assert!(std::ptr::eq(
+        registration.install(redundant).context(),
+        pointer
+    ));
+    assert_eq!(pool.used(), required);
+    let alias = registration.get().unwrap().clone();
+    drop(registration);
+    assert_eq!(pool.used(), required);
+    assert_eq!(alias.context().ca_cert_der, cert);
+    assert_eq!(alias.context().ca_key_pkcs8, key);
+    drop(alias);
+    assert_eq!(pool.used(), 0);
 }

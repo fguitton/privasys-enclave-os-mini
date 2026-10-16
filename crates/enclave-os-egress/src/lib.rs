@@ -38,7 +38,7 @@
 //! use enclave_os_enclave::modules::register_module;
 //! use enclave_os_common::hex::hex_decode;
 //!
-//! let (config, mut sealed_cfg) = init_enclave(config_json, config_len)?;
+//! let (config, mut sealed_cfg, ca) = init_enclave(config_json, config_len)?;
 //!
 //! // Load egress CA bundle from config
 //! let pem = config.extra.get("egress_ca_bundle_hex")
@@ -48,7 +48,7 @@
 //! let (egress, cert_count) = EgressModule::new(pem)?;
 //! register_module(Box::new(egress));
 //!
-//! finalize_and_run(&config, &sealed_cfg);
+//! finalize_and_run(&config, &sealed_cfg, ca);
 //! ```
 
 #![cfg_attr(all(test, feature = "fallible-allocation-v1"), feature(allocator_api))]

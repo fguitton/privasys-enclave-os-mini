@@ -58,7 +58,12 @@ def prepare(source, destination):
         original.append({'path': name, 'sha256': expected,
                          'mode': path.stat().st_mode & 0o777})
     for row in supplier['files']:
-        verified(source / relative(row['path']), row['before_sha256'])
+        before = source / relative(row['path'])
+        if row['before_sha256'] is None:
+            if before.exists() or before.is_symlink():
+                raise ValueError('new source path already exists: ' + str(before))
+        else:
+            verified(before, row['before_sha256'])
     destination.mkdir(mode=0o700)
     for row in original:
         path = relative(row['path'])
@@ -73,11 +78,14 @@ def prepare(source, destination):
     expected_after.update({row['path']: row['after_sha256'] for row in supplier['files']})
     generated = []
     for row in original:
-        path = relative(row['path'])
-        verified(source / path, row['sha256'])
-        verified(destination / path, expected_after[row['path']])
-        generated.append({'path': row['path'], 'sha256': digest(destination / path),
-                          'mode': (destination / path).stat().st_mode & 0o777})
+        verified(source / relative(row['path']), row['sha256'])
+    actual = {p.relative_to(destination).as_posix() for p in destination.rglob('*') if p.is_file()}
+    if actual != set(expected_after):
+        raise ValueError('generated source inventory differs')
+    for name, expected in sorted(expected_after.items()):
+        output = destination / relative(name)
+        verified(output, expected)
+        generated.append({'path': name, 'sha256': expected, 'mode': output.stat().st_mode & 0o777})
     verified(checksum_path, checksum_hash)
     receipt = {'schema': 1, 'profile': 'retained-provider',
                'package': supplier['package'], 'version': supplier['version'],

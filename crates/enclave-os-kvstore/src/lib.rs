@@ -17,12 +17,12 @@
 //! use enclave_os_enclave::ecall::{init_enclave, finalize_and_run};
 //! use enclave_os_enclave::modules::register_module;
 //!
-//! let (config, sealed_cfg) = init_enclave(config_json, config_len)?;
+//! let (config, sealed_cfg, ca) = init_enclave(config_json, config_len)?;
 //!
 //! let kvstore = KvStoreModule::new(sealed_cfg.master_key())?;
 //! register_module(Box::new(kvstore));
 //!
-//! finalize_and_run(&config, &sealed_cfg);
+//! finalize_and_run(&config, &sealed_cfg, ca);
 //! ```
 
 mod sealed;

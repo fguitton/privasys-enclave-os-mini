@@ -4,6 +4,10 @@
 //! Real TLS sessions and the production certificate store. No hardware or
 //! quote-verification claim: these exercise configuration revocation boundaries.
 
+#[cfg(feature = "fallible-allocation-v1")]
+#[path = "client_hello_owner_check.rs"]
+mod client_hello_owner_check;
+
 use super::super::cert_store::CertStore;
 use super::{FidoIdentity, RaTlsSession, TlsOutput};
 use enclave_os_common::modules::{AppIdentity, PeerEvidence};
@@ -160,6 +164,8 @@ fn replacement_during_handshake_requires_a_new_connection() {
 
 #[test]
 fn replacement_rejects_buffered_requests_and_re_attestation() {
+    #[cfg(feature = "fallible-allocation-v1")]
+    client_hello_owner_check::check();
     streamed_request_preserves_tls_and_following_request();
     checked_plaintext_backing();
     checked_tls_output_backing();

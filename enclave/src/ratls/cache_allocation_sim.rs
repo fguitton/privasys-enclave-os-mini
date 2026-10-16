@@ -3,6 +3,9 @@ use enclave_os_common::allocation::{AllocationPoolV1, LoanAllocator};
 use rustls::server::{ServerSessionMemoryCache, StoresServerSessions};
 use std::sync::Arc;
 
+#[path = "client_hello_owner_check.rs"]
+mod client_hello_owner_check;
+
 #[path = "record_owner_check.rs"]
 mod record_owner_check;
 
@@ -95,6 +98,8 @@ pub fn check_paid_session_cache(pool: &Arc<AllocationPoolV1>) -> Result<(), &'st
     }
     std::println!("TLS-RECORD-CIPHER-SIM: actual-SDK inline keys independent-AEAD byte-equality plaintext corruption-refusal PASS");
     check_input_buffer(pool)?;
+    client_hello_owner_check::check_in(pool);
+    std::println!("TLS-CLIENTHELLO-CHILDREN-SIM: original-pool exact-backing every-refusal clone aliases wire final-refund PASS");
     std::println!("TLS-SESSION-CACHE-SIM: actual-SDK backing entry get take exact-minus-one exact plus-one aliases returned-origin final-refund PASS");
     Ok(())
 }
