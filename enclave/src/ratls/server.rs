@@ -1906,15 +1906,13 @@ fn wall_seconds_now() -> u64 {
 fn handle_session_bootstrap(
     http_req: &enclave_os_common::protocol::HttpRequest,
 ) -> HttpHandleResult {
-    #[derive(serde::Deserialize)]
-    struct Req {
-        sdk_pub: String,
-        #[serde(default)]
-        encauth: Option<crate::encauth::EncAuthEnvelope>,
-    }
-    let req: Req = match serde_json::from_slice(&http_req.body) {
-        Ok(v) => v,
-        Err(_) => return HttpHandleResult::err(400, "invalid bootstrap body"),
+    let Some(pool) = crate::local_allocation_pool() else {
+        return HttpHandleResult::err(503, "request resources unavailable");
+    };
+    let req = match super::request_json::bootstrap(&pool, &http_req.body) {
+        Ok(value) => value,
+        Err(enclave_os_common::request_json::Refusal::Malformed) => return HttpHandleResult::err(400, "invalid bootstrap body"),
+        Err(enclave_os_common::request_json::Refusal::Unavailable) => return HttpHandleResult::err(503, "request resources unavailable"),
     };
     let sdk_pub = match crate::sessionrelay::b64_decode(&req.sdk_pub) {
         Some(v) => v,
@@ -1979,7 +1977,7 @@ fn handle_session_bootstrap(
 /// fallback (which only gates role checks), accepting an unverified
 /// voucher would mint an authenticated session.
 fn verify_encauth_request(
-    env: &crate::encauth::EncAuthEnvelope,
+    env: &enclave_os_common::protocol::EncAuthEnvelope<enclave_os_common::request_json::Text<'_>>,
     now: u64,
 ) -> Result<crate::encauth::EncAuthPayload, &'static str> {
     #[cfg(feature = "wasm")]

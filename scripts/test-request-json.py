@@ -93,11 +93,11 @@ def main():
                                                        '--', '--list', '--format=json', '-Z', 'unstable-options'])
     records = [json.loads(line) for line in discovery.read_text().splitlines() if line.startswith('{')]
     tests = [row for row in records if row.get('event') == 'discovered' and row.get('type') == 'test']
-    if len(tests) != 6 or any(row['ignore'] for row in tests):
+    if len(tests) != 9 or any(row['ignore'] for row in tests):
         raise ValueError('request admission discovery differs')
     execution = execute('request-admission', wrapper + ['test', *base, 'attest::request_tests::',
                                                       '--', '--test-threads=1'])
-    if '6 passed; 0 failed; 0 ignored' not in execution.read_text():
+    if '9 passed; 0 failed; 0 ignored' not in execution.read_text():
         raise ValueError('request admission execution count differs')
     execute('common-library-strict', wrapper + ['clippy', '--locked', '--offline', '--manifest-path', str(manifest),
                                                 '--features', 'crypto', '--lib', '--', '-D', 'warnings'])
@@ -105,12 +105,12 @@ def main():
                                                     '--features', 'request-json-tests', '--all-targets', '--', '-D', 'warnings'])
     if expected_source != audit(source):
         raise ValueError('compiler source changed during qualification')
-    (args.output / 'receipt.json').write_text(json.dumps({'status': 'PASS', 'discovered': 6, 'executed': 6,
+    (args.output / 'receipt.json').write_text(json.dumps({'status': 'PASS', 'discovered': 9, 'executed': 9,
                                                         'lock_input_sha256': digest(args.lock),
                                                         'resolved_lock_sha256': digest(source / 'Cargo.lock'),
                                                         'compiler_source_unchanged': True,
                                                         'claim': 'native request admission only; no endpoint/target/whole-parser qualification'}, indent=2) + '\n')
-    print('REQUEST-JSON-ADMISSION PASS discovered=6 executed=6')
+    print('REQUEST-JSON-ADMISSION PASS discovered=9 executed=9')
 
 
 if __name__ == '__main__':

@@ -21,6 +21,28 @@ use std::vec::Vec;
 
 use serde::{Deserialize, Serialize};
 
+/// Session bootstrap request; an optional verified voucher enables silent rebind.
+#[derive(Debug, Deserialize)]
+pub struct SessionBootstrapRequest<T = String> {
+    pub sdk_pub: T,
+    #[serde(default)]
+    pub encauth: Option<EncAuthEnvelope<T>>,
+}
+/// EncAuth JSON envelope matching the IdP wire protocol.
+#[derive(Debug, Deserialize)]
+pub struct EncAuthEnvelope<T = String> {
+    pub v: u8,
+    /// Base64url canonical CBOR payload.
+    pub payload: T,
+    /// Base64url hardware signature.
+    pub hw_sig: T,
+    /// Base64url identity-provider signature.
+    #[serde(default)]
+    pub idp_sig: T,
+}
+/// Admitted bootstrap and voucher field visitors.
+pub mod session_bootstrap;
+
 /// Maximum HTTP request body: 16 MiB.
 pub const MAX_BODY_SIZE: usize = 16 * 1024 * 1024;
 /// Optional header-only streamed ceiling: eight canonical8MiB frames plus

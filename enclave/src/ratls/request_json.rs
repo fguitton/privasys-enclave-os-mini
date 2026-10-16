@@ -23,3 +23,20 @@ pub(super) fn attest<'de>(
     parser.parser_mut().end().map_err(|_| Refusal::Malformed)?;
     Ok(request)
 }
+
+/// Parse the current bootstrap object using the same admitted parser supplier.
+pub(super) fn bootstrap<'de>(
+    pool: &Arc<AllocationPoolV1>,
+    input: &'de [u8],
+) -> Result<enclave_os_common::protocol::SessionBootstrapRequest<Text<'de>>, Refusal> {
+    let capacity = serde_json::Deserializer::slice_scratch_capacity(input.len())
+        .ok_or(Refusal::Unavailable)?;
+    let mut parser = AdmittedParser::new(pool, capacity, |scratch| {
+        serde_json::Deserializer::from_slice_with_scratch(input, scratch).ok()
+    })?;
+    let request = enclave_os_common::protocol::session_bootstrap::Seed::new(pool)
+        .deserialize(parser.parser_mut())
+        .map_err(|_| Refusal::Malformed)??;
+    parser.parser_mut().end().map_err(|_| Refusal::Malformed)?;
+    Ok(request)
+}

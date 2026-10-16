@@ -54,18 +54,7 @@ const REBIND_MAP_SWEEP_LEN: usize = 10_000;
 /// Allowed clock skew for the voucher time window (matches Go: 30 s).
 const TIME_SKEW_SECS: u64 = 30;
 
-/// On-wire JSON envelope (matches `sessions.Envelope` at the IdP).
-#[derive(serde::Deserialize)]
-pub struct EncAuthEnvelope {
-    pub v: u8,
-    /// base64url(canonical CBOR payload)
-    pub payload: String,
-    /// base64url(64 B R||S)
-    pub hw_sig: String,
-    /// base64url(64 B R||S)
-    #[serde(default)]
-    pub idp_sig: String,
-}
+use enclave_os_common::protocol::EncAuthEnvelope;
 
 /// Decoded canonical-CBOR payload (crypto-contract §8.1, integer keys
 /// 1..10 ascending).
@@ -96,8 +85,8 @@ pub struct EncAuthPayload {
 /// Verification order matches Go: idp_sig → hw_sig → enc_pub →
 /// quote_hash → time window → non-empty sid. Nothing payload-derived is
 /// trusted before `idp_sig` passes.
-pub fn verify_encauth(
-    env: &EncAuthEnvelope,
+pub fn verify_encauth<T: AsRef<str>>(
+    env: &EncAuthEnvelope<T>,
     idp_keys: &[Vec<u8>],
     enc_static_pub_sec1: &[u8],
     expected_quote_digest: Option<&[u8; 32]>,
@@ -106,9 +95,9 @@ pub fn verify_encauth(
     if env.v != 1 {
         return Err("unsupported version");
     }
-    let payload_bytes = crate::sessionrelay::b64_decode(&env.payload).ok_or("payload b64")?;
-    let hw_sig_raw = crate::sessionrelay::b64_decode(&env.hw_sig).ok_or("hw_sig b64")?;
-    let idp_sig_raw = crate::sessionrelay::b64_decode(&env.idp_sig).ok_or("idp_sig b64")?;
+    let payload_bytes = crate::sessionrelay::b64_decode(env.payload.as_ref()).ok_or("payload b64")?;
+    let hw_sig_raw = crate::sessionrelay::b64_decode(env.hw_sig.as_ref()).ok_or("hw_sig b64")?;
+    let idp_sig_raw = crate::sessionrelay::b64_decode(env.idp_sig.as_ref()).ok_or("idp_sig b64")?;
 
     // idp_sig over (payload || hw_sig), against any current IdP key.
     // MUST pass before any payload field is trusted.
@@ -211,8 +200,8 @@ pub fn allow_rebind(sid: &str, now: u64) -> bool {
 
 /// Extract the sid with a cheap decode and NO signature verification.
 /// Only safe for non-authoritative uses such as rate-limit bucketing.
-pub fn encauth_sid(env: &EncAuthEnvelope) -> Option<String> {
-    let payload_bytes = crate::sessionrelay::b64_decode(&env.payload)?;
+pub fn encauth_sid<T: AsRef<str>>(env: &EncAuthEnvelope<T>) -> Option<String> {
+    let payload_bytes = crate::sessionrelay::b64_decode(env.payload.as_ref())?;
     decode_encauth_payload(&payload_bytes).map(|p| p.sid)
 }
 

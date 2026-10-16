@@ -1,6 +1,8 @@
 //! Caller-admitted JSON parser backing and visitor-owned text.
 //! The supplied parser must use the admitted scratch and an allocation-free
 //! syntax-error representation. This owner does not bless arbitrary parsers.
+pub(crate) mod fields;
+
 use crate::allocation::{AllocationLeaseV1, AllocationPoolV1};
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::{fmt, ops::Deref};
@@ -123,5 +125,11 @@ fn reserve(
 fn publish(allocation: Option<&AllocationLeaseV1>) {
     if let Some(allocation) = allocation {
         allocation.activate_release_notification();
+    }
+}
+
+impl AsRef<str> for Text<'_> {
+    fn as_ref(&self) -> &str {
+        self.as_str()
     }
 }

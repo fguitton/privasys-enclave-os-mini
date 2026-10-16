@@ -220,6 +220,7 @@ mod tests {
             br#"{"v":2}"#,
             br#"{"v":2,"mode":true}"#,
             br#"{"v":2,"mode":"x","mode":"y"}"#,
+            br#"{"v":"\u0032","mode":"x"}"#,
             br#"[2,"x",null]"#,
             br#""\u0061""#,
             br#"{"v":2,"mode":"\uD800"}"#,
@@ -249,5 +250,165 @@ mod tests {
         assert_eq!(count, (1, scratch));
         assert_eq!(pool.used(), 0);
         assert_eq!(request.quote.as_deref(), Some("q"));
+    }
+    fn compare_bootstrap(input: &[u8]) {
+        let pool = AllocationPoolV1::new(1 << 20).unwrap();
+        let original =
+            serde_json::from_slice::<enclave_os_common::protocol::SessionBootstrapRequest>(input);
+        let admitted = endpoint::bootstrap(&pool, input);
+        assert_eq!(
+            original.is_ok(),
+            admitted.is_ok(),
+            "{}",
+            String::from_utf8_lossy(input)
+        );
+        if let (Ok(original), Ok(admitted)) = (original, admitted) {
+            assert_eq!(original.sdk_pub, admitted.sdk_pub.as_str());
+            match (original.encauth, admitted.encauth) {
+                (None, None) => (),
+                (Some(original), Some(admitted)) => {
+                    assert_eq!(original.v, admitted.v);
+                    assert_eq!(original.payload, admitted.payload.as_str());
+                    assert_eq!(original.hw_sig, admitted.hw_sig.as_str());
+                    assert_eq!(original.idp_sig, admitted.idp_sig.as_str());
+                }
+                _ => panic!("optional envelope differs"),
+            }
+        }
+        assert_eq!(pool.used(), 0);
+    }
+    #[test]
+    fn bootstrap_object_array_nested_defaults_unicode_and_refusals_match_current_model() {
+        for input in [
+            r#"{"sdk_pub":"raw"}"#,
+            r#"["raw"]"#,
+            r#"["raw",null]"#,
+            r#"{"sdk_pub":"\uD834\uDD1E","encauth":[1,"p","s"]}"#,
+            r#"["raw",{"v":1,"payload":"p","hw_sig":"s","idp_sig":"i"}]"#,
+            r#"{"sdk_pub":"x","sdk_\u0070ub":"y"}"#,
+            r#"{"sdk_pub":"x","encauth":null,"encauth":null}"#,
+            r#"{"sdk_pub":"x","unknown":{"x":[true,"\u0061"]},"unknown":1}"#,
+            r#"{"sdk_pub":"x","encauth":{"v":1,"payload":"p","hw_sig":"s","idp_sig":null}}"#,
+            r#"["raw",[1,"p","s","i",0]]"#,
+            r#"{"sdk_pub":"x","encauth":{"v":1,"payload":"p","hw_sig":"s","v":1}}"#,
+            r#"{"sdk_pub":"x","encauth":[1,"p"]}"#,
+            r#"{"sdk_pub":"\uD800"}"#,
+            r#"{"sdk_pub":"raw"}[]"#,
+            r#"{"sdk_pub":"raw","unknown":1e400}"#,
+            r#"[]"#,
+            r#"{}"#,
+            r#"null"#,
+            r#"true"#,
+            r#"1"#,
+            r#""x""#,
+        ] {
+            compare_bootstrap(input.as_bytes());
+        }
+        for field in ["v", "payload", "hw_sig", "idp_sig"] {
+            for value in [
+                "null",
+                "true",
+                "-1",
+                "-0",
+                "1",
+                "255",
+                "256",
+                "1.0",
+                "[]",
+                "{}",
+                "\"x\"",
+                "\"\\u0061\"",
+            ] {
+                let mut object = serde_json::json!({"v":1,"payload":"p","hw_sig":"s"})
+                    .as_object()
+                    .unwrap()
+                    .clone();
+                object.remove(field);
+                let prefix = serde_json::to_string(&object).unwrap();
+                let stem = &prefix[..prefix.len() - 1];
+                compare_bootstrap(
+                    format!("{{\"sdk_pub\":\"raw\",\"encauth\":{stem},\"{field}\":{value}}}}}")
+                        .as_bytes(),
+                );
+                compare_bootstrap(format!("{{\"sdk_pub\":\"raw\",\"encauth\":{stem},\"{field}\":{value},\"{field}\":{value}}}}}").as_bytes());
+            }
+        }
+        for value in ["null", "true", "1", "1.0", "[]", "{}", "\"x\""] {
+            compare_bootstrap(format!("{{\"sdk_pub\":{value}}}").as_bytes());
+            compare_bootstrap(format!("{{\"sdk_pub\":\"x\",\"encauth\":{value}}}").as_bytes());
+        }
+        for input in [b"\xff".as_slice(), b"", b"{", b"["] {
+            compare_bootstrap(input);
+        }
+    }
+    #[test]
+    fn bootstrap_nested_text_lifetime_and_each_allocation_boundary_are_paid() {
+        let input = br#"{"sdk_pub":"s\u0064k","encauth":{"v":1,"payload":"p\u0061y","hw_sig":"h\u0077","idp_sig":"raw"}}"#;
+        let scratch = serde_json::Deserializer::slice_scratch_capacity(input.len()).unwrap();
+        for extra in [0, 2, 3, 5, 6, 7, 8] {
+            let pool = AllocationPoolV1::new(scratch + extra).unwrap();
+            let (request, count) = measured(|| endpoint::bootstrap(&pool, input));
+            // Parsing still validates later fields after an admission refusal;
+            // a smaller later field can fit and must also refund on rejection.
+            let (allocations, admitted_text) = match extra {
+                0 => (1, 0),
+                2 => (2, 2),
+                3 => (2, 3),
+                5 => (3, 5),
+                6 | 7 => (3, 6),
+                8 => (4, 8),
+                _ => unreachable!(),
+            };
+            assert_eq!(count, (allocations, scratch + admitted_text));
+            if extra < 8 {
+                assert_eq!(*request.as_ref().unwrap_err(), Refusal::Unavailable);
+                assert_eq!(pool.used(), 0);
+            } else {
+                let request = request.as_ref().unwrap();
+                assert_eq!(request.sdk_pub.as_str(), "sdk");
+                let envelope = request.encauth.as_ref().unwrap();
+                assert_eq!(
+                    (
+                        envelope.v,
+                        envelope.payload.as_str(),
+                        envelope.hw_sig.as_str(),
+                        envelope.idp_sig.as_str()
+                    ),
+                    (1, "pay", "hw", "raw")
+                );
+                let bounds = input.as_ptr_range();
+                assert!(
+                    envelope.idp_sig.as_ptr() >= bounds.start
+                        && envelope.idp_sig.as_ptr() < bounds.end
+                );
+                assert_eq!(pool.used(), 8);
+            }
+            drop(request);
+            assert_eq!(pool.used(), 0);
+        }
+        let pool = AllocationPoolV1::new(scratch - 1).unwrap();
+        let (request, count) = measured(|| endpoint::bootstrap(&pool, input));
+        assert_eq!(*request.as_ref().unwrap_err(), Refusal::Unavailable);
+        assert_eq!(count, (0, 0));
+        assert_eq!(pool.used(), 0);
+    }
+    #[test]
+    fn bootstrap_malformed_and_semantic_errors_refund_without_custom_messages() {
+        for input in [
+            br#"{"sdk_pub":"x","encauth":{"v":1,"payload":"p","hw_sig":null}}"#.as_slice(),
+            br#"{"sdk_pub":"x","encauth":{"v":1,"payload":"p","hw_sig":"s",}}"#,
+            br#"{"sdk_pub":"x","encauth":[1,"p","s",null]}"#,
+            br#"{"sdk_pub":"x","encauth":[1,"p","s","i",0]}"#,
+            br#"{"sdk_pub":"x","encauth":{"v":1,"v":1,"payload":"p","hw_sig":"s"}}"#,
+            br#"{"sdk_pub":"x","encauth":"\u0061"}"#,
+            br#"{"sdk_pub":"x","encauth":{"v":"\u0031","payload":"p","hw_sig":"s"}}"#,
+        ] {
+            let scratch = serde_json::Deserializer::slice_scratch_capacity(input.len()).unwrap();
+            let pool = AllocationPoolV1::new(scratch).unwrap();
+            let (result, count) = measured(|| endpoint::bootstrap(&pool, input));
+            assert_eq!(*result.as_ref().unwrap_err(), Refusal::Malformed);
+            assert_eq!(count, (1, scratch));
+            assert_eq!(pool.used(), 0);
+        }
     }
 }
