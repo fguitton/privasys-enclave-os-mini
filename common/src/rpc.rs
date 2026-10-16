@@ -245,18 +245,24 @@ pub fn encode_response(req_id: u64, status: i32, payload: &[u8]) -> Vec<u8> {
 
 /// Decode an RPC response header. Returns `(req_id, status, payload)`.
 pub fn decode_response(data: &[u8]) -> Option<(u64, i32, &[u8])> {
-    if data.len() < RESP_HEADER_SIZE {
-        return None;
-    }
-    let req_id = u64::from_le_bytes(data[0..8].try_into().ok()?);
-    let status = i32::from_le_bytes(data[8..12].try_into().ok()?);
-    let payload_len = u32::from_le_bytes(data[12..16].try_into().ok()?) as usize;
+    let (request, status, payload) = decode_response_header(data, data.len())?;
+    Some((request, status, &data[payload]))
+}
 
-    if data.len() < RESP_HEADER_SIZE + payload_len {
+/// Validate the current response header against a separately bounded complete
+/// frame length. Extra bytes retain the ordinary decoder's existing semantics.
+pub fn decode_response_header(
+    header: &[u8],
+    frame_length: usize,
+) -> Option<(u64, i32, core::ops::Range<usize>)> {
+    if header.len() < RESP_HEADER_SIZE || frame_length < RESP_HEADER_SIZE {
         return None;
     }
-    let payload = &data[RESP_HEADER_SIZE..RESP_HEADER_SIZE + payload_len];
-    Some((req_id, status, payload))
+    let request = u64::from_le_bytes(header[..8].try_into().ok()?);
+    let status = i32::from_le_bytes(header[8..12].try_into().ok()?);
+    let length = u32::from_le_bytes(header[12..16].try_into().ok()?) as usize;
+    let end = RESP_HEADER_SIZE.checked_add(length)?;
+    (end <= frame_length).then_some((request, status, RESP_HEADER_SIZE..end))
 }
 
 mod honest;

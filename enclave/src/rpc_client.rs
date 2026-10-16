@@ -196,6 +196,18 @@ enum RequestReserveError {
     OperationIdExhausted,
 }
 
+// The exact-size callback may refuse after request publication. Keep the
+// existing reservation through the whole exchange and release on every exit.
+struct RequestReservation<'a> {
+    client: &'a RpcClient,
+    id: u64,
+}
+impl Drop for RequestReservation<'_> {
+    fn drop(&mut self) {
+        self.client.release_request(self.id);
+    }
+}
+
 // SAFETY: RpcClient uses SPSC queues backed by shared memory pointers.
 // Complete synchronous exchanges are serialized. Polled operations reserve the
 // endpoints atomically and have a single owning execution thread.
@@ -780,6 +792,96 @@ impl RpcClient {
         }
     }
 
+    /// Receive a KV reply into an exact-sized caller-owned buffer. The factory
+    /// is called only for a matching successful response, after bounded header
+    /// validation. Request/ID ownership is identical to the synchronous call.
+    pub fn kv_get_into<B: AsRef<[u8]> + AsMut<[u8]>>(
+        &self,
+        table: &[u8],
+        key: &[u8],
+        mut owner: impl FnMut(usize) -> Result<B, i32>,
+    ) -> Result<Option<(B, core::ops::Range<usize>)>, i32> {
+        let payload = rpc::encode_kv_get_req(table, key);
+        let maximum = self.request_tx.max_message_bytes();
+        if !rpc::framed_payload_len_valid(payload.len(), rpc::REQ_HEADER_SIZE, maximum) {
+            return Err(-22);
+        }
+        let _exchange = self.synchronous_exchange.lock().map_err(|_| -1)?;
+        let request_id = self.try_reserve_request().map_err(|error| match error {
+            RequestReserveError::Busy => -16,
+            RequestReserveError::OperationIdExhausted => -75,
+        })?;
+        let _reservation = RequestReservation {
+            client: self,
+            id: request_id,
+        };
+        let request = rpc::encode_request_bounded(request_id, RpcMethod::KvGet, &payload, maximum)
+            .ok_or(-22)?;
+        self.request_tx.send_bounded(&request).map_err(|_| -22)?;
+        notify_host();
+        self.receive_kv_into(request_id, &mut owner)
+    }
+
+    fn receive_kv_into<B: AsRef<[u8]> + AsMut<[u8]>>(
+        &self,
+        request_id: u64,
+        owner: &mut impl FnMut(usize) -> Result<B, i32>,
+    ) -> Result<Option<(B, core::ops::Range<usize>)>, i32> {
+        loop {
+            // Empty storage queries the current complete frame without consuming
+            // it. Empty malformed messages are consumed as before. The next
+            // operation revalidates framing, never trusts this sampled length.
+            if self.response_rx.try_recv_into(&mut []).is_ok() {
+                std::thread::yield_now();
+                continue;
+            }
+            let mut status_only = None;
+            let mut received_length = None;
+            let frame = self
+                .response_rx
+                .try_recv_with::<{ rpc::RESP_HEADER_SIZE }, B, i32>(|length, prefix| {
+                    let Some((id, status, _)) = rpc::decode_response_header(prefix, length) else {
+                        return Ok(None);
+                    };
+                    if id != request_id {
+                        return Ok(None);
+                    }
+                    if status != 0 {
+                        status_only = Some(status);
+                        return Ok(None);
+                    }
+                    received_length = Some(length);
+                    owner(length).map(Some)
+                })
+                .map_err(|error| match error {
+                    enclave_os_common::queue::ReceiveOwnerError::Owner(error) => error,
+                    enclave_os_common::queue::ReceiveOwnerError::TooShort => -22,
+                })?;
+            if let Some(status) = status_only {
+                return if status == 1 { Ok(None) } else { Err(status) };
+            }
+            let Some(frame) = frame else {
+                continue;
+            };
+            // Shared memory is untrusted: validate the actual copied header
+            // within the received wire extent, never the owner's spare capacity.
+            // AsRef and AsMut providers must both cover that exact copied prefix.
+            let length = received_length.ok_or(-22)?;
+            let bytes = frame.as_ref().get(..length).ok_or(-22)?;
+            let Some((id, status, payload)) = rpc::decode_response_header(bytes, length) else {
+                continue;
+            };
+            if id != request_id {
+                continue;
+            }
+            return match status {
+                0 => Ok(Some((frame, payload))),
+                1 => Ok(None),
+                other => Err(other),
+            };
+        }
+    }
+
     /// Delete an entry from the given table. Returns true if it existed.
     pub fn kv_delete(&self, table: &[u8], enc_key: &[u8]) -> Result<bool, i32> {
         let payload = rpc::encode_kv_delete_req(table, enc_key);
@@ -1183,10 +1285,153 @@ pub(crate) fn check_config_buffers(
         .try_reserve_request()
         .map_err(|_| "config reservation not released")?;
     client.release_request(next);
+    check_kv_reply_owner(&client, &response_tx)?;
+    check_kv_received_extent(&client, &response_tx, &mut response_backing)?;
     drop(client);
     drop(request_rx);
     drop(response_tx);
     drop(request_backing);
     drop(response_backing);
+    Ok(())
+}
+
+// Existing signed config/RPC owner exercises this same production receiver.
+// Vec here is protocol test storage, not evidence of selected pool admission.
+#[cfg(all(
+    feature = "sgx-sim-attestation",
+    feature = "fallible-allocation-v1",
+    target_vendor = "teaclave"
+))]
+fn check_kv_reply_owner(
+    client: &RpcClient,
+    response_tx: &SpscProducer,
+) -> Result<(), &'static str> {
+    let id = client
+        .try_reserve_request()
+        .map_err(|_| "source request reservation")?;
+    let reservation = RequestReservation { client, id };
+    let mut malformed = rpc::encode_response(id, 0, b"");
+    malformed[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+    for wire in [
+        b"short".to_vec(),
+        malformed,
+        rpc::encode_response(id + 1, 0, b"wrong"),
+        rpc::encode_response(id, 0, b"refuse"),
+    ] {
+        response_tx
+            .send_bounded(&wire)
+            .map_err(|_| "source refusal fixture queue")?;
+    }
+    let mut calls = 0;
+    let refused = client.receive_kv_into::<Vec<u8>>(id, &mut |length| {
+        calls += 1;
+        if length != rpc::RESP_HEADER_SIZE + b"refuse".len() {
+            return Err(-22);
+        }
+        Err(-12)
+    });
+    if !matches!(refused, Err(-12)) || calls != 1 || !client.response_rx.is_empty() {
+        return Err("source refusal did not consume matching frame exactly once");
+    }
+    drop(reservation);
+    let retry = client
+        .try_reserve_request()
+        .map_err(|_| "source retry request slot")?;
+    let reservation = RequestReservation { client, id: retry };
+    let mut wire = rpc::encode_response(retry, 0, b"payload");
+    wire.push(99); // Existing response parser permits a trailing frame byte.
+    response_tx
+        .send_bounded(&wire)
+        .map_err(|_| "source retry fixture queue")?;
+    let mut allocated = 0;
+    let (output, range) = client
+        .receive_kv_into(retry, &mut |length| {
+            allocated = length;
+            Ok(vec![0; length])
+        })
+        .map_err(|_| "source retry receiver")?
+        .ok_or("source retry absent")?;
+    if allocated != wire.len() || output != wire || &output[range] != b"payload" {
+        return Err("source exact reply geometry or trailing semantics changed");
+    }
+    drop(reservation);
+    for status in [1, -5] {
+        let id = client
+            .try_reserve_request()
+            .map_err(|_| "source status reservation")?;
+        let reservation = RequestReservation { client, id };
+        response_tx
+            .send_bounded(&rpc::encode_response(id, status, b"ignored"))
+            .map_err(|_| "source status fixture queue")?;
+        let result = client.receive_kv_into::<Vec<u8>>(id, &mut |_| Err(-12));
+        drop(reservation);
+        if (status == 1 && !matches!(result, Ok(None)))
+            || (status == -5 && !matches!(result, Err(-5)))
+        {
+            return Err("source status must precede successful-payload admission");
+        }
+    }
+    Ok(())
+}
+
+// Same signed owner, same receiver: unused provided-buffer tail is never wire.
+#[cfg(all(
+    feature = "sgx-sim-attestation",
+    feature = "fallible-allocation-v1",
+    target_vendor = "teaclave"
+))]
+fn check_kv_received_extent(
+    client: &RpcClient,
+    response_tx: &SpscProducer,
+    response_backing: &mut Vec<u8>,
+) -> Result<(), &'static str> {
+    for mutate_after_prefix in [false, true] {
+        let id = client
+            .try_reserve_request()
+            .map_err(|_| "source extent reservation")?;
+        let _reservation = RequestReservation { client, id };
+        let mut invalid = rpc::encode_response(id, 0, b"bad");
+        let forged = u32::try_from(invalid.len() + 1).map_err(|_| "source forged extent")?;
+        if !mutate_after_prefix {
+            invalid[12..16].copy_from_slice(&forged.to_le_bytes());
+        }
+        response_tx
+            .send_bounded(&invalid)
+            .map_err(|_| "source forged queue")?;
+        // The valid successor proves that a malformed copied header is consumed,
+        // not accepted from zero tail and not left poisoning this request's head.
+        let mut valid = rpc::encode_response(id, 0, b"real");
+        valid.push(99); // The existing within-frame trailing byte remains allowed.
+        response_tx
+            .send_bounded(&valid)
+            .map_err(|_| "source valid extent queue")?;
+        let mut calls = 0;
+        let (output, payload) = client
+            .receive_kv_into(id, &mut |length| {
+                calls += 1;
+                if mutate_after_prefix && calls == 1 {
+                    // Safe mutation of the fixture's own retained queue allocation,
+                    // after bounded prefix inspection but before the real payload copy.
+                    let tail = response_tx.diagnostic_positions().1;
+                    let offset =
+                        tail.wrapping_add(enclave_os_common::queue::MSG_HEADER_SIZE as u64 + 12);
+                    for (index, byte) in forged.to_le_bytes().iter().enumerate() {
+                        let at = offset.wrapping_add(index as u64) % response_backing.len() as u64;
+                        response_backing[usize::try_from(at).map_err(|_| -22)?] = *byte;
+                    }
+                }
+                Ok(vec![0_u8; length + rpc::RESP_HEADER_SIZE * 2])
+            })
+            .map_err(|_| "source exact received extent")?
+            .ok_or("source extent missing")?;
+        if calls != if mutate_after_prefix { 2 } else { 1 }
+            || &output[payload] != b"real"
+            || output[..valid.len()] != valid
+            || !output[valid.len()..].iter().all(|byte| *byte == 0)
+            || !client.response_rx.is_empty()
+        {
+            return Err("source unread provided tail accepted or framing changed");
+        }
+    }
     Ok(())
 }

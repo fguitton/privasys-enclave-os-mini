@@ -370,6 +370,13 @@ pub struct SpscConsumer {
 unsafe impl Send for SpscConsumer {}
 unsafe impl Sync for SpscConsumer {}
 
+/// A provided owner was refused or did not cover the validated frame.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReceiveOwnerError<E> {
+    Owner(E),
+    TooShort,
+}
+
 impl SpscConsumer {
     /// Create a consumer from raw pointers.
     ///
@@ -460,12 +467,46 @@ impl SpscConsumer {
             tail.wrapping_add(MSG_HEADER_SIZE as u64),
             &mut output[..length],
         );
-        let end = tail
-            .wrapping_add(MSG_HEADER_SIZE as u64)
-            .wrapping_add(length as u64);
-        // SAFETY: the handle owns this validated queue endpoint.
-        unsafe { &*self.header }.tail.store(end, Ordering::Release);
+        self.consume_frame(tail, length);
         Ok(Some(length))
+    }
+
+    /// Copy a bounded prefix from one validated complete frame, then let the
+    /// caller admit its exact backing. `None` discards this frame without a
+    /// payload allocation. Refusal also consumes it, so a retryable request
+    /// cannot strand the queue head. No untrusted length escapes validation.
+    /// The caller must revalidate protocol fields in the final copied bytes.
+    /// # Errors
+    /// Returns the owner refusal or insufficient returned backing; either consumes
+    /// the same validated frame before returning, without publishing partial data.
+    pub fn try_recv_with<const PREFIX: usize, B: AsMut<[u8]>, E>(
+        &self,
+        owner: impl FnOnce(usize, &[u8]) -> Result<Option<B>, E>,
+    ) -> Result<Option<B>, ReceiveOwnerError<E>> {
+        let Some((tail, length)) = self.readable_frame() else {
+            return Ok(None);
+        };
+        let mut prefix = [0; PREFIX];
+        let copied = length.min(PREFIX);
+        self.read_bytes(
+            tail.wrapping_add(MSG_HEADER_SIZE as u64),
+            &mut prefix[..copied],
+        );
+        let result = owner(length, &prefix[..copied])
+            .map_err(ReceiveOwnerError::Owner)
+            .and_then(|buffer| {
+                let Some(mut buffer) = buffer else {
+                    return Ok(None);
+                };
+                let output = buffer
+                    .as_mut()
+                    .get_mut(..length)
+                    .ok_or(ReceiveOwnerError::TooShort)?;
+                self.read_bytes(tail.wrapping_add(MSG_HEADER_SIZE as u64), output);
+                Ok(Some(buffer))
+            });
+        self.consume_frame(tail, length);
+        result
     }
 
     /// Try to read a message. Returns `Some(Vec<u8>)` or `None` if empty.
@@ -473,12 +514,18 @@ impl SpscConsumer {
         let (tail, length) = self.readable_frame()?;
         let mut payload = vec![0u8; length];
         self.read_bytes(tail.wrapping_add(MSG_HEADER_SIZE as u64), &mut payload);
+        self.consume_frame(tail, length);
+        Some(payload)
+    }
+
+    // Call only with the complete frame returned by readable_frame. The
+    // primitive's one consumer owns this endpoint throughout the operation.
+    fn consume_frame(&self, tail: u64, length: usize) {
         let end = tail
             .wrapping_add(MSG_HEADER_SIZE as u64)
             .wrapping_add(length as u64);
         // SAFETY: the handle owns this validated queue endpoint.
         unsafe { &*self.header }.tail.store(end, Ordering::Release);
-        Some(payload)
     }
 
     /// Blocking receive: spins until a message is available.
@@ -952,6 +999,7 @@ mod tests {
     }
 
     fn check_receive_into() {
+        check_receive_owner();
         let capacity = MIN_SHARED_QUEUE_CAPACITY;
         let maximum = max_message_bytes(capacity);
         for length in [0, 1, maximum - 1, maximum] {
@@ -999,5 +1047,72 @@ mod tests {
         assert_eq!(consumer.try_recv_into(&mut output), Ok(Some(bytes.len())));
         assert_eq!(&output[..bytes.len()], bytes);
         assert_eq!(producer.diagnostic_positions(), (end, end));
+    }
+    fn check_receive_owner() {
+        let capacity = MIN_SHARED_QUEUE_CAPACITY;
+        let (producer, consumer) = alloc_test_queue(capacity);
+        // Move both indices near the ring end using a real consumed frame.
+        let padding = vec![0; max_message_bytes(capacity) - 7];
+        producer.try_send(&padding).unwrap();
+        assert_eq!(consumer.try_recv().unwrap(), padding);
+        for length in [1, 15, 16, 31] {
+            let wire = vec![7; length];
+            producer.try_send(&wire).unwrap();
+            let before = producer.diagnostic_positions();
+            assert_eq!(consumer.try_recv_into(&mut []), Err(length));
+            assert_eq!(producer.diagnostic_positions(), before);
+            let received = consumer
+                .try_recv_with::<16, Vec<u8>, ()>(|actual, prefix| {
+                    assert_eq!(actual, length);
+                    assert_eq!(prefix, &wire[..length.min(16)]);
+                    Ok(Some(vec![0; actual]))
+                })
+                .unwrap()
+                .unwrap();
+            assert_eq!(received, wire);
+            assert!(consumer.is_empty());
+        }
+        for decision in [0, 1, 2] {
+            producer.try_send(b"refused-frame").unwrap();
+            let result = consumer.try_recv_with::<16, Vec<u8>, u8>(|_, _| match decision {
+                0 => Ok(None),
+                1 => Err(9),
+                _ => Ok(Some(Vec::new())),
+            });
+            match decision {
+                0 => assert_eq!(result, Ok(None)),
+                1 => assert_eq!(result, Err(ReceiveOwnerError::Owner(9))),
+                _ => assert_eq!(result, Err(ReceiveOwnerError::TooShort)),
+            }
+            assert!(consumer.is_empty(), "refusal never strands a frame");
+            producer.try_send(b"retry").unwrap();
+            assert_eq!(consumer.try_recv().unwrap(), b"retry");
+        }
+        let start = producer.diagnostic_positions().1;
+        producer.write_bytes(start, &16_u32.to_le_bytes());
+        // SAFETY: this fixture owns both queue endpoints and their backing.
+        unsafe { &*producer.header }.head.store(
+            start.wrapping_add(MSG_HEADER_SIZE as u64 + 15),
+            Ordering::Release,
+        );
+        let before = producer.diagnostic_positions();
+        let incomplete = consumer
+            .try_recv_with::<16, Vec<u8>, ()>(|_, _| panic!("incomplete frame must not admit"));
+        assert_eq!(incomplete, Ok(None));
+        assert_eq!(producer.diagnostic_positions(), before);
+        producer.write_bytes(start.wrapping_add(MSG_HEADER_SIZE as u64), &[9; 16]);
+        unsafe { &*producer.header }.head.store(
+            start.wrapping_add(MSG_HEADER_SIZE as u64 + 16),
+            Ordering::Release,
+        );
+        let complete = consumer
+            .try_recv_with::<16, Vec<u8>, ()>(|length, prefix| {
+                assert_eq!(prefix, &[9; 16]);
+                Ok(Some(vec![0; length]))
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(complete, [9; 16]);
+        assert!(consumer.is_empty());
     }
 }

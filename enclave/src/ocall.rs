@@ -171,6 +171,19 @@ pub fn kv_store_get(
     rpc().kv_get(table, enc_key)
 }
 
+/// Get a retained KV response using the caller's exact-sized physical owner.
+/// The range addresses payload within that same allocation; no detach/copy.
+/// # Errors
+/// Preserves request/status refusals and returns the caller backing refusal after
+/// consuming the matching response and releasing its request reservation.
+pub fn kv_store_get_into<B: AsRef<[u8]> + AsMut<[u8]>>(
+    table: &[u8],
+    key: &[u8],
+    owner: impl FnMut(usize) -> Result<B, i32>,
+) -> Result<Option<(B, core::ops::Range<usize>)>, i32> {
+    rpc().kv_get_into(table, key, owner)
+}
+
 /// Delete an encrypted KV entry on the host.
 pub fn kv_store_delete(table: &[u8], enc_key: &[u8]) -> Result<bool, i32> {
     rpc().kv_delete(table, enc_key)
