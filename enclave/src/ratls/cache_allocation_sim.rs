@@ -102,6 +102,8 @@ pub fn check_paid_session_cache(pool: &Arc<AllocationPoolV1>) -> Result<(), &'st
     check_input_buffer(pool)?;
     client_hello_owner_check::check_in(pool);
     transcript_owner_check::check_in(pool);
+    crate::sealed_config::serialization::check_in(pool)?;
+    std::println!("SEALED-CONFIG-OUTPUT-SIM: current-v3-wire original-pool minus-one exact plus-one allocator-refusal unpublished-no-wake final-refund PASS");
     #[cfg(feature = "egress")]
     {
         check_incremental_origin(pool)?;

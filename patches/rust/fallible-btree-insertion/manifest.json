@@ -5,12 +5,12 @@
     {
       "path": "alloc/src/collections/btree/node.rs",
       "before_sha256": "2200ca0a4fe38592c314dc7f5f40bbb160e06b6f9e4abd1eb5bc40701540ab25",
-      "after_sha256": "d3529da5fa04ae17f84a9a8d2ef22ada68656f1f8f0087ad77f0c0f35ea602e3"
+      "after_sha256": "35a1c5217a8e77d2914ef7e6ca13bb7e5bb6c5975b81c482122f5bddbbfce0a0"
     },
     {
       "path": "alloc/src/collections/btree/map.rs",
       "before_sha256": "2ce3f3468c9686421c216a74b38211fefdfe506c794b3c350bbf69ce3fb71a19",
-      "after_sha256": "57d4a20c555ae8487fc989e164a36387df43add6286731a11b6f7ae3b9536f3e"
+      "after_sha256": "574a67662d8d33c5b5671bdcbd8e2eb3c37c2ce33401838b0e337556f0e60562"
     },
     {
       "path": "alloc/src/collections/btree/map/entry.rs",
@@ -18,6 +18,6 @@
       "after_sha256": "8368eab7dc4f8637e607d85ea1e205ad01076543be02f3652fd167aabd627f7c"
     }
   ],
-  "patch_sha256": "a08dfe64aee8acd2cff5132de4d23762bdbd668b54955f1f2d2ca2f38415e223",
+  "patch_sha256": "4a043ee18da5eab01110a4850ce62e96ff67c44243a736daf65c67a67692a54c",
   "scope": "Physical allocation before vacant insertion; no decoded children, authority, or global allocator claim"
 }

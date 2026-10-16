@@ -381,8 +381,9 @@ pub fn initialise_runtime_and_ingress(
 ) -> Result<(), i32> {
     let _initialisation_guard = crate::CoreInitialisationGuard::new();
 
-    // Persist the (possibly updated) sealed config
-    if let Err(e) = sealed_cfg.seal_to_disk() {
+    // Persist the (possibly updated) sealed config through the original pool.
+    let pool = crate::local_allocation_pool().ok_or(-12)?;
+    if let Err(e) = sealed_cfg.seal_to_disk(&pool) {
         enclave_log_error!("Failed to seal config: {}", e);
         return Err(-12);
     }

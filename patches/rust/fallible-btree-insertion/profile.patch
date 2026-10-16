@@ -10,7 +10,7 @@
  use crate::boxed::Box;
  
  const B: usize = 6;
-@@ -1881,3 +1882,111 @@
+@@ -1881,3 +1882,119 @@
  
  #[cfg(test)]
  mod tests;
@@ -92,42 +92,70 @@
 +    }
 +}
 +
-+/// Follow the actual vacant leaf's full ancestor chain before modifying it.
-+pub(super) fn reserve_insert<K, V, A: Allocator>(
-+    handle: Option<&Handle<NodeRef<marker::Mut<'_>, K, V, marker::Leaf>, marker::Edge>>,
-+    alloc: A,
-+) -> Result<InsertAllocation<A>, AllocError> {
-+    let mut reserved = InsertAllocation::new(alloc);
-+    let Some(handle) = handle else {
-+        reserved.reserve(Layout::new::<LeafNode<K, V>>())?;
-+        return Ok(reserved);
++/// Visit precisely the layouts required by the vacant leaf's full ancestor chain.
++/// This shared plan performs no allocation and does not modify the tree.
++pub(super) fn visit_insert_layouts<K, V, E>(
++    node: Option<NodeRef<marker::Immut<'_>, K, V, marker::LeafOrInternal>>,
++    mut visit: impl FnMut(Layout) -> Result<(), E>,
++) -> Result<(), E> {
++    let Some(mut node) = node else {
++        return visit(Layout::new::<LeafNode<K, V>>());
 +    };
-+    let mut node = handle.reborrow().into_node().forget_type();
 +    loop {
 +        if node.len() < CAPACITY {
-+            return Ok(reserved);
++            return Ok(());
 +        }
 +        let layout = if node.height() == 0 {
 +            Layout::new::<LeafNode<K, V>>()
 +        } else {
 +            Layout::new::<InternalNode<K, V>>()
 +        };
-+        reserved.reserve(layout)?;
++        visit(layout)?;
 +        match node.ascend() {
 +            Ok(parent) => node = parent.into_node().forget_type(),
-+            Err(_) => {
-+                reserved.reserve(Layout::new::<InternalNode<K, V>>())?;
-+                return Ok(reserved);
-+            }
++            Err(_) => return visit(Layout::new::<InternalNode<K, V>>()),
 +        }
 +    }
 +}
++
++/// Reserve the shared exact plan before the first tree mutation.
++pub(super) fn reserve_insert<K, V, A: Allocator>(
++    handle: Option<&Handle<NodeRef<marker::Mut<'_>, K, V, marker::Leaf>, marker::Edge>>,
++    alloc: A,
++) -> Result<InsertAllocation<A>, AllocError> {
++    let mut reserved = InsertAllocation::new(alloc);
++    visit_insert_layouts(
++        handle.map(|handle| handle.reborrow().into_node().forget_type()),
++        |layout| reserved.reserve(layout),
++    )?;
++    Ok(reserved)
++}
 --- a/alloc/src/collections/btree/map.rs
 +++ b/alloc/src/collections/btree/map.rs
-@@ -1052,6 +1052,21 @@
+@@ -1052,6 +1052,41 @@
                  entry.insert(value);
                  None
              }
++        }
++    }
++
++    /// Visit the exact physical node layouts a vacant insertion would allocate.
++    /// The query neither allocates nor mutates the map. Occupied keys visit no
++    /// layouts. Visitor refusal stops the query without changing the map.
++    #[unstable(feature = "allocator_api", issue = "32838")]
++    pub fn try_visit_insert_layouts<E>(
++        &self, key: &K, visitor: impl FnMut(crate::alloc::Layout) -> Result<(), E>,
++    ) -> Result<(), E>
++    where K: Ord,
++    {
++        let Some(root) = self.root.as_ref() else {
++            return super::node::visit_insert_layouts::<K, V, E>(None, visitor);
++        };
++        match root.reborrow().search_tree(key) {
++            Found(_) => Ok(()),
++            GoDown(handle) => super::node::visit_insert_layouts(
++                Some(handle.into_node().forget_type()), visitor,
++            ),
 +        }
 +    }
 +

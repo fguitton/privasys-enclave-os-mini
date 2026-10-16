@@ -31,7 +31,11 @@ use std::collections::BTreeMap;
 use std::string::String;
 use std::vec::Vec;
 
-const FORMAT_VERSION: u32 = 3;
+pub(crate) mod serialization;
+use enclave_os_common::allocation::AllocationPoolV1;
+use serialization::FORMAT_VERSION;
+pub use serialization::{SealConfigError, SerializedConfig};
+use std::sync::Arc;
 
 /// KV tag under which the sealed config blob is stored on the host.
 const SEALED_CONFIG_TAG: &[u8] = b"__enclave_os_sealed_config__";
@@ -84,31 +88,22 @@ impl SealedConfig {
         self.module_data.insert(key.into(), data);
     }
 
-    /// Serialize to the versioned binary format.
-    pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-
-        // Master encryption key (fixed 32 bytes)
-        buf.extend_from_slice(&self.master_key);
-
-        buf.extend_from_slice(&(self.ca_cert_der.len() as u32).to_le_bytes());
-        buf.extend_from_slice(&self.ca_cert_der);
-
-        buf.extend_from_slice(&(self.ca_key_pkcs8.len() as u32).to_le_bytes());
-        buf.extend_from_slice(&self.ca_key_pkcs8);
-
-        // Module data entries (sorted by BTreeMap key order)
-        buf.extend_from_slice(&(self.module_data.len() as u32).to_le_bytes());
-        for (key, value) in &self.module_data {
-            let key_bytes = key.as_bytes();
-            buf.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(key_bytes);
-            buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
-            buf.extend_from_slice(value);
-        }
-
-        buf
+    /// Serialize the current binary format into an admitted move-only output.
+    ///
+    /// # Errors
+    /// Refuses unrepresentable field lengths, original-pool admission, or backing
+    /// allocation before publishing any output.
+    pub fn serialize(
+        &self,
+        pool: &Arc<AllocationPoolV1>,
+    ) -> Result<SerializedConfig, &'static str> {
+        serialization::serialize(
+            pool,
+            &self.master_key,
+            &self.ca_cert_der,
+            &self.ca_key_pkcs8,
+            &self.module_data,
+        )
     }
 
     /// Deserialize from the versioned binary format.
@@ -220,14 +215,15 @@ impl SealedConfig {
     }
 
     /// Seal this config and store it on the host.
-    pub fn seal_to_disk(&self) -> Result<(), String> {
-        let plaintext = self.serialize();
-        let sealed_blob = sealing::seal_with_mrenclave(&plaintext, SEALED_CONFIG_AAD)
-            .map_err(|e| format!("SealedConfig seal failed: {}", e))?;
+    pub fn seal_to_disk(&self, pool: &Arc<AllocationPoolV1>) -> Result<(), SealConfigError> {
+        let plaintext = self
+            .serialize(pool)
+            .map_err(SealConfigError::Serialization)?;
+        let sealed_blob = sealing::seal_with_mrenclave(plaintext.as_slice(), SEALED_CONFIG_AAD)
+            .map_err(SealConfigError::Seal)?;
 
         let tag = config_storage_tag();
-        crate::ocall::kv_store_put(SYSTEM_TABLE, &tag, &sealed_blob)
-            .map_err(|e| format!("Host KV put (config) failed: {}", e))
+        crate::ocall::kv_store_put(SYSTEM_TABLE, &tag, &sealed_blob).map_err(SealConfigError::Host)
     }
 
     /// Unseal a previously stored config from the host.

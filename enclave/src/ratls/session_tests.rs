@@ -11,6 +11,9 @@ mod client_hello_owner_check;
 #[path = "transcript_owner_check.rs"]
 mod transcript_owner_check;
 
+#[path = "../sealed_config/serialization.rs"]
+mod sealed_config_serialization;
+
 use super::super::cert_store::CertStore;
 use super::{FidoIdentity, RaTlsSession, TlsOutput};
 use enclave_os_common::modules::{AppIdentity, PeerEvidence};
@@ -167,6 +170,7 @@ fn replacement_during_handshake_requires_a_new_connection() {
 
 #[test]
 fn replacement_rejects_buffered_requests_and_re_attestation() {
+    sealed_config_serialization::check();
     #[cfg(feature = "fallible-allocation-v1")]
     client_hello_owner_check::check();
     #[cfg(feature = "fallible-allocation-v1")]

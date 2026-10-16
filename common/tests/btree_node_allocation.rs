@@ -79,6 +79,27 @@ mod tests {
             reference_owner.reset(None);
             reference.insert(key, value);
             let expected = reference_owner.requests();
+            owner.reset(None);
+            let mut planned = Vec::new();
+            map.try_visit_insert_layouts(&key, |layout| {
+                planned.push((layout.size(), layout.align()));
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+            assert!(owner.requests().is_empty(), "query allocated nodes");
+            assert_eq!(planned, expected, "query differs from actual node requests");
+            for stop in 0..planned.len() {
+                let mut visited = 0;
+                let result = map.try_visit_insert_layouts(&key, |_| {
+                    if visited == stop {
+                        return Err(stop);
+                    }
+                    visited += 1;
+                    Ok(())
+                });
+                assert_eq!(result, Err(stop));
+                assert!(owner.requests().is_empty());
+            }
             maximum = maximum.max(expected.len());
             let before = if expected.is_empty() {
                 Vec::new()
