@@ -68,6 +68,8 @@ pub(crate) mod retained_evidence;
 #[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
 #[path = "attest_response.rs"]
 pub(crate) mod attest_response;
+#[path = "ca_context.rs"]
+pub(crate) mod ca_context;
 #[cfg(any(test, target_env = "sgx", target_vendor = "teaclave"))]
 #[path = "decoded_attest.rs"]
 pub(crate) mod decoded_attest;

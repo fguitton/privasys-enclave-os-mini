@@ -16,8 +16,6 @@
 //!                hctx = TLS-Exporter("EXPORTER-privasys-ratls-attest-v2", context, 32)
 //! ```
 
-use ring::rand::SystemRandom;
-use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 use std::string::String;
 use std::vec::Vec;
 use time::OffsetDateTime;
@@ -36,37 +34,9 @@ pub const CLIENT_IDENTITY_VALIDITY_SECS: u64 = 3600;
 //  Types
 // ---------------------------------------------------------------------------
 
-/// Intermediary CA context provided to the enclave at startup.
-///
-/// The enclave uses it to sign leaf RA-TLS certificates so that the
-/// trust chain is: `root / intermediary → leaf`.
-///
-/// The CA material is generated inside the enclave on first boot and sealed so
-/// subsequent restarts can unseal it without host provisioning.
-#[derive(Clone)]
-pub struct CaContext {
-    /// DER-encoded X.509 certificate of the intermediary CA.
-    pub ca_cert_der: Vec<u8>,
-    /// PKCS#8-encoded private key of the intermediary CA.
-    pub ca_key_pkcs8: Vec<u8>,
-}
+pub use super::session::ca_context::{CaContext, RetainedCaContext};
 
 impl CaContext {
-    /// Construct from unsealed DER cert and PKCS#8 key.
-    ///
-    /// Performs a basic validation that the key material is usable
-    /// (i.e. it can be parsed as an ECDSA P-256 key pair).
-    pub fn from_parts(ca_cert_der: Vec<u8>, ca_key_pkcs8: Vec<u8>) -> Result<Self, String> {
-        let rng = SystemRandom::new();
-        let _ = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &ca_key_pkcs8, &rng)
-            .map_err(|_| String::from("CA key is not valid ECDSA P-256 PKCS#8"))?;
-
-        Ok(Self {
-            ca_cert_der,
-            ca_key_pkcs8,
-        })
-    }
-
     /// Generate a fresh enclave-owned intermediary CA for first boot.
     pub fn generate() -> Result<Self, String> {
         use rcgen::{

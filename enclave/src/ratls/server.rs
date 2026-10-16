@@ -26,13 +26,12 @@
 
 use std::cell::{Cell, RefCell};
 use std::string::String;
-use std::sync::Arc;
 use std::vec::Vec;
 
 use super::session::leaf_key::RetainedLeafKey;
 use crate::modules;
 use crate::ocall;
-use crate::ratls::attestation::{self, CaContext, LeafKey};
+use crate::ratls::attestation::{self, CaContext, LeafKey, RetainedCaContext};
 use crate::ratls::cert_store;
 use crate::ratls::session::RaTlsSession;
 use crate::{enclave_log_error, enclave_log_info};
@@ -102,7 +101,7 @@ pub struct IngressServer {
     stream_generations: super::session::ordered_map::OrderedMap<u32, u64>,
     paused_stream_reads: super::session::ordered_map::OrderedMap<u32, ()>,
     /// Intermediary CA for certificate generation.
-    ca: Arc<CaContext>,
+    ca: RetainedCaContext,
     /// Producer for `data_enc_to_host` — sends TLS bytes to the TCP proxy.
     data_tx: &'static SpscProducer,
     /// Shutdown flag.
@@ -151,7 +150,7 @@ impl IngressServer {
     /// `data_tx` is the producer for the `data_enc_to_host` SPSC queue.
     /// The host TCP proxy reads from the other end and sends bytes on
     /// the wire.
-    pub fn new(ca: Arc<CaContext>, data_tx: &'static SpscProducer) -> Self {
+    pub fn new(ca: RetainedCaContext, data_tx: &'static SpscProducer) -> Self {
         Self {
             sessions: super::session::ordered_map::OrderedMap::default(),
             write_windows: RefCell::new(super::session::ordered_map::OrderedMap::default()),
@@ -1396,7 +1395,7 @@ impl IngressServer {
         let require_peer_client_auth =
             sni.as_deref() == Some(enclave_os_common::modules::HONEST_PEER_SNI);
         let tls_result = build_tls_config(
-            &self.ca,
+            self.ca.context(),
             &key,
             app_data.as_ref(),
             require_peer_client_auth,

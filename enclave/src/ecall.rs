@@ -39,9 +39,8 @@
 //!    RA-TLS server, and enter the event loop.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
-use crate::ratls::attestation::CaContext;
+use crate::ratls::attestation::{CaContext, RetainedCaContext};
 use crate::ratls::server::IngressServer;
 use crate::rpc_client::RpcClient;
 use crate::sealed_config::SealedConfig;
@@ -417,11 +416,12 @@ pub fn initialise_runtime_and_ingress(
     enclave_log_info!("Enclave state initialised");
 
     // Build CA context from sealed config
-    let ca = match CaContext::from_parts(
-        sealed_cfg.ca_cert_der.clone(),
-        sealed_cfg.ca_key_pkcs8.clone(),
+    let ca = match RetainedCaContext::copy_from_parts(
+        &crate::local_allocation_pool().ok_or(-20)?,
+        &sealed_cfg.ca_cert_der,
+        &sealed_cfg.ca_key_pkcs8,
     ) {
-        Ok(ca) => Arc::new(ca),
+        Ok(ca) => ca,
         Err(e) => {
             enclave_log_error!("CA validation failed: {}", e);
             return Err(-20);

@@ -55,6 +55,7 @@ fn pair_with_all_pools(
         .unwrap()
         .der()
         .to_vec();
+    super::ca_context::check_runtime_ca_ownership(&cert, &key.serialize_der());
     use super::retained_tls_config::RetainedTlsConfig;
     let authentication = super::retained_tls_config::ClientAuthentication::Anonymous;
     let config_bytes = RetainedTlsConfig::required_bytes(authentication).unwrap();
