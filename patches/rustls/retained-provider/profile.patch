@@ -1,0 +1,63 @@
+--- a/src/crypto/ring/mod.rs
++++ b/src/crypto/ring/mod.rs
+@@ -3,7 +3,6 @@
+ use webpki::ring as webpki_algs;
+ use zeroize::Zeroizing;
+ 
+-use crate::Error;
+ use crate::crypto::{CryptoProvider, KeyProvider, SecureRandom, SupportedKxGroup};
+ use crate::enums::SignatureScheme;
+ use crate::rand::GetRandomFailed;
+@@ -11,6 +10,7 @@
+ use crate::suites::SupportedCipherSuite;
+ use crate::sync::Arc;
+ use crate::webpki::WebPkiSupportedAlgorithms;
++use crate::Error;
+ 
+ /// Using software keys for authentication.
+ pub mod sign;
+@@ -30,9 +30,42 @@
+ ///
+ /// [*ring*]: https://github.com/briansmith/ring
+ pub fn default_provider() -> CryptoProvider {
++    provider_with_buffers(DEFAULT_CIPHER_SUITES.to_vec(), DEFAULT_KX_GROUPS.to_vec())
++}
++
++/// Refusal from the selected provider's fallible default-list allocation.
++#[derive(Debug)]
++pub struct DefaultProviderAllocationError;
++
++/// Construct the identical default algorithm lists with fallible backing storage.
++pub fn try_default_provider() -> Result<CryptoProvider, DefaultProviderAllocationError> {
++    let mut cipher_suites = alloc::vec::Vec::new();
++    cipher_suites
++        .try_reserve_exact(DEFAULT_CIPHER_SUITES.len())
++        .map_err(|_| DefaultProviderAllocationError)?;
++    let mut kx_groups = alloc::vec::Vec::new();
++    kx_groups
++        .try_reserve_exact(DEFAULT_KX_GROUPS.len())
++        .map_err(|_| DefaultProviderAllocationError)?;
++    // The caller prepays these exact backing layouts. Refuse an allocator that
++    // reports a larger retained capacity rather than publish uncharged storage.
++    if cipher_suites.capacity() != DEFAULT_CIPHER_SUITES.len()
++        || kx_groups.capacity() != DEFAULT_KX_GROUPS.len()
++    {
++        return Err(DefaultProviderAllocationError);
++    }
++    cipher_suites.extend_from_slice(DEFAULT_CIPHER_SUITES);
++    kx_groups.extend_from_slice(DEFAULT_KX_GROUPS);
++    Ok(provider_with_buffers(cipher_suites, kx_groups))
++}
++
++fn provider_with_buffers(
++    cipher_suites: alloc::vec::Vec<SupportedCipherSuite>,
++    kx_groups: alloc::vec::Vec<&'static dyn SupportedKxGroup>,
++) -> CryptoProvider {
+     CryptoProvider {
+-        cipher_suites: DEFAULT_CIPHER_SUITES.to_vec(),
+-        kx_groups: DEFAULT_KX_GROUPS.to_vec(),
++        cipher_suites,
++        kx_groups,
+         signature_verification_algorithms: SUPPORTED_SIG_ALGS,
+         secure_random: &Ring,
+         key_provider: &Ring,

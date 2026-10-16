@@ -167,7 +167,19 @@ endfunction()
 set(RUST_REQUEST_JSON_CARGO_SCRIPT
     "${CMAKE_CURRENT_LIST_DIR}/../scripts/run-request-json-cargo.py")
 
+set(RUST_RETAINED_PROVIDER_CARGO_SCRIPT
+    "${CMAKE_CURRENT_LIST_DIR}/../scripts/run-retained-provider-cargo.py")
+
 function(rust_build_enclave CRATE_DIR OUTPUT_NAME FEATURES)
+    set(_TRUSTED_CARGO_SCRIPT "${RUST_REQUEST_JSON_CARGO_SCRIPT}")
+    if(HONEST_TEACLAVE_FALLIBLE_ALLOCATION_V1)
+        set(_TRUSTED_CARGO_SCRIPT "${RUST_RETAINED_PROVIDER_CARGO_SCRIPT}")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+            "${RUST_RETAINED_PROVIDER_CARGO_SCRIPT}"
+            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../scripts/prepare-retained-provider.py"
+            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../patches/rustls/retained-provider/manifest.json"
+            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../patches/rustls/retained-provider/profile.patch")
+    endif()
     set(_FEATURES "${FEATURES}")
 
     if(NOT TEACLAVE_CHECKOUT)
@@ -224,7 +236,7 @@ function(rust_build_enclave CRATE_DIR OUTPUT_NAME FEATURES)
             "CXX=${CMAKE_CXX_COMPILER}"
             "RUSTFLAGS=${_ENCLAVE_RUSTFLAGS}"
             "${RUST_HOST_CONTRACT_PYTHON}" -B
-                "${RUST_REQUEST_JSON_CARGO_SCRIPT}"
+                "${_TRUSTED_CARGO_SCRIPT}"
                 --cargo "${CARGO_EXECUTABLE}"
                 --manifest-path "${CRATE_DIR}/Cargo.toml"
                 --build-root "${_ENCLAVE_TARGET_DIR}/request-json-source"

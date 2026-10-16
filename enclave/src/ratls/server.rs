@@ -40,10 +40,8 @@ use crate::{enclave_log_error, enclave_log_info};
 use enclave_os_common::channel::{self, ChannelMsgType};
 use enclave_os_common::queue::SpscProducer;
 
-use rustls::crypto::ring::default_provider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::Acceptor;
-use rustls::ServerConfig;
 
 // ========================================================================
 //  Session states
@@ -1528,18 +1526,16 @@ fn build_tls_config(
 
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(result.pkcs8_key));
 
-    let builder = ServerConfig::builder_with_provider(Arc::new(default_provider()))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|e| format!("TLS config error: {:?}", e))?;
-    let builder = builder.with_client_cert_verifier(Arc::new(
-        super::client_auth::AttestedClientAuth::new(require_peer_client_auth),
-    ));
-    let config = builder
-        .with_single_cert(certs, key)
-        .map_err(|e| format!("cert chain error: {:?}", e))?;
+    let config = config_reservation.configure(
+        certs,
+        key,
+        Some(Arc::new(super::client_auth::AttestedClientAuth::new(
+            require_peer_client_auth,
+        ))),
+    )?;
 
     Ok(TlsConfigResult {
-        config: config_reservation.finish(config).ok_or_else(String::new)?,
+        config,
         local_cert_der,
         attested_endpoint: app.and_then(|app| app.attested_endpoint),
         configuration,
@@ -1914,8 +1910,12 @@ fn handle_session_bootstrap(
     };
     let req = match super::request_json::bootstrap(&pool, &http_req.body) {
         Ok(value) => value,
-        Err(enclave_os_common::request_json::Refusal::Malformed) => return HttpHandleResult::err(400, "invalid bootstrap body"),
-        Err(enclave_os_common::request_json::Refusal::Unavailable) => return HttpHandleResult::err(503, "request resources unavailable"),
+        Err(enclave_os_common::request_json::Refusal::Malformed) => {
+            return HttpHandleResult::err(400, "invalid bootstrap body")
+        }
+        Err(enclave_os_common::request_json::Refusal::Unavailable) => {
+            return HttpHandleResult::err(503, "request resources unavailable")
+        }
     };
     let sdk_pub = match crate::sessionrelay::b64_decode(&req.sdk_pub) {
         Some(v) => v,
@@ -2325,11 +2325,23 @@ fn handle_rpc_request(
     let Some(pool) = crate::local_allocation_pool() else {
         return HttpHandleResult::err(503, "request resources unavailable");
     };
-    let body = match super::request_json::rpc(&pool, &http_req.body, app_name, tail, http_req.billing_approved.as_deref()) {
+    let body = match super::request_json::rpc(
+        &pool,
+        &http_req.body,
+        app_name,
+        tail,
+        http_req.billing_approved.as_deref(),
+    ) {
         Ok(body) => body,
-        Err(super::request_json::ValueError::Syntax(error)) => return HttpHandleResult::err(400, &format!("invalid JSON body: {error}")),
-        Err(super::request_json::ValueError::Refused(enclave_os_common::request_json::Refusal::Malformed)) => return HttpHandleResult::err(400, "invalid JSON body"),
-        Err(super::request_json::ValueError::Refused(enclave_os_common::request_json::Refusal::Unavailable)) => return HttpHandleResult::err(503, "request resources unavailable"),
+        Err(super::request_json::ValueError::Syntax(error)) => {
+            return HttpHandleResult::err(400, &format!("invalid JSON body: {error}"))
+        }
+        Err(super::request_json::ValueError::Refused(
+            enclave_os_common::request_json::Refusal::Malformed,
+        )) => return HttpHandleResult::err(400, "invalid JSON body"),
+        Err(super::request_json::ValueError::Refused(
+            enclave_os_common::request_json::Refusal::Unavailable,
+        )) => return HttpHandleResult::err(503, "request resources unavailable"),
     };
     let req = Request::Data(body);
     dispatch_and_respond(req, &ctx)
@@ -2440,11 +2452,23 @@ fn handle_mcp_tools_request(
     let Some(pool) = crate::local_allocation_pool() else {
         return HttpHandleResult::err(503, "request resources unavailable");
     };
-    let body = match super::request_json::mcp(&pool, &http_req.body, &app_from_host(http_req), fn_name, http_req.app_auth.as_deref()) {
+    let body = match super::request_json::mcp(
+        &pool,
+        &http_req.body,
+        &app_from_host(http_req),
+        fn_name,
+        http_req.app_auth.as_deref(),
+    ) {
         Ok(body) => body,
-        Err(super::request_json::ValueError::Syntax(error)) => return HttpHandleResult::err(400, &format!("invalid JSON body: {error}")),
-        Err(super::request_json::ValueError::Refused(enclave_os_common::request_json::Refusal::Malformed)) => return HttpHandleResult::err(400, "invalid JSON body"),
-        Err(super::request_json::ValueError::Refused(enclave_os_common::request_json::Refusal::Unavailable)) => return HttpHandleResult::err(503, "request resources unavailable"),
+        Err(super::request_json::ValueError::Syntax(error)) => {
+            return HttpHandleResult::err(400, &format!("invalid JSON body: {error}"))
+        }
+        Err(super::request_json::ValueError::Refused(
+            enclave_os_common::request_json::Refusal::Malformed,
+        )) => return HttpHandleResult::err(400, "invalid JSON body"),
+        Err(super::request_json::ValueError::Refused(
+            enclave_os_common::request_json::Refusal::Unavailable,
+        )) => return HttpHandleResult::err(503, "request resources unavailable"),
     };
     let result = dispatch_and_respond(Request::Data(body), &ctx);
     transform_mcp_call_response(result)
@@ -2459,16 +2483,30 @@ fn handle_mcp_tools_request(
 ///
 /// On error or non-OK statuses, returns a 400 with `{"error": "<msg>"}`.
 fn transform_mcp_tools_response(result: HttpHandleResult) -> HttpHandleResult {
-    if result.status != 200 { return result; }
-    let Some(body) = result.body.contiguous() else { return result; };
-    let Some(pool) = crate::local_allocation_pool() else { return HttpHandleResult::err(503, "request resources unavailable"); };
+    if result.status != 200 {
+        return result;
+    }
+    let Some(body) = result.body.contiguous() else {
+        return result;
+    };
+    let Some(pool) = crate::local_allocation_pool() else {
+        return HttpHandleResult::err(503, "request resources unavailable");
+    };
     let transformed = match super::request_json::mcp_tools_response(&pool, body) {
         Ok(value) => value,
-        Err(super::request_json::ValueError::Refused(enclave_os_common::request_json::Refusal::Unavailable)) => return HttpHandleResult::err(503, "request resources unavailable"),
+        Err(super::request_json::ValueError::Refused(
+            enclave_os_common::request_json::Refusal::Unavailable,
+        )) => return HttpHandleResult::err(503, "request resources unavailable"),
         Err(_) => None,
     };
     match transformed {
-        Some((status, body)) => HttpHandleResult { status, body: body.into(), shutdown: false, content_type: None, extra_headers: Vec::new() },
+        Some((status, body)) => HttpHandleResult {
+            status,
+            body: body.into(),
+            shutdown: false,
+            content_type: None,
+            extra_headers: Vec::new(),
+        },
         None => result,
     }
 }
@@ -2481,16 +2519,30 @@ fn transform_mcp_tools_response(result: HttpHandleResult) -> HttpHandleResult {
 /// - Multiple returns → array of `value` fields.
 /// - `{"status":"error","message": M}` → 400 with `{"error": M}`.
 fn transform_mcp_call_response(result: HttpHandleResult) -> HttpHandleResult {
-    if result.status != 200 { return result; }
-    let Some(body) = result.body.contiguous() else { return result; };
-    let Some(pool) = crate::local_allocation_pool() else { return HttpHandleResult::err(503, "request resources unavailable"); };
+    if result.status != 200 {
+        return result;
+    }
+    let Some(body) = result.body.contiguous() else {
+        return result;
+    };
+    let Some(pool) = crate::local_allocation_pool() else {
+        return HttpHandleResult::err(503, "request resources unavailable");
+    };
     let transformed = match super::request_json::mcp_call_response(&pool, body) {
         Ok(value) => value,
-        Err(super::request_json::ValueError::Refused(enclave_os_common::request_json::Refusal::Unavailable)) => return HttpHandleResult::err(503, "request resources unavailable"),
+        Err(super::request_json::ValueError::Refused(
+            enclave_os_common::request_json::Refusal::Unavailable,
+        )) => return HttpHandleResult::err(503, "request resources unavailable"),
         Err(_) => None,
     };
     match transformed {
-        Some((status, body)) => HttpHandleResult { status, body: body.into(), shutdown: false, content_type: None, extra_headers: Vec::new() },
+        Some((status, body)) => HttpHandleResult {
+            status,
+            body: body.into(),
+            shutdown: false,
+            content_type: None,
+            extra_headers: Vec::new(),
+        },
         None => result,
     }
 }

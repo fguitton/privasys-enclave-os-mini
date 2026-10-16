@@ -8,7 +8,7 @@ use super::super::cert_store::CertStore;
 use super::{FidoIdentity, RaTlsSession, TlsOutput};
 use enclave_os_common::modules::{AppIdentity, PeerEvidence};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
-use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig};
+use rustls::{ClientConfig, ClientConnection, RootCertStore};
 use std::io::{Cursor, Write};
 use std::sync::Arc;
 
@@ -55,24 +55,6 @@ fn pair_with_all_pools(
         .unwrap()
         .der()
         .to_vec();
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let server = ServerConfig::builder_with_provider(provider.clone())
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![CertificateDer::from(cert.clone())],
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
-        )
-        .unwrap();
-    let mut roots = RootCertStore::empty();
-    roots.add(CertificateDer::from(cert.clone())).unwrap();
-    let client = ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    let (app, lease) = store.snapshot(Some(name)).unwrap();
     use super::retained_tls_config::RetainedTlsConfig;
     let config_bytes = RetainedTlsConfig::required_bytes().unwrap();
     let config_short =
@@ -83,10 +65,25 @@ fn pair_with_all_pools(
         config_bytes.checked_add(extra_config_bytes).unwrap(),
     )
     .unwrap();
-    let retained_config = RetainedTlsConfig::reserve(&config_pool)
-        .unwrap()
-        .finish(server)
+    #[cfg(feature = "fallible-allocation-v1")]
+    super::retained_tls_config::check_provider_allocation_refusals();
+    let reservation = RetainedTlsConfig::reserve(&config_pool).unwrap();
+    let retained_config = reservation
+        .configure(
+            vec![CertificateDer::from(cert.clone())],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+            None,
+        )
         .unwrap();
+    let mut roots = RootCertStore::empty();
+    roots.add(CertificateDer::from(cert.clone())).unwrap();
+    let client =
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+    let (app, lease) = store.snapshot(Some(name)).unwrap();
     assert_eq!(config_pool.used(), config_bytes);
     let config_alias = retained_config.clone();
     let server = retained_config.connect().unwrap();

@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "profile": "retained-provider",
+  "routing": "build-owned Cargo paths override; same package manifests, lock and dependency graph",
+  "patch_sha256": "bcd53c045413875d012ddc32daada2af6cf823b078b74db439a920f661a7f9ce",
+  "suppliers": [
+    {
+      "package": "rustls",
+      "version": "0.23.45",
+      "base_checksum_manifest_sha256": "0f7d16d687490d7b9d2084bab2af7c38cfef70eb09f0afac9df47e1ff1009051",
+      "base_package_checksum": "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634",
+      "files": [
+        {
+          "path": "src/crypto/ring/mod.rs",
+          "before_sha256": "0548e46ea13e22f6f6f7918d99f68d724d1d7a3e6f3a5a8171c5c6741c2e88e3",
+          "after_sha256": "4511612232d70dac900136e45cd7311ede3111aa466d75c36ff8bd4ae779ad46"
+        }
+      ]
+    }
+  ]
+}
