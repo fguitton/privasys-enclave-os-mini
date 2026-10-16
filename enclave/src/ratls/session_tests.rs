@@ -11,6 +11,10 @@ mod client_hello_owner_check;
 #[path = "transcript_owner_check.rs"]
 mod transcript_owner_check;
 
+#[cfg(feature = "fallible-allocation-v1")]
+#[path = "state_owner_check.rs"]
+mod state_owner_check;
+
 #[path = "../sealed_config/serialization.rs"]
 mod sealed_config_serialization;
 
@@ -170,6 +174,12 @@ fn replacement_during_handshake_requires_a_new_connection() {
 
 #[test]
 fn replacement_rejects_buffered_requests_and_re_attestation() {
+    #[cfg(feature = "fallible-allocation-v1")]
+    {
+        state_owner_check::check();
+        checked_steady_state_backing();
+    }
+
     sealed_config_serialization::check();
     #[cfg(feature = "fallible-allocation-v1")]
     client_hello_owner_check::check();
@@ -1969,5 +1979,30 @@ mod retained_cache_checks {
         drop(cache);
         assert_eq!(counts.live.load(Ordering::SeqCst), 0);
         assert_eq!(Arc::strong_count(&counts), 1);
+    }
+}
+
+#[cfg(feature = "fallible-allocation-v1")]
+fn checked_steady_state_backing() {
+    let store = CertStore::new();
+    register(&store, "state.test");
+    let (mut client, mut session) = pair(&store, "state.test");
+    handshake(&mut client, &mut session);
+    let before = rustls::internal::state::connection_allocation(&session.tls_conn).unwrap();
+    // Exercise multiple distinct encrypted application records on the real
+    // steady traffic state. Buffer/HTTP ownership has its separate assertions.
+    for _ in 0..32 {
+        client
+            .writer()
+            .write_all(b"GET /state HTTP/1.1\r\nHost: state.test\r\n\r\n")
+            .unwrap();
+        let bytes = flight(&mut client);
+        super::retained_tls_config::check_no_native_state_backing(before.1, || {
+            session.feed_tls_bytes(&bytes).unwrap();
+        });
+        assert_eq!(
+            rustls::internal::state::connection_allocation(&session.tls_conn),
+            Some(before)
+        );
     }
 }

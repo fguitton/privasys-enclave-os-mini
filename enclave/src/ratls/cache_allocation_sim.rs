@@ -8,6 +8,9 @@ mod client_hello_owner_check;
 #[path = "transcript_owner_check.rs"]
 mod transcript_owner_check;
 
+#[path = "state_owner_check.rs"]
+mod state_owner_check;
+
 #[path = "record_owner_check.rs"]
 mod record_owner_check;
 
@@ -102,6 +105,9 @@ pub fn check_paid_session_cache(pool: &Arc<AllocationPoolV1>) -> Result<(), &'st
     check_input_buffer(pool)?;
     client_hello_owner_check::check_in(pool);
     transcript_owner_check::check_in(pool);
+    state_owner_check::check();
+    std::println!("TLS-STATE-CARRIER-SIM: actual-slot original-pool refusal-before-normalization Stay-same-backing Next consumed-once kernel-move error-drop final-alias-refund PASS");
+
     crate::sealed_config::serialization::check_in(pool)?;
     std::println!("SEALED-CONFIG-OUTPUT-SIM: current-v3-wire original-pool minus-one exact plus-one allocator-refusal unpublished-no-wake final-refund PASS");
     #[cfg(feature = "egress")]

@@ -278,6 +278,16 @@ pub(crate) fn check_one_native_context<T>(
     provider_refusal::one_native_context(layout, action)
 }
 
+/// Observe real traffic processing without refusing any allocation. Other named
+/// record/buffer children are outside this state-backing assertion.
+#[cfg(all(test, feature = "fallible-allocation-v1"))]
+pub(crate) fn check_no_native_state_backing<T>(
+    layout: std::alloc::Layout,
+    action: impl FnOnce() -> T,
+) -> T {
+    provider_refusal::no_state_backing(layout, action)
+}
+
 // This native fixture changes no production allocator. A thread-local arm
 // refuses one exact provider request and counts only that constructor's scope.
 #[cfg(all(test, feature = "fallible-allocation-v1"))]
@@ -396,6 +406,28 @@ mod provider_refusal {
             "the allocation must match the dynamic context Layout"
         );
         assert_eq!(arm.live, 0, "temporary context must be freed on refusal");
+        result
+    }
+
+    pub(super) fn no_state_backing<T>(layout: Layout, action: impl FnOnce() -> T) -> T {
+        ARM.with(|cell| {
+            assert!(cell.get().is_none());
+            cell.set(Some(Arm {
+                expected: layout,
+                refused: false,
+                live: 0,
+                allocations: 0,
+                matching_allocations: 0,
+                skip_matching: usize::MAX,
+            }));
+        });
+        let result = action();
+        let arm = ARM.with(|cell| cell.take()).unwrap();
+        assert!(!arm.refused);
+        assert_eq!(
+            arm.matching_allocations, 0,
+            "steady traffic must not request another state slot"
+        );
         result
     }
 
