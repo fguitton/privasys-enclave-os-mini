@@ -21,6 +21,8 @@ crate-type = ["staticlib", "rlib"]
 fallible-allocation-v1 = ["enclave-os-common/fallible-allocation-v1"]
 # Untrusted elapsed observations only; disabled in product builds.
 diagnostic-transfer-profile = []
+# Host-log stamps of control request readiness for the replay latency harness.
+diagnostic-replay-latency = []
 default = ["sgx", "default-ecall"]
 sgx = []
 # Provides the default ecall_run implementation.

@@ -63,6 +63,20 @@ pub use allocation_admission::{
     local_allocation_pool, reserve_local_allocation, take_local_allocation_release,
 };
 pub mod config_merkle;
+/// The untrusted host monotonic clock the replay latency stamps share.
+#[cfg(feature = "diagnostic-replay-latency")]
+pub mod latency_clock {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    /// Nanoseconds since the enclave's first stamp, on the host monotonic
+    /// clock: comparable between every stamp of one enclave instance.
+    #[must_use]
+    pub fn now_ns() -> u128 {
+        static EPOCH: OnceLock<Instant> = OnceLock::new();
+        EPOCH.get_or_init(Instant::now).elapsed().as_nanos()
+    }
+}
 pub mod cpuid_cache;
 pub mod crypto;
 pub mod ecall;

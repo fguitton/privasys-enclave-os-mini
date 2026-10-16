@@ -968,6 +968,12 @@ impl IngressServer {
     /// close that connection, not silently discard its only readiness marker.
     fn mark_dispatch(&mut self, connection: u32) -> bool {
         if self.pending_dispatch.try_insert(connection, ()).is_ok() {
+            #[cfg(feature = "diagnostic-replay-latency")]
+            enclave_log_info!(
+                "LATENCY-READY conn={} ready_ns={} clock=UNTRUSTED-HOST-MONOTONIC",
+                connection,
+                crate::latency_clock::now_ns()
+            );
             return true;
         }
         self.invalidate_deferred(connection);
