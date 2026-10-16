@@ -67,8 +67,9 @@ impl SealedConfig {
         let sealed_blob = crate::ocall::config_store_get(pool, SYSTEM_TABLE, &tag)
             .map_err(ConfigLoadError::Host)?
             .ok_or(ConfigLoadError::NotFound)?;
-        let plaintext = sealing::unseal_with_mrenclave(pool, sealed_blob.as_slice())
-            .map_err(ConfigLoadError::Unseal)?;
+        let (plaintext, _authenticated_aad) =
+            sealing::unseal_with_mrenclave(pool, sealed_blob.as_slice())
+                .map_err(ConfigLoadError::Unseal)?;
         Self::deserialize(pool, &plaintext).map_err(ConfigLoadError::Decode)
     }
 }

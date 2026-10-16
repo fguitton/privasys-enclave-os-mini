@@ -47,20 +47,20 @@ pub fn seal_with_mrenclave(
 }
 
 #[cfg(not(feature = "mock"))]
-pub fn unseal_with_mrenclave(
+pub fn unseal_with_mrenclave<'a>(
     pool: &Arc<AllocationPoolV1>,
-    raw: &[u8],
-) -> Result<ConfigBytes, &'static str> {
+    raw: &'a [u8],
+) -> Result<(ConfigBytes, &'a [u8]), &'static str> {
     let length =
         SealedData::<[u8]>::plaintext_size(raw).map_err(|_| "Invalid sealed data format")?;
     let origin = ConfigAllocator::try_new(pool)?;
     let mut output = origin.try_zeroed(length)?;
-    // AAD is authenticated by the same SDK primitive and remains borrowed.
-    // The config consumer never used it; no copied AAD owner is constructed.
-    SealedData::<[u8]>::unseal_into(raw, output.as_mut_slice())
+    // The authenticated domain borrows the original raw owner; neither backing
+    // is copied or detached when the caller validates it.
+    let aad = SealedData::<[u8]>::unseal_into(raw, output.as_mut_slice())
         .map_err(|_| "sgx_unseal_data failed")?;
     output.activate_release_notification();
-    Ok(output)
+    Ok((output, aad))
 }
 
 #[cfg(feature = "mock")]
@@ -102,10 +102,10 @@ pub fn seal_with_mrenclave(
 }
 
 #[cfg(feature = "mock")]
-pub fn unseal_with_mrenclave(
+pub fn unseal_with_mrenclave<'a>(
     pool: &Arc<AllocationPoolV1>,
-    raw: &[u8],
-) -> Result<ConfigBytes, &'static str> {
+    raw: &'a [u8],
+) -> Result<(ConfigBytes, &'a [u8]), &'static str> {
     let mut data = raw
         .strip_prefix(MOCK_PREFIX)
         .ok_or("Not a mock-sealed blob")?;
@@ -122,11 +122,11 @@ pub fn unseal_with_mrenclave(
             usize::try_from(length).map_err(|_| "Invalid mock sealed data")?,
         )
     }
-    let _aad = field(&mut data)?;
+    let aad = field(&mut data)?;
     let plaintext = field(&mut data)?;
     let output = ConfigAllocator::try_new(pool)?.try_copy(plaintext)?;
     output.activate_release_notification();
-    Ok(output)
+    Ok((output, aad))
 }
 
 #[cfg(all(
@@ -143,8 +143,8 @@ pub(crate) fn check_in(pool: &Arc<AllocationPoolV1>) -> Result<(), &'static str>
     let aad = [3, 4, 5];
     let before = pool.used();
     let sealed = seal_with_mrenclave(pool, &plaintext, &aad)?;
-    let unsealed = unseal_with_mrenclave(pool, &sealed)?;
-    if unsealed.as_slice() != plaintext {
+    let (unsealed, authenticated) = unseal_with_mrenclave(pool, &sealed)?;
+    if unsealed.as_slice() != plaintext || authenticated != aad {
         return Err("provided sealed plaintext changed");
     }
     let policy = core::mem::offset_of!(CSealedData, key_request)
@@ -181,8 +181,8 @@ pub(crate) fn check_in(pool: &Arc<AllocationPoolV1>) -> Result<(), &'static str>
     .map_err(|_| "standard SDK seal oracle")?
     .into_bytes()
     .map_err(|_| "standard SDK wire oracle")?;
-    let crossed = unseal_with_mrenclave(pool, &standard)?;
-    if crossed.as_slice() != plaintext {
+    let (crossed, authenticated) = unseal_with_mrenclave(pool, &standard)?;
+    if crossed.as_slice() != plaintext || authenticated != aad {
         return Err("supplied standard wire oracle");
     }
     drop(crossed);
@@ -200,7 +200,7 @@ pub(crate) fn check_in(pool: &Arc<AllocationPoolV1>) -> Result<(), &'static str>
                 .ok_or("provided boundary")?;
             let isolated = AllocationPoolV1::new(limit).ok_or("provided boundary pool")?;
             let result = if decrypt {
-                unseal_with_mrenclave(&isolated, &sealed)
+                unseal_with_mrenclave(&isolated, &sealed).map(|(output, _)| output)
             } else {
                 seal_with_mrenclave(&isolated, &plaintext, &aad)
             };
@@ -224,8 +224,8 @@ pub(crate) fn check_in(pool: &Arc<AllocationPoolV1>) -> Result<(), &'static str>
     let mut unaligned =
         origin.try_zeroed(sealed.len().checked_add(1).ok_or("unaligned length")?)?;
     unaligned.as_mut_slice()[1..].copy_from_slice(&sealed);
-    let result = unseal_with_mrenclave(pool, &unaligned[1..])?;
-    if result.as_slice() != plaintext {
+    let (result, authenticated) = unseal_with_mrenclave(pool, &unaligned[1..])?;
+    if result.as_slice() != plaintext || authenticated != aad {
         return Err("unaligned supplied raw wire");
     }
     drop(result);

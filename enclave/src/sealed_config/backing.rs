@@ -151,8 +151,8 @@ impl ConfigAllocator {
     }
 }
 
-/// Move-only configuration bytes. Mutable access is limited to the defining
-/// crate's codecs and SGX supplied-buffer calls; the backing cannot be detached.
+/// Move-only configuration bytes. Borrowed mutable access permits caller
+/// zeroization; the allocation and original payer cannot be detached.
 pub struct ConfigBytes {
     // Declaration order frees the actual backing before default-backend credit.
     bytes: Bytes,
@@ -172,7 +172,7 @@ impl ConfigBytes {
         self.bytes.is_empty()
     }
 
-    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
         &mut self.bytes
     }
 
