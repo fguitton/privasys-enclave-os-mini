@@ -1155,6 +1155,7 @@ impl RaTlsSession {
             None => None,
         };
         let context = enclave_os_common::modules::RequestContext {
+            allocation_pool: pool.cloned(),
             ingress_class,
             connection_id,
             server_name: self.server_name().map(str::to_owned),

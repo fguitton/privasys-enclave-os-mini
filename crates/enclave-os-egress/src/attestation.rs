@@ -158,10 +158,14 @@ pub fn tcb_status_acceptable(status: &str, acceptable: &[String]) -> bool {
 ///
 /// // Use the globally configured attestation servers
 /// let servers = enclave_os_common::attestation_servers::server_urls();
-/// attestation::verify_quote(&raw_quote_bytes, &servers)?;
+/// attestation::verify_quote(&raw_quote_bytes, &servers, Some(&pool))?;
 /// ```
-pub fn verify_quote(evidence: &[u8], attestation_servers: &[String]) -> Result<(), String> {
-    verify_quote_statuses(evidence, attestation_servers).map(|_| ())
+pub fn verify_quote(
+    evidence: &[u8],
+    attestation_servers: &[String],
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
+) -> Result<(), String> {
+    verify_quote_statuses(evidence, attestation_servers, pool).map(|_| ())
 }
 
 /// Like [`verify_quote`], but returns each server's full [`VerifyResponse`]
@@ -172,6 +176,8 @@ pub fn verify_quote(evidence: &[u8], attestation_servers: &[String]) -> Result<(
 pub fn verify_quote_statuses(
     evidence: &[u8],
     attestation_servers: &[String],
+
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> Result<Vec<VerifyResponse>, String> {
     #[cfg(feature = "sgx-sim-attestation")]
     if evidence.starts_with(enclave_os_common::quote::SGX_SIM_REPORT_PREFIX) {
@@ -224,7 +230,13 @@ pub fn verify_quote_statuses(
             Some(body.as_bytes().to_vec()),
         )
         .and_then(|request| {
-            client::https_fetch_interruptible(&mut client::GlobalOcallNetIo, &request, store, None)
+            client::https_fetch_interruptible(
+                &mut client::GlobalOcallNetIo,
+                &request,
+                store,
+                None,
+                pool,
+            )
         })
         .map_err(|e| format!("attestation server request to {} failed: {}", server_url, e))?;
 
@@ -257,9 +269,9 @@ mod simulation_tests {
         let mut evidence = SGX_SIM_REPORT_PREFIX.to_vec();
         evidence.extend_from_slice(&[7; 32]);
         evidence.extend_from_slice(&[9; 64]);
-        assert!(verify_quote(&evidence, &[]).is_ok());
+        assert!(verify_quote(&evidence, &[], None,).is_ok());
         assert!(
-            verify_quote(&evidence, &["https://appraiser.invalid".into()])
+            verify_quote(&evidence, &["https://appraiser.invalid".into()], None,)
                 .unwrap_err()
                 .contains("cannot be sent")
         );

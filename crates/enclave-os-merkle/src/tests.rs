@@ -829,6 +829,7 @@ mod module_tests {
 
     fn ctx(oidc_claims: Option<OidcClaims>) -> RequestContext {
         RequestContext {
+            allocation_pool: None,
             ingress_class: IngressClass::ExternalNetwork,
             connection_id: 0,
             server_name: None,

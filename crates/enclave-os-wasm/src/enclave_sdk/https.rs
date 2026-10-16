@@ -221,6 +221,7 @@ impl wit::Host for AppContext {
                 &request,
                 root_store,
                 ratls_policy.as_ref(),
+                self.allocation_pool.as_ref(),
             )
         })?;
 

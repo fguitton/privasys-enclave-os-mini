@@ -52,6 +52,7 @@ pub struct VaultModule {
 
 impl VaultModule {
     pub fn new() -> Self {
+        const { assert!(core::mem::size_of::<VaultModule>() == 0) };
         Self { _private: () }
     }
 }
@@ -83,20 +84,36 @@ impl EnclaveModule for VaultModule {
                 handle,
                 material_b64,
                 grant,
-            } => handle_create(&handle, &material_b64, &grant, ctx),
+            } => handle_create(
+                &handle,
+                &material_b64,
+                &grant,
+                ctx,
+                ctx.allocation_pool.as_ref(),
+            ),
             VaultRequest::ExportKey { handle, approvals } => {
-                handle_export(&handle, &approvals, ctx)
+                handle_export(&handle, &approvals, ctx, ctx.allocation_pool.as_ref())
             }
             VaultRequest::DeleteKey { handle, approvals } => {
-                handle_delete(&handle, &approvals, ctx)
+                handle_delete(&handle, &approvals, ctx, ctx.allocation_pool.as_ref())
             }
             VaultRequest::UpdatePolicy {
                 handle,
                 new_policy,
                 approvals,
-            } => handle_update_policy(&handle, new_policy, &approvals, ctx),
-            VaultRequest::GetPolicy { handle } => handle_get_policy(&handle, ctx),
-            VaultRequest::GetKeyInfo { handle } => handle_get_info(&handle, ctx),
+            } => handle_update_policy(
+                &handle,
+                new_policy,
+                &approvals,
+                ctx,
+                ctx.allocation_pool.as_ref(),
+            ),
+            VaultRequest::GetPolicy { handle } => {
+                handle_get_policy(&handle, ctx, ctx.allocation_pool.as_ref())
+            }
+            VaultRequest::GetKeyInfo { handle } => {
+                handle_get_info(&handle, ctx, ctx.allocation_pool.as_ref())
+            }
             VaultRequest::ListKeys => handle_list(ctx),
 
             VaultRequest::Wrap {
@@ -112,6 +129,7 @@ impl EnclaveModule for VaultModule {
                 iv_b64.as_deref(),
                 &approvals,
                 ctx,
+                ctx.allocation_pool.as_ref(),
             ),
             VaultRequest::Unwrap {
                 handle,
@@ -126,18 +144,32 @@ impl EnclaveModule for VaultModule {
                 aad_b64.as_deref(),
                 &approvals,
                 ctx,
+                ctx.allocation_pool.as_ref(),
             ),
             VaultRequest::Sign {
                 handle,
                 message_b64,
                 prehashed,
                 approvals,
-            } => handle_sign(&handle, &message_b64, prehashed, &approvals, ctx),
+            } => handle_sign(
+                &handle,
+                &message_b64,
+                prehashed,
+                &approvals,
+                ctx,
+                ctx.allocation_pool.as_ref(),
+            ),
             VaultRequest::Mac {
                 handle,
                 message_b64,
                 approvals,
-            } => handle_mac(&handle, &message_b64, &approvals, ctx),
+            } => handle_mac(
+                &handle,
+                &message_b64,
+                &approvals,
+                ctx,
+                ctx.allocation_pool.as_ref(),
+            ),
 
             VaultRequest::IssueApprovalToken {
                 handle,
@@ -149,21 +181,29 @@ impl EnclaveModule for VaultModule {
                 handle,
                 since_seq,
                 limit,
-            } => handle_read_audit(&handle, since_seq, limit, ctx),
+            } => handle_read_audit(&handle, since_seq, limit, ctx, ctx.allocation_pool.as_ref()),
 
             VaultRequest::StagePendingProfile {
                 handle,
                 profile,
                 source,
-            } => handle_stage_pending(&handle, profile, source, ctx),
-            VaultRequest::ListPendingProfiles { handle } => handle_list_pending(&handle, ctx),
+            } => handle_stage_pending(&handle, profile, source, ctx, ctx.allocation_pool.as_ref()),
+            VaultRequest::ListPendingProfiles { handle } => {
+                handle_list_pending(&handle, ctx, ctx.allocation_pool.as_ref())
+            }
             VaultRequest::PromotePendingProfile {
                 handle,
                 pending_id,
                 approvals,
-            } => handle_promote_pending(&handle, pending_id, &approvals, ctx),
+            } => handle_promote_pending(
+                &handle,
+                pending_id,
+                &approvals,
+                ctx,
+                ctx.allocation_pool.as_ref(),
+            ),
             VaultRequest::RevokePendingProfile { handle, pending_id } => {
-                handle_revoke_pending(&handle, pending_id, ctx)
+                handle_revoke_pending(&handle, pending_id, ctx, ctx.allocation_pool.as_ref())
             }
         };
 
@@ -332,6 +372,8 @@ fn handle_create(
     material_b64: &str,
     grant_jwt: &str,
     ctx: &RequestContext,
+
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> VaultResponse {
     if handle.is_empty() {
         return VaultResponse::Error("handle must not be empty".into());
@@ -343,7 +385,7 @@ fn handle_create(
     }
 
     let now = now_secs();
-    let grant = match crate::grant::verify_grant(grant_jwt, ctx, now) {
+    let grant = match crate::grant::verify_grant(grant_jwt, ctx, now, pool) {
         Ok(g) => g,
         Err(e) => return VaultResponse::Error(e),
     };
@@ -435,7 +477,12 @@ fn handle_create(
     }
 }
 
-fn handle_export(handle: &str, approvals: &[ApprovalToken], ctx: &RequestContext) -> VaultResponse {
+fn handle_export(
+    handle: &str,
+    approvals: &[ApprovalToken],
+    ctx: &RequestContext,
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
+) -> VaultResponse {
     let mut record = match load_record(handle) {
         Ok(r) => r,
         Err(e) => return VaultResponse::Error(e),
@@ -464,6 +511,7 @@ fn handle_export(handle: &str, approvals: &[ApprovalToken], ctx: &RequestContext
         approvals,
         ctx,
         Some(&op_binding),
+        pool,
     ) {
         Ok(()) => {
             let _ = audit_and_save(
@@ -485,7 +533,12 @@ fn handle_export(handle: &str, approvals: &[ApprovalToken], ctx: &RequestContext
     }
 }
 
-fn handle_delete(handle: &str, approvals: &[ApprovalToken], ctx: &RequestContext) -> VaultResponse {
+fn handle_delete(
+    handle: &str,
+    approvals: &[ApprovalToken],
+    ctx: &RequestContext,
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
+) -> VaultResponse {
     let mut record = match load_record(handle) {
         Ok(r) => r,
         Err(e) => return VaultResponse::Error(e),
@@ -498,6 +551,7 @@ fn handle_delete(handle: &str, approvals: &[ApprovalToken], ctx: &RequestContext
         approvals,
         ctx,
         None,
+        pool,
     ) {
         let _ = audit_and_save(&mut record, "DeleteKey", &caller, AuditDecision::Denied, &e);
         return VaultResponse::Error(e);
@@ -540,6 +594,8 @@ fn handle_update_policy(
     new_policy: KeyPolicy,
     approvals: &[ApprovalToken],
     ctx: &RequestContext,
+
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> VaultResponse {
     let mut record = match load_record(handle) {
         Ok(r) => r,
@@ -557,6 +613,7 @@ fn handle_update_policy(
         approvals,
         ctx,
         None,
+        pool,
     ) {
         let _ = audit_and_save(
             &mut record,
@@ -567,7 +624,7 @@ fn handle_update_policy(
         );
         return VaultResponse::Error(e);
     }
-    let role = match resolve_caller(&record.policy, ctx) {
+    let role = match resolve_caller(&record.policy, ctx, pool) {
         Some((_pref, role)) => role,
         None => return VaultResponse::Error("caller is not in policy.principals".into()),
     };
@@ -600,12 +657,16 @@ fn handle_update_policy(
     }
 }
 
-fn handle_get_policy(handle: &str, ctx: &RequestContext) -> VaultResponse {
+fn handle_get_policy(
+    handle: &str,
+    ctx: &RequestContext,
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
+) -> VaultResponse {
     let record = match load_record(handle) {
         Ok(r) => r,
         Err(e) => return VaultResponse::Error(e),
     };
-    if resolve_caller(&record.policy, ctx).is_none() {
+    if resolve_caller(&record.policy, ctx, pool).is_none() {
         return VaultResponse::Error("caller is not in policy.principals".into());
     }
     VaultResponse::Policy {
@@ -614,12 +675,16 @@ fn handle_get_policy(handle: &str, ctx: &RequestContext) -> VaultResponse {
     }
 }
 
-fn handle_get_info(handle: &str, ctx: &RequestContext) -> VaultResponse {
+fn handle_get_info(
+    handle: &str,
+    ctx: &RequestContext,
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
+) -> VaultResponse {
     let record = match load_record(handle) {
         Ok(r) => r,
         Err(e) => return VaultResponse::Error(e),
     };
-    if resolve_caller(&record.policy, ctx).is_none() {
+    if resolve_caller(&record.policy, ctx, pool).is_none() {
         return VaultResponse::Error("caller is not in policy.principals".into());
     }
     VaultResponse::KeyInfo(KeyInfo {
@@ -681,6 +746,8 @@ fn require_op(
     expect_type: KeyType,
     approvals: &[ApprovalToken],
     ctx: &RequestContext,
+
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> Result<KeyRecord, String> {
     let mut record = load_record(handle)?;
     if expired(&record) {
@@ -708,7 +775,7 @@ fn require_op(
         return Err(msg);
     }
     let caller = caller_str(ctx);
-    if let Err(e) = evaluate_op(&record.policy, op, handle, approvals, ctx, None) {
+    if let Err(e) = evaluate_op(&record.policy, op, handle, approvals, ctx, None, pool) {
         let _ = audit_and_save(&mut record, op_name(op), &caller, AuditDecision::Denied, &e);
         return Err(e);
     }
@@ -742,6 +809,8 @@ fn handle_wrap(
     iv_b64: Option<&str>,
     approvals: &[ApprovalToken],
     ctx: &RequestContext,
+
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> VaultResponse {
     let record = match require_op(
         handle,
@@ -749,6 +818,7 @@ fn handle_wrap(
         KeyType::Aes256GcmKey,
         approvals,
         ctx,
+        pool,
     ) {
         Ok(r) => r,
         Err(e) => return VaultResponse::Error(e),
@@ -784,6 +854,8 @@ fn handle_unwrap(
     aad_b64: Option<&str>,
     approvals: &[ApprovalToken],
     ctx: &RequestContext,
+
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> VaultResponse {
     let record = match require_op(
         handle,
@@ -791,6 +863,7 @@ fn handle_unwrap(
         KeyType::Aes256GcmKey,
         approvals,
         ctx,
+        pool,
     ) {
         Ok(r) => r,
         Err(e) => return VaultResponse::Error(e),
@@ -822,6 +895,8 @@ fn handle_sign(
     prehashed: bool,
     approvals: &[ApprovalToken],
     ctx: &RequestContext,
+
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> VaultResponse {
     let record = match require_op(
         handle,
@@ -829,6 +904,7 @@ fn handle_sign(
         KeyType::P256SigningKey,
         approvals,
         ctx,
+        pool,
     ) {
         Ok(r) => r,
         Err(e) => return VaultResponse::Error(e),
@@ -858,6 +934,8 @@ fn handle_mac(
     message_b64: &str,
     approvals: &[ApprovalToken],
     ctx: &RequestContext,
+
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> VaultResponse {
     let record = match require_op(
         handle,
@@ -865,6 +943,7 @@ fn handle_mac(
         KeyType::HmacSha256Key,
         approvals,
         ctx,
+        pool,
     ) {
         Ok(r) => r,
         Err(e) => return VaultResponse::Error(e),
@@ -981,12 +1060,14 @@ fn handle_read_audit(
     since_seq: u64,
     limit: u32,
     ctx: &RequestContext,
+
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> VaultResponse {
     let record = match load_record(handle) {
         Ok(r) => r,
         Err(e) => return VaultResponse::Error(e),
     };
-    if resolve_caller(&record.policy, ctx).is_none() {
+    if resolve_caller(&record.policy, ctx, pool).is_none() {
         return VaultResponse::Error("caller is not in policy.principals".into());
     }
     let limit = if limit == 0 { 256 } else { limit.min(1024) };
@@ -1016,8 +1097,10 @@ fn handle_read_audit(
 fn check_pending_mutability(
     record: &KeyRecord,
     ctx: &RequestContext,
+
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> Result<CallerRole, String> {
-    let role = match resolve_caller(&record.policy, ctx) {
+    let role = match resolve_caller(&record.policy, ctx, pool) {
         Some((_pref, role)) => role,
         None => return Err("caller is not in policy.principals".into()),
     };
@@ -1066,9 +1149,11 @@ enum StagerIdentity {
 fn check_stage_authority(
     record: &KeyRecord,
     ctx: &RequestContext,
+
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> Result<StagerIdentity, String> {
-    if resolve_caller(&record.policy, ctx).is_some() {
-        return check_pending_mutability(record, ctx).map(|_| StagerIdentity::Principal);
+    if resolve_caller(&record.policy, ctx, pool).is_some() {
+        return check_pending_mutability(record, ctx, pool).map(|_| StagerIdentity::Principal);
     }
     let is_platform = ctx
         .oidc_claims
@@ -1096,13 +1181,15 @@ fn handle_stage_pending(
     mut profile: AttestationProfile,
     source: PendingProfileSource,
     ctx: &RequestContext,
+
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> VaultResponse {
     let mut record = match load_record(handle) {
         Ok(r) => r,
         Err(e) => return VaultResponse::Error(e),
     };
     let caller = caller_str(ctx);
-    let stager = match check_stage_authority(&record, ctx) {
+    let stager = match check_stage_authority(&record, ctx, pool) {
         Ok(s) => s,
         Err(e) => {
             let _ = audit_and_save(
@@ -1240,12 +1327,16 @@ fn handle_stage_pending(
     }
 }
 
-fn handle_list_pending(handle: &str, ctx: &RequestContext) -> VaultResponse {
+fn handle_list_pending(
+    handle: &str,
+    ctx: &RequestContext,
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
+) -> VaultResponse {
     let record = match load_record(handle) {
         Ok(r) => r,
         Err(e) => return VaultResponse::Error(e),
     };
-    if resolve_caller(&record.policy, ctx).is_none() {
+    if resolve_caller(&record.policy, ctx, pool).is_none() {
         return VaultResponse::Error("caller is not in policy.principals".into());
     }
     VaultResponse::PendingProfileList {
@@ -1258,6 +1349,8 @@ fn handle_promote_pending(
     pending_id: u32,
     approvals: &[ApprovalToken],
     ctx: &RequestContext,
+
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> VaultResponse {
     let mut record = match load_record(handle) {
         Ok(r) => r,
@@ -1288,6 +1381,7 @@ fn handle_promote_pending(
         approvals,
         ctx,
         op_binding.as_ref(),
+        pool,
     ) {
         let _ = audit_and_save(
             &mut record,
@@ -1360,13 +1454,18 @@ fn handle_promote_pending(
     }
 }
 
-fn handle_revoke_pending(handle: &str, pending_id: u32, ctx: &RequestContext) -> VaultResponse {
+fn handle_revoke_pending(
+    handle: &str,
+    pending_id: u32,
+    ctx: &RequestContext,
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
+) -> VaultResponse {
     let mut record = match load_record(handle) {
         Ok(r) => r,
         Err(e) => return VaultResponse::Error(e),
     };
     let caller = caller_str(ctx);
-    if let Err(e) = check_pending_mutability(&record, ctx) {
+    if let Err(e) = check_pending_mutability(&record, ctx, pool) {
         let _ = audit_and_save(
             &mut record,
             "RevokePendingProfile",

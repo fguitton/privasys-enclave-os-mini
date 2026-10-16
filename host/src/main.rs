@@ -11,6 +11,8 @@
 //! - Provide the CLI entry point
 
 mod build_contract;
+#[cfg(feature = "diagnostic-transfer-profile")]
+mod control_observation;
 #[cfg(all(target_os = "linux", not(sgx_mode_sim), not(feature = "mock")))]
 mod dcap;
 mod dispatcher;

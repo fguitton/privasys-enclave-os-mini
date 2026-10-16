@@ -117,6 +117,8 @@ pub enum CallerRole {
 pub fn resolve_caller(
     policy: &KeyPolicy,
     ctx: &RequestContext,
+
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> Option<(PrincipalRef, CallerRole)> {
     if let Some(claims) = ctx.oidc_claims.as_ref() {
         if oidc_matches(&policy.principals.owner, claims) {
@@ -137,7 +139,7 @@ pub fn resolve_caller(
     if let Some(peer_der) = ctx.peer_cert_der.as_deref() {
         for (i, p) in policy.principals.tees.iter().enumerate() {
             if let Principal::Tee(profile) = p {
-                if tee_matches(profile, peer_der, ctx.peer_evidence.as_ref()) {
+                if tee_matches(profile, peer_der, ctx.peer_evidence.as_ref(), pool) {
                     return Some((PrincipalRef::Tee(i as u32), CallerRole::Tee));
                 }
             }
@@ -200,6 +202,8 @@ pub(crate) fn tee_matches(
     profile: &AttestationProfile,
     peer_der: &[u8],
     peer_evidence: Option<&enclave_os_common::modules::PeerEvidence>,
+
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> bool {
     // A TEE principal must have presented evidence for its leaf on this
     // connection; a v2 leaf carries none itself.
@@ -221,11 +225,14 @@ pub(crate) fn tee_matches(
         // Refuse: a TEE principal must list at least one attestation server.
         return false;
     }
-    let verdicts =
-        match enclave_os_egress::attestation::verify_quote_statuses(&evidence.evidence, &urls) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
+    let verdicts = match enclave_os_egress::attestation::verify_quote_statuses(
+        &evidence.evidence,
+        &urls,
+        pool,
+    ) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
     // Require each server to report a status accepted by the explicit policy.
     for v in &verdicts {
         if !enclave_os_egress::attestation::tcb_status_acceptable(
@@ -299,8 +306,10 @@ pub fn evaluate_op(
     approvals: &[ApprovalToken],
     ctx: &RequestContext,
     op_binding: Option<&OpBinding>,
+
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> Result<(), String> {
-    let (caller_ref, _role) = resolve_caller(policy, ctx).ok_or_else(|| {
+    let (caller_ref, _role) = resolve_caller(policy, ctx, pool).ok_or_else(|| {
         "caller is not in policy.principals (no OIDC subject or RA-TLS TEE \
          matches the key's PrincipalSet)"
             .to_string()
@@ -319,7 +328,7 @@ pub fn evaluate_op(
             op,
             handle,
             approvals,
-            ctx,
+            (ctx, pool),
             op_binding,
         ) {
             Ok(()) => return Ok(()),
@@ -360,9 +369,13 @@ fn evaluate_conditions(
     op: Operation,
     handle: &str,
     approvals: &[ApprovalToken],
-    ctx: &RequestContext,
+    caller: (
+        &RequestContext,
+        Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
+    ),
     op_binding: Option<&OpBinding>,
 ) -> Result<(), String> {
+    let (ctx, pool) = caller;
     let now = enclave_os_common::ocall::get_current_time().unwrap_or(0);
     for cond in conditions {
         match cond {
@@ -387,7 +400,7 @@ fn evaluate_conditions(
                 let peer = ctx.peer_cert_der.as_deref().ok_or_else(|| {
                     "AttestationMatches: no peer RA-TLS cert in request".to_string()
                 })?;
-                if !tee_matches(profile, peer, ctx.peer_evidence.as_ref()) {
+                if !tee_matches(profile, peer, ctx.peer_evidence.as_ref(), pool) {
                     return Err(format!(
                         "AttestationMatches: peer does not match profile '{}'",
                         profile.name

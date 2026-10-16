@@ -107,6 +107,8 @@ pub fn check_paid_session_cache(pool: &Arc<AllocationPoolV1>) -> Result<(), &'st
     #[cfg(feature = "egress")]
     {
         check_incremental_origin(pool)?;
+        check_sync_origin(pool)?;
+        std::println!("TLS-SYNCHRONOUS-ORIGIN-SIM: current-constructor original-pool missing-origin origin-refusal child-refusal exact-close no-HTTP no-authorization final-refund PASS");
         std::println!("TLS-INCREMENTAL-ORIGIN-SIM: current-constructor original-pool retained-backing missing-origin origin-refusal child-refusal final-refund PASS");
     }
     std::println!("TLS-TRANSCRIPT-BACKING-SIM: original-pool admission-before-hash clone HRR bytes refusal aliases refund PASS");
@@ -329,6 +331,141 @@ fn check_incremental_origin(pool: &Arc<AllocationPoolV1>) -> Result<(), &'static
         if isolated.used() != 0 {
             return Err("incremental refused origin or child leaked credit");
         }
+    }
+    Ok(())
+}
+
+// Current synchronous constructor is exercised by the existing signed owner.
+// Transport refuses its first TLS write; this proves construction/refusal/close,
+// never an HTTP dispatch or successful remote handshake.
+#[cfg(feature = "egress")]
+fn check_sync_origin(pool: &Arc<AllocationPoolV1>) -> Result<(), &'static str> {
+    use enclave_os_egress::{
+        https_fetch_authorized_interruptible_detailed, BoundedHttpsRequest, HttpsFetchFailurePhase,
+        InterruptibleBlockingNetIo,
+    };
+    struct RefuseTls<'a> {
+        pool: &'a Arc<AllocationPoolV1>,
+        connects: usize,
+        closes: usize,
+        sends: usize,
+        retained: usize,
+    }
+    impl InterruptibleBlockingNetIo for RefuseTls<'_> {
+        fn tcp_connect(&mut self, _host: &str, _port: u16) -> Result<i32, i32> {
+            self.connects += 1;
+            Ok(23)
+        }
+        fn send(&mut self, fd: i32, _bytes: &[u8]) -> Result<usize, i32> {
+            assert_eq!(fd, 23);
+            self.sends += 1;
+            self.retained = self.pool.used();
+            Err(-1)
+        }
+        fn recv(&mut self, _fd: i32, _out: &mut [u8]) -> Result<usize, i32> {
+            Err(-1)
+        }
+        fn close(&mut self, fd: i32) {
+            assert_eq!(fd, 23);
+            self.closes += 1;
+        }
+    }
+    let request = BoundedHttpsRequest::new("GET", "https://retained.invalid/", Vec::new(), None)
+        .map_err(|_| "sync request fixture")?;
+    let roots = rustls::RootCertStore::empty();
+    let before = pool.used();
+    let mut io = RefuseTls {
+        pool,
+        connects: 0,
+        closes: 0,
+        sends: 0,
+        retained: 0,
+    };
+    let mut authorizations = 0;
+    let mut authorize = |_: &enclave_os_egress::TlsPeerCertificateChain| {
+        authorizations += 1;
+        Ok(())
+    };
+    let missing = https_fetch_authorized_interruptible_detailed(
+        &mut io,
+        &request,
+        &roots,
+        None,
+        &mut authorize,
+        None,
+    )
+    .err()
+    .ok_or("sync missing origin was accepted")?;
+    if missing.phase != HttpsFetchFailurePhase::RequestRejectedBeforeDispatch
+        || missing.to_string() != "trusted HTTPS requires the original allocation pool"
+        || missing.request_may_have_been_dispatched()
+        || (io.connects, io.closes, io.sends) != (0, 0, 0)
+    {
+        return Err("sync missing origin reached configuration or transport");
+    }
+    let refused = https_fetch_authorized_interruptible_detailed(
+        &mut io,
+        &request,
+        &roots,
+        None,
+        &mut authorize,
+        Some(pool),
+    )
+    .err()
+    .ok_or("sync refused transport unexpectedly succeeded")?;
+    let metadata = LoanAllocator::required_origin_bytes().ok_or("sync origin geometry")?;
+    if refused.phase != HttpsFetchFailurePhase::TlsBeforeDispatch
+        || refused.request_may_have_been_dispatched()
+        || (io.connects, io.closes, io.sends) != (1, 1, 1)
+        || io.retained <= before.checked_add(metadata).ok_or("sync retained sum")?
+        || pool.used() != before
+    {
+        return Err("sync constructor/transport lost origin, phase, close or refund");
+    }
+    let root = enclave_os_common::allocation::shared_allocation_bytes::<AllocationPoolV1>()
+        .ok_or("sync root geometry")?;
+    let required = root.checked_add(metadata).ok_or("sync origin total")?;
+    for short in [true, false] {
+        let capacity = if short {
+            required.checked_sub(1).ok_or("sync short capacity")?
+        } else {
+            required
+        };
+        let isolated =
+            AllocationPoolV1::try_new_with_release(capacity, None).ok_or("sync isolated root")?;
+        let mut io = RefuseTls {
+            pool: &isolated,
+            connects: 0,
+            closes: 0,
+            sends: 0,
+            retained: 0,
+        };
+        let error = https_fetch_authorized_interruptible_detailed(
+            &mut io,
+            &request,
+            &roots,
+            None,
+            &mut authorize,
+            Some(&isolated),
+        )
+        .err()
+        .ok_or("sync admitted unavailable origin/child")?;
+        let expected = if short {
+            "HTTPS TLS origin allocation refused"
+        } else {
+            "TLS init failed: received corrupt message of type AllocationFailed"
+        };
+        if error.phase != HttpsFetchFailurePhase::TlsBeforeDispatch
+            || error.to_string() != expected
+            || error.request_may_have_been_dispatched()
+            || (io.connects, io.closes, io.sends) != (1, 1, 0)
+            || isolated.used() != 0
+        {
+            return Err("sync refused constructor changed phase, transport or refund");
+        }
+    }
+    if authorizations != 0 || pool.used() != before {
+        return Err("sync refusal dispatched authorization or leaked original pool");
     }
     Ok(())
 }

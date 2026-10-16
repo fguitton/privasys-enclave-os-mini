@@ -65,6 +65,8 @@ pub use allocation_admission::{
     local_allocation_pool, reserve_local_allocation, take_local_allocation_release,
 };
 pub mod config_merkle;
+#[cfg(feature = "diagnostic-transfer-profile")]
+pub mod control_observation;
 pub mod cpuid_cache;
 pub mod crypto;
 pub mod ecall;

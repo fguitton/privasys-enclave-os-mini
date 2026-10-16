@@ -61,12 +61,14 @@ pub fn verify_grant(
     grant_jwt: &str,
     ctx: &RequestContext,
     now: u64,
+
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> Result<KeyCreationGrant, String> {
     let cfg = enclave_os_common::oidc::global_oidc_config()
         .ok_or_else(|| "OIDC is not configured; cannot verify a key-creation grant".to_string())?;
 
     let grant: KeyCreationGrant =
-        enclave_os_egress::jwks::verify_jwt_with_jwks(grant_jwt, &cfg.issuer, &cfg.jwks_uri)
+        enclave_os_egress::jwks::verify_jwt_with_jwks(grant_jwt, &cfg.issuer, &cfg.jwks_uri, pool)
             .map_err(|e| format!("key-creation grant verification failed: {e}"))?;
 
     if grant.iss != cfg.issuer {

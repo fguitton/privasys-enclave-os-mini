@@ -157,7 +157,7 @@ impl WasmModule {
     pub fn new(
         allocation_pool: std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
     ) -> Result<Self, String> {
-        let engine = crate::engine::WasmEngine::new()?;
+        let engine = crate::engine::WasmEngine::new(Some(allocation_pool.clone()))?;
         let mut registry = AppRegistry::new(engine);
 
         // Try to restore metrics from a previous snapshot in the KV store.

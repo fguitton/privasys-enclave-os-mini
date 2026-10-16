@@ -57,6 +57,7 @@ use enclave_os_common::types::AEAD_KEY_SIZE;
 pub struct WasmEngine {
     engine: Engine,
     linker: Linker<AppContext>,
+    allocation_pool: Option<std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 }
 
 impl WasmEngine {
@@ -67,7 +68,9 @@ impl WasmEngine {
     /// - Component Model enabled
     /// - Conservative memory limits suitable for SGX EPC
     /// - No CoW image init (no mmap file backing in SGX)
-    pub fn new() -> Result<Self, String> {
+    pub fn new(
+        pool: Option<std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
+    ) -> Result<Self, String> {
         // The runtime and both host AOT tools consume this sole factory.
         // Its role-independent descriptor is the compatibility gate for
         // precompiled native components.
@@ -85,7 +88,17 @@ impl WasmEngine {
         crate::enclave_sdk::add_to_linker(&mut linker)
             .map_err(|e| format!("Enclave SDK linker setup failed: {}", e))?;
 
-        Ok(Self { engine, linker })
+        Ok(Self {
+            engine,
+            linker,
+            allocation_pool: pool,
+        })
+    }
+
+    pub(crate) fn allocation_pool(
+        &self,
+    ) -> Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>> {
+        self.allocation_pool.as_ref()
     }
 
     /// Access the underlying wasmtime [`Engine`].
@@ -131,7 +144,7 @@ impl WasmEngine {
         master_key: [u8; AEAD_KEY_SIZE],
         fuel: u64,
     ) -> Result<Store<AppContext>, String> {
-        let host = AppContext::with_app(app_name, master_key);
+        let host = AppContext::with_app(app_name, master_key, self.allocation_pool.clone());
         let mut store = honest_wasmtime_profile::new_store(&self.engine, host);
 
         // ── Fuel / resource limits ─────────────────────────────

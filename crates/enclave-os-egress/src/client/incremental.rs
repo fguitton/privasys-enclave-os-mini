@@ -305,7 +305,7 @@ impl IncrementalTlsClient {
         }
         let evidence = self.peer_evidence().ok_or("RA-TLS evidence missing")?;
         let policy = self.ratls.as_ref().ok_or("RA-TLS policy missing")?;
-        let result = super::appraise_evidence(evidence, policy);
+        let result = super::appraise_evidence(evidence, policy, self.application_pool.as_ref());
         if result.is_ok() {
             self.appraisal_pending = false;
         } else {

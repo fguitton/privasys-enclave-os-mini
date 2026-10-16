@@ -327,13 +327,18 @@ impl InterruptibleBlockingNetIo for GlobalOcallNetIo {
 }
 
 /// Perform a bounded HTTPS request using only caller-injected network I/O.
+/// `pool` is the caller's original allocation origin, independent of request
+/// limits. `None` is the explicit untrusted/native capability; a selected
+/// trusted allocator build refuses it before configuration or network work.
 pub fn https_fetch_interruptible(
     io: &mut dyn InterruptibleBlockingNetIo,
     request: &BoundedHttpsRequest,
     root_store: &RootCertStore,
     ratls: Option<&RaTlsPolicy>,
+
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> Result<HttpResponse, String> {
-    https_fetch_interruptible_detailed(io, request, root_store, ratls)
+    https_fetch_interruptible_detailed(io, request, root_store, ratls, pool)
         .map_err(|error| error.to_string())
 }
 
@@ -344,8 +349,17 @@ pub fn https_fetch_interruptible_detailed(
     request: &BoundedHttpsRequest,
     root_store: &RootCertStore,
     ratls: Option<&RaTlsPolicy>,
+
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> Result<HttpResponse, HttpsFetchError> {
-    https_fetch_authorized_interruptible_detailed(io, request, root_store, ratls, &mut |_| Ok(()))
+    https_fetch_authorized_interruptible_detailed(
+        io,
+        request,
+        root_store,
+        ratls,
+        &mut |_| Ok(()),
+        pool,
+    )
 }
 
 /// Perform the normal TLS/optional RA-TLS handshake, then require the caller's
@@ -363,6 +377,8 @@ pub fn https_fetch_authorized_interruptible_detailed(
     root_store: &RootCertStore,
     ratls: Option<&RaTlsPolicy>,
     authorize_peer: &mut dyn FnMut(&TlsPeerCertificateChain) -> Result<(), String>,
+
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> Result<HttpResponse, HttpsFetchError> {
     fetch_authorized(
         io,
@@ -370,6 +386,7 @@ pub fn https_fetch_authorized_interruptible_detailed(
             metadata: request,
             body: request.body.as_deref(),
             response_limit: MAX_RESPONSE_BODY,
+            pool,
         },
         root_store,
         ratls,
@@ -381,11 +398,13 @@ struct RequestInput<'a> {
     metadata: &'a BoundedHttpsRequest,
     body: Option<&'a [u8]>,
     response_limit: usize,
+    pool: Option<&'a Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 }
 struct WireRequest<'a> {
     head: Zeroizing<Vec<u8>>,
     body: &'a [u8],
     response_limit: usize,
+    pool: Option<&'a Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 }
 fn fetch_authorized(
     io: &mut dyn InterruptibleBlockingNetIo,
@@ -420,6 +439,7 @@ fn fetch_authorized(
         head: Zeroizing::new(request_head.into_bytes()),
         body: input.body.unwrap_or_default(),
         response_limit: input.response_limit,
+        pool: input.pool,
     };
     https_request_inner(
         io,
@@ -441,6 +461,13 @@ fn https_request_inner(
     ratls: Option<&RaTlsPolicy>,
     authorize_peer: &mut dyn FnMut(&TlsPeerCertificateChain) -> Result<(), String>,
 ) -> Result<HttpResponse, HttpsFetchError> {
+    #[cfg(all(feature = "fallible-allocation-v1", target_vendor = "teaclave"))]
+    if request.pool.is_none() {
+        return Err(HttpsFetchError::new(
+            HttpsFetchFailurePhase::RequestRejectedBeforeDispatch,
+            "trusted HTTPS requires the original allocation pool",
+        ));
+    }
     let (tls_config, identity) = build_client_config(root_store, ratls).map_err(|error| {
         HttpsFetchError::new(
             HttpsFetchFailurePhase::RequestRejectedBeforeDispatch,
@@ -460,6 +487,7 @@ fn https_request_inner(
         request,
         TlsSetup {
             config: tls_config,
+            pool: request.pool,
             ratls,
             identity: identity.as_ref(),
         },
@@ -471,9 +499,53 @@ fn https_request_inner(
 
 struct TlsSetup<'a> {
     config: Arc<ClientConfig>,
+    pool: Option<&'a Arc<enclave_os_common::allocation::AllocationPoolV1>>,
     ratls: Option<&'a RaTlsPolicy>,
     identity: Option<&'a Arc<IdentityClientAuth>>,
 }
+fn start_connection(
+    config: Arc<ClientConfig>,
+    server_name: ServerName<'static>,
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
+) -> Result<ClientConnection, HttpsFetchError> {
+    #[cfg(all(feature = "fallible-allocation-v1", target_vendor = "teaclave"))]
+    {
+        use enclave_os_common::allocation::LoanAllocator;
+        let pool = pool.ok_or_else(|| {
+            HttpsFetchError::new(
+                HttpsFetchFailurePhase::TlsBeforeDispatch,
+                "trusted HTTPS requires the original allocation pool",
+            )
+        })?;
+        let allocator = LoanAllocator::from_pool_unpublished(pool).map_err(|_| {
+            HttpsFetchError::new(
+                HttpsFetchFailurePhase::TlsBeforeDispatch,
+                "HTTPS TLS origin allocation refused",
+            )
+        })?;
+        let connection =
+            ClientConnection::new_with_allocator(config, server_name, allocator.owned_allocator())
+                .map_err(|error| {
+                    HttpsFetchError::new(
+                        HttpsFetchFailurePhase::TlsBeforeDispatch,
+                        format!("TLS init failed: {error}"),
+                    )
+                })?;
+        allocator.activate_release_notification();
+        Ok(connection)
+    }
+    #[cfg(not(all(feature = "fallible-allocation-v1", target_vendor = "teaclave")))]
+    {
+        let _ = pool;
+        ClientConnection::new(config, server_name).map_err(|error| {
+            HttpsFetchError::new(
+                HttpsFetchFailurePhase::TlsBeforeDispatch,
+                format!("TLS init failed: {error}"),
+            )
+        })
+    }
+}
+
 fn https_request_connected(
     io: &mut dyn InterruptibleBlockingNetIo,
     fd: i32,
@@ -488,13 +560,7 @@ fn https_request_connected(
             "invalid server name",
         )
     })?;
-    let mut tls_conn =
-        ClientConnection::new(setup.config, server_name.to_owned()).map_err(|error| {
-            HttpsFetchError::new(
-                HttpsFetchFailurePhase::TlsBeforeDispatch,
-                format!("TLS init failed: {error}"),
-            )
-        })?;
+    let mut tls_conn = start_connection(setup.config, server_name.to_owned(), setup.pool)?;
 
     tls_conn.set_buffer_limit(Some(
         (crate::attest::MAX_MESSAGE + 4096).max(TLS_OUTPUT_WINDOW),
@@ -506,12 +572,14 @@ fn https_request_connected(
         )
     })?;
     if let Some(policy) = setup.ratls {
-        exchange::run_blocking(io, fd, &mut tls_conn, policy, setup.identity).map_err(|error| {
-            HttpsFetchError::new(
-                HttpsFetchFailurePhase::PeerVerificationBeforeDispatch,
-                error,
-            )
-        })?;
+        exchange::run_blocking(io, fd, &mut tls_conn, policy, setup.identity, setup.pool).map_err(
+            |error| {
+                HttpsFetchError::new(
+                    HttpsFetchFailurePhase::PeerVerificationBeforeDispatch,
+                    error,
+                )
+            },
+        )?;
     }
     let (tls_peer, tls_peer_chain) = tls_peer_certificate_evidence(&tls_conn)?;
     authorize_peer(&tls_peer_chain).map_err(|error| {
@@ -1096,8 +1164,9 @@ mod tests {
             BoundedHttpsRequest::new("GET", "https://fixture.test:8443/chunk/0", vec![], None)
                 .unwrap();
         let mut io = FailingInjectedIo::default();
-        let error = https_fetch_interruptible(&mut io, &request, &RootCertStore::empty(), None)
-            .unwrap_err();
+        let error =
+            https_fetch_interruptible(&mut io, &request, &RootCertStore::empty(), None, None)
+                .unwrap_err();
         assert!(error.contains("network read error"));
         assert!(io.connected);
         assert!(io.sent > 0);
@@ -1108,6 +1177,7 @@ mod tests {
             &mut detailed_io,
             &request,
             &RootCertStore::empty(),
+            None,
             None,
         )
         .unwrap_err();

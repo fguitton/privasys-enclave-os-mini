@@ -852,6 +852,7 @@ fn streamed_request_preserves_tls_and_following_request() {
         RaTlsSession::STREAM_CHUNK_SLOTS
     );
     let context = enclave_os_common::modules::RequestContext {
+        allocation_pool: None,
         ingress_class: enclave_os_common::modules::IngressClass::ExternalNetwork,
         connection_id: 7,
         server_name: Some("stream.test".into()),
@@ -1467,6 +1468,16 @@ fn checked_ordinary_context_admission() {
         let context = session
             .request_context_with_pool(7, IngressClass::ExternalNetwork, Some(&pool))
             .unwrap();
+        assert!(std::sync::Arc::ptr_eq(
+            context.allocation_pool.as_ref().unwrap(),
+            &pool
+        ));
+        let aliases = std::sync::Arc::strong_count(&pool);
+        let origin = context.allocation_pool.clone().unwrap();
+        assert_eq!(std::sync::Arc::strong_count(&pool), aliases + 1);
+        assert_eq!(pool.used(), needed);
+        drop(origin);
+        assert_eq!(std::sync::Arc::strong_count(&pool), aliases);
         assert_eq!(context.connection_id, 7);
         assert_eq!(context.server_name.as_deref(), Some("context.test"));
         assert_eq!(context.local_cert_der, session.local_cert_der());

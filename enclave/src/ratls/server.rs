@@ -1094,6 +1094,8 @@ impl IngressServer {
         // different tokens (or none — e.g. GET /healthz).
         match session.recv_http_request() {
             Ok(Some(http_req)) => {
+                #[cfg(feature = "diagnostic-transfer-profile")]
+                let _parsed_observation = crate::control_observation::ParsedGuard::begin(conn_id);
                 let mut close = http_req.connection_close;
                 if session.attestation_failed() {
                     self.send_close(conn_id);
@@ -1556,6 +1558,8 @@ fn fresh_context(
     session: &RaTlsSession,
 ) -> enclave_os_common::modules::RequestContext {
     enclave_os_common::modules::RequestContext {
+        // Deferred Honest ingress callbacks do not dispatch generic modules.
+        allocation_pool: None,
         ingress_class,
         connection_id: conn_id,
         server_name: session.server_name().map(str::to_owned),
@@ -1941,7 +1945,7 @@ fn handle_session_bootstrap(
                     .with_header(crate::encauth::ENCAUTH_REJECT_HEADER, "rate-limited");
             }
         }
-        match verify_encauth_request(env, now) {
+        match verify_encauth_request(env, now, &pool) {
             Ok(payload) => sub = Some(payload.sub),
             Err(e) => reject = Some(e.to_string()),
         }
@@ -1985,20 +1989,25 @@ fn handle_session_bootstrap(
 fn verify_encauth_request(
     env: &enclave_os_common::protocol::EncAuthEnvelope<enclave_os_common::request_json::Text<'_>>,
     now: u64,
+
+    pool: &std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>,
 ) -> Result<crate::encauth::EncAuthPayload, &'static str> {
     #[cfg(feature = "wasm")]
     {
         let config = crate::oidc_config().ok_or("oidc not configured")?;
-        let keys =
-            enclave_os_wasm::jwks_fetcher::idp_ec_p256_keys(&config.issuer, &config.jwks_uri)
-                .map_err(|_| "idp jwks unavailable")?;
+        let keys = enclave_os_wasm::jwks_fetcher::idp_ec_p256_keys(
+            &config.issuer,
+            &config.jwks_uri,
+            Some(pool),
+        )
+        .map_err(|_| "idp jwks unavailable")?;
         let enc_pub =
             crate::sessionrelay::identity_pub_sec1().map_err(|_| "identity key unavailable")?;
         crate::encauth::verify_encauth(env, &keys, &enc_pub, None, now)
     }
     #[cfg(not(feature = "wasm"))]
     {
-        let _ = (env, now);
+        let _ = (env, now, pool);
         Err("no trusted idp key source (egress disabled)")
     }
 }
@@ -2163,6 +2172,7 @@ fn handle_fido2_request(
     };
 
     let ctx = enclave_os_common::modules::RequestContext {
+        allocation_pool: base_ctx.allocation_pool.clone(),
         ingress_class: base_ctx.ingress_class,
         connection_id: base_ctx.connection_id,
         server_name: base_ctx.server_name.clone(),
@@ -2221,6 +2231,7 @@ fn handle_data_request_http(
     };
 
     let ctx = enclave_os_common::modules::RequestContext {
+        allocation_pool: base_ctx.allocation_pool.clone(),
         ingress_class: base_ctx.ingress_class,
         connection_id: base_ctx.connection_id,
         server_name: base_ctx.server_name.clone(),
@@ -2305,6 +2316,7 @@ fn handle_rpc_request(
     };
 
     let ctx = enclave_os_common::modules::RequestContext {
+        allocation_pool: base_ctx.allocation_pool.clone(),
         ingress_class: base_ctx.ingress_class,
         connection_id: base_ctx.connection_id,
         server_name: base_ctx.server_name.clone(),
@@ -2420,6 +2432,7 @@ fn handle_mcp_tools_request(
     };
 
     let ctx = enclave_os_common::modules::RequestContext {
+        allocation_pool: base_ctx.allocation_pool.clone(),
         ingress_class: base_ctx.ingress_class,
         connection_id: base_ctx.connection_id,
         server_name: base_ctx.server_name.clone(),

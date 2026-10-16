@@ -32,6 +32,7 @@ tempfile = "3"
 # Optional generation-bound source-stream socket-read flow control.
 stream-read-credit = []
 diagnostic-worker-storage-rpc = []
+diagnostic-transfer-profile = []
 mock = []
 
 [build-dependencies]

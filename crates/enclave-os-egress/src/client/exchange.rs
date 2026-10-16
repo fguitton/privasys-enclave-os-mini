@@ -262,6 +262,8 @@ pub(super) fn run_blocking(
     tls: &mut ClientConnection,
     policy: &RaTlsPolicy,
     identity: Option<&Arc<IdentityClientAuth>>,
+
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> Result<(), String> {
     let mut exchange = AttestationExchange::start(tls, policy)?;
     loop {
@@ -271,6 +273,7 @@ pub(super) fn run_blocking(
             return super::appraise_evidence(
                 exchange.peer_evidence().ok_or("RA-TLS: evidence missing")?,
                 policy,
+                pool,
             );
         }
         // A transition may have queued the mutual evidence request.

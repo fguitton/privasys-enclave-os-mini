@@ -154,6 +154,9 @@ pub struct DirEntryStreamState {
 /// streams, sockets, etc.) are tracked in BTreeMaps keyed by a
 /// monotonically-increasing `u32` representation value.
 pub struct AppContext {
+    /// Original module allocation origin; native primitive contexts explicitly use None.
+    pub(crate) allocation_pool:
+        Option<std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
     /// KV table name for this app's data.
     ///
     /// Each app gets its own RocksDB column family (table), enabling
@@ -229,15 +232,20 @@ impl Default for AppContext {
 impl AppContext {
     /// Create a new empty app context.
     pub fn new() -> Self {
-        Self::with_app("default", [0u8; AEAD_KEY_SIZE])
+        Self::with_app("default", [0u8; AEAD_KEY_SIZE], None)
     }
 
     /// Create an app context scoped to a specific app.
     ///
     /// All KV store operations (filesystem, key persistence) will use
     /// the `app:<app_name>` table (RocksDB column family) for isolation.
-    pub fn with_app(app_name: &str, master_key: [u8; AEAD_KEY_SIZE]) -> Self {
+    pub fn with_app(
+        app_name: &str,
+        master_key: [u8; AEAD_KEY_SIZE],
+        pool: Option<std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
+    ) -> Self {
         Self {
+            allocation_pool: pool,
             app_table: format!("app:{}", app_name),
             app_name: app_name.to_string(),
             stdout_buf: Vec::new(),

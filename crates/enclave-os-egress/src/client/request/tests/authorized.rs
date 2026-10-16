@@ -171,6 +171,7 @@ pub(super) fn check_authorization_boundary() {
                 &roots,
                 None,
                 &mut authorize,
+                None,
             )
         } else {
             let request = BoundedHttpsRequest::new("PUT", url, vec![], Some(body.clone())).unwrap();
@@ -180,6 +181,7 @@ pub(super) fn check_authorization_boundary() {
                 &roots,
                 None,
                 &mut authorize,
+                None,
             )
         };
         let received = server.join().unwrap();

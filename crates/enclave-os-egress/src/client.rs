@@ -962,9 +962,13 @@ fn verify_evidence_locally(
     Ok((peer_mrenclave, peer_mrtd))
 }
 
-fn appraise_evidence(ev: &crate::attest::Evidence, policy: &RaTlsPolicy) -> Result<(), String> {
+fn appraise_evidence(
+    ev: &crate::attest::Evidence,
+    policy: &RaTlsPolicy,
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
+) -> Result<(), String> {
     let verdicts =
-        crate::attestation::verify_quote_statuses(&ev.quote, &policy.attestation_servers)?;
+        crate::attestation::verify_quote_statuses(&ev.quote, &policy.attestation_servers, pool)?;
     for v in &verdicts {
         if !crate::attestation::tcb_status_acceptable(
             &v.tcb_status,

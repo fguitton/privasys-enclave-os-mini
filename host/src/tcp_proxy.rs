@@ -1387,8 +1387,14 @@ impl TcpProxy {
     }
 
     fn send_to_enclave(&mut self, message: Vec<u8>) {
-        if self.pending_to_enclave.is_empty() && self.data_tx.try_send(&message).is_ok() {
-            return;
+        if self.pending_to_enclave.is_empty() {
+            #[cfg(feature = "diagnostic-transfer-profile")]
+            let observation = crate::control_observation::Publication::begin();
+            if self.data_tx.try_send(&message).is_ok() {
+                #[cfg(feature = "diagnostic-transfer-profile")]
+                observation.sent(&message);
+                return;
+            }
         }
         if self.pending_to_enclave_bytes.saturating_add(message.len()) > MAX_PENDING_TO_ENCLAVE {
             error!(
@@ -1408,9 +1414,13 @@ impl TcpProxy {
         let Some(message) = self.pending_to_enclave.front() else {
             return false;
         };
+        #[cfg(feature = "diagnostic-transfer-profile")]
+        let observation = crate::control_observation::Publication::begin();
         if self.data_tx.try_send(message).is_err() {
             return false;
         }
+        #[cfg(feature = "diagnostic-transfer-profile")]
+        observation.sent(message);
         let sent = self.pending_to_enclave.pop_front().expect("front existed");
         self.pending_to_enclave_bytes -= sent.len();
         true

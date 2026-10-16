@@ -156,6 +156,8 @@ fn resolve_vault_backed_key(
     code_hash: &[u8; 32],
     app_id: Option<[u8; 16]>,
     byok: Option<[u8; AEAD_KEY_SIZE]>,
+
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> Result<([u8; AEAD_KEY_SIZE], String, crate::vaultkey::VaultConfig), String> {
     use crate::vaultkey;
     use enclave_os_common::aead::AeadCipher;
@@ -167,13 +169,14 @@ fn resolve_vault_backed_key(
     // directory (authenticated by a timestamp-bound quote, inside `discover`).
     let cfg = match &vb.sealed {
         Some(c) => c.clone(),
-        None => vaultkey::discover(&vb.mgmt_url, &vb.environment)?,
+        None => vaultkey::discover(&vb.mgmt_url, &vb.environment, pool)?,
     };
 
     // Reconstruct the KEK; on first boot resolve_or_provision creates the key with
     // the platform-minted grant. A policy denial is the upgrade gate (fail closed),
     // not a first boot.
-    let kek = vaultkey::resolve_or_provision(&cfg, &vb.handle, &vb.grant, code_hash, app_id_slice)?;
+    let kek =
+        vaultkey::resolve_or_provision(&cfg, &vb.handle, &vb.grant, code_hash, app_id_slice, pool)?;
 
     let cipher = AeadCipher::from_key(kek);
     let key_id = vb.handle.as_bytes();
@@ -236,21 +239,30 @@ fn rotate_vault_backed_key(
     old_handle: &str,
     new_handle: &str,
     new_grant: &str,
-    code_hash: &[u8; 32],
-    app_id: Option<[u8; 16]>,
+    identity: (&[u8; 32], Option<[u8; 16]>),
+
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> Result<(), String> {
     use crate::vaultkey;
     use enclave_os_common::aead::AeadCipher;
     use enclave_os_common::ocall;
 
+    let (code_hash, app_id) = identity;
     let app_id_slice = app_id.as_ref().map(|a| a.as_slice());
 
     // Old KEK: the key already exists, so export it (a grant is only needed to
     // CREATE). A policy denial here is the upgrade gate, not a first boot.
-    let old_kek = vaultkey::resolve_or_provision(old_cfg, old_handle, "", code_hash, app_id_slice)?;
+    let old_kek =
+        vaultkey::resolve_or_provision(old_cfg, old_handle, "", code_hash, app_id_slice, pool)?;
     // New KEK: create the new generation with the owner-minted grant.
-    let new_kek =
-        vaultkey::resolve_or_provision(new_cfg, new_handle, new_grant, code_hash, app_id_slice)?;
+    let new_kek = vaultkey::resolve_or_provision(
+        new_cfg,
+        new_handle,
+        new_grant,
+        code_hash,
+        app_id_slice,
+        pool,
+    )?;
 
     let old_cipher = AeadCipher::from_key(old_kek);
     let new_cipher = AeadCipher::from_key(new_kek);
@@ -724,8 +736,13 @@ impl AppRegistry {
         // enclave upgrade); others keep the BYOK / generated key as before.
         let (app_key, key_source, vault_config) = match &vault {
             Some(vb) => {
-                let (k, src, cfg) =
-                    resolve_vault_backed_key(vb, &code_hash, app_id, encryption_key)?;
+                let (k, src, cfg) = resolve_vault_backed_key(
+                    vb,
+                    &code_hash,
+                    app_id,
+                    encryption_key,
+                    self.engine.allocation_pool(),
+                )?;
                 (k, src, Some(cfg))
             }
             None => match encryption_key {
@@ -974,7 +991,9 @@ impl AppRegistry {
         }
         let old_cfg = match &meta.vault_config {
             Some(c) => c.clone(),
-            None => crate::vaultkey::discover(mgmt_url, environment)?,
+            None => {
+                crate::vaultkey::discover(mgmt_url, environment, self.engine.allocation_pool())?
+            }
         };
         let target_cfg = new_cfg.clone().unwrap_or_else(|| old_cfg.clone());
         let code_hash = meta.code_hash;
@@ -986,8 +1005,8 @@ impl AppRegistry {
             &old_handle,
             new_handle,
             new_grant,
-            &code_hash,
-            app_id,
+            (&code_hash, app_id),
+            self.engine.allocation_pool(),
         )?;
 
         // Advance the sealed handle (the DEK is unchanged); on a migration the
@@ -1738,7 +1757,7 @@ mod funding_tests {
 
     #[test]
     fn sponsored_calls_require_explicit_current_funding() {
-        let mut registry = AppRegistry::new(WasmEngine::new().unwrap());
+        let mut registry = AppRegistry::new(WasmEngine::new(None).unwrap());
         assert!(!registry.funded_rp_allowed("rp.test"));
         assert_eq!(registry.set_funded_rps(vec!["rp.test".into()]), 1);
         assert!(registry.funded_rp_allowed("rp.test"));

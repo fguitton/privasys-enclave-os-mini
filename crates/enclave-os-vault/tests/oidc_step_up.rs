@@ -36,8 +36,37 @@ fn owner_policy(sub: &str, ops: Vec<Operation>) -> KeyPolicy {
     }
 }
 
+// These existing policy primitives intentionally run without a host clock.
+// Register that absence explicitly; unrelated host calls remain forbidden.
+fn no_clock_host() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        enclave_os_common::ocall::register(enclave_os_common::ocall::OcallVtable {
+            net_tcp_listen: |_, _| panic!("unexpected network call"),
+            net_tcp_accept: |_| panic!("unexpected network call"),
+            net_tcp_connect: |_, _| panic!("unexpected network call"),
+            net_send: |_, _| panic!("unexpected network call"),
+            net_recv: |_, _| panic!("unexpected network call"),
+            net_close: |_| panic!("unexpected network call"),
+            kv_store_put: |_, _, _| panic!("unexpected storage call"),
+            kv_store_get: |_, _| panic!("unexpected storage call"),
+            kv_store_delete: |_, _| panic!("unexpected storage call"),
+            kv_store_list_keys: |_, _| panic!("unexpected storage call"),
+            kv_store_write_batch: |_, _| panic!("unexpected storage call"),
+            kv_store_multi_get: |_, _| panic!("unexpected storage call"),
+            kv_store_scan: |_, _, _, _| panic!("unexpected storage call"),
+            get_current_time: || Err(-1),
+            log: |_, _| panic!("unexpected log call"),
+            cert_store_register: |_| panic!("unexpected certificate call"),
+            cert_store_unregister: |_| panic!("unexpected certificate call"),
+        });
+    });
+}
+
 fn ctx_with_amr(sub: &str, amr: &[&str]) -> RequestContext {
+    no_clock_host();
     RequestContext {
+        allocation_pool: None,
         ingress_class: enclave_os_common::modules::IngressClass::ExternalNetwork,
         connection_id: 0,
         server_name: None,
@@ -70,7 +99,9 @@ fn ctx_step_up(
     nonce: Option<&str>,
     exp: u64,
 ) -> RequestContext {
+    no_clock_host();
     RequestContext {
+        allocation_pool: None,
         ingress_class: enclave_os_common::modules::IngressClass::ExternalNetwork,
         connection_id: 0,
         server_name: None,
@@ -110,11 +141,29 @@ fn oidc_step_up_amr_gate() {
 
     // owner bearer carrying a webauthn step-up: allowed.
     let c_ok = ctx_with_amr("dev", &["webauthn"]);
-    assert!(evaluate_op(&policy, Operation::PromoteProfile, "h", &[], &c_ok, None).is_ok());
+    assert!(evaluate_op(
+        &policy,
+        Operation::PromoteProfile,
+        "h",
+        &[],
+        &c_ok,
+        None,
+        None,
+    )
+    .is_ok());
 
     // same owner, no webauthn in amr: denied.
     let c_no = ctx_with_amr("dev", &["pwd"]);
-    assert!(evaluate_op(&policy, Operation::PromoteProfile, "h", &[], &c_no, None).is_err());
+    assert!(evaluate_op(
+        &policy,
+        Operation::PromoteProfile,
+        "h",
+        &[],
+        &c_no,
+        None,
+        None,
+    )
+    .is_err());
 }
 
 #[test]
@@ -148,7 +197,8 @@ fn oidc_step_up_operation_bound() {
         handle,
         &[],
         &ok,
-        Some(&binding)
+        Some(&binding),
+        None,
     )
     .is_ok());
 
@@ -161,12 +211,22 @@ fn oidc_step_up_operation_bound() {
         handle,
         &[],
         &bad,
-        Some(&binding)
+        Some(&binding),
+        None,
     )
     .is_err());
 
     // operation_bound but the handler supplied no binding -> fail closed.
-    assert!(evaluate_op(&policy, Operation::PromoteProfile, handle, &[], &ok, None).is_err());
+    assert!(evaluate_op(
+        &policy,
+        Operation::PromoteProfile,
+        handle,
+        &[],
+        &ok,
+        None,
+        None,
+    )
+    .is_err());
 
     // operation_bound but the token carries no vault_op -> fail closed.
     let noop = ctx_step_up("dev", &["webauthn"], None, Some(nonce), exp);
@@ -176,7 +236,8 @@ fn oidc_step_up_operation_bound() {
         handle,
         &[],
         &noop,
-        Some(&binding)
+        Some(&binding),
+        None,
     )
     .is_err());
 }
@@ -214,7 +275,8 @@ fn oidc_step_up_export_operation_bound() {
         handle,
         &[],
         &ok,
-        Some(&binding)
+        Some(&binding),
+        None,
     )
     .is_ok());
 
@@ -229,7 +291,8 @@ fn oidc_step_up_export_operation_bound() {
         handle,
         &[],
         &bad,
-        Some(&binding)
+        Some(&binding),
+        None,
     )
     .is_err());
 
@@ -241,7 +304,8 @@ fn oidc_step_up_export_operation_bound() {
         handle,
         &[],
         &noop,
-        Some(&binding)
+        Some(&binding),
+        None,
     )
     .is_err());
 }

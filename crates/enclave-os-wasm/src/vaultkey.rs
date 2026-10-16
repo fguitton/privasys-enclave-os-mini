@@ -177,6 +177,8 @@ struct DirVault {
 fn fetch_directory(
     mgmt_url: &str,
     environment: &str,
+
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> Result<(DirConstellation, Vec<DirVault>), String> {
     let base = mgmt_url.trim_end_matches('/');
     // mgmt-service has a normal (publicly-trusted) TLS cert — verify it against
@@ -198,7 +200,7 @@ fn fetch_directory(
     ];
     let resp =
         BoundedHttpsRequest::new("GET", &dir_url, headers.to_vec(), None).and_then(|request| {
-            https_fetch_interruptible(&mut GlobalOcallNetIo, &request, roots, None)
+            https_fetch_interruptible(&mut GlobalOcallNetIo, &request, roots, None, pool)
         })?;
     if resp.status < 200 || resp.status >= 300 {
         return Err(format!("directory HTTP {}", resp.status));
@@ -277,8 +279,12 @@ struct KeyCreatedResp {
 /// then [`resolve`]s an existing key against it or, if none exists yet,
 /// [`create`]s one. Used on first load (no sealed selection) and on upgrade
 /// (the sealed selection is unreadable under the new MRENCLAVE).
-pub fn discover(mgmt_url: &str, environment: &str) -> Result<VaultConfig, String> {
-    let (con, vaults) = fetch_directory(mgmt_url, environment)?;
+pub fn discover(
+    mgmt_url: &str,
+    environment: &str,
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
+) -> Result<VaultConfig, String> {
+    let (con, vaults) = fetch_directory(mgmt_url, environment, pool)?;
     let mrenclave = parse_mrenclave(&con.mrenclave)?;
     let threshold = con.threshold.unwrap_or(2).max(2);
 
@@ -326,6 +332,8 @@ pub fn resolve_or_provision(
     grant: &str,
     code_hash: &[u8],
     app_id: Option<&[u8]>,
+
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> Result<[u8; KEK_SIZE], String> {
     if cfg.endpoints.is_empty() {
         return Err("vaultkey: sealed config has no vault endpoints".into());
@@ -356,6 +364,7 @@ pub fn resolve_or_provision(
             },
             &root_store,
             &policy,
+            pool,
         ) {
             Ok(material) => match decode_share(&material) {
                 Ok((gen, share)) => push_share(&mut by_gen, gen, share),
@@ -429,6 +438,7 @@ pub fn resolve_or_provision(
                 },
                 &root_store,
                 &policy,
+                pool,
             ) {
                 Ok(_) => {
                     acks += 1;
@@ -463,6 +473,8 @@ pub fn read_policy_measurements(
     handle: &str,
     code_hash: &[u8],
     app_id: Option<&[u8]>,
+
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> Result<Vec<enclave_os_common::quote::TeeMeasurement>, String> {
     let root_store = root_store_from_der(cfg.ca_roots_der.iter().cloned())
         .map_err(|e| format!("vaultkey: bad CA roots: {e}"))?;
@@ -485,6 +497,7 @@ pub fn read_policy_measurements(
                     &request,
                     &root_store,
                     Some(&policy),
+                    pool,
                 )
             }) {
             Ok(r) => r,
@@ -652,12 +665,20 @@ fn call_vault(
     req: &VaultRequest,
     root_store: &RootCertStore,
     policy: &RaTlsPolicy,
+
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> Result<Vec<u8>, String> {
     let body = serde_json::to_vec(req).map_err(|e| format!("marshal request: {e}"))?;
     let url = format!("https://{endpoint}/data");
     let resp = BoundedHttpsRequest::new("POST", &url, Vec::new(), Some(body.to_vec())).and_then(
         |request| {
-            https_fetch_interruptible(&mut GlobalOcallNetIo, &request, root_store, Some(policy))
+            https_fetch_interruptible(
+                &mut GlobalOcallNetIo,
+                &request,
+                root_store,
+                Some(policy),
+                pool,
+            )
         },
     )?;
     if resp.status < 200 || resp.status >= 300 {

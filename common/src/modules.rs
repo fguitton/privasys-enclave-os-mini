@@ -147,6 +147,10 @@ impl PeerEvidence {
 ///
 /// Carries optional metadata extracted from the TLS session and OIDC auth.
 pub struct RequestContext {
+    /// Original request allocation origin, shared without allocating new backing.
+    /// This resource capability conveys no application or peer authority.
+    pub allocation_pool: Option<alloc::sync::Arc<crate::allocation::AllocationPoolV1>>,
+
     /// Enclave-observed ingress class carried by the ciphertext multiplexer.
     ///
     /// This is route-selection metadata, not semantic authorization: the host
@@ -335,6 +339,7 @@ mod tests {
 
     fn context(server_name: Option<&str>, mutual: bool) -> RequestContext {
         RequestContext {
+            allocation_pool: None,
             ingress_class: super::IngressClass::ExternalNetwork,
             connection_id: 0,
             server_name: server_name.map(str::to_owned),

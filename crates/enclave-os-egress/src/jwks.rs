@@ -40,7 +40,10 @@ fn ensure_store() {
 }
 
 /// Discover the JWKS URI from `{issuer}/.well-known/openid-configuration`.
-fn discover_jwks_uri(issuer: &str) -> Result<String, String> {
+fn discover_jwks_uri(
+    issuer: &str,
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
+) -> Result<String, String> {
     let url = format!(
         "{}/.well-known/openid-configuration",
         issuer.trim_end_matches('/')
@@ -52,7 +55,13 @@ fn discover_jwks_uri(issuer: &str) -> Result<String, String> {
         None,
     )
     .and_then(|request| {
-        https_fetch_interruptible(&mut GlobalOcallNetIo, &request, mozilla_root_store(), None)
+        https_fetch_interruptible(
+            &mut GlobalOcallNetIo,
+            &request,
+            mozilla_root_store(),
+            None,
+            pool,
+        )
     })?;
 
     if resp.status != 200 {
@@ -72,7 +81,10 @@ fn discover_jwks_uri(issuer: &str) -> Result<String, String> {
 }
 
 /// Fetch JWKS JSON from a URI and parse it into a [`JwksCache`].
-fn fetch_jwks(jwks_uri: &str) -> Result<JwksCache, String> {
+fn fetch_jwks(
+    jwks_uri: &str,
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
+) -> Result<JwksCache, String> {
     let resp = BoundedHttpsRequest::new(
         "GET",
         jwks_uri,
@@ -80,7 +92,13 @@ fn fetch_jwks(jwks_uri: &str) -> Result<JwksCache, String> {
         None,
     )
     .and_then(|request| {
-        https_fetch_interruptible(&mut GlobalOcallNetIo, &request, mozilla_root_store(), None)
+        https_fetch_interruptible(
+            &mut GlobalOcallNetIo,
+            &request,
+            mozilla_root_store(),
+            None,
+            pool,
+        )
     })?;
 
     if resp.status != 200 {
@@ -94,15 +112,22 @@ fn fetch_jwks(jwks_uri: &str) -> Result<JwksCache, String> {
 }
 
 /// Resolve the JWKS URI: explicit `jwks_uri` if non-empty, else OIDC discovery.
-fn resolve_jwks_uri(issuer: &str, jwks_uri: &str) -> Result<String, String> {
+fn resolve_jwks_uri(
+    issuer: &str,
+    jwks_uri: &str,
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
+) -> Result<String, String> {
     if !jwks_uri.is_empty() {
         return Ok(jwks_uri.to_string());
     }
-    discover_jwks_uri(issuer)
+    discover_jwks_uri(issuer, pool)
 }
 
 /// Get or fetch a [`JwksCache`] for the given JWKS URI (TTL-based expiry).
-fn get_or_fetch_cache(jwks_uri: &str) -> Result<(), String> {
+fn get_or_fetch_cache(
+    jwks_uri: &str,
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
+) -> Result<(), String> {
     ensure_store();
     let now = enclave_os_common::ocall::get_current_time().unwrap_or(0);
 
@@ -113,7 +138,7 @@ fn get_or_fetch_cache(jwks_uri: &str) -> Result<(), String> {
     };
 
     if needs_fetch {
-        let cache = fetch_jwks(jwks_uri)?;
+        let cache = fetch_jwks(jwks_uri, pool)?;
         let mut store = JWKS_STORE.lock().unwrap_or_else(|e| e.into_inner());
         let store = store.as_mut().unwrap();
         store.insert(
@@ -134,10 +159,15 @@ pub fn verify_jwt_with_jwks<T: serde::de::DeserializeOwned>(
     token: &str,
     issuer: &str,
     jwks_uri: &str,
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> Result<T, String> {
-    with_verifier(token, issuer, jwks_uri, |verifier| {
-        verifier.verify_and_decode(token.as_bytes())
-    })
+    with_verifier(
+        token,
+        issuer,
+        jwks_uri,
+        |verifier| verifier.verify_and_decode(token.as_bytes()),
+        pool,
+    )
 }
 
 fn with_verifier<T, E: From<String>>(
@@ -145,10 +175,11 @@ fn with_verifier<T, E: From<String>>(
     issuer: &str,
     jwks_uri: &str,
     consume: impl FnOnce(enclave_os_common::jwt::JwtVerifier) -> Result<T, E>,
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> Result<T, E> {
     let kid = extract_jwt_kid(token)?;
-    let resolved_uri = resolve_jwks_uri(issuer, jwks_uri)?;
-    get_or_fetch_cache(&resolved_uri)?;
+    let resolved_uri = resolve_jwks_uri(issuer, jwks_uri, pool)?;
+    get_or_fetch_cache(&resolved_uri, pool)?;
     let store = JWKS_STORE.lock().unwrap_or_else(|e| e.into_inner());
     let entry = store
         .as_ref()
@@ -174,18 +205,26 @@ pub fn verify_jwt_signature(
     enclave_os_common::request_json::value::Value<'static>,
     enclave_os_common::jwt::ClaimsError,
 > {
-    with_verifier(token, issuer, jwks_uri, |verifier| {
-        verifier.verify_claims(pool, token.as_bytes())
-    })
+    with_verifier(
+        token,
+        issuer,
+        jwks_uri,
+        |verifier| verifier.verify_claims(pool, token.as_bytes()),
+        Some(pool),
+    )
 }
 
 /// Return the IdP's current EC P-256 signing keys as SEC1 uncompressed points
 /// (65 B each), fetching/caching the JWKS as needed. Used for raw-ES256
 /// verification (EncAuth voucher `idp_sig`), which carries no `kid` — callers
 /// try each key.
-pub fn idp_ec_p256_keys(issuer: &str, jwks_uri: &str) -> Result<Vec<Vec<u8>>, String> {
-    let resolved_uri = resolve_jwks_uri(issuer, jwks_uri)?;
-    get_or_fetch_cache(&resolved_uri)?;
+pub fn idp_ec_p256_keys(
+    issuer: &str,
+    jwks_uri: &str,
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
+) -> Result<Vec<Vec<u8>>, String> {
+    let resolved_uri = resolve_jwks_uri(issuer, jwks_uri, pool)?;
+    get_or_fetch_cache(&resolved_uri, pool)?;
 
     let store = JWKS_STORE.lock().unwrap_or_else(|e| e.into_inner());
     let entry = store

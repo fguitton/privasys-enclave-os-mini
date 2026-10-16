@@ -81,6 +81,8 @@ pub fn https_fetch_resource_authorized_interruptible_detailed(
     root_store: &RootCertStore,
     ratls: Option<&RaTlsPolicy>,
     authorize_peer: &mut dyn FnMut(&TlsPeerCertificateChain) -> Result<(), String>,
+
+    pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> Result<HttpResponse, HttpsFetchError> {
     fetch_authorized(
         io,
@@ -88,6 +90,7 @@ pub fn https_fetch_resource_authorized_interruptible_detailed(
             metadata: &request.metadata,
             body: request.body,
             response_limit: request.limits.response,
+            pool,
         },
         root_store,
         ratls,

@@ -782,6 +782,9 @@ pub fn run_control_loop(hook: &mut dyn ControlLoopHook) -> i32 {
             // Try to receive a data channel message
             match data_rx.try_recv() {
                 Some(msg) => {
+                    #[cfg(feature = "diagnostic-transfer-profile")]
+                    let _transport_observation =
+                        crate::control_observation::TransportGuard::consumed(&msg);
                     // Tick is a finite deadline fallback; data progress uses the
                     // independently retained adopter revision, not idle polling.
                     // Decode the channel message
@@ -1154,8 +1157,10 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
     // ── WASM module (Component Model runtime) ────────────────────────
     #[cfg(feature = "wasm")]
     {
-        let wasm = match enclave_os_wasm::WasmModule::new(crate::local_allocation_pool().ok_or(-2)?)
-        {
+        let Some(pool) = crate::local_allocation_pool() else {
+            return -2;
+        };
+        let wasm = match enclave_os_wasm::WasmModule::new(pool) {
             Ok(m) => m,
             Err(e) => {
                 enclave_log_error!("WasmModule init failed: {}", e);
