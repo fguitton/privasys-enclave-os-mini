@@ -1,6 +1,7 @@
 //! Top-level rustls config allocation and its opaque cached/session owner.
 //! The selected provider Arc and its two default-list Vec backings share this
-//! config lifetime. Certificate/signing and handshake children remain separate.
+//! config lifetime. The selected P256 key/signature is included; certificate
+//! buffers, rcgen startup and handshake record children remain separate.
 use enclave_os_common::allocation::{
     shared_allocation_bytes, AllocationPoolV1, SharedAllocationReservationV1, SharedAllocationV1,
 };
@@ -270,6 +271,7 @@ mod provider_refusal {
         expected: Layout,
         refused: bool,
         live: usize,
+        allocations: usize,
         skip_matching: usize,
     }
     thread_local! {
@@ -306,6 +308,7 @@ mod provider_refusal {
                 let _ = ARM.try_with(|cell| {
                     if let Some(mut arm) = cell.get() {
                         arm.live += 1;
+                        arm.allocations += 1;
                         cell.set(Some(arm));
                     }
                 });
@@ -370,6 +373,7 @@ mod provider_refusal {
                     expected,
                     refused: false,
                     live: 0,
+                    allocations: 0,
                     skip_matching: 0,
                 }))
             });
@@ -414,6 +418,7 @@ mod provider_refusal {
                     expected,
                     refused: false,
                     live: 0,
+                    allocations: 0,
                     skip_matching: 0,
                 }))
             });
@@ -454,6 +459,50 @@ mod provider_refusal {
         assert!(retained
             .choose_scheme(&[rustls::SignatureScheme::ECDSA_NISTP384_SHA384])
             .is_none());
+        // Actual selected scheme/sign/clone scope: the original pair/key is
+        // retained, and the test counter arms without refusing any request.
+        ARM.with(|cell| {
+            cell.set(Some(Arm {
+                expected: Layout::new::<rustls::sign::Signature>(),
+                refused: false,
+                live: 0,
+                allocations: 0,
+                skip_matching: usize::MAX,
+            }))
+        });
+        let signer = retained
+            .choose_scheme(&[rustls::SignatureScheme::ECDSA_NISTP256_SHA256])
+            .unwrap();
+        let message = b"current retained P256 signature";
+        let signature = signer.sign(message).unwrap();
+        let copied_signature = signature.clone();
+        let refusal = rustls::Error::SigningFailed;
+        let cloned_refusal = refusal.clone();
+        drop(signer);
+        let arm = ARM.with(|cell| cell.take()).unwrap();
+        assert!(!arm.refused);
+        assert_eq!(
+            arm.allocations, 0,
+            "selected signer/signature/clone must allocate nothing"
+        );
+        assert_eq!(arm.live, 0);
+        assert_eq!(refusal, cloned_refusal);
+        assert_eq!(format!("{refusal}"), "unexpected error: signing failed");
+        assert_eq!(signature.as_ref(), copied_signature.as_ref());
+        ring::signature::UnparsedPublicKey::new(
+            &ring::signature::ECDSA_P256_SHA256_ASN1,
+            original.public_key_raw(),
+        )
+        .verify(message, signature.as_ref())
+        .unwrap();
+        let mut corrupted = signature.as_ref().to_vec();
+        corrupted[0] ^= 1;
+        assert!(ring::signature::UnparsedPublicKey::new(
+            &ring::signature::ECDSA_P256_SHA256_ASN1,
+            original.public_key_raw()
+        )
+        .verify(message, &corrupted)
+        .is_err());
         let alias = retained.clone();
         drop(creator);
         drop(retained);
@@ -466,6 +515,14 @@ mod provider_refusal {
         .unwrap();
         assert_eq!(counts.live.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(Arc::strong_count(&counts), 1);
+        // Inline signature bytes remain valid after the key/SPKI origin is gone.
+        assert_eq!(signature.as_ref(), copied_signature.as_ref());
+        ring::signature::UnparsedPublicKey::new(
+            &ring::signature::ECDSA_P256_SHA256_ASN1,
+            original.public_key_raw(),
+        )
+        .verify(message, copied_signature.as_ref())
+        .unwrap();
         let malformed = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(&[0_u8][..]));
         assert!(matches!(
             try_p256_signing_key_in(&malformed, std::alloc::Global),
@@ -551,6 +608,7 @@ mod provider_refusal {
                     expected,
                     refused: false,
                     live: 0,
+                    allocations: 0,
                     skip_matching,
                 }))
             });

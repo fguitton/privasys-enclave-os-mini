@@ -119,6 +119,18 @@ fn p256_successful(pool: &Arc<AllocationPoolV1>) -> Result<usize, &'static str> 
     let peak = fixed_bytes
         .checked_add(origin.peak_used())
         .ok_or("P256 peak overflow")?;
+    let signature_before = pool.used();
+    let signer = retained
+        .choose_scheme(&[rustls::SignatureScheme::ECDSA_NISTP256_SHA256])
+        .ok_or("P256 selected scheme refused")?;
+    let signature = signer
+        .sign(b"current signed SDK P256 owner")
+        .map_err(|_| "P256 actual SDK signing refused")?;
+    let copied_signature = signature.clone();
+    drop(signer);
+    if pool.used() != signature_before || signature.as_ref() != copied_signature.as_ref() {
+        return Err("P256 signer/signature changed owned backing or bytes");
+    }
     let alias = retained.clone();
     origin.activate_release_notification();
     drop(origin);
@@ -133,6 +145,9 @@ fn p256_successful(pool: &Arc<AllocationPoolV1>) -> Result<usize, &'static str> 
     drop(fixed);
     if pool.used() != before {
         return Err("P256 final backing/origin refund");
+    }
+    if signature.as_ref().is_empty() || signature.as_ref() != copied_signature.as_ref() {
+        return Err("P256 inline signature lost after key/origin refund");
     }
     Ok(peak)
 }
@@ -167,6 +182,6 @@ fn check_p256(pool: &Arc<AllocationPoolV1>) -> Result<(), &'static str> {
     if pool.used() != before {
         return Err("P256 original owning pool changed");
     }
-    std::println!("TLS-P256-CONSTRUCTOR-SIM: actual-SDK metadata SPKI exact-minus-one exact plus-one aliases original-origin final-refund PASS");
+    std::println!("TLS-P256-CONSTRUCTOR-SIM: actual-SDK metadata SPKI exact-minus-one exact plus-one aliases original-origin final-refund PASS\nTLS-P256-SIGNER-SIM: actual-SDK inline signer signature clone same-backing same-bytes after-key-origin-refund PASS");
     Ok(())
 }

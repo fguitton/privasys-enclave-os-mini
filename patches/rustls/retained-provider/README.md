@@ -14,4 +14,13 @@ requests are fallible. The SPKI DER buffers use the original retained allocator,
 and the key exposes a borrowed SPKI for the unchanged certificate/key match.
 Malformed current keys and mismatched certificates still refuse. The generic
 supplier key APIs retain their standards scope; they are not a fallback from
-this selected constructor. Signer Box/signature and record children remain open.
+this selected constructor. Handshake record and rcgen startup children remain open.
+
+The selected P256 chosen signer holds the pair Arc inline, and its signature
+retains ring's actual inline Signature value through CertificateVerify framing.
+No Signer Box, signature Vec, handwritten signature capacity or global allocator
+conversion exists in that selected path. Other standards backends retain their
+existing boxed-provider semantics. Signature framing uses the original u16
+owner/decoder; native real sessions exercise the original TLS handshake.
+
+Selected signing refusal is a typed allocation-free error with the original Display text; no error String is constructed on that failure edge.
