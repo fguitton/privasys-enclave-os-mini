@@ -140,12 +140,12 @@ pub struct ModuleStatus {
 /// long-lived OIDC bearer token that the enclave presents when
 /// submitting quotes for verification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AttestationServer {
+pub struct AttestationServer<T = String> {
     /// Attestation server verification URL.
-    pub url: String,
+    pub url: T,
     /// Optional OIDC bearer token for authenticated servers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token: Option<String>,
+    pub token: Option<T>,
 }
 
 /// Enclave-level metrics counters.

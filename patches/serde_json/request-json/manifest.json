@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "profile": "request-json",
-  "patch_sha256": "02a1eb717229cb6aa010301e997191a44ae46e9019d65b17e72acb2c2fbcea64",
+  "patch_sha256": "61b91b446a495b29b989419c685014db110a534afe5298d8dfcab5abfc83e743",
   "suppliers": [
     {
       "package": "serde_json",
@@ -12,12 +12,17 @@
         {
           "path": "src/de.rs",
           "before_sha256": "2364aaa767bb40eeedd4aa24e3bf917be5e007a00bd3d911b61f9de74aa5f074",
-          "after_sha256": "a0f385e37cf0ae361a598af4b8349414439562ed272aeb2f4638d25820587227"
+          "after_sha256": "b354e974368ffa56188be0f121049c8878f8bdc4f999c73ff63ddf0cf1e7eb78"
         },
         {
           "path": "src/error.rs",
           "before_sha256": "a13add05a63adf53d89e37effa03221d897a60486cfe360a5a958c0dd2a7e90d",
-          "after_sha256": "f069c03cfdd4913ac33a12760da03bc765cb15f9afc3f4ff5d9a7efe4f8b5c69"
+          "after_sha256": "2e34b9fd85e58747c2fe821c47545fcb8a7e260c207a511f3f83a99491750a5a"
+        },
+        {
+          "path": "src/lib.rs",
+          "before_sha256": "6cbb5e1394bd47080fb1a2305590960ea90b1690257b7ed5ee3d6ff03350cec6",
+          "after_sha256": "288705054d3e74c6bfe4effd7d3fd9caffc8c4f62d891ef71014ccb3adc88360"
         },
         {
           "path": "src/read.rs",
@@ -40,12 +45,17 @@
         {
           "path": "src/de.rs",
           "before_sha256": "4998d7e252eb513be85b298e287048b4fb283882e9ba7df905f572f07200f3f3",
-          "after_sha256": "3f1ba46bd369c72c79c4d8bee5da77b97d96db99c7477e611e3317e9544f63dd"
+          "after_sha256": "99a954f14ec06a56a14e94eaafdd3d3094b1608974daa419df97f8ec1e18556a"
         },
         {
           "path": "src/error.rs",
           "before_sha256": "a13add05a63adf53d89e37effa03221d897a60486cfe360a5a958c0dd2a7e90d",
-          "after_sha256": "f069c03cfdd4913ac33a12760da03bc765cb15f9afc3f4ff5d9a7efe4f8b5c69"
+          "after_sha256": "2e34b9fd85e58747c2fe821c47545fcb8a7e260c207a511f3f83a99491750a5a"
+        },
+        {
+          "path": "src/lib.rs",
+          "before_sha256": "34a1ddabdcf4759d9a6c64a2e851372546d635d1a578ad902d962fef3c45de58",
+          "after_sha256": "45be78ca45b59b5781b51acec2fffdabd5d8905d3f9343dcd375eee4a3a3fdf0"
         },
         {
           "path": "src/read.rs",
@@ -61,5 +71,5 @@
     }
   ],
   "routing": "Cargo paths override; original dependency/feature manifests and registry lock identity unchanged",
-  "scope": "Current Mini149 and Composition151 suppliers. Admitted scratch APIs and inline fixed ErrorImpl are unconditional in this generated source; custom Message/IO and visitor values remain separate owners. No vendor/checksum/lock edits."
+  "scope": "Current Mini149/Composition151 graph-preserving profile. Admitted scratch, inline syntax errors, and exact private semantic-abort token. Ordinary custom Message/IO retain original behavior and remain separate owners. Min specialization requires the acquired supported nightly compiler; no public token type/text matching."
 }

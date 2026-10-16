@@ -292,13 +292,17 @@ pub fn init_enclave(
         unsafe { core::slice::from_raw_parts(config_json, config_len) }
     };
 
-    let config: EnclaveConfig = match serde_json::from_slice(config_bytes) {
-        Ok(c) => c,
-        Err(e) => {
-            enclave_log_error!("Config parse failed: {}", e);
-            return Err(-2);
-        }
-    };
+    // The SDK heap is available before config and CPUID setup; this is the
+    // same lazy original pool already used by selected fixed-futex startup.
+    let pool = crate::local_allocation_pool().ok_or(-2)?;
+    let config: EnclaveConfig =
+        match crate::ratls::request_json::manager::configuration::parse(&pool, config_bytes) {
+            Ok(c) => c,
+            Err(e) => {
+                enclave_log_error!("Config parse failed: {}", e);
+                return Err(-2);
+            }
+        };
 
     // ── CPUID cache: must be initialised BEFORE any crypto ──────────
     // ring / rustls use CPUID for feature detection (SHA-NI, AES-NI, …).
@@ -1019,34 +1023,41 @@ pub fn register_ocall_vtable() {
 }
 
 /// Apply Mini-owned OIDC and attestation-server configuration.
-pub fn configure_core(config: &EnclaveConfig) {
-    if let Some(ref oidc) = config.oidc {
+pub fn configure_core(config: &mut EnclaveConfig) -> Result<(), i32> {
+    let pool = crate::local_allocation_pool().ok_or(-2)?;
+    if let Some(oidc) = config.oidc.take() {
         enclave_log_info!(
             "OIDC enabled: issuer={}, audience={}",
             oidc.issuer,
             oidc.audience
         );
-        crate::set_oidc_config(oidc.clone());
-        enclave_os_common::oidc::set_global_oidc_config(oidc.clone());
+        let reservation =
+            enclave_os_common::allocation::SharedAllocationV1::reserve(&pool, 0).ok_or(-2)?;
+        #[cfg(feature = "fallible-allocation-v1")]
+        let oidc = reservation.try_finish(oidc).map_err(|_| -2)?;
+        #[cfg(not(feature = "fallible-allocation-v1"))]
+        let oidc = reservation.finish(oidc);
+        let installed = crate::set_oidc_config(oidc);
+        enclave_os_common::oidc::set_global_oidc_config(installed);
     } else {
         enclave_log_info!("OIDC not configured — auth layer disabled");
     }
-
-    use enclave_os_common::protocol::AttestationServer;
-    let servers: Vec<AttestationServer> = config
-        .extra
-        .get("attestation_servers")
-        .map(|value| serde_json::from_value(value.clone()).unwrap_or_default())
-        .unwrap_or_default();
-    let (count, hash) = enclave_os_common::attestation_servers::init(servers);
+    let servers = enclave_os_common::attestation_servers::from_configuration(
+        &pool,
+        config.extra.remove("attestation_servers"),
+    )
+    .map_err(|_| -2)?;
+    let (count, hash) =
+        enclave_os_common::attestation_servers::set(&pool, servers).map_err(|_| -2)?;
     if count > 0 {
         let hash_hex = hash.map(|value| hex_encode(&value)).unwrap_or_default();
         enclave_log_info!(
             "Attestation servers: {} configured, hash={}",
             count,
-            hash_hex,
+            hash_hex
         );
     }
+    Ok(())
 }
 
 /// Default `ecall_run` that registers modules based on enabled Cargo features.
@@ -1066,12 +1077,14 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
 
     register_ocall_vtable();
 
-    let (config, sealed_cfg) = match init_enclave(config_json, config_len) {
+    let (mut config, sealed_cfg) = match init_enclave(config_json, config_len) {
         Ok(pair) => pair,
         Err(code) => return code,
     };
 
-    configure_core(&config);
+    if let Err(code) = configure_core(&mut config) {
+        return code;
+    }
 
     let mut _module_count: u32 = 0;
 
@@ -1187,7 +1200,7 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
         let aaguid_allowlist: Option<Vec<String>> = config
             .extra
             .get("fido2_aaguid_allowlist")
-            .and_then(|v| serde_json::from_value(v.clone()).ok());
+            .and_then(|v| serde::Deserialize::deserialize(v).ok());
         let aaguid_ref = aaguid_allowlist.as_deref();
         let fido2 = enclave_os_fido2::Fido2Module::new(rp_id, rp_name, aaguid_ref);
         crate::modules::register_module(Box::new(fido2));
@@ -1234,26 +1247,7 @@ pub extern "C" fn ecall_shutdown() -> i32 {
 /// is captured in [`extra`](Self::extra) via `#[serde(flatten)]`, so
 /// adopters can read their module config with e.g.
 /// `config.extra["egress_ca_bundle_hex"]`.
-#[derive(serde::Deserialize)]
-pub struct EnclaveConfig {
-    #[serde(default = "default_port")]
-    pub port: u16,
-    #[serde(default = "default_backlog")]
-    pub backlog: i32,
-    /// OIDC provider configuration.  When present, all operations except
-    /// `Healthz` require a valid bearer token in the JSON `"auth"` field.
-    pub oidc: Option<enclave_os_common::oidc::OidcConfig>,
-    /// Module-specific configuration (catch-all for unknown JSON fields).
-    #[serde(flatten)]
-    pub extra: serde_json::Map<String, serde_json::Value>,
-}
-
-fn default_port() -> u16 {
-    443
-}
-fn default_backlog() -> i32 {
-    128
-}
+pub use enclave_os_common::request_json::configuration::EnclaveConfig;
 
 // ==========================================================================
 //  Unified sealed config resolution

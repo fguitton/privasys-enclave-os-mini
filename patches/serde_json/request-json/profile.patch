@@ -1,10 +1,9 @@
 --- a/src/de.rs
 +++ b/src/de.rs
-@@ -88,6 +88,47 @@
-     /// Creates a JSON deserializer from a `&[u8]`.
+@@ -89,6 +89,47 @@
      pub fn from_slice(bytes: &'a [u8]) -> Self {
          Deserializer::new(read::SliceRead::new(bytes))
-+    }
+     }
 +
 +    /// Scratch backing sufficient for a single immutable input slice.
 +    ///
@@ -45,9 +44,38 @@
 +
 +    pub fn into_scratch(self) -> Vec<u8> {
 +        self.scratch
-     }
++    }
  }
  
+ impl<'a> Deserializer<read::StrRead<'a>> {
+@@ -1431,9 +1472,12 @@
+                 }
+             }
+             b'[' => {
++                let request_position = self.read.position();
+                 check_recursion! {
+                     self.eat_char();
+-                    let ret = visitor.visit_seq(SeqAccess::new(self));
++                    let ret = visitor.visit_seq(SeqAccess::new(self)).map_err(|error| {
++                        error.request_container_position(request_position.line, request_position.column)
++                    });
+                 }
+ 
+                 match (ret, self.end_seq()) {
+@@ -1442,9 +1486,12 @@
+                 }
+             }
+             b'{' => {
++                let request_position = self.read.position();
+                 check_recursion! {
+                     self.eat_char();
+-                    let ret = visitor.visit_map(MapAccess::new(self));
++                    let ret = visitor.visit_map(MapAccess::new(self)).map_err(|error| {
++                        error.request_container_position(request_position.line, request_position.column)
++                    });
+                 }
+ 
+                 match (ret, self.end_map()) {
 --- a/src/error.rs
 +++ b/src/error.rs
 @@ -15,10 +15,9 @@
@@ -64,7 +92,27 @@
  }
  
  /// Alias for a `Result` with the error type `serde_json::Error`.
-@@ -314,7 +313,7 @@
+@@ -53,7 +52,7 @@
+     /// - `Category::Eof` - unexpected end of the input data
+     pub fn classify(&self) -> Category {
+         match self.err.code {
+-            ErrorCode::Message(_) => Category::Data,
++            ErrorCode::Message(_) | ErrorCode::RequestSemanticAbort | ErrorCode::RequestContainerAbort => Category::Data,
+             ErrorCode::Io(_) => Category::Io,
+             ErrorCode::EofWhileParsingList
+             | ErrorCode::EofWhileParsingObject
+@@ -240,6 +239,10 @@
+     /// Some I/O error occurred while serializing or deserializing.
+     Io(io::Error),
+ 
++    /// Supplier-private exact typed abort; the request retains its paid diagnostic.
++    RequestSemanticAbort,
++    RequestContainerAbort,
++
+     /// EOF while parsing a list.
+     EofWhileParsingList,
+ 
+@@ -314,7 +317,7 @@
      #[cold]
      pub(crate) fn syntax(code: ErrorCode, line: usize, column: usize) -> Self {
          Error {
@@ -73,7 +121,7 @@
          }
      }
  
-@@ -325,11 +324,11 @@
+@@ -325,11 +328,11 @@
      #[cold]
      pub fn io(error: io::Error) -> Self {
          Error {
@@ -87,7 +135,15 @@
          }
      }
  
-@@ -398,7 +397,7 @@
+@@ -350,6 +353,7 @@
+     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+         match self {
+             ErrorCode::Message(msg) => f.write_str(msg),
++            ErrorCode::RequestSemanticAbort | ErrorCode::RequestContainerAbort => f.write_str("request JSON semantic abort"),
+             ErrorCode::Io(err) => Display::fmt(err, f),
+             ErrorCode::EofWhileParsingList => f.write_str("EOF while parsing a list"),
+             ErrorCode::EofWhileParsingObject => f.write_str("EOF while parsing an object"),
+@@ -398,7 +402,7 @@
  
  impl Display for Error {
      fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -96,7 +152,75 @@
      }
  }
  
-@@ -483,11 +482,11 @@
+@@ -430,10 +434,66 @@
+     }
+ }
+ 
++// Specialization recognizes only the exact supplier-private token type. No
++// message text, type names, vtables, global or thread-local context participates.
++struct RequestSemanticAbort { before_container: bool }
++impl Display for RequestSemanticAbort {
++    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
++        f.write_str("request JSON semantic abort")
++    }
++}
++trait RequestErrorMessage {
++    fn into_error(self) -> Error;
++}
++impl<T: Display> RequestErrorMessage for T {
++    default fn into_error(self) -> Error { make_error(self.to_string()) }
++}
++impl RequestErrorMessage for RequestSemanticAbort {
++    fn into_error(self) -> Error { Error::syntax(if self.before_container { ErrorCode::RequestContainerAbort } else { ErrorCode::RequestSemanticAbort }, 0, 0) }
++}
++impl Error {
++    /// Internal token for a visitor that separately retained its paid diagnostic.
++    /// An ordinary identical-text custom message is never this token.
++    pub fn request_semantic_abort() -> impl Display { RequestSemanticAbort { before_container: false } }
++    /// Exact typed rejection before a container is consumed.
++    pub fn request_container_abort() -> impl Display { RequestSemanticAbort { before_container: true } }
++    /// Whether the exact private request token caused this data error.
++    #[must_use]
++    pub fn is_request_semantic_abort(&self) -> bool { matches!(self.err.code, ErrorCode::RequestSemanticAbort | ErrorCode::RequestContainerAbort) }
++    pub(crate) fn request_container_position(mut self, line: usize, column: usize) -> Self {
++        if matches!(self.err.code, ErrorCode::RequestContainerAbort) && self.err.line == 0 {
++            self.err.line = line;
++            self.err.column = column;
++        }
++        self
++    }
++    /// The current invalid-value wording, without allocating an Error message.
++    pub fn request_invalid_value<'a>(unexpected: de::Unexpected<'a>, expected: &'static str) -> impl Display + 'a {
++        RequestInvalidValue { unexpected, expected }
++    }
++    /// The current serde_json invalid-type formatting, without constructing Error.
++    pub fn request_invalid_type<'a>(unexpected: de::Unexpected<'a>, expected: &'static str) -> impl Display + 'a {
++        RequestInvalidType { unexpected, expected }
++    }
++}
++struct RequestInvalidType<'a> { unexpected: de::Unexpected<'a>, expected: &'static str }
++impl Display for RequestInvalidType<'_> {
++    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
++        write!(f, "invalid type: {}, expected {}", JsonUnexpected(self.unexpected), self.expected)
++    }
++}
++
++struct RequestInvalidValue<'a> { unexpected: de::Unexpected<'a>, expected: &'static str }
++impl Display for RequestInvalidValue<'_> {
++    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
++        write!(f, "invalid value: {}, expected {}", JsonUnexpected(self.unexpected), self.expected)
++    }
++}
++
+ impl de::Error for Error {
+     #[cold]
+     fn custom<T: Display>(msg: T) -> Error {
+-        make_error(msg.to_string())
++        RequestErrorMessage::into_error(msg)
+     }
+ 
+     #[cold]
+@@ -483,11 +543,11 @@
  fn make_error(mut msg: String) -> Error {
      let (line, column) = parse_line_col(&mut msg).unwrap_or((0, 0));
      Error {
@@ -110,18 +234,28 @@
      }
  }
  
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -366,6 +366,7 @@
+ #![allow(non_upper_case_globals)]
+ #![deny(missing_docs)]
+ #![no_std]
++#![feature(min_specialization)]
+ #![cfg_attr(docsrs, feature(doc_cfg))]
+ #![allow(unknown_lints, mismatched_lifetime_syntaxes)]
+ 
 --- a/src/read.rs
 +++ b/src/read.rs
-@@ -4,6 +4,9 @@
- use core::mem;
+@@ -5,6 +5,9 @@
  use core::ops::Deref;
  use core::str;
-+
+ 
 +/// Maximum complete scalar emitted by the actual WTF-8 scratch writer.
 +pub(crate) const UTF8_CODEPOINT_BYTES: usize = char::MAX.len_utf8();
- 
++
  #[cfg(feature = "std")]
  use crate::io;
+ #[cfg(feature = "std")]
 @@ -981,7 +984,7 @@
          return;
      }
@@ -168,15 +302,15 @@
  fn test_parse_ok<T>(tests: Vec<(&str, T)>)
  where
      T: Clone + Debug + PartialEq + ser::Serialize + de::DeserializeOwned,
-@@ -606,6 +625,8 @@
- 
+@@ -607,6 +626,8 @@
          let v: T = from_slice(s.as_bytes()).unwrap();
          assert_eq!(v, value.clone());
-+
-+        assert_eq!(from_slice_preallocated::<T>(s.as_bytes()).unwrap(), value);
  
++        assert_eq!(from_slice_preallocated::<T>(s.as_bytes()).unwrap(), value);
++
          // Make sure we can deserialize into a `Value`.
          let json_value: Value = from_str(s).unwrap();
+         assert_eq!(json_value, to_value(&value).unwrap());
 @@ -652,6 +673,9 @@
  
          let v: T = from_slice(s.as_bytes()).unwrap();

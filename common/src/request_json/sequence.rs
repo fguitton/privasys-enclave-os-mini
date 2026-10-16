@@ -23,6 +23,10 @@ impl<T> Sequence<T> {
     pub fn as_slice(&self) -> &[T] {
         &self.values
     }
+    /// Mutate existing elements without changing the admitted backing.
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        &mut self.values
+    }
     #[must_use]
     pub fn capacity(&self) -> usize {
         self.values.capacity()
@@ -66,5 +70,33 @@ impl<T> Sequence<T> {
             allocation.activate_release_notification();
         }
         Ok(())
+    }
+}
+
+/// Consuming iteration keeps the old backing charged while elements move out.
+/// The iterator buffer drops before its original allocation credit.
+pub struct IntoIter<T> {
+    values: alloc::vec::IntoIter<T>,
+    _allocation: Option<AllocationLeaseV1>,
+    _pool: Arc<AllocationPoolV1>,
+}
+impl<T> Iterator for IntoIter<T> {
+    type Item = T;
+    fn next(&mut self) -> Option<T> {
+        self.values.next()
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.values.size_hint()
+    }
+}
+impl<T> IntoIterator for Sequence<T> {
+    type Item = T;
+    type IntoIter = IntoIter<T>;
+    fn into_iter(self) -> Self::IntoIter {
+        IntoIter {
+            values: self.values.into_iter(),
+            _allocation: self.allocation,
+            _pool: self.pool,
+        }
     }
 }

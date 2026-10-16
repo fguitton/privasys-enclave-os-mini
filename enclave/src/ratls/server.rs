@@ -2065,22 +2065,20 @@ fn handle_set_attestation_servers(
         }
     }
 
-    // Parse request body
-    #[derive(serde::Deserialize)]
-    struct SetAttestationServersRequest {
-        servers: Vec<enclave_os_common::protocol::AttestationServer>,
-    }
-
-    let parsed: SetAttestationServersRequest = match serde_json::from_slice(&http_req.body) {
-        Ok(p) => p,
-        Err(e) => {
-            return HttpHandleResult::err(400, &format!("invalid request body: {e}"));
-        }
+    let Some(pool) = crate::local_allocation_pool() else {
+        return HttpHandleResult::err(503, "request allocation unavailable");
     };
-
-    let servers = parsed.servers;
-
-    let (count, hash) = enclave_os_common::attestation_servers::set(servers);
+    let servers = match super::request_json::manager::parse(&pool, &http_req.body) {
+        Ok(servers) => servers,
+        Err(super::request_json::manager::Error::Unavailable) => {
+            return HttpHandleResult::err(503, "request allocation unavailable");
+        }
+        Err(error) => return HttpHandleResult::err(400, &format!("invalid request body: {error}")),
+    };
+    let (count, hash) = match enclave_os_common::attestation_servers::set(&pool, servers) {
+        Ok(result) => result,
+        Err(_) => return HttpHandleResult::err(503, "request allocation unavailable"),
+    };
 
     let hash_hex = hash
         .map(|h| enclave_os_common::hex::hex_encode(&h))

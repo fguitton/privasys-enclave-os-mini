@@ -215,16 +215,25 @@ pub struct EnclaveState {
 static ENCLAVE_STATE: OnceLock<Mutex<EnclaveState>> = OnceLock::new();
 
 /// Global OIDC configuration (set by `ecall_run` if `oidc` is in config).
-static OIDC_CONFIG: OnceLock<enclave_os_common::oidc::OidcConfig> = OnceLock::new();
+static OIDC_CONFIG: OnceLock<
+    enclave_os_common::allocation::SharedAllocationV1<
+        enclave_os_common::oidc::retained::RetainedOidcConfig,
+    >,
+> = OnceLock::new();
 
-/// Set the global OIDC configuration.
-pub fn set_oidc_config(config: enclave_os_common::oidc::OidcConfig) {
+/// Install the one immutable owner; subsequent attempts retain first-writer behavior.
+pub fn set_oidc_config(
+    config: enclave_os_common::allocation::SharedAllocationV1<
+        enclave_os_common::oidc::retained::RetainedOidcConfig,
+    >,
+) -> &'static enclave_os_common::oidc::OidcConfig {
     let _ = OIDC_CONFIG.set(config);
+    OIDC_CONFIG.get().expect("OIDC owner installed")
 }
 
-/// Get the global OIDC configuration, if configured.
+/// Borrow the same configuration retained by the process's original owner.
 pub fn oidc_config() -> Option<&'static enclave_os_common::oidc::OidcConfig> {
-    OIDC_CONFIG.get()
+    Some(OIDC_CONFIG.get()?)
 }
 
 /// Get a reference to the global enclave state.

@@ -49,6 +49,27 @@ impl Value<'_> {
         }
     }
     #[must_use]
+    pub fn as_object(&self) -> Option<&PaidOrderedMapV1<Text<'_>, Self>> {
+        match self {
+            Self::Object(map) => Some(map),
+            _ => None,
+        }
+    }
+    #[must_use]
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Bool(value) => Some(*value),
+            _ => None,
+        }
+    }
+    #[must_use]
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Self::Number(value) => value.as_i64(),
+            _ => None,
+        }
+    }
+    #[must_use]
     pub fn is_null(&self) -> bool {
         matches!(self, Self::Null)
     }
@@ -90,16 +111,30 @@ impl Serialize for Value<'_> {
     }
 }
 /// Visit the current standard numeric JSON profile, borrowing unescaped input.
-pub struct Seed<'a> {
-    pool: &'a Arc<AllocationPoolV1>,
+#[derive(Clone, Copy)]
+pub struct Seed<'pool, 'input, 'output> {
+    pool: &'pool Arc<AllocationPoolV1>,
+    text: fn(&Arc<AllocationPoolV1>, &'input str) -> Result<Text<'output>, Refusal>,
 }
-impl<'a> Seed<'a> {
-    pub fn new(pool: &'a Arc<AllocationPoolV1>) -> Self {
-        Self { pool }
+impl<'pool, 'input> Seed<'pool, 'input, 'input> {
+    pub fn new(pool: &'pool Arc<AllocationPoolV1>) -> Self {
+        Self {
+            pool,
+            text: |_, value| Ok(Text::borrowed(value)),
+        }
     }
 }
-impl<'de> DeserializeSeed<'de> for Seed<'_> {
-    type Value = Result<Value<'de>, Refusal>;
+impl<'pool, 'input> Seed<'pool, 'input, 'static> {
+    /// Retain strings independently of temporary or untrusted input storage.
+    pub fn retained(pool: &'pool Arc<AllocationPoolV1>) -> Self {
+        Self {
+            pool,
+            text: Text::copy,
+        }
+    }
+}
+impl<'de, 'out> DeserializeSeed<'de> for Seed<'_, 'de, 'out> {
+    type Value = Result<Value<'out>, Refusal>;
     fn deserialize<D: serde::Deserializer<'de>>(
         self,
         deserializer: D,
@@ -107,8 +142,8 @@ impl<'de> DeserializeSeed<'de> for Seed<'_> {
         deserializer.deserialize_any(self)
     }
 }
-impl<'de> Visitor<'de> for Seed<'_> {
-    type Value = Result<Value<'de>, Refusal>;
+impl<'de, 'out> Visitor<'de> for Seed<'_, 'de, 'out> {
+    type Value = Result<Value<'out>, Refusal>;
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("JSON value")
     }
@@ -130,14 +165,14 @@ impl<'de> Visitor<'de> for Seed<'_> {
         Ok(Ok(Value::Null))
     }
     fn visit_borrowed_str<E: serde::de::Error>(self, value: &'de str) -> Result<Self::Value, E> {
-        Ok(Ok(Value::String(Text::borrowed(value))))
+        Ok((self.text)(self.pool, value).map(Value::String))
     }
     fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
         Ok(Text::copy(self.pool, value).map(Value::String))
     }
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
         let mut values = Sequence::new(Arc::clone(self.pool));
-        while let Some(value) = seq.next_element_seed(Seed::new(self.pool))? {
+        while let Some(value) = seq.next_element_seed(self)? {
             if let Err(error) = value.and_then(|value| values.try_push(value)) {
                 drop(values);
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
@@ -148,8 +183,11 @@ impl<'de> Visitor<'de> for Seed<'_> {
     }
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
         let mut values = PaidOrderedMapV1::new(Arc::clone(self.pool));
-        while let Some(key) = map.next_key_seed(KeySeed(self.pool))? {
-            let value = map.next_value_seed(Seed::new(self.pool))?;
+        while let Some(key) = map.next_key_seed(KeySeed {
+            pool: self.pool,
+            text: self.text,
+        })? {
+            let value = map.next_value_seed(self)?;
             let result = key.and_then(|key| {
                 value.and_then(|value| {
                     values
@@ -167,9 +205,12 @@ impl<'de> Visitor<'de> for Seed<'_> {
         Ok(Ok(Value::Object(values)))
     }
 }
-struct KeySeed<'a>(&'a Arc<AllocationPoolV1>);
-impl<'de> DeserializeSeed<'de> for KeySeed<'_> {
-    type Value = Result<Text<'de>, Refusal>;
+struct KeySeed<'pool, 'input, 'output> {
+    pool: &'pool Arc<AllocationPoolV1>,
+    text: fn(&Arc<AllocationPoolV1>, &'input str) -> Result<Text<'output>, Refusal>,
+}
+impl<'de, 'out> DeserializeSeed<'de> for KeySeed<'_, 'de, 'out> {
+    type Value = Result<Text<'out>, Refusal>;
     fn deserialize<D: serde::Deserializer<'de>>(
         self,
         deserializer: D,
@@ -177,15 +218,17 @@ impl<'de> DeserializeSeed<'de> for KeySeed<'_> {
         deserializer.deserialize_str(self)
     }
 }
-impl<'de> Visitor<'de> for KeySeed<'_> {
-    type Value = Result<Text<'de>, Refusal>;
+impl<'de, 'out> Visitor<'de> for KeySeed<'_, 'de, 'out> {
+    type Value = Result<Text<'out>, Refusal>;
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("JSON object key")
     }
     fn visit_borrowed_str<E: serde::de::Error>(self, value: &'de str) -> Result<Self::Value, E> {
-        Ok(Ok(Text::borrowed(value)))
+        Ok((self.text)(self.pool, value))
     }
     fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
-        Ok(Text::copy(self.0, value))
+        Ok(Text::copy(self.pool, value))
     }
 }
+
+mod view;

@@ -43,7 +43,6 @@
 
 #[cfg(feature = "sgx")]
 use alloc::{
-    boxed::Box,
     string::{String, ToString},
     vec::Vec,
 };
@@ -74,21 +73,16 @@ static OIDC_CONFIG: AtomicPtr<OidcConfig> = AtomicPtr::new(core::ptr::null_mut()
 ///
 /// Must be called exactly once during enclave init.  Subsequent calls
 /// are silently ignored (first-writer-wins).
-pub fn set_global_oidc_config(config: OidcConfig) {
-    let ptr = Box::into_raw(Box::new(config));
-    // Only store if still null (first writer wins).
-    let prev = OIDC_CONFIG.compare_exchange(
+pub fn set_global_oidc_config(config: &'static OidcConfig) {
+    // The enclave's immutable shared owner retains every original field credit
+    // for this static borrow. This store neither clones nor owns a second tree.
+    let ptr = core::ptr::from_ref(config).cast_mut();
+    let _ = OIDC_CONFIG.compare_exchange(
         core::ptr::null_mut(),
         ptr,
         Ordering::AcqRel,
         Ordering::Acquire,
     );
-    if prev.is_err() {
-        // Another call already set it — free our copy.
-        unsafe {
-            drop(Box::from_raw(ptr));
-        }
-    }
     OIDC_CONFIGURED.store(true, Ordering::Release);
 }
 
@@ -108,8 +102,8 @@ pub fn global_oidc_config() -> Option<&'static OidcConfig> {
     if ptr.is_null() {
         None
     } else {
-        // SAFETY: ptr was created from Box::into_raw in set_global_oidc_config
-        // and is never freed during the enclave's lifetime.
+        // SAFETY: set_global_oidc_config accepts only an immutable static
+        // reference. Its owner cannot be freed during the enclave lifetime.
         Some(unsafe { &*ptr })
     }
 }
@@ -149,14 +143,17 @@ pub struct OidcConfig {
     pub monitoring_role: String,
 }
 
+pub const DEFAULT_ROLE_CLAIM: &str = "roles";
 fn default_role_claim() -> String {
-    "roles".into()
+    DEFAULT_ROLE_CLAIM.into()
 }
+pub const DEFAULT_MANAGER_ROLE: &str = "privasys-platform:manager";
 fn default_manager_role() -> String {
-    "privasys-platform:manager".into()
+    DEFAULT_MANAGER_ROLE.into()
 }
+pub const DEFAULT_MONITORING_ROLE: &str = "privasys-platform:monitoring";
 fn default_monitoring_role() -> String {
-    "privasys-platform:monitoring".into()
+    DEFAULT_MONITORING_ROLE.into()
 }
 
 // ---------------------------------------------------------------------------
@@ -527,3 +524,6 @@ mod tests {
         assert_eq!(c.iat, 0);
     }
 }
+
+/// Original OIDC field backing retained with its exact allocation credits.
+pub mod retained;

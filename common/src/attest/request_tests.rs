@@ -728,4 +728,721 @@ mod tests {
         assert_eq!(count, (1, 1));
         assert_eq!(pool.used(), 0);
     }
+    #[test]
+    fn private_semantic_token_never_matches_ordinary_identical_custom_messages() {
+        use serde::de::Error as _;
+        let (token, count) =
+            measured(|| serde_json::Error::custom(serde_json::Error::request_semantic_abort()));
+        assert!(token.is_request_semantic_abort());
+        assert!(token.is_data());
+        assert_eq!(count, (0, 0));
+        struct Same;
+        impl core::fmt::Display for Same {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str("request JSON semantic abort")
+            }
+        }
+        let (ordinary, count) = measured(|| serde_json::Error::custom(Same));
+        assert!(!ordinary.is_request_semantic_abort());
+        assert!(ordinary.is_data());
+        assert_eq!(ordinary.to_string(), "request JSON semantic abort");
+        assert_eq!(count, (1, "request JSON semantic abort".len()));
+        for message in [
+            "request JSON semantic abort",
+            " request JSON semantic abort ",
+            "\n ü😀  at line 12 column 34",
+        ] {
+            let ordinary = serde_json::Error::custom(message);
+            assert!(!ordinary.is_request_semantic_abort());
+            assert_eq!(ordinary.to_string(), message);
+        }
+        let formatted =
+            serde_json::Error::custom(format_args!("{}", "request JSON semantic abort"));
+        assert!(!formatted.is_request_semantic_abort());
+        assert_eq!(formatted.to_string(), "request JSON semantic abort");
+        let diagnostic = serde_json::Error::request_invalid_type(
+            serde::de::Unexpected::Str("a\n\"😀"),
+            "a sequence",
+        );
+        let expected = "invalid type: string \"a\\n\\\"😀\", expected a sequence";
+        let pool = AllocationPoolV1::new(expected.len()).unwrap();
+        let (owned, count) =
+            measured(|| enclave_os_common::request_json::Text::display(&pool, &diagnostic));
+        let owned = owned.unwrap();
+        assert_eq!(owned.as_str(), expected);
+        assert_eq!(count, (1, expected.len()));
+        assert_eq!(pool.used(), expected.len());
+        drop(owned);
+        assert_eq!(pool.used(), 0);
+        let pool = AllocationPoolV1::new(expected.len() - 1).unwrap();
+        let (refused, count) =
+            measured(|| enclave_os_common::request_json::Text::display(&pool, &diagnostic));
+        assert_eq!(*refused.as_ref().unwrap_err(), Refusal::Unavailable);
+        assert_eq!(count, (0, 0));
+        assert_eq!(pool.used(), 0);
+    }
+    #[test]
+    fn retained_value_copies_all_text_and_outlives_its_temporary_input() {
+        use enclave_os_common::request_json::{
+            value::{Seed, Value},
+            AdmittedParser,
+        };
+        use serde::de::DeserializeSeed;
+        let pool = AllocationPoolV1::new(1 << 20).unwrap();
+        let value = {
+            let input = String::from(r#"{"plain":["raw","\u0061"]}"#);
+            let capacity = serde_json::Deserializer::slice_scratch_capacity(input.len()).unwrap();
+            let mut parser = AdmittedParser::new(&pool, capacity, |scratch| {
+                serde_json::Deserializer::from_slice_with_scratch(input.as_bytes(), scratch).ok()
+            })
+            .unwrap();
+            let value: Value<'static> = Seed::retained(&pool)
+                .deserialize(parser.parser_mut())
+                .unwrap()
+                .unwrap();
+            parser.parser_mut().end().unwrap();
+            value
+        };
+        assert_eq!(
+            value.get("plain").unwrap().as_array().unwrap()[0].as_str(),
+            Some("raw")
+        );
+        assert_eq!(
+            serde_json::to_vec(&value).unwrap(),
+            br#"{"plain":["raw","a"]}"#
+        );
+        let entry = core::mem::size_of::<(enclave_os_common::request_json::Text<'_>, Value<'_>)>();
+        let item = core::mem::size_of::<Value<'_>>();
+        assert_eq!(
+            pool.used(),
+            "plain".len() + "raw".len() + "a".len() + entry + 2 * item
+        );
+        drop(value);
+        assert_eq!(pool.used(), 0);
+    }
+    #[derive(serde::Deserialize)]
+    struct SetAttestationServersRequest {
+        servers: Vec<enclave_os_common::protocol::AttestationServer>,
+    }
+    fn compare_manager(input: &[u8]) {
+        let pool = AllocationPoolV1::new(1 << 20).unwrap();
+        let original = serde_json::from_slice::<SetAttestationServersRequest>(input);
+        let admitted = endpoint::manager::parse(&pool, input);
+        match (original, admitted) {
+            (Ok(original), Ok(admitted)) => {
+                assert_eq!(original.servers.len(), admitted.as_slice().len());
+                for (original, admitted) in original.servers.iter().zip(admitted.as_slice()) {
+                    assert_eq!(original.url, admitted.url.as_str());
+                    assert_eq!(original.token.as_deref(), admitted.token.as_deref());
+                }
+            }
+            (Err(original), Err(admitted)) => assert_eq!(
+                original.to_string(),
+                admitted.to_string(),
+                "{}",
+                String::from_utf8_lossy(input)
+            ),
+            _ => panic!(
+                "manager outcome mismatch: {}",
+                String::from_utf8_lossy(input)
+            ),
+        }
+        assert_eq!(pool.used(), 0);
+    }
+    #[test]
+    fn manager_typed_object_sequence_and_error_diagnostics_match_original() {
+        for input in [
+            r#"{"servers":[]}"#,
+            r#"[[]]"#,
+            r#"{"servers":[{"url":"raw"},{"url":"\u0061","token":"日本😀"}]}"#,
+            r#"[[["url"],["url",null],["u","token"]]]"#,
+            r#"{"servers":[{"url":"a","token":null,"other":{"a":[1,"x"]}}],"x":true}"#,
+            r#"{"ser\u0076ers":[{"u\u0072l":"\uD834\uDD1E","token":"\n\t\\\""}]}"#,
+            r#"{}"#,
+            r#"[]"#,
+            r#"[[],0]"#,
+            r#"{"servers":[],"servers":[]}"#,
+            r#"{"servers":[{}]}"#,
+            r#"{"servers":[[]]}"#,
+            r#"{"servers":[["a",null,3]]}"#,
+            r#"{"servers":[{"url":"a","url":"b"}]}"#,
+            r#"{"servers":[{"url":"a","token":null,"token":null}]}"#,
+            r#"{"servers":null}"#,
+            r#"{"servers":{}}"#,
+            r#"{"servers":true}"#,
+            r#"{"servers":1}"#,
+            r#"{"servers":-1}"#,
+            r#"{"servers":1.0}"#,
+            r#"{"servers":"x😀"}"#,
+            r#"{"servers":[null]}"#,
+            r#"{"servers":[false]}"#,
+            r#"{"servers":[-1.2]}"#,
+            r#"{"servers":["x"]}"#,
+            r#"{"servers":[{"url":null}]}"#,
+            r#"{"servers":[{"url":{}}]}"#,
+            r#"{"servers":[{"url":[]}]}"#,
+            r#"{"servers":[{"url":false}]}"#,
+            r#"{"servers":[{"url":12}]}"#,
+            r#"{"servers":[{"url":"a","token":12}]}"#,
+            r#"{"servers":0,broken"#,
+            r#"{"servers":[],broken"#,
+            r#"{"servers":[]} null"#,
+            r#"{"servers":[{"url":"\uD800"}]}"#,
+            r#"{"servers":[{"url":"a","token":"\uDC00"}]}"#,
+            "null",
+            "true",
+            "1",
+            "-1",
+            "1.0",
+            r#""x""#,
+            "",
+            "{",
+            "[",
+            "[null]",
+        ] {
+            compare_manager(input.as_bytes());
+        }
+    }
+    #[test]
+    fn manager_semantic_message_has_exact_admission_and_refund() {
+        let input = br#"{\n \"servers\": 1}"#;
+        // Use real newlines; the escaped spelling above is intentionally malformed.
+        compare_manager(input);
+        let input = b"{\n \"servers\": 1}";
+        let original = serde_json::from_slice::<SetAttestationServersRequest>(input)
+            .err()
+            .unwrap()
+            .to_string();
+        let message = "invalid type: integer `1`, expected a sequence";
+        let scratch = serde_json::Deserializer::slice_scratch_capacity(input.len()).unwrap();
+        let pool = AllocationPoolV1::new(scratch + message.len()).unwrap();
+        let (error, count) = measured(|| endpoint::manager::parse(&pool, input).err().unwrap());
+        assert_eq!(error.to_string(), original);
+        assert_eq!(count, (2, scratch + message.len()));
+        assert_eq!(pool.used(), message.len());
+        drop(error);
+        assert_eq!(pool.used(), 0);
+        let pool = AllocationPoolV1::new(scratch + message.len() - 1).unwrap();
+        let (error, count) = measured(|| endpoint::manager::parse(&pool, input).err().unwrap());
+        assert!(matches!(error, endpoint::manager::Error::Unavailable));
+        assert_eq!(count, (1, scratch));
+        assert_eq!(pool.used(), 0);
+        let pool = AllocationPoolV1::new(scratch - 1).unwrap();
+        let (error, count) = measured(|| endpoint::manager::parse(&pool, input).err().unwrap());
+        assert!(matches!(error, endpoint::manager::Error::Unavailable));
+        assert_eq!(count, (0, 0));
+        assert_eq!(pool.used(), 0);
+    }
+    #[test]
+    fn manager_retained_children_survive_input_and_partial_refusals_refund() {
+        let pool = AllocationPoolV1::new(1 << 20).unwrap();
+        let servers = {
+            let input = String::from(r#"{"servers":[{"url":"raw","token":"\u0061"}]}"#);
+            endpoint::manager::parse(&pool, input.as_bytes()).unwrap()
+        };
+        assert_eq!(servers.as_slice()[0].url.as_str(), "raw");
+        assert_eq!(servers.as_slice()[0].token.as_deref(), Some("a"));
+        let bytes = core::mem::size_of::<
+            enclave_os_common::protocol::AttestationServer<
+                enclave_os_common::request_json::Text<'static>,
+            >,
+        >();
+        assert_eq!(pool.used(), 3 + 1 + bytes);
+        drop(servers);
+        assert_eq!(pool.used(), 0);
+        let input = br#"{"servers":[{"url":"raw","token":"token"},{"url":"another"}]}"#;
+        let scratch = serde_json::Deserializer::slice_scratch_capacity(input.len()).unwrap();
+        for capacity in [
+            scratch,
+            scratch + 2,
+            scratch + 3,
+            scratch + 8,
+            scratch + 8 + bytes,
+            scratch + 15 + bytes,
+        ] {
+            let pool = AllocationPoolV1::new(capacity).unwrap();
+            assert!(matches!(
+                endpoint::manager::parse(&pool, input),
+                Err(endpoint::manager::Error::Unavailable)
+            ));
+            assert_eq!(pool.used(), 0);
+        }
+    }
+
+    #[test]
+    fn manager_store_moves_original_children_and_releases_only_after_replacement() {
+        use enclave_os_common::{attestation_servers as store, request_json::sequence::Sequence};
+        let pool = AllocationPoolV1::new(1 << 20).unwrap();
+        let servers = endpoint::manager::parse(
+            &pool,
+            br#"{"servers":[{"url":"z","token":"secret"},{"url":"a"},{"url":"z"}]}"#,
+        )
+        .unwrap();
+        let retained = pool.used();
+        let (count, hash) = store::set(&pool, servers).unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(store::server_urls(), ["z", "a", "z"]);
+        assert_eq!(store::token_for("z").as_deref(), Some("secret"));
+        assert_eq!(
+            store::canonical_form().as_deref(),
+            Some(b"a\nz\nz".as_slice())
+        );
+        let expected = ring::digest::digest(&ring::digest::SHA256, b"a\nz\nz");
+        assert_eq!(hash.as_ref().map(|h| h.as_slice()), Some(expected.as_ref()));
+        assert_eq!(pool.used(), retained + b"a\nz\nz".len());
+        let input = br#"{"servers":[{"url":"replacement"}]}"#;
+        let scratch = serde_json::Deserializer::slice_scratch_capacity(input.len()).unwrap();
+        let entry = core::mem::size_of::<
+            enclave_os_common::protocol::AttestationServer<
+                enclave_os_common::request_json::Text<'static>,
+            >,
+        >();
+        let refused = AllocationPoolV1::new(scratch + "replacement".len() + entry).unwrap();
+        let servers = endpoint::manager::parse(&refused, input).unwrap();
+        // Fill the released parser-scratch headroom so the next physical
+        // reference buffer must refuse before allocation or state mutation.
+        let remaining = refused.reserve_unpublished(scratch).unwrap();
+        assert_eq!(store::set(&refused, servers), Err(Refusal::Unavailable));
+        assert_eq!(
+            store::canonical_form().as_deref(),
+            Some(b"a\nz\nz".as_slice())
+        );
+        assert_eq!(refused.used(), scratch);
+        drop(remaining);
+        assert_eq!(refused.used(), 0);
+        let empty = AllocationPoolV1::new(1).unwrap();
+        assert_eq!(
+            store::set(&empty, Sequence::new(std::sync::Arc::clone(&empty))).unwrap(),
+            (0, None)
+        );
+        assert_eq!(pool.used(), 0);
+        assert_eq!(empty.used(), 0);
+        assert_eq!(store::hash(), None);
+        assert_eq!(store::canonical_form(), None);
+    }
+    #[test]
+    fn oidc_shared_owner_moves_paid_fields_and_refunds_only_after_last_alias() {
+        use enclave_os_common::{
+            allocation::SharedAllocationV1, oidc::retained::RetainedOidcConfig, request_json::Text,
+        };
+        let pool = AllocationPoolV1::new(1 << 20).unwrap();
+        let field = |text| Text::copy(&pool, text).unwrap();
+        let config = RetainedOidcConfig::new(
+            field("issuer"),
+            field("audience"),
+            field(""),
+            field("roles"),
+            field("manager"),
+            field("monitor"),
+        )
+        .unwrap();
+        let children =
+            "issuer".len() + "audience".len() + "roles".len() + "manager".len() + "monitor".len();
+        assert_eq!(pool.used(), children);
+        let expected = SharedAllocationV1::<RetainedOidcConfig>::required_bytes(0).unwrap();
+        let reservation = SharedAllocationV1::reserve(&pool, 0).unwrap();
+        let (shared, allocations) = measured(|| reservation.finish(config));
+        assert_eq!(allocations.0, 2);
+        assert_eq!(allocations.1, expected);
+        assert_eq!(pool.used(), children + expected);
+        let (alias, allocations) = measured(|| shared.clone());
+        assert_eq!(allocations, (0, 0));
+        drop(shared);
+        assert_eq!(alias.issuer, "issuer");
+        assert_eq!(alias.manager_role, "manager");
+        assert_eq!(pool.used(), children + expected);
+        drop(alias);
+        assert_eq!(pool.used(), 0);
+        let refused = RetainedOidcConfig::new(
+            field("paid"),
+            Text::borrowed("not owned"),
+            field(""),
+            field("r"),
+            field("m"),
+            field("n"),
+        );
+        assert!(matches!(refused, Err(Refusal::Unavailable)));
+        assert_eq!(pool.used(), 0);
+        let short = AllocationPoolV1::new(expected - 1).unwrap();
+        let (refused, allocations) =
+            measured(|| SharedAllocationV1::<RetainedOidcConfig>::reserve(&short, 0));
+        assert!(refused.is_none());
+        assert_eq!(allocations, (0, 0));
+        assert_eq!(short.used(), 0);
+    }
+    fn compare_configuration(input: &[u8]) {
+        #[derive(serde::Deserialize)]
+        struct EnclaveConfig {
+            #[serde(default = "port")]
+            port: u16,
+            #[serde(default = "backlog")]
+            backlog: i32,
+            oidc: Option<enclave_os_common::oidc::OidcConfig>,
+            #[serde(flatten)]
+            extra: serde_json::Map<String, serde_json::Value>,
+        }
+        fn port() -> u16 {
+            443
+        }
+        fn backlog() -> i32 {
+            128
+        }
+        let original = serde_json::from_slice::<EnclaveConfig>(input);
+        let pool = AllocationPoolV1::new(1 << 20).unwrap();
+        let current = endpoint::manager::configuration::parse(&pool, input);
+        match (original, current) {
+            (Ok(original), Ok(current)) => {
+                assert_eq!(original.port, current.port);
+                assert_eq!(original.backlog, current.backlog);
+                assert_eq!(
+                    serde_json::to_value(&original.oidc).unwrap(),
+                    current
+                        .oidc
+                        .as_ref()
+                        .map(|v| serde_json::to_value(&**v).unwrap())
+                        .unwrap_or(serde_json::Value::Null)
+                );
+                assert_eq!(original.extra.len(), current.extra.len());
+                for (key, value) in original.extra {
+                    assert_eq!(
+                        value,
+                        serde_json::to_value(current.extra.get(key.as_str()).unwrap()).unwrap()
+                    );
+                }
+            }
+            (Err(original), Err(current)) => assert_eq!(
+                original.to_string(),
+                current.to_string(),
+                "{}",
+                String::from_utf8_lossy(input)
+            ),
+            _ => panic!(
+                "startup outcome mismatch: {}",
+                String::from_utf8_lossy(input)
+            ),
+        }
+        assert_eq!(pool.used(), 0);
+    }
+    #[test]
+    fn startup_configuration_original_flatten_defaults_types_and_errors_are_preserved() {
+        for input in [
+            r#"{}"#,
+            r#"{"port":0,"backlog":-2147483648}"#,
+            r#"{"port":65535,"backlog":2147483647}"#,
+            r#"{"oidc":null,"extra":{"deep":[1,true,null,"\u0061"]},"extra":7}"#,
+            r#"{"oidc":{"issuer":"i","audience":"a"},"unknown":"日本😀"}"#,
+            r#"{"oidc":["i","a"]}"#,
+            r#"{"oidc":["i","a","","r","m","n"]}"#,
+            r#"{"oidc":{"issuer":"\uD834\uDD1E","audience":"a","role_claim":"x","unknown":null}}"#,
+            r#"{"attestation_servers":true}"#,
+            r#"{"attestation_servers":[{"url":"a"}],"attestation_servers":null}"#,
+            r#"{"port":-1}"#,
+            r#"{"port":65536}"#,
+            r#"{"port":1.0}"#,
+            r#"{"port":"\u0031"}"#,
+            r#"{"port":null}"#,
+            r#"{"port":{}}"#,
+            r#"{"port":[]}"#,
+            r#"{"backlog":2147483648}"#,
+            r#"{"backlog":-2147483649}"#,
+            r#"{"backlog":true}"#,
+            r#"{"port":1,"port":2}"#,
+            r#"{"oidc":null,"oidc":null}"#,
+            r#"{"oidc":{}}"#,
+            r#"{"oidc":{"issuer":"i"}}"#,
+            r#"{"oidc":[]}"#,
+            r#"{"oidc":["i"]}"#,
+            r#"{"oidc":["i","a","","r","m","n",0]}"#,
+            r#"{"oidc":true}"#,
+            r#"{"oidc":"x"}"#,
+            r#"{"oidc":{"issuer":"i","issuer":"j","audience":"a"}}"#,
+            r#"{"oidc":{"issuer":{},"audience":"a"}}"#,
+            r#"{"oidc":{"issuer":"i","audience":"a","role_claim":null}}"#,
+            r#"{"port":false,broken"#,
+            r#"{"oidc":{},broken"#,
+            r#"{"x":true,broken"#,
+            r#"{"x":"\uD800"}"#,
+            r#"{} null"#,
+            "null",
+            "true",
+            "1",
+            "-1",
+            "1.0",
+            r#""x""#,
+            "[]",
+            "[{}]",
+            "",
+            "{",
+        ] {
+            compare_configuration(input.as_bytes());
+        }
+    }
+    #[test]
+    fn startup_retains_original_host_children_and_each_shortage_refunds() {
+        let pool = AllocationPoolV1::new(1 << 20).unwrap();
+        let config = {
+            let input =
+                String::from(r#"{"oidc":{"issuer":"i","audience":"a"},"store":{"path":"raw"}}"#);
+            endpoint::manager::configuration::parse(&pool, input.as_bytes()).unwrap()
+        };
+        assert_eq!(config.oidc.as_ref().unwrap().issuer, "i");
+        assert_eq!(
+            config
+                .extra
+                .get("store")
+                .unwrap()
+                .get("path")
+                .unwrap()
+                .as_str(),
+            Some("raw")
+        );
+        assert!(pool.used() > 0);
+        drop(config);
+        assert_eq!(pool.used(), 0);
+        let input = br#"{"oidc":{"issuer":"i","audience":"a"},"store":{"path":"raw"}}"#;
+        let scratch = serde_json::Deserializer::slice_scratch_capacity(input.len()).unwrap();
+        let full = AllocationPoolV1::new(1 << 20).unwrap();
+        let value = endpoint::manager::configuration::parse(&full, input).unwrap();
+        let retained = full.used();
+        drop(value);
+        assert_eq!(full.used(), 0);
+        for capacity in [
+            scratch - 1,
+            scratch,
+            scratch + 1,
+            scratch + 2,
+            scratch + retained - 1,
+        ] {
+            let pool = AllocationPoolV1::new(capacity).unwrap();
+            assert!(matches!(
+                endpoint::manager::configuration::parse(&pool, input),
+                Err(endpoint::manager::Error::Unavailable)
+            ));
+            assert_eq!(pool.used(), 0);
+        }
+    }
+
+    #[test]
+    fn startup_server_projection_moves_strings_and_keeps_original_invalid_list_default() {
+        use enclave_os_common::{
+            attestation_servers as store, protocol::AttestationServer, request_json::Text,
+        };
+        for field in [
+            r#"null"#,
+            r#"true"#,
+            r#"{}"#,
+            r#"[]"#,
+            r#"[[]]"#,
+            r#"[{"url":"a"}]"#,
+            r#"[["a"],["b",null],["c","t"]]"#,
+            r#"[{"url":"a","url":"b","token":null,"unknown":[1,2]}]"#,
+            r#"[{"url":"a"},{"url":false}]"#,
+            r#"[["a",null,0]]"#,
+        ] {
+            let expected: Vec<AttestationServer> = serde_json::from_str::<serde_json::Value>(field)
+                .and_then(serde_json::from_value)
+                .unwrap_or_default();
+            let input = format!("{{\"attestation_servers\":{field}}}");
+            let pool = AllocationPoolV1::new(1 << 20).unwrap();
+            let mut config =
+                endpoint::manager::configuration::parse(&pool, input.as_bytes()).unwrap();
+            let servers =
+                store::from_configuration(&pool, config.extra.remove("attestation_servers"))
+                    .unwrap();
+            drop(config);
+            assert_eq!(expected.len(), servers.as_slice().len());
+            for (expected, actual) in expected.iter().zip(servers.as_slice()) {
+                assert_eq!(expected.url, actual.url.as_str());
+                assert_eq!(expected.token.as_deref(), actual.token.as_deref());
+            }
+            drop(servers);
+            assert_eq!(pool.used(), 0);
+        }
+        let pool = AllocationPoolV1::new(1 << 20).unwrap();
+        let mut config = endpoint::manager::configuration::parse(
+            &pool,
+            br#"{"attestation_servers":[{"url":"a"},{"url":"b"},{"url":"c","token":"t"}]}"#,
+        )
+        .unwrap();
+        let value = config.extra.remove("attestation_servers");
+        let (servers, count) = measured(|| store::from_configuration(&pool, value).unwrap());
+        drop(config);
+        let entry = core::mem::size_of::<AttestationServer<Text<'static>>>();
+        assert_eq!(count, (3, (1 + 2 + 4) * entry));
+        assert_eq!(pool.used(), 4 + 4 * entry);
+        drop(servers);
+        assert_eq!(pool.used(), 0);
+        let mut config = endpoint::manager::configuration::parse(
+            &pool,
+            br#"{"attestation_servers":[{"url":"a"},{"url":"b"},{"url":"c"}]}"#,
+        )
+        .unwrap();
+        let value = config.extra.remove("attestation_servers");
+        let remaining = pool.reserve_unpublished((1 << 20) - pool.used()).unwrap();
+        let (refused, count) = measured(|| store::from_configuration(&pool, value));
+        assert!(matches!(refused, Err(Refusal::Unavailable)));
+        assert_eq!(count, (1, entry));
+        drop(config);
+        drop(remaining);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn borrowed_paid_value_projects_current_config_shapes_and_refuses_extra_tuple_items() {
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct CurrentInput {
+            hosts: std::collections::BTreeMap<String, Vec<String>>,
+            pin: [u8; 3],
+            enabled: Option<bool>,
+        }
+        for input in [
+            r#"{"hosts":{"a":["1","2"]},"pin":[1,2,3],"enabled":true}"#,
+            r#"{"hosts":{},"pin":[1,2,3],"enabled":null}"#,
+            r#"{"hosts":{},"pin":[1,2,3,4]}"#,
+            r#"{"hosts":{},"pin":[1,2]}"#,
+            r#"{"hosts":{},"pin":[1,2,256]}"#,
+            r#"{"hosts":[],"pin":[1,2,3]}"#,
+            r#"{"hosts":{"a":3},"pin":[1,2,3]}"#,
+            r#"{"hosts":{"a":[null]},"pin":[1,2,3]}"#,
+            r#"{"hosts":{},"pin":[1,2,3],"enabled":false,"unknown":1}"#,
+        ] {
+            let old: serde_json::Value = serde_json::from_str(input).unwrap();
+            let original = serde_json::from_value::<CurrentInput>(old);
+            let pool = AllocationPoolV1::new(1 << 20).unwrap();
+            let paid = endpoint::value(&pool, input.as_bytes()).unwrap();
+            let current = CurrentInput::deserialize(&paid);
+            match (original, current) {
+                (Ok(original), Ok(current)) => assert_eq!(original, current),
+                (Err(original), Err(current)) => {
+                    assert_eq!(original.to_string(), current.to_string())
+                }
+                _ => panic!("typed config projection mismatch: {input}"),
+            }
+            drop(paid);
+            assert_eq!(pool.used(), 0);
+        }
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        enum Projection {
+            Unit,
+            Pair(u8, u8),
+            Object { x: u8 },
+        }
+        for input in [
+            r#""Unit""#,
+            r#"{"Unit":null}"#,
+            r#"{"Pair":[1,2]}"#,
+            r#"{"Object":{"x":1}}"#,
+            r#"{}"#,
+            r#"{"Unit":null,"Pair":[1,2]}"#,
+            r#"{"Pair":[]}"#,
+            r#"{"Pair":[1]}"#,
+            r#"{"Pair":[1,2,3]}"#,
+            r#"{"Pair":null}"#,
+            r#"{"Object":[1]}"#,
+            r#"{"Object":{}}"#,
+        ] {
+            let original =
+                serde_json::from_value::<Projection>(serde_json::from_str(input).unwrap());
+            let pool = AllocationPoolV1::new(1 << 20).unwrap();
+            let value = endpoint::value(&pool, input.as_bytes()).unwrap();
+            let current = Projection::deserialize(&value);
+            match (original, current) {
+                (Ok(a), Ok(b)) => assert_eq!(a, b),
+                (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string()),
+                _ => panic!("enum projection mismatch: {input}"),
+            }
+            drop(value);
+            assert_eq!(pool.used(), 0);
+        }
+        for input in [
+            r#"{"1":7}"#,
+            r#"{"-1":7}"#,
+            r#"{"01":7}"#,
+            r#"{"1 ":7}"#,
+            r#"{"+1":7}"#,
+            r#"{"x":7}"#,
+            r#"{"1.0":7}"#,
+        ] {
+            type Map = std::collections::BTreeMap<i32, u64>;
+            let original = serde_json::from_value::<Map>(serde_json::from_str(input).unwrap());
+            let pool = AllocationPoolV1::new(1 << 20).unwrap();
+            let value = endpoint::value(&pool, input.as_bytes()).unwrap();
+            let current = Map::deserialize(&value);
+            match (original, current) {
+                (Ok(a), Ok(b)) => assert_eq!(a, b),
+                (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string()),
+                _ => panic!("numeric-key projection mismatch: {input}"),
+            }
+            drop(value);
+            assert_eq!(pool.used(), 0);
+        }
+        use serde::Deserialize;
+        #[derive(Deserialize)]
+        struct Borrowed<'a> {
+            name: &'a str,
+            number: u64,
+        }
+        let pool = AllocationPoolV1::new(1 << 20).unwrap();
+        let paid = endpoint::value(&pool, br#"{"name":"raw","number":7}"#).unwrap();
+        let (view, count) = measured(|| Borrowed::deserialize(&paid).unwrap());
+        assert_eq!(count, (0, 0));
+        assert_eq!(view.name, "raw");
+        assert_eq!(view.number, 7);
+        drop(paid);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn global_oidc_borrows_the_installed_owner_and_keeps_first_writer_without_allocation() {
+        use enclave_os_common::{
+            allocation::SharedAllocationV1,
+            oidc::{self, retained::RetainedOidcConfig, OidcConfig},
+            request_json::Text,
+        };
+        static OWNER: std::sync::OnceLock<SharedAllocationV1<RetainedOidcConfig>> =
+            std::sync::OnceLock::new();
+        static OTHER: OidcConfig = OidcConfig {
+            issuer: String::new(),
+            audience: String::new(),
+            jwks_uri: String::new(),
+            role_claim: String::new(),
+            manager_role: String::new(),
+            monitoring_role: String::new(),
+        };
+        let pool = AllocationPoolV1::new(1 << 20).unwrap();
+        let field = |value| Text::copy(&pool, value).unwrap();
+        let config = RetainedOidcConfig::new(
+            field("global issuer"),
+            field("a"),
+            field(""),
+            field("r"),
+            field("m"),
+            field("n"),
+        )
+        .unwrap();
+        let owner = SharedAllocationV1::reserve(&pool, 0)
+            .unwrap()
+            .finish(config);
+        assert!(OWNER.set(owner).is_ok());
+        let reference: &'static OidcConfig = OWNER.get().unwrap();
+        let (before, count) = measured(|| {
+            oidc::set_global_oidc_config(reference);
+            pool.used()
+        });
+        assert_eq!(count, (0, 0));
+        assert!(core::ptr::eq(
+            reference,
+            oidc::global_oidc_config().unwrap()
+        ));
+        assert!(oidc::is_oidc_configured());
+        let ((), count) = measured(|| oidc::set_global_oidc_config(&OTHER));
+        assert_eq!(count, (0, 0));
+        assert_eq!(pool.used(), before);
+        assert!(core::ptr::eq(
+            reference,
+            oidc::global_oidc_config().unwrap()
+        ));
+        assert_eq!(oidc::global_oidc_config().unwrap().issuer, "global issuer");
+    }
 }

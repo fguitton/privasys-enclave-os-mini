@@ -98,6 +98,24 @@ impl<'a> Text<'a> {
         }
     }
 }
+/// Crate-local transfer: backing always drops before its original field credit.
+pub(crate) struct OwnedText {
+    pub(crate) value: String,
+    pub(crate) credit: Option<AllocationLeaseV1>,
+}
+impl Text<'_> {
+    pub(crate) fn into_owned(self) -> Result<OwnedText, Refusal> {
+        let value = match self.backing {
+            TextBacking::Owned(value) => value,
+            TextBacking::Borrowed("") => String::new(),
+            TextBacking::Borrowed(_) => return Err(Refusal::Unavailable),
+        };
+        Ok(OwnedText {
+            value,
+            credit: self._allocation,
+        })
+    }
+}
 impl Default for Text<'_> {
     fn default() -> Self {
         Self::borrowed("")
@@ -222,3 +240,6 @@ impl Text<'_> {
         })
     }
 }
+
+/// Current enclave startup configuration with retained JSON backing.
+pub mod configuration;
