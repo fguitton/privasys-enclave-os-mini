@@ -15,6 +15,10 @@ mod transcript_owner_check;
 #[path = "state_owner_check.rs"]
 mod state_owner_check;
 
+#[cfg(feature = "fallible-allocation-v1")]
+#[path = "send_owner_check.rs"]
+mod send_owner_check;
+
 #[path = "../sealed_config/serialization.rs"]
 mod sealed_config_serialization;
 use sealed_config_serialization as serialization;
@@ -157,6 +161,50 @@ fn handshake(client: &mut ClientConnection, session: &mut RaTlsSession) {
     panic!("TLS handshake did not complete within the fixture bound");
 }
 
+#[cfg(feature = "fallible-allocation-v1")]
+fn checked_send_transactions() {
+    use rustls::internal::send::{connection_snapshot, encrypt_connection, request_refresh};
+    let store = CertStore::new();
+    register(&store, "send.test");
+    let (mut client, mut session) = pair(&store, "send.test");
+    handshake(&mut client, &mut session);
+    assert_eq!(
+        client.protocol_version(),
+        Some(rustls::ProtocolVersion::TLSv1_3)
+    );
+    let request = b"GET /send HTTP/1.1\r\nHost: send.test\r\n\r\n";
+    client.writer().write_all(request).unwrap();
+    session.feed_tls_bytes(&flight(&mut client)).unwrap();
+    assert!(connection_snapshot(&client).sequence > 0);
+    request_refresh(&mut client);
+    let before = connection_snapshot(&client);
+    assert_eq!(before.queued_bytes, 0);
+    assert_eq!(before.pending_bytes, 0);
+    let Err(rustls::unbuffered::EncryptError::InsufficientSize(required)) =
+        encrypt_connection(&mut client, request, &mut [])
+    else {
+        panic!("exact unbuffered refresh short-output refusal")
+    };
+    assert_eq!(connection_snapshot(&client), before);
+    let mut output = vec![0; required.required_size];
+    let written = encrypt_connection(&mut client, request, &mut output).unwrap();
+    assert_eq!(written, output.len());
+    assert_eq!(
+        send_owner_check::record_count(&output),
+        2,
+        "one key-update then one application record"
+    );
+    let refreshed = connection_snapshot(&client);
+    assert_eq!(refreshed.sequence, 1);
+    assert!(!refreshed.refresh);
+    assert!(refreshed.active);
+    session.feed_tls_bytes(&output).unwrap();
+    let written = encrypt_connection(&mut client, request, &mut output).unwrap();
+    assert_eq!(send_owner_check::record_count(&output[..written]), 1);
+    assert_eq!(connection_snapshot(&client).sequence, 2);
+    session.feed_tls_bytes(&output[..written]).unwrap();
+}
+
 fn write_requests(client: &mut ClientConnection, session: &mut RaTlsSession, requests: &[u8]) {
     client.writer().write_all(requests).unwrap();
     session.feed_tls_bytes(&flight(client)).unwrap();
@@ -183,6 +231,8 @@ fn replacement_rejects_buffered_requests_and_re_attestation() {
     {
         state_owner_check::check();
         checked_steady_state_backing();
+        send_owner_check::check();
+        checked_send_transactions();
     }
 
     sealed_config_serialization::check();

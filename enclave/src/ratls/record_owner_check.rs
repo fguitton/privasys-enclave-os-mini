@@ -2,6 +2,7 @@
 pub(super) fn check_record_wire(
     suite: rustls::SupportedCipherSuite,
     independent: &'static ring::aead::Algorithm,
+    #[cfg(feature = "fallible-allocation-v1")] allocator: rustls::RetainedAllocator,
 ) {
     use rustls::crypto::cipher::{
         make_tls13_aad, AeadKey, InboundOpaqueMessage, Iv, Nonce, OutboundChunks,
@@ -14,16 +15,32 @@ pub(super) fn check_record_wire(
     let plaintext = b"retained original record bytes";
     let seq = 7;
     let mut enc = cipher.encrypter(AeadKey::from([7; 32]), Iv::from([0; 12]));
-    let encrypted = enc
-        .encrypt(
-            OutboundPlainMessage {
-                typ: ContentType::ApplicationData,
-                version: ProtocolVersion::TLSv1_3,
-                payload: OutboundChunks::Single(plaintext),
-            },
-            seq,
+    let message = || OutboundPlainMessage {
+        typ: ContentType::ApplicationData,
+        version: ProtocolVersion::TLSv1_3,
+        payload: OutboundChunks::Single(plaintext),
+    };
+    #[cfg(feature = "fallible-allocation-v1")]
+    let encrypted = {
+        use rustls::crypto::cipher::PrefixedPayload;
+        #[cfg(any(target_env = "sgx", target_vendor = "teaclave"))]
+        let short_allocator = allocator.clone();
+        #[cfg(not(any(target_env = "sgx", target_vendor = "teaclave")))]
+        let short_allocator = allocator;
+        let short = PrefixedPayload::try_with_capacity_in(0, short_allocator).unwrap();
+        assert!(matches!(
+            enc.encrypt(message(), seq, short),
+            Err(rustls::Error::AllocationFailed)
+        ));
+        let backing = PrefixedPayload::try_with_capacity_in(
+            enc.encrypted_payload_len(plaintext.len()),
+            allocator,
         )
         .unwrap();
+        enc.encrypt(message(), seq, backing).unwrap()
+    };
+    #[cfg(not(feature = "fallible-allocation-v1"))]
+    let encrypted = enc.encrypt(message(), seq).unwrap();
     assert_eq!(encrypted.typ, ContentType::ApplicationData);
     assert_eq!(encrypted.version, ProtocolVersion::TLSv1_2);
     let mut expected = plaintext.to_vec();

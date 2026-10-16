@@ -537,7 +537,7 @@ mod provider_refusal {
                 "actual ring record keys must stay inline"
             );
             assert_eq!(arm.live, 0);
-            super::record_owner_check::check_record_wire(suite, independent);
+            super::record_owner_check::check_record_wire(suite, independent, std::alloc::Global);
         }
     }
 

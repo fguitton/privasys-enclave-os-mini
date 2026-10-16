@@ -11,6 +11,9 @@ mod transcript_owner_check;
 #[path = "state_owner_check.rs"]
 mod state_owner_check;
 
+#[path = "send_owner_check.rs"]
+mod send_owner_check;
+
 #[path = "record_owner_check.rs"]
 mod record_owner_check;
 
@@ -89,6 +92,9 @@ pub fn check_paid_session_cache(pool: &Arc<AllocationPoolV1>) -> Result<(), &'st
         return Err("cache owning pool not refunded");
     }
     check_p256(pool)?;
+    let record_before = pool.used();
+    let record_origin =
+        LoanAllocator::from_pool_unpublished(pool).map_err(|_| "record send origin")?;
     for (suite, independent) in [
         (
             rustls::crypto::ring::cipher_suite::TLS13_AES_256_GCM_SHA384,
@@ -99,9 +105,15 @@ pub fn check_paid_session_cache(pool: &Arc<AllocationPoolV1>) -> Result<(), &'st
             &ring::aead::CHACHA20_POLY1305,
         ),
     ] {
-        record_owner_check::check_record_wire(suite, independent);
+        record_owner_check::check_record_wire(suite, independent, record_origin.owned_allocator());
     }
     std::println!("TLS-RECORD-CIPHER-SIM: actual-SDK inline keys independent-AEAD byte-equality plaintext corruption-refusal PASS");
+    drop(record_origin);
+    if pool.used() != record_before {
+        return Err("record send backing refund");
+    }
+    send_owner_check::check_in(pool);
+    std::println!("TLS-SEND-TRANSACTION-SIM: original-pool descriptor/backing refusals inline-fit batch/growth FIFO prefix late-cipher invalidation close retry staged-refund retained-output PASS");
     check_input_buffer(pool)?;
     client_hello_owner_check::check_in(pool);
     transcript_owner_check::check_in(pool);
