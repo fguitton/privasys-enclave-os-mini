@@ -12,6 +12,7 @@ pub use map_allocator::PoolMapAllocator;
 pub struct AllocationPoolV1 {
     capacity: usize,
     used: AtomicUsize,
+    gross_reserved: AtomicUsize,
     released: Option<fn()>,
 }
 impl AllocationPoolV1 {
@@ -29,6 +30,7 @@ impl AllocationPoolV1 {
         Some(Arc::new(Self {
             capacity,
             used: AtomicUsize::new(0),
+            gross_reserved: AtomicUsize::new(0),
             released,
         }))
     }
@@ -49,6 +51,7 @@ impl AllocationPoolV1 {
         Arc::try_new(Self {
             capacity: available,
             used: AtomicUsize::new(0),
+            gross_reserved: AtomicUsize::new(0),
             released,
         })
         .ok()
@@ -58,6 +61,14 @@ impl AllocationPoolV1 {
     }
     pub fn used(&self) -> usize {
         self.used.load(Ordering::Acquire)
+    }
+    /// Successful reservation bytes over this pool's lifetime, across all threads.
+    /// Includes later backing-allocation failures and rollback; never decreases
+    /// on release. This is neither actual allocated bytes nor a live/peak count.
+    /// None means the monotonic observation overflowed; admission is unaffected.
+    pub fn gross_reserved_bytes(&self) -> Option<usize> {
+        let bytes = self.gross_reserved.load(Ordering::Acquire);
+        (bytes != usize::MAX).then_some(bytes)
     }
     /// Reserve before allocation; a shared payload must retain the same lease
     /// through its final alias. Failed/zero/overflowing requests consume nothing.
@@ -96,6 +107,12 @@ impl AllocationPoolV1 {
                     .filter(|next| *next <= self.capacity)
             })
             .ok()?;
+        // Saturation is an explicit unknown observation, never an admission cap.
+        let _ = self
+            .gross_reserved
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |total| {
+                Some(total.saturating_add(bytes))
+            });
         Some(())
     }
     fn release_backend_bytes(&self, bytes: usize, notify: bool) {
@@ -537,12 +554,15 @@ pub(crate) fn check_allocation_owner() {
     assert_eq!(notified.used(), 0);
     assert!(AllocationPoolV1::new(0).is_none());
     let pool = AllocationPoolV1::new(9).unwrap();
+    assert_eq!(pool.gross_reserved_bytes(), Some(0));
     assert!(pool.reserve(0).is_none());
     let first = Arc::new(pool.reserve(7).unwrap());
     let alias = first.clone();
     let second = pool.reserve(2).unwrap();
     assert_eq!(pool.used(), 9);
+    assert_eq!(pool.gross_reserved_bytes(), Some(9));
     assert!(pool.reserve(1).is_none());
+    assert_eq!(pool.gross_reserved_bytes(), Some(9));
     drop(first);
     assert_eq!(pool.used(), 9);
     drop(second);
@@ -551,11 +571,18 @@ pub(crate) fn check_allocation_owner() {
     assert!(!alias.covers(&AllocationPoolV1::new(9).unwrap(), 7));
     drop(alias);
     assert_eq!(pool.used(), 0);
+    assert_eq!(pool.gross_reserved_bytes(), Some(9));
+    drop(pool.reserve_unpublished(7).unwrap());
+    assert_eq!(pool.used(), 0);
+    assert_eq!(pool.gross_reserved_bytes(), Some(16));
     let full = AllocationPoolV1::new(usize::MAX).unwrap();
     let held = full.reserve(usize::MAX).unwrap();
     assert!(full.reserve(1).is_none());
     drop(held);
     assert_eq!(full.used(), 0);
+    assert_eq!(full.gross_reserved_bytes(), None);
+    drop(full.reserve(1).unwrap());
+    assert_eq!(full.gross_reserved_bytes(), None);
 }
 
 // The SDK ABI exists only in the explicitly selected, source-verified sysroot.
