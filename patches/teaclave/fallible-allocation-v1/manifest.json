@@ -31,6 +31,10 @@
     {
       "path": "sealed-buffers.patch",
       "sha256": "306e27d4e4cc13f9845ac7c0e5682e88652b19a79053c0b1fc4c99353ec149f5"
+    },
+    {
+      "path": "allocation-observation.patch",
+      "sha256": "1f10528543a5bf573b4537bf539983cb800c31060ecd9fd930fbe4d3a44127aa"
     }
   ],
   "files": [
@@ -57,7 +61,7 @@
     {
       "path": "sgx_alloc/src/lib.rs",
       "before_sha256": "7893e8e98a9d8248a7da0f3555bd3dca69ff4527daeba881e51af01f5525fe21",
-      "after_sha256": "4c29cab00bf5f53f355cfd71d1fbdfa747906b3548f871a69c253f249697c9f6"
+      "after_sha256": "92e454e5a39b9aa5a54212422d08b2391713bf57b4ecde42ad0e12bf12f7f065"
     },
     {
       "path": "sgx_alloc/src/owned.rs",
@@ -67,7 +71,7 @@
     {
       "path": "sgx_alloc/src/system.rs",
       "before_sha256": "50dbb71de2150643f52fbf48e077d615994553cf59591b3b17a892fd11637830",
-      "after_sha256": "50dbb71de2150643f52fbf48e077d615994553cf59591b3b17a892fd11637830"
+      "after_sha256": "99ebf496cf8eeaaf89645a6bf79e43ba793de9ed3c039daddb195d68d96586eb"
     },
     {
       "path": "sgx_sync/src/lib.rs",
@@ -127,7 +131,7 @@
     {
       "path": "sgx_tstd/src/alloc.rs",
       "before_sha256": "77bd807108ac94bc83ce38652003f4ff8814b52d77c18111a3ecd90911916b24",
-      "after_sha256": "28588d8aecfb319dda5d329f8551c1b1b7d5024ffbbf4cd91e2b732b42917d93"
+      "after_sha256": "cd2c0f968df1d87acf406e32559ee94207062ff50291678b80c889c800821298"
     },
     {
       "path": "sgx_tstd/src/collections/mod.rs",

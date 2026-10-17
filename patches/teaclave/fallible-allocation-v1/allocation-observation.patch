@@ -1,0 +1,85 @@
+--- a/sgx_alloc/src/system.rs
++++ b/sgx_alloc/src/system.rs
+@@ -30,6 +30,30 @@
+ #[cfg(target_arch = "x86_64")]
+ const MIN_ALIGN: usize = 16;
+ 
++// Successful backend layout requests, across all enclave threads. A failed
++// request contributes nothing. This is neither usable malloc size nor a peak.
++static ALLOCATED_LAYOUT_BYTES: core::sync::atomic::AtomicUsize =
++    core::sync::atomic::AtomicUsize::new(0);
++
++/// Cumulative requested bytes of successful System backend allocations.
++/// Includes successful realloc requests at their new requested size, including
++/// in-place changes. Delegating paths record once. Direct C calls that bypass
++/// System are outside this counter. None permanently denotes overflow.
++pub fn successful_allocation_bytes() -> Option<usize> {
++    let value = ALLOCATED_LAYOUT_BYTES.load(core::sync::atomic::Ordering::Relaxed);
++    if value == usize::MAX { None } else { Some(value) }
++}
++fn record_allocation(pointer: *mut u8, bytes: usize) -> *mut u8 {
++    if !pointer.is_null() {
++        let _ = ALLOCATED_LAYOUT_BYTES.fetch_update(
++            core::sync::atomic::Ordering::Relaxed,
++            core::sync::atomic::Ordering::Relaxed,
++            |old| Some(old.checked_add(bytes).unwrap_or(usize::MAX)),
++        );
++    }
++    pointer
++}
++
+ pub struct System;
+ 
+ impl System {
+@@ -222,17 +246,18 @@
+     unsafe impl GlobalAlloc for System {
+         #[inline]
+         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+-            if layout.align() <= MIN_ALIGN && layout.align() <= layout.size() {
++            let pointer = if layout.align() <= MIN_ALIGN && layout.align() <= layout.size() {
+                 libc::malloc(layout.size()) as *mut u8
+             } else {
+                 aligned_malloc(&layout)
+-            }
++            };
++            record_allocation(pointer, layout.size())
+         }
+ 
+         #[inline]
+         unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+             if layout.align() <= MIN_ALIGN && layout.align() <= layout.size() {
+-                libc::calloc(layout.size(), 1) as *mut u8
++                record_allocation(libc::calloc(layout.size(), 1) as *mut u8, layout.size())
+             } else {
+                 let ptr = self.alloc(layout);
+                 if !ptr.is_null() {
+@@ -250,7 +275,7 @@
+         #[inline]
+         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+             if layout.align() <= MIN_ALIGN && layout.align() <= new_size {
+-                libc::realloc(ptr as *mut c_void, new_size) as *mut u8
++                record_allocation(libc::realloc(ptr as *mut c_void, new_size) as *mut u8, new_size)
+             } else {
+                 self.realloc_fallback(ptr, layout, new_size)
+             }
+--- a/sgx_alloc/src/lib.rs
++++ b/sgx_alloc/src/lib.rs
+@@ -51,3 +51,6 @@
+ 
+ pub mod fallible_c;
+ pub use fallible_c::{drain_pending_c_releases, CAllocationError, CAllocationHandle, FallibleCSystem, OwnedCAllocation};
++
++/// Diagnostic successful backend layout-request bytes, never a memory quota.
++pub use system::successful_allocation_bytes;
+--- a/sgx_tstd/src/alloc.rs
++++ b/sgx_tstd/src/alloc.rs
+@@ -77,6 +77,9 @@
+ pub use alloc_crate::alloc::*;
+ 
+ pub use sgx_alloc::System;
++/// Successful requested backend bytes, all enclave threads; None on overflow.
++/// Not a malloc usable-size, live-byte or peak measurement.
++pub use sgx_alloc::successful_allocation_bytes;
+ /// Explicit fallible allocator; quota refusal never enters a global OOM handler.
+ pub use sgx_alloc::{AllocationTicket, FallibleAllocationHooks, FallibleSystem};
+ 
