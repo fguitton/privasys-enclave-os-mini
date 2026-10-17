@@ -677,12 +677,7 @@ fn build_attested_client_config(
     policy: &RaTlsPolicy,
     pool: Option<&Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> Result<RetainedClientConfig, &'static str> {
-    let ReportDataBinding::ChallengeResponse { nonce } = &policy.report_data else {
-        return Err("attested-only TLS requires challenge-response report data");
-    };
-    if nonce.len() != 32 {
-        return Err("attested-only TLS challenge must be exactly 32 bytes");
-    }
+    validate_attested_challenge(policy)?;
     if policy.mr_enclave.is_none() && policy.mr_td.is_none() {
         return Err("attested-only TLS requires an expected enclave measurement");
     }
@@ -692,6 +687,16 @@ fn build_attested_client_config(
     }
 
     config::build(server_name, None, Some(policy), true, pool)
+}
+
+fn validate_attested_challenge(policy: &RaTlsPolicy) -> Result<(), &'static str> {
+    let ReportDataBinding::ChallengeResponse { nonce } = &policy.report_data else {
+        return Err("attested-only TLS requires challenge-response report data");
+    };
+    if nonce.len() != 32 {
+        return Err("attested-only TLS challenge must be exactly 32 bytes");
+    }
+    Ok(())
 }
 
 // =========================================================================

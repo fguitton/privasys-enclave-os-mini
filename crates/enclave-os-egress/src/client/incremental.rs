@@ -97,38 +97,7 @@ impl IncrementalTlsClient {
         let retained_config =
             build_client_config(server_name, root_store, ratls.as_ref(), pool.as_ref())
                 .map_err(str::to_string)?;
-        let identity = retained_config.identity().cloned();
-        let server_name =
-            retained_config
-                .server_name(server_name)
-                .map_err(|error| match error {
-                    super::config::NameError::Allocation => {
-                        "TLS config allocation refused".to_string()
-                    }
-                    super::config::NameError::Invalid => {
-                        "invalid incremental TLS server name".to_string()
-                    }
-                })?;
-        let mut tls_conn =
-            start_client_connection(retained_config.config(), server_name, pool.as_ref())?;
-        // Rustls's smaller default plaintext buffer would otherwise undercut
-        // the explicit request bound below. Keep the queue finite and aligned
-        // with the public incremental-client contract.
-        tls_conn.set_buffer_limit(Some(MAX_INCREMENTAL_REQUEST));
-        retained_config.publish();
-        Ok(Self {
-            tls_conn,
-            ratls,
-            channel_verified: false,
-            plaintext: Vec::new(),
-            plaintext_allocation: None,
-            application_pool: pool,
-            identity,
-            exchange: None,
-            failed: false,
-            appraisal_pending: false,
-            _retained_config: retained_config,
-        })
+        Self::from_config(server_name, ratls, pool, retained_config, false)
     }
 
     /// Construct a TLS 1.3 client for an enclave-owned CA, authenticating the
@@ -141,8 +110,51 @@ impl IncrementalTlsClient {
         require_connection_origin(pool.as_ref())?;
         let retained_config = build_attested_client_config(server_name, &policy, pool.as_ref())
             .map_err(str::to_string)?;
-        let identity = retained_config.identity().cloned();
         let appraisal_pending = !policy.attestation_servers.is_empty();
+        Self::from_config(
+            server_name,
+            Some(policy),
+            pool,
+            retained_config,
+            appraisal_pending,
+        )
+    }
+
+    /// Construct a channel-bound mutual RA-TLS transport whose owner pumps
+    /// quote appraisal separately. This establishes TLS key possession, not
+    /// application authority: the owner must appraise both connection proofs
+    /// and check the remote measurement and role before sending any request.
+    /// Ordinary HTTPS and operator clients must use their existing factories.
+    /// # Errors
+    /// Refuses a missing client identity, non-challenge policy, remote appraisal
+    /// URLs, invalid TLS configuration, or failure of the original allocator.
+    pub fn new_attested_deferred(
+        server_name: &str,
+        policy: RaTlsPolicy,
+        pool: Option<ConnectionPool>,
+    ) -> Result<Self, String> {
+        require_connection_origin(pool.as_ref())?;
+        super::validate_attested_challenge(&policy).map_err(str::to_string)?;
+        if policy.client_identity.is_none() || !policy.attestation_servers.is_empty() {
+            return Err(
+                "deferred mutual TLS requires a client identity and external appraisal owner"
+                    .into(),
+            );
+        }
+        let retained_config =
+            super::config::build(server_name, None, Some(&policy), true, pool.as_ref())
+                .map_err(str::to_string)?;
+        Self::from_config(server_name, Some(policy), pool, retained_config, false)
+    }
+
+    fn from_config(
+        server_name: &str,
+        ratls: Option<RaTlsPolicy>,
+        pool: Option<ConnectionPool>,
+        retained_config: super::RetainedClientConfig,
+        appraisal_pending: bool,
+    ) -> Result<Self, String> {
+        let identity = retained_config.identity().cloned();
         let server_name =
             retained_config
                 .server_name(server_name)
@@ -160,7 +172,7 @@ impl IncrementalTlsClient {
         retained_config.publish();
         Ok(Self {
             tls_conn,
-            ratls: Some(policy),
+            ratls,
             channel_verified: false,
             plaintext: Vec::new(),
             plaintext_allocation: None,
@@ -555,7 +567,7 @@ mod tests {
 
     use super::{IncrementalTlsClient, MAX_INCREMENTAL_REQUEST};
     #[cfg(any(not(feature = "mock"), feature = "sgx-sim-attestation"))]
-    use crate::client::{RaTlsPolicy, ReportDataBinding, TeeType};
+    use crate::client::{ClientCertIdentity, RaTlsPolicy, ReportDataBinding, TeeType};
 
     #[test]
     fn rustls_buffer_does_not_undercut_the_declared_request_bound() {
@@ -669,6 +681,7 @@ mod tests {
             client_identity: None,
             dependencies: None,
         };
+        check_deferred_mutual_constructor(policy.clone());
         assert_eq!(
             IncrementalTlsClient::new_attested("local-control.invalid", policy, None)
                 .err()
@@ -692,6 +705,50 @@ mod tests {
             client_identity: None,
             dependencies: None,
         };
+        check_deferred_mutual_constructor(policy.clone());
         assert!(IncrementalTlsClient::new_attested("local-control.invalid", policy, None).is_ok());
+    }
+    #[cfg(any(not(feature = "mock"), feature = "sgx-sim-attestation"))]
+    fn check_deferred_mutual_constructor(mut policy: RaTlsPolicy) {
+        let pool = enclave_os_common::allocation::AllocationPoolV1::new(usize::MAX).unwrap();
+        let make = |policy| {
+            IncrementalTlsClient::new_attested_deferred(
+                "peer.s1.invalid",
+                policy,
+                Some(pool.clone()),
+            )
+        };
+        assert!(
+            make(policy.clone()).is_err(),
+            "missing mutual client identity"
+        );
+        policy.client_identity = Some(ClientCertIdentity {
+            code_hash: vec![0; 32],
+            app_id: None,
+        });
+        let mut invalid = policy.clone();
+        invalid.report_data = ReportDataBinding::Deterministic;
+        assert!(make(invalid).is_err(), "missing connection challenge");
+        let mut invalid = policy.clone();
+        invalid.report_data = ReportDataBinding::ChallengeResponse { nonce: vec![9; 31] };
+        assert!(make(invalid).is_err(), "short connection challenge");
+        let mut invalid = policy.clone();
+        invalid
+            .attestation_servers
+            .push("https://appraiser.invalid".into());
+        assert!(
+            make(invalid).is_err(),
+            "blocking appraisal URLs are forbidden"
+        );
+        assert_eq!(pool.used(), 0, "invalid capability allocates no config");
+        let mut client = make(policy).expect("actual externally appraised transport config");
+        assert!(
+            !client.is_ready(),
+            "constructor is not an appraised channel"
+        );
+        assert!(client.write_plaintext(b"not yet authorized").is_err());
+        assert!(!client.collect_tls_output().unwrap().is_empty());
+        drop(client);
+        assert_eq!(pool.used(), 0, "same config and connection owner refunds");
     }
 }
