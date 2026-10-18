@@ -74,6 +74,11 @@ def prepare(source, destination):
         verified(output, row['sha256'])
     subprocess.run([str(PATCH), '--batch', '--fuzz=0', '-p1', '-i', str(patch)],
                    cwd=destination, check=True)
+    # Patch creates added files through the caller's umask. Restore their
+    # manifest-owned modes so strict gates behave identically under umask 077.
+    for row in supplier['files']:
+        if row['before_sha256'] is None:
+            (destination / relative(row['path'])).chmod(row['mode'])
     expected_after = {row['path']: row['sha256'] for row in original}
     expected_after.update({row['path']: row['after_sha256'] for row in supplier['files']})
     generated = []
