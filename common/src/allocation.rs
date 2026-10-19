@@ -1,16 +1,20 @@
 //! Shared transient allocation admission. Numeric capacity grants no authority.
+mod mandatory;
 #[cfg(feature = "fallible-allocation-v1")]
 mod map_allocator;
 /// Pool-bound fallible ordered metadata backing; child admission remains separate.
 pub mod ordered_map;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+pub use mandatory::{AdmissionV1, MandatoryAuthorityV1, MandatoryCreditV1, MandatoryTokenV1};
 #[cfg(feature = "fallible-allocation-v1")]
 pub use map_allocator::PoolMapAllocator;
 
 #[derive(Debug)]
 pub struct AllocationPoolV1 {
     capacity: usize,
+    /// Bytes below capacity that only mandatory cleanup tokens may use.
+    floor: AtomicUsize,
     used: AtomicUsize,
     gross_reserved: AtomicUsize,
     released: Option<fn()>,
@@ -29,6 +33,7 @@ impl AllocationPoolV1 {
         }
         Some(Arc::new(Self {
             capacity,
+            floor: AtomicUsize::new(0),
             used: AtomicUsize::new(0),
             gross_reserved: AtomicUsize::new(0),
             released,
@@ -50,6 +55,7 @@ impl AllocationPoolV1 {
             .filter(|bytes| *bytes != 0)?;
         Arc::try_new(Self {
             capacity: available,
+            floor: AtomicUsize::new(0),
             used: AtomicUsize::new(0),
             gross_reserved: AtomicUsize::new(0),
             released,
@@ -98,13 +104,20 @@ impl AllocationPoolV1 {
     // The same original-pool admission serves move-only leases and explicit
     // backend headers. Header owners retain the pool until actual free.
     fn reserve_backend_bytes(&self, bytes: usize) -> Option<()> {
+        self.admit(bytes, self.ordinary_capacity())
+    }
+    /// Admission up to the whole capacity, floor included, for a mandatory
+    /// token's pre-reservation only.
+    fn reserve_mandatory_bytes(&self, bytes: usize) -> Option<()> {
+        self.admit(bytes, self.capacity)
+    }
+    fn admit(&self, bytes: usize, limit: usize) -> Option<()> {
         if bytes == 0 {
             return None;
         }
         self.used
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(bytes)
-                    .filter(|next| *next <= self.capacity)
+                used.checked_add(bytes).filter(|next| *next <= limit)
             })
             .ok()?;
         // Saturation is an explicit unknown observation, never an admission cap.
@@ -132,6 +145,14 @@ pub struct AllocationLeaseV1 {
     notify: AtomicBool,
 }
 impl AllocationLeaseV1 {
+    /// A lease over bytes a mandatory token already counted as used.
+    fn already_reserved(pool: Arc<AllocationPoolV1>, bytes: usize) -> Self {
+        Self {
+            pool,
+            bytes,
+            notify: AtomicBool::new(false),
+        }
+    }
     pub fn bytes(&self) -> usize {
         self.bytes
     }
@@ -227,8 +248,15 @@ impl<T> SharedAllocationV1<T> {
         pool: &Arc<AllocationPoolV1>,
         retained_child_bytes: usize,
     ) -> Option<SharedAllocationReservationV1<T>> {
+        Self::reserve_in(&AdmissionV1::Ordinary(pool.clone()), retained_child_bytes)
+    }
+    /// Reserve through `admission`: ordinary headroom or a mandatory token.
+    pub fn reserve_in(
+        admission: &AdmissionV1,
+        retained_child_bytes: usize,
+    ) -> Option<SharedAllocationReservationV1<T>> {
         Self::from_admission(
-            pool.reserve_unpublished(Self::required_bytes(retained_child_bytes)?)?,
+            admission.reserve_unpublished(Self::required_bytes(retained_child_bytes)?)?,
             retained_child_bytes,
         )
     }
@@ -255,6 +283,22 @@ impl<T> SharedAllocationV1<T> {
         retained_child_bytes: usize,
         clone: impl FnOnce(&T) -> Result<T, E>,
     ) -> Result<&mut T, SharedMutationErrorV1<E>> {
+        self.try_make_unique_in(
+            &AdmissionV1::Ordinary(pool.clone()),
+            retained_child_bytes,
+            clone,
+        )
+    }
+    /// As [`Self::try_make_unique_with`], admitting a copy through `admission`.
+    /// # Errors
+    /// Refuses a foreign pool, admission, clone failure or actual Arc refusal.
+    pub fn try_make_unique_in<E>(
+        &mut self,
+        admission: &AdmissionV1,
+        retained_child_bytes: usize,
+        clone: impl FnOnce(&T) -> Result<T, E>,
+    ) -> Result<&mut T, SharedMutationErrorV1<E>> {
+        let pool = admission.pool();
         let credit = self
             .credit
             .as_ref()
@@ -275,8 +319,8 @@ impl<T> SharedAllocationV1<T> {
             }
             return self.get_mut().ok_or(SharedMutationErrorV1::Allocation);
         }
-        let reservation =
-            Self::reserve(pool, retained_child_bytes).ok_or(SharedMutationErrorV1::Admission)?;
+        let reservation = Self::reserve_in(admission, retained_child_bytes)
+            .ok_or(SharedMutationErrorV1::Admission)?;
         let value = match clone(self) {
             Ok(value) => value,
             Err(error) => {
@@ -429,6 +473,7 @@ impl<T, C> Drop for SharedAllocationV1<T, C> {
 #[cfg(test)]
 pub(crate) fn check_allocation_owner() {
     ordered_map::check();
+    mandatory::check();
     assert_eq!(bounded_vec_capacity(0, 3), None);
     assert_eq!(bounded_vec_capacity(2, 3), Some(2));
     assert_eq!(bounded_vec_capacity(3, 3), Some(3));

@@ -1,5 +1,5 @@
 //! Physically fallible node backing from one original pool.
-use super::{AllocationLeaseV1, AllocationPoolV1, SharedAllocationV1};
+use super::{AdmissionV1, AllocationLeaseV1, AllocationPoolV1, SharedAllocationV1};
 use alloc::sync::Arc;
 use core::{
     alloc::{AllocError, Allocator, Layout},
@@ -9,7 +9,7 @@ use core::{
 use std::alloc::System;
 
 struct Origin {
-    pool: Arc<AllocationPoolV1>,
+    admission: AdmissionV1,
     published: AtomicBool,
 }
 
@@ -37,9 +37,17 @@ impl PoolMapAllocator {
     /// # Errors
     /// Refuses metadata admission or actual Arc allocation without publishing.
     pub fn try_new(pool: &Arc<AllocationPoolV1>) -> Result<Self, AllocError> {
-        let reservation = SharedAllocationV1::reserve(pool, 0).ok_or(AllocError)?;
+        Self::try_new_in(&AdmissionV1::Ordinary(pool.clone()))
+    }
+
+    /// As [`Self::try_new`], with the origin and every node admitted through
+    /// `admission`: a mandatory token's credit while it lives.
+    /// # Errors
+    /// Refuses metadata admission or actual Arc allocation without publishing.
+    pub fn try_new_in(admission: &AdmissionV1) -> Result<Self, AllocError> {
+        let reservation = SharedAllocationV1::reserve_in(admission, 0).ok_or(AllocError)?;
         let origin = reservation.try_finish_unpublished(Origin {
-            pool: pool.clone(),
+            admission: admission.clone(),
             published: AtomicBool::new(false),
         })?;
         Ok(Self { origin })
@@ -85,7 +93,7 @@ unsafe impl Allocator for PoolMapAllocator {
         let (backend, offset) = Self::geometry(node)?;
         let lease = self
             .origin
-            .pool
+            .admission
             .reserve_unpublished(backend.size())
             .ok_or(AllocError)?;
         let allocation = System.allocate(backend)?;
