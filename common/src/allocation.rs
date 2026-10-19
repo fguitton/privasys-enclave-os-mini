@@ -16,6 +16,9 @@ pub struct AllocationPoolV1 {
     /// Bytes below capacity that only mandatory cleanup tokens may use.
     floor: AtomicUsize,
     used: AtomicUsize,
+    /// Serializes every admission against floor installation and removal, so
+    /// no admission decides against a floor that changes before it commits.
+    admission: AtomicBool,
     gross_reserved: AtomicUsize,
     released: Option<fn()>,
 }
@@ -35,6 +38,7 @@ impl AllocationPoolV1 {
             capacity,
             floor: AtomicUsize::new(0),
             used: AtomicUsize::new(0),
+            admission: AtomicBool::new(false),
             gross_reserved: AtomicUsize::new(0),
             released,
         }))
@@ -57,6 +61,7 @@ impl AllocationPoolV1 {
             capacity: available,
             floor: AtomicUsize::new(0),
             used: AtomicUsize::new(0),
+            admission: AtomicBool::new(false),
             gross_reserved: AtomicUsize::new(0),
             released,
         })
@@ -104,22 +109,46 @@ impl AllocationPoolV1 {
     // The same original-pool admission serves move-only leases and explicit
     // backend headers. Header owners retain the pool until actual free.
     fn reserve_backend_bytes(&self, bytes: usize) -> Option<()> {
-        self.admit(bytes, self.ordinary_capacity())
+        self.admit(bytes, false)
     }
     /// Admission up to the whole capacity, floor included, for a mandatory
     /// token's pre-reservation only.
     fn reserve_mandatory_bytes(&self, bytes: usize) -> Option<()> {
-        self.admit(bytes, self.capacity)
+        self.admit(bytes, true)
     }
-    fn admit(&self, bytes: usize, limit: usize) -> Option<()> {
+    /// Run `change` while no other admission or floor change can interleave.
+    /// The section only reads and writes this pool's counters.
+    fn serialized<R>(&self, change: impl FnOnce() -> R) -> R {
+        while self
+            .admission
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        let result = change();
+        self.admission.store(false, Ordering::Release);
+        result
+    }
+    fn admit(&self, bytes: usize, mandatory: bool) -> Option<()> {
         if bytes == 0 {
             return None;
         }
-        self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(bytes).filter(|next| *next <= limit)
-            })
-            .ok()?;
+        self.serialized(|| {
+            let limit = if mandatory {
+                self.capacity
+            } else {
+                self.capacity - self.floor.load(Ordering::Acquire)
+            };
+            // Releases stay lock-free and only lower `used`, so the update
+            // retries over them rather than overwriting them.
+            self.used
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                    used.checked_add(bytes).filter(|next| *next <= limit)
+                })
+                .ok()
+                .map(|_| ())
+        })?;
         // Saturation is an explicit unknown observation, never an admission cap.
         let _ = self
             .gross_reserved

@@ -44,17 +44,25 @@ impl AllocationPoolV1 {
     /// Refuses a second protection, a zero floor, or a floor that does not fit
     /// beside the bytes already admitted.
     pub fn protect_floor(self: &Arc<Self>, floor: usize) -> Option<MandatoryAuthorityV1> {
-        if floor == 0
-            || self
-                .used()
-                .checked_add(floor)
-                .is_none_or(|bytes| bytes > self.capacity)
-        {
+        if floor == 0 {
             return None;
         }
-        self.floor
-            .compare_exchange(0, floor, Ordering::AcqRel, Ordering::Acquire)
-            .ok()?;
+        // Serialized with every admission: at installation the pool holds no
+        // more than its new ordinary capacity, and no admission decided
+        // against the previous floor can commit afterwards.
+        self.serialized(|| {
+            if self.floor.load(Ordering::Acquire) != 0
+                || self
+                    .used
+                    .load(Ordering::Acquire)
+                    .checked_add(floor)
+                    .is_none_or(|bytes| bytes > self.capacity)
+            {
+                return None;
+            }
+            self.floor.store(floor, Ordering::Release);
+            Some(())
+        })?;
         Some(MandatoryAuthorityV1 { pool: self.clone() })
     }
     /// The capacity ordinary admission may use.
@@ -89,7 +97,8 @@ impl MandatoryAuthorityV1 {
 
 impl Drop for MandatoryAuthorityV1 {
     fn drop(&mut self) {
-        self.pool.floor.store(0, Ordering::Release);
+        self.pool
+            .serialized(|| self.pool.floor.store(0, Ordering::Release));
     }
 }
 
@@ -234,4 +243,43 @@ pub(super) fn check() {
     let bound = pool.protect_floor(floor).unwrap();
     assert_eq!(pool.ordinary_capacity(), 60);
     drop((bound, held));
+    floor_installation_races_admission();
+}
+
+/// Ordinary reservers race repeated floor installation and removal. Each
+/// would fit three at a time without the floor and only one beside it, so an
+/// admission decided against a stale limit would push `used` past the
+/// protected limit while the floor holds.
+#[cfg(test)]
+fn floor_installation_races_admission() {
+    use core::sync::atomic::{AtomicBool, AtomicUsize};
+    let pool = AllocationPoolV1::new(1000).unwrap();
+    let stop = AtomicBool::new(false);
+    let admitted = AtomicUsize::new(0);
+    let mut protected = 0_usize;
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                while !stop.load(Ordering::Acquire) {
+                    if let Some(lease) = pool.reserve(300) {
+                        admitted.fetch_add(1, Ordering::Relaxed);
+                        core::hint::spin_loop();
+                        drop(lease);
+                    }
+                }
+            });
+        }
+        for _ in 0..20_000 {
+            if let Some(authority) = pool.protect_floor(600) {
+                protected += 1;
+                for _ in 0..64 {
+                    assert!(pool.used() <= 400, "ordinary admission entered the floor");
+                }
+                drop(authority);
+            }
+        }
+        stop.store(true, Ordering::Release);
+    });
+    assert!(protected > 0 && admitted.load(Ordering::Relaxed) > 0);
+    assert_eq!(pool.used(), 0);
 }
