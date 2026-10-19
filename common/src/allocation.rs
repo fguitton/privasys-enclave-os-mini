@@ -166,6 +166,10 @@ impl AllocationPoolV1 {
         Some(())
     }
     fn release_backend_bytes(&self, bytes: usize, notify: bool) {
+        #[cfg(feature = "std")]
+        if growth::refund_lent(self, bytes) {
+            return;
+        }
         self.used.fetch_sub(bytes, Ordering::AcqRel);
         if notify {
             if let Some(released) = self.released {

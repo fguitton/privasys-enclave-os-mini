@@ -2,9 +2,11 @@
 //!
 //! A step that must not fail part-way reserves its whole ordinary growth in
 //! one admission before it starts. While the credit is lent on a thread,
-//! every ordinary admission of its pool on that thread draws only on it: the
-//! step can neither run short of headroom other work took meanwhile nor grow
-//! past what it declared.
+//! every ordinary admission of its pool on that thread draws only on it, and
+//! every release of that pool on that thread returns to it: the step can
+//! neither run short of headroom other work took meanwhile nor grow past
+//! what it declared, and what it frees it may reuse. The credit therefore
+//! bounds the step's net growth.
 use super::mandatory::ReservedCreditV1;
 use super::AllocationPoolV1;
 use alloc::sync::Arc;
@@ -90,6 +92,17 @@ pub(super) fn admit_lent(pool: &AllocationPoolV1, bytes: usize) -> Option<Option
     })
 }
 
+/// Return `bytes` released from `pool` to the open credit of that pool lent
+/// on this thread; false when there is none.
+pub(super) fn refund_lent(pool: &AllocationPoolV1, bytes: usize) -> bool {
+    LENT.with(|lent| {
+        let lent = lent.borrow();
+        lent.as_ref().is_some_and(|credit| {
+            core::ptr::eq(Arc::as_ptr(&credit.pool), pool) && credit.refund(bytes)
+        })
+    })
+}
+
 #[cfg(test)]
 pub(super) fn check() {
     let pool = AllocationPoolV1::new(1000).unwrap();
@@ -110,17 +123,28 @@ pub(super) fn check() {
         assert!(pool.reserve(1).is_none());
         // Another pool is admitted ordinarily.
         drop(other.reserve(10).unwrap());
-        drop((first, second));
-        assert_eq!(pool.used(), 600);
+        // What the step frees returns to its credit, not to the pool: net
+        // growth, not gross allocation, is bounded.
+        drop(first);
+        assert_eq!((pool.used(), growth.remaining()), (900, 200));
+        let again = pool.reserve(200).unwrap();
+        assert_eq!(growth.remaining(), 0);
+        drop((again, second));
+        assert_eq!((pool.used(), growth.remaining()), (900, 300));
     }
-    // Unlent, ordinary admission returns; dropping returns unused credit.
+    // Closing returns the refunded credit to the pool.
+    drop(growth);
+    assert_eq!(pool.used(), 600);
+    // Unlent, ordinary admission and release return to the pool; dropping a
+    // credit returns what it holds.
     assert!(pool.reserve(100).is_some_and(|lease| {
         drop(lease);
         true
     }));
+    assert_eq!(pool.used(), 600);
     let unused = pool.reserve_growth(50).unwrap();
     assert_eq!(pool.used(), 650);
     drop(unused);
-    drop((growth, held));
+    drop(held);
     assert_eq!(pool.used(), 0);
 }

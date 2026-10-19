@@ -133,6 +133,15 @@ impl ReservedCreditV1 {
     pub(super) fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }
+    /// Return `bytes` freed while the credit is open; they stay counted as
+    /// used until the credit closes.
+    pub(super) fn refund(&self, bytes: usize) -> bool {
+        if self.is_closed() {
+            return false;
+        }
+        self.remaining.fetch_add(bytes, Ordering::AcqRel);
+        true
+    }
     /// Take `bytes` of the credit, all of them or none.
     pub(super) fn take(&self, bytes: usize) -> Option<()> {
         self.remaining
