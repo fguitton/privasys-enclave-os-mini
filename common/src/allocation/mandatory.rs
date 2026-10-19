@@ -19,13 +19,14 @@ pub struct MandatoryAuthorityV1 {
 /// Credit pre-reserved for one cleanup transition. Move-only.
 #[derive(Debug)]
 pub struct MandatoryTokenV1 {
-    credit: Arc<MandatoryCreditV1>,
+    credit: Arc<ReservedCreditV1>,
 }
 
-/// A token's pre-reserved credit, shared with the allocators it admits.
+/// Bytes already counted as used, split into leases without charging the
+/// pool again; whatever is not split returns when its owner closes it.
 #[derive(Debug)]
-pub struct MandatoryCreditV1 {
-    pool: Arc<AllocationPoolV1>,
+pub struct ReservedCreditV1 {
+    pub(super) pool: Arc<AllocationPoolV1>,
     remaining: AtomicUsize,
     closed: AtomicBool,
 }
@@ -35,7 +36,7 @@ pub struct MandatoryCreditV1 {
 #[derive(Clone, Debug)]
 pub enum AdmissionV1 {
     Ordinary(Arc<AllocationPoolV1>),
-    Mandatory(Arc<MandatoryCreditV1>),
+    Mandatory(Arc<ReservedCreditV1>),
 }
 
 impl AllocationPoolV1 {
@@ -82,11 +83,7 @@ impl MandatoryAuthorityV1 {
         }
         self.pool.reserve_mandatory_bytes(demand)?;
         Some(MandatoryTokenV1 {
-            credit: Arc::new(MandatoryCreditV1 {
-                pool: self.pool.clone(),
-                remaining: AtomicUsize::new(demand),
-                closed: AtomicBool::new(false),
-            }),
+            credit: Arc::new(ReservedCreditV1::reserved(self.pool.clone(), demand)),
         })
     }
     #[must_use]
@@ -111,33 +108,56 @@ impl MandatoryTokenV1 {
     /// Credit not yet split into leases.
     #[must_use]
     pub fn remaining(&self) -> usize {
-        self.credit.remaining.load(Ordering::Acquire)
+        self.credit.remaining()
     }
 }
 
 impl Drop for MandatoryTokenV1 {
     fn drop(&mut self) {
-        // Close first: allocators that outlive the token fall back to
-        // ordinary admission and can no longer draw on returned credit.
-        self.credit.closed.store(true, Ordering::Release);
-        let unused = self.credit.remaining.swap(0, Ordering::AcqRel);
-        if unused != 0 {
-            self.credit.pool.release_backend_bytes(unused, true);
-        }
+        self.credit.close();
     }
 }
 
-impl MandatoryCreditV1 {
-    fn split(&self, bytes: usize) -> Option<AllocationLeaseV1> {
+impl ReservedCreditV1 {
+    /// Credit over `bytes` the caller has already admitted to `pool`.
+    pub(super) fn reserved(pool: Arc<AllocationPoolV1>, bytes: usize) -> Self {
+        Self {
+            pool,
+            remaining: AtomicUsize::new(bytes),
+            closed: AtomicBool::new(false),
+        }
+    }
+    pub(super) fn remaining(&self) -> usize {
+        self.remaining.load(Ordering::Acquire)
+    }
+    pub(super) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+    /// Take `bytes` of the credit, all of them or none.
+    pub(super) fn take(&self, bytes: usize) -> Option<()> {
         self.remaining
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                 remaining.checked_sub(bytes)
             })
-            .ok()?;
+            .ok()
+            .map(|_| ())
+    }
+    fn split(&self, bytes: usize) -> Option<AllocationLeaseV1> {
+        self.take(bytes)?;
         Some(AllocationLeaseV1::already_reserved(
             self.pool.clone(),
             bytes,
         ))
+    }
+    /// Close first, so allocators that outlive the owner fall back to
+    /// ordinary admission and cannot draw on returned credit, then return
+    /// what was not taken.
+    pub(super) fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        let unused = self.remaining.swap(0, Ordering::AcqRel);
+        if unused != 0 {
+            self.pool.release_backend_bytes(unused, true);
+        }
     }
 }
 
@@ -160,7 +180,7 @@ impl AdmissionV1 {
                 if bytes == 0 {
                     return None;
                 }
-                if credit.closed.load(Ordering::Acquire) {
+                if credit.is_closed() {
                     return credit.pool.reserve_unpublished(bytes);
                 }
                 credit.split(bytes)

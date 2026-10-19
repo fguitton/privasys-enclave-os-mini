@@ -1,4 +1,6 @@
 //! Shared transient allocation admission. Numeric capacity grants no authority.
+#[cfg(feature = "std")]
+mod growth;
 mod mandatory;
 #[cfg(feature = "fallible-allocation-v1")]
 mod map_allocator;
@@ -6,7 +8,9 @@ mod map_allocator;
 pub mod ordered_map;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-pub use mandatory::{AdmissionV1, MandatoryAuthorityV1, MandatoryCreditV1, MandatoryTokenV1};
+#[cfg(feature = "std")]
+pub use growth::{GrowthCreditV1, GrowthLendV1};
+pub use mandatory::{AdmissionV1, MandatoryAuthorityV1, MandatoryTokenV1, ReservedCreditV1};
 #[cfg(feature = "fallible-allocation-v1")]
 pub use map_allocator::PoolMapAllocator;
 
@@ -109,6 +113,10 @@ impl AllocationPoolV1 {
     // The same original-pool admission serves move-only leases and explicit
     // backend headers. Header owners retain the pool until actual free.
     fn reserve_backend_bytes(&self, bytes: usize) -> Option<()> {
+        #[cfg(feature = "std")]
+        if let Some(admitted) = growth::admit_lent(self, bytes) {
+            return admitted;
+        }
         self.admit(bytes, false)
     }
     /// Admission up to the whole capacity, floor included, for a mandatory
@@ -503,6 +511,8 @@ impl<T, C> Drop for SharedAllocationV1<T, C> {
 pub(crate) fn check_allocation_owner() {
     ordered_map::check();
     mandatory::check();
+    #[cfg(feature = "std")]
+    growth::check();
     assert_eq!(bounded_vec_capacity(0, 3), None);
     assert_eq!(bounded_vec_capacity(2, 3), Some(2));
     assert_eq!(bounded_vec_capacity(3, 3), Some(3));
