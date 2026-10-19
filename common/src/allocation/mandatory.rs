@@ -10,6 +10,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// The single capability that may issue mandatory cleanup tokens for one pool.
 /// It is not `Clone`; its owner decides which commands receive tokens.
+/// Dropping it lifts the floor, so a refused owner's retry can protect again.
 #[derive(Debug)]
 pub struct MandatoryAuthorityV1 {
     pool: Arc<AllocationPoolV1>,
@@ -40,9 +41,15 @@ pub enum AdmissionV1 {
 impl AllocationPoolV1 {
     /// Protect `floor` bytes from ordinary admission and return the one
     /// authority that may spend them.
-    /// Refuses a second protection, a zero floor or a floor beyond capacity.
+    /// Refuses a second protection, a zero floor, or a floor that does not fit
+    /// beside the bytes already admitted.
     pub fn protect_floor(self: &Arc<Self>, floor: usize) -> Option<MandatoryAuthorityV1> {
-        if floor == 0 || floor > self.capacity {
+        if floor == 0
+            || self
+                .used()
+                .checked_add(floor)
+                .is_none_or(|bytes| bytes > self.capacity)
+        {
             return None;
         }
         self.floor
@@ -77,6 +84,12 @@ impl MandatoryAuthorityV1 {
     #[must_use]
     pub fn pool(&self) -> &Arc<AllocationPoolV1> {
         &self.pool
+    }
+}
+
+impl Drop for MandatoryAuthorityV1 {
+    fn drop(&mut self) {
+        self.pool.floor.store(0, Ordering::Release);
     }
 }
 
@@ -210,4 +223,15 @@ pub(super) fn check() {
     }));
     assert!(outlived.reserve_unpublished(61).is_none());
     assert_eq!(pool.used(), 0);
+    // Dropping the authority lifts the floor; the pool may be protected again.
+    drop(authority);
+    assert_eq!(pool.ordinary_capacity(), capacity);
+    assert!(pool.protect_floor(floor).is_some());
+    // Admitted state plus the floor must fit: limit+1, limit, and overflow.
+    let held = pool.reserve(60).unwrap();
+    assert!(pool.protect_floor(floor + 1).is_none());
+    assert!(pool.protect_floor(usize::MAX).is_none());
+    let bound = pool.protect_floor(floor).unwrap();
+    assert_eq!(pool.ordinary_capacity(), 60);
+    drop((bound, held));
 }
