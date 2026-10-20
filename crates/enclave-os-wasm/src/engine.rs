@@ -124,8 +124,11 @@ impl WasmEngine {
     /// Wasmtime validates the header and will reject corrupt data, but
     /// loading arbitrary native code is inherently unsafe.
     pub fn deserialize(&self, precompiled_bytes: &[u8]) -> Result<Component, String> {
-        // SAFETY: pre-compiled bytes come from the trusted build pipeline.
-        // The enclave verifies the code hash before loading.
+        // SAFETY: wasmtime requires `precompiled_bytes` to be its own output
+        // for this engine's settings. Nothing in this crate checks their
+        // origin or hash: callers must pass only bytes the trusted build
+        // pipeline produced. The source guard keeps this crate out of the
+        // product.
         unsafe {
             Component::deserialize(&self.engine, precompiled_bytes)
                 .map_err(|e| format!("WASM deserialization failed: {}", e))
