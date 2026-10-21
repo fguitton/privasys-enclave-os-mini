@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create an exact task-owned SDK copy for the default-off allocation profile."""
+"""Create an exact task-owned SDK copy for the fallible allocation profile."""
 import argparse
 import hashlib
 import json

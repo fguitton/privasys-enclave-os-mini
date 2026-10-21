@@ -1,4 +1,4 @@
-# Verbatim bounded extraction from reviewed stock script; see manifest.
+# Reviewed network-off Autotools generation and refusal owners; see manifest.
 AUTOTOOLS_GENERATED_FILES=(
   INSTALL
   Makefile.in

@@ -33,9 +33,15 @@
 git clone https://github.com/Privasys/enclave-os-mini.git
 cd enclave-os-mini
 
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release     -DHONEST_PINNED_TEACLAVE_FALLIBLE_SOURCE=$PWD/build/sdk-source     -DHONEST_TEACLAVE_FALLIBLE_AUTOTOOLS_RECEIPT=/absolute/autotools/input-receipt.json
 cmake --build build -j$(nproc)
 ```
+
+Every enclave build compiles against the fallible-allocation SDK source
+profile. Prepare its build-owned SDK mirror and pregenerated libunwind input
+receipt as described in
+[`patches/teaclave/fallible-allocation-v1/README.md`](../patches/teaclave/fallible-allocation-v1/README.md);
+configuration refuses an enclave build without them.
 
 Outputs in `build/bin/`:
 - `enclave-os-host` — untrusted host binary
@@ -84,6 +90,8 @@ points CMake at the composition crate that registers the WASM module.
 | `CMAKE_BUILD_TYPE` | `Debug` | `Release` for production (LTO, no debug symbols) |
 | `RUST_ENCLAVE_SOURCE_ROOT` | source checkout | Source prefix remapped to `/workspace` for path-independent enclave measurements |
 | `CUSTOM_ENCLAVE_DIR` | *(none)* | Absolute path to an adopter-owned enclave composition `staticlib` crate |
+| `HONEST_PINNED_TEACLAVE_FALLIBLE_SOURCE` | *(none)* | Build-owned fallible-allocation SDK mirror inside the build directory (required for enclave builds) |
+| `HONEST_TEACLAVE_FALLIBLE_AUTOTOOLS_RECEIPT` | *(none)* | Pregenerated libunwind input receipt for that mirror (required for enclave builds) |
 | `SOURCE_DATE_EPOCH` | `0` | Stable build epoch fed to Cargo for reproducible enclave artifacts |
 | `ENABLE_WASM` | `OFF` | Enable the WASM runtime module |
 | `WASM_ENCLAVE_DIR` | *(none)* | Path to the WASM composition crate (required when `ENABLE_WASM=ON`) |

@@ -142,49 +142,15 @@ if(BUILD_ENCLAVE)
     require_sdk230_teaclave("${TEACLAVE_CHECKOUT}")
 endif()
 
-# The SGX-SIM gate may mirror the already verified revision into its bounded
-# CMake build tree so compiler inputs can be mounted read-only while generated
-# Cargo output stays disposable. This is SIM-only, must be inside
-# CMAKE_BINARY_DIR, and retains the exact branch-owned patched source.
-set(HONEST_PINNED_TEACLAVE_SIM_SOURCE "" CACHE PATH
-    "Bounded exact Teaclave source mirror used only by the SGX-SIM gate")
-if(HONEST_PINNED_TEACLAVE_SIM_SOURCE)
-    if(NOT SGX_MODE STREQUAL "SIM")
-        message(FATAL_ERROR "The bounded Teaclave source mirror is SGX-SIM-only")
-    endif()
-    file(REAL_PATH "${HONEST_PINNED_TEACLAVE_SIM_SOURCE}"
-        TEACLAVE_SIM_SOURCE_REAL)
-    file(REAL_PATH "${CMAKE_BINARY_DIR}" CMAKE_BINARY_REAL)
-    string(FIND "${TEACLAVE_SIM_SOURCE_REAL}" "${CMAKE_BINARY_REAL}/"
-        TEACLAVE_SIM_SOURCE_PREFIX)
-    if(NOT TEACLAVE_SIM_SOURCE_PREFIX EQUAL 0)
-        message(FATAL_ERROR "The bounded Teaclave source mirror is outside the build tree")
-    endif()
-    set(TEACLAVE_PATCHED_SOURCE
-        "${TEACLAVE_SIM_SOURCE_REAL}/sgx_unwind/libunwind/src/mi/mempool.c")
-    if(NOT EXISTS "${TEACLAVE_PATCHED_SOURCE}" OR IS_SYMLINK "${TEACLAVE_PATCHED_SOURCE}")
-        message(FATAL_ERROR "The bounded Teaclave patched source is invalid")
-    endif()
-    file(SHA256 "${TEACLAVE_PATCHED_SOURCE}" TEACLAVE_PATCHED_SOURCE_SHA256)
-    if(NOT TEACLAVE_PATCHED_SOURCE_SHA256 STREQUAL
-        "623824d8f94eaa2a1a39de4a352f35f17417c89378891deef586a4be3fdaed70")
-        message(FATAL_ERROR "The bounded Teaclave patched source identity is invalid")
-    endif()
-    set(TEACLAVE_CHECKOUT "${TEACLAVE_SIM_SOURCE_REAL}")
-    require_sdk230_teaclave("${TEACLAVE_CHECKOUT}")
-endif()
-
-# The optional allocator source is a verified, build-owned mirror for both
-# HW and SIM. Identity remains the original pinned checkout; no global SDK is
-# edited. Cargo acquisition must select the same owned source explicitly.
+# The enclave compiles against the fallible-allocation SDK source profile, a
+# verified build-owned mirror for both HW and SIM. Identity remains the
+# original pinned checkout; no global SDK is edited. Cargo acquisition selects
+# the same owned source explicitly.
 set(HONEST_PINNED_TEACLAVE_FALLIBLE_SOURCE "" CACHE PATH
-    "Build-owned SDK source for the default-off fallible allocation profile")
-if(HONEST_PINNED_TEACLAVE_FALLIBLE_SOURCE)
-    if(NOT HONEST_TEACLAVE_FALLIBLE_ALLOCATION_V1)
-        message(FATAL_ERROR "Fallible SDK mirror requires explicit allocation profile")
-    endif()
-    if(HONEST_PINNED_TEACLAVE_SIM_SOURCE)
-        message(FATAL_ERROR "Use one selected SDK source mirror, not conflicting mirrors")
+    "Build-owned SDK source for the fallible allocation profile")
+if(BUILD_ENCLAVE)
+    if(NOT HONEST_PINNED_TEACLAVE_FALLIBLE_SOURCE)
+        message(FATAL_ERROR "The enclave requires the build-owned fallible-allocation SDK source")
     endif()
     file(REAL_PATH "${HONEST_PINNED_TEACLAVE_FALLIBLE_SOURCE}" _fallible_source_real)
     file(REAL_PATH "${CMAKE_BINARY_DIR}" _fallible_build_real)

@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "profile": "fallible-allocation-v1",
-  "status": "default-off-source-proposal-not-complete-allocator",
+  "status": "selected-source-profile-not-complete-allocator",
   "base_sdk_commit": "2330b2a5aa8404d3c0a38e9d3a760144549f4943",
   "patches": [
     {
@@ -176,7 +176,7 @@
     "TLS/config/crypto fallible allocation graph",
     "Connected C allocation and raw ownership compatibility",
     "New std/native/trusted/signed-SIM owning qualification",
-    "Early fixed-futex SDK startup/consumer runtime qualification; source wired, experimental profile remains default-off",
+    "Early fixed-futex SDK startup/consumer runtime qualification; source wired and selected by every enclave build",
     "Explicit C-system API is not C free/Drop or global/TLS enforcement: Busy retry, actual held-origin provider, no symbol interposition, fallible library consumer closure required.",
     "Typed thread factory source pending actual new std and runtime qualification; lazy current-thread and TLS remain open."
   ],
@@ -189,13 +189,13 @@
     },
     {
       "path": "approved-functions.sh",
-      "sha256": "24acd61c83e3ed9155cf479a92f0fe864476f4be9ac5642aa41d6433ae77ab1c",
+      "sha256": "735b6715b77dc7cffc7ad6e3f87e59324dd044237f2b5b5b1a08009280d8a9c2",
       "mode": 420
     }
   ],
   "autotools_owner": {
     "path": "scripts/ci/test-teaclave-sim.sh",
-    "sha256": "ac1f2de829482b230f4cb4bf7a85c20c915925df8633e09c639064ab185a210b",
+    "sha256": "a49da7322a8ad27c9f0101abf9fd0fa802f551d0800c80382c28cc800b7e1d75",
     "mode": 493
   }
 }
