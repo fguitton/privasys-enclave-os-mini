@@ -152,6 +152,10 @@ impl ReservedCreditV1 {
             .map(|_| ())
     }
     fn split(&self, bytes: usize) -> Option<AllocationLeaseV1> {
+        #[cfg(feature = "allocation-fault-fixture")]
+        if self.pool.fault.refuses() {
+            return None;
+        }
         self.take(bytes)?;
         Some(AllocationLeaseV1::already_reserved(
             self.pool.clone(),

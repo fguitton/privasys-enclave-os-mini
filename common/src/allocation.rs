@@ -1,4 +1,6 @@
 //! Shared transient allocation admission. Numeric capacity grants no authority.
+#[cfg(feature = "allocation-fault-fixture")]
+mod fault;
 #[cfg(feature = "std")]
 mod growth;
 mod mandatory;
@@ -25,6 +27,8 @@ pub struct AllocationPoolV1 {
     admission: AtomicBool,
     gross_reserved: AtomicUsize,
     released: Option<fn()>,
+    #[cfg(feature = "allocation-fault-fixture")]
+    fault: fault::Fault,
 }
 impl AllocationPoolV1 {
     /// Construct from the caller's actual physical admission input. This is not
@@ -45,6 +49,8 @@ impl AllocationPoolV1 {
             admission: AtomicBool::new(false),
             gross_reserved: AtomicUsize::new(0),
             released,
+            #[cfg(feature = "allocation-fault-fixture")]
+            fault: fault::Fault::default(),
         }))
     }
     /// Fallible measured startup root, before any child pool or loan exists.
@@ -68,6 +74,8 @@ impl AllocationPoolV1 {
             admission: AtomicBool::new(false),
             gross_reserved: AtomicUsize::new(0),
             released,
+            #[cfg(feature = "allocation-fault-fixture")]
+            fault: fault::Fault::default(),
         })
         .ok()
     }
@@ -113,6 +121,10 @@ impl AllocationPoolV1 {
     // The same original-pool admission serves move-only leases and explicit
     // backend headers. Header owners retain the pool until actual free.
     fn reserve_backend_bytes(&self, bytes: usize) -> Option<()> {
+        #[cfg(feature = "allocation-fault-fixture")]
+        if self.fault.refuses() {
+            return None;
+        }
         #[cfg(feature = "std")]
         if let Some(admitted) = growth::admit_lent(self, bytes) {
             return admitted;
@@ -517,6 +529,8 @@ pub(crate) fn check_allocation_owner() {
     mandatory::check();
     #[cfg(feature = "std")]
     growth::check();
+    #[cfg(all(feature = "std", feature = "allocation-fault-fixture"))]
+    fault::check();
     assert_eq!(bounded_vec_capacity(0, 3), None);
     assert_eq!(bounded_vec_capacity(2, 3), Some(2));
     assert_eq!(bounded_vec_capacity(3, 3), Some(3));

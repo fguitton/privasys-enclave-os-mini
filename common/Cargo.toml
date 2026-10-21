@@ -11,6 +11,8 @@ description = "Shared types and protocol definitions for enclave-os-mini"
 [features]
 # Explicit new-SDK loan API; native/default allocator behavior stays unchanged.
 fallible-allocation-v1 = []
+# Fixture only: refuse a chosen admission draw of a pool, numbered in order.
+allocation-fault-fixture = []
 # Native admission proofs require the verified build-owned request JSON source.
 request-json-tests = ["crypto", "jwt", "request-json-parser", "serde_json/std"]
 # Pool-explicit parser; requires the verified build-owned JSON supplier.
