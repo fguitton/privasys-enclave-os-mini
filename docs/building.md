@@ -33,7 +33,9 @@
 git clone https://github.com/Privasys/enclave-os-mini.git
 cd enclave-os-mini
 
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release     -DHONEST_PINNED_TEACLAVE_FALLIBLE_SOURCE=$PWD/build/sdk-source     -DHONEST_TEACLAVE_FALLIBLE_AUTOTOOLS_RECEIPT=/absolute/autotools/input-receipt.json
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+    -DHONEST_PINNED_TEACLAVE_FALLIBLE_SOURCE=$PWD/build/sdk-source \
+    -DHONEST_TEACLAVE_FALLIBLE_AUTOTOOLS_RECEIPT=/absolute/autotools/input-receipt.json
 cmake --build build -j$(nproc)
 ```
 

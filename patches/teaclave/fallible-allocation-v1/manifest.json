@@ -195,7 +195,7 @@
   ],
   "autotools_owner": {
     "path": "scripts/ci/test-teaclave-sim.sh",
-    "sha256": "a49da7322a8ad27c9f0101abf9fd0fa802f551d0800c80382c28cc800b7e1d75",
+    "sha256": "121ce9cd3fc49c7079664fdcc87456b0034a36432cd9aae8d70b40a123058659",
     "mode": 493
   }
 }
