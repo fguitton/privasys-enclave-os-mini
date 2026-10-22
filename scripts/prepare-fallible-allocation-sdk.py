@@ -71,6 +71,11 @@ def prepare(source, identity, destination):
         if digest(old) != digest(new):
             raise ValueError('SDK copy differs: ' + name)
         copied.append({'path': name, 'sha256': digest(new)})
+    # Patched files keep their copied modes and new files take the patch's
+    # regular-file mode, independent of the caller's umask.
+    modes = {row['path']: (destination / row['path']).stat().st_mode & 0o777
+             if row['before_sha256'] is not None else 0o644
+             for row in manifest['files']}
     for patch in patches:
         subprocess.run(['git', 'apply', '--check', str(patch)],
                        cwd=destination, check=True, env={'PATH': '/usr/bin:/bin', 'GIT_CEILING_DIRECTORIES': str(parent)})
@@ -79,6 +84,8 @@ def prepare(source, identity, destination):
     after = []
     for row in manifest['files']:
         path = destination / row['path']
+        if path.is_file() and not path.is_symlink():
+            path.chmod(modes[row['path']])
         if not path.is_file() or path.is_symlink() or digest(path) != row['after_sha256']:
             raise ValueError('patched SDK differs: ' + row['path'])
         after.append({'path': row['path'], 'sha256': digest(path)})
