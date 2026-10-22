@@ -531,7 +531,15 @@ fn request_with_status(
     let response =
         BoundedHttpsRequest::new(method, &url, headers.to_vec(), (body).map(<[u8]>::to_vec))
             .and_then(|request| {
-                https_fetch_interruptible(&mut GlobalOcallNetIo, &request, roots, Some(&policy))
+                // Native client: the allocation-pool origin applies only to
+                // the fallible Teaclave target.
+                https_fetch_interruptible(
+                    &mut GlobalOcallNetIo,
+                    &request,
+                    roots,
+                    Some(&policy),
+                    None,
+                )
             })?;
     Ok((response.status, response.body))
 }
