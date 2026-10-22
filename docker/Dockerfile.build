@@ -8,20 +8,23 @@
 # BUILD:
 #   docker build -f docker/Dockerfile.build -t privasys/enclave-os-build:v0.3 .
 #
-# USE (build the enclave):
-#   docker run --rm -v $(pwd):/src privasys/enclave-os-build:v0.3
+# USE (build the enclave; mount the parent Honest repository whose
+# third_party/privasys/enclave-os-mini submodule is this tree):
+#   docker run --rm --security-opt seccomp=unconfined \
+#     -v /path/to/honest-ehds:/honest privasys/enclave-os-build:v0.3
+# The SDK input preparation runs bubblewrap, which needs unprivileged user
+# namespaces inside the container.
 #
-# The container outputs:
-#   /src/build/bin/enclave.signed.so   — Signed enclave binary
-#   /src/build/bin/enclave-os-host     — Host binary
-#   /src/build/mrenclave.txt           — Hex-encoded MRENCLAVE
+# The container outputs, relative to the mounted Mini tree:
+#   build/bin/enclave.signed.so   — Signed enclave binary
+#   build/bin/enclave-os-host     — Host binary
+#   build/mrenclave.txt           — Hex-encoded MRENCLAVE
 #
 # ─── Pinned versions ─────────────────────────────────────────────────────
-# Ubuntu         24.04  (noble)
-# GCC            13.3.0
-# Binutils/ld    2.42
-# cmake          3.28.x  (from Ubuntu repos)
-# Intel SGX SDK  2.29.100.1  (binary installer — controls sgx_sign/sgx_edger8r)
+# Ubuntu         26.04  (matches the reviewed Autotools/perl inputs)
+# GCC            13.x (gcc-13 / g++-13 packages)
+# cmake          from Ubuntu repos
+# Intel SGX SDK  2.30.101.1  (binary installer, SHA-256 pinned)
 # SGX apt pkgs   latest from Intel repo (host-side only, don't affect MRENCLAVE)
 # Rust           nightly-2026-06-21  → rustc 1.98.0-nightly (8b6558a02)
 # LLVM           22.1.7  (bundled with rustc)
@@ -30,7 +33,7 @@
 
 # Pin by tag; for maximum reproducibility, replace with a digest:
 #   docker pull ubuntu:24.04 && docker inspect --format='{{index .RepoDigests 0}}' ubuntu:24.04
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 LABEL org.opencontainers.image.source="https://github.com/Privasys/enclave-os-mini"
 LABEL org.opencontainers.image.description="Reproducible build environment for enclave-os-mini"
@@ -50,6 +53,9 @@ ENV PATH="${CARGO_HOME}/bin:${PATH}"
 # ── System packages ──────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
+        gcc-13 \
+        g++-13 \
+        bubblewrap \
         cmake \
         autoconf \
         automake \
@@ -84,7 +90,8 @@ RUN mkdir -p /etc/apt/keyrings \
 
 # Install SGX SDK (provides sgx_edger8r, sgx_sign, headers, link libraries)
 RUN wget -qO /tmp/sgx_sdk.bin \
-        "https://download.01.org/intel-sgx/sgx-linux/2.29/distro/ubuntu24.04-server/sgx_linux_x64_sdk_2.29.100.1.bin" \
+        "https://download.01.org/intel-sgx/sgx-linux/2.30.1/distro/ubuntu24.04-server/sgx_linux_x64_sdk_2.30.101.1.bin" \
+    && echo "5e3908ad32d271855a8d089da38e1d85590a1bb866452e9578fef198c5ed07d8  /tmp/sgx_sdk.bin" | sha256sum -c - \
     && chmod +x /tmp/sgx_sdk.bin \
     && echo "yes" | /tmp/sgx_sdk.bin --prefix=/opt/intel \
     && rm /tmp/sgx_sdk.bin
@@ -102,5 +109,5 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 COPY docker/build-enclave.sh /usr/local/bin/build-enclave
 RUN chmod +x /usr/local/bin/build-enclave
 
-WORKDIR /src
+WORKDIR /honest
 ENTRYPOINT ["build-enclave"]

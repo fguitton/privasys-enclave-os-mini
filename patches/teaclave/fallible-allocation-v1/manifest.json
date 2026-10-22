@@ -184,7 +184,7 @@
   "build_inputs": [
     {
       "path": "prepare-inputs.sh",
-      "sha256": "445996213105d231d6f8c72dabb956994fb76ba8c5622a663108f947be205eab",
+      "sha256": "e0f7e2c2c4ecc83dafa834accdc2d81ced50e8e962854355287379ba08e72a8f",
       "mode": 420
     },
     {
@@ -192,10 +192,5 @@
       "sha256": "735b6715b77dc7cffc7ad6e3f87e59324dd044237f2b5b5b1a08009280d8a9c2",
       "mode": 420
     }
-  ],
-  "autotools_owner": {
-    "path": "scripts/ci/test-teaclave-sim.sh",
-    "sha256": "f4a3afbeaa9665bc6d5ef5c6b51c783673e85a54eb676a79af7aa129d774f862",
-    "mode": 493
-  }
+  ]
 }

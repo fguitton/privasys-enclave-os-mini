@@ -7,12 +7,12 @@ main_source=$(realpath -e -- "$1")
 teaclave_checkout=$(realpath -e -- "$2")
 [[ $3 == /* && ! -e $3 && ! -L $3 ]] || exit 64
 helper_root=$(cd -- "$(dirname -- "$0")" && pwd)
-# The profile manifest is the sole digest/path/mode owner. It hashes this
-# script after authoring; this script reads those declarations without a cycle.
-generation_owner=$(/usr/bin/python3 -I -B - "$main_source" "$helper_root" <<'OWNERS'
+# The profile manifest is the sole digest/path/mode owner of this script and
+# of approved-functions.sh, the Autotools generation and refusal owner.
+/usr/bin/python3 -I -B - "$helper_root" <<'OWNERS'
 from pathlib import Path, PurePosixPath
 import hashlib,json,re,sys
-main,helper=map(Path,sys.argv[1:])
+helper=Path(sys.argv[1])
 def unique(pairs):
  result={}
  for key,value in pairs:
@@ -41,15 +41,11 @@ def verify(root,row):
  if hashlib.sha256(path.read_bytes()).hexdigest()!=expected:
   raise ValueError('SDK generation owner bytes differ')
  return path
-owner=verify(main,manifest['autotools_owner'])
 for name in ('prepare-inputs.sh','approved-functions.sh'):
  rows=[row for row in manifest['build_inputs'] if row['path']==name]
  if len(rows)!=1:raise ValueError('SDK generation input declaration differs')
  verify(helper,rows[0])
-print(owner)
 OWNERS
-)
-readonly generation_owner
 mkdir -- "$3"
 BUILD_ROOT=$(realpath -e -- "$3")
 BWRAP_BIN=/usr/bin/bwrap
@@ -112,14 +108,14 @@ negative_check_autogen_failure_propagation "$BUILD_ROOT" "$source_mirror"
 validate_autotools_outputs "$source_mirror"
 [[ $(hash_source_without_autotools_outputs "$source_mirror") == "$unchanged" ]]
 full_tree=$(hash_tree "$source_mirror")
-/usr/bin/python3 -I -B - "$BUILD_ROOT" "$helper_root" "$main_source" "$teaclave_checkout" "$unchanged" "$full_tree" "$generation_owner" <<'RECEIPT'
+/usr/bin/python3 -I -B - "$BUILD_ROOT" "$helper_root" "$main_source" "$teaclave_checkout" "$unchanged" "$full_tree" <<'RECEIPT'
 from pathlib import Path
 import hashlib,json,os,sys
 out,helper,main,checkout=map(Path,sys.argv[1:5]);sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
 files=[]
 for p in sorted((out/'source').rglob('*')):
  if p.is_file():files.append({'path':str(p.relative_to(out/'source')),'mode':oct(p.stat().st_mode&0o777),'sha256':sha(p)})
-receipt={'schema':1,'scope':'task-owned pregenerated libunwind input only; no build/execution/stock-complete qualification','source_checkout':str(checkout),'mount_source':str(out/'source/sgx_unwind/libunwind'),'mount_destination':str(checkout/'sgx_unwind/libunwind'),'mount_required':'read-only private namespace only','required_build_env':{'HONEST_TEACLAVE_PREGENERATED_AUTOTOOLS':'1','SGX_MODE':'SIM'},'source_excluding_generated_sha256':sys.argv[5],'whole_input_tree_sha256':sys.argv[6],'files':files,'bindings':{str(p):sha(p) for p in [helper/'prepare-inputs.sh',helper/'approved-functions.sh',Path(sys.argv[7]),out/'source-inputs.json',out/'approved-patches.json',out/'autotools-data.tsv',out/'generation-tools.tsv']}}
+receipt={'schema':1,'scope':'task-owned pregenerated libunwind input only; no build/execution/stock-complete qualification','source_checkout':str(checkout),'mount_source':str(out/'source/sgx_unwind/libunwind'),'mount_destination':str(checkout/'sgx_unwind/libunwind'),'mount_required':'read-only private namespace only','required_build_env':{'HONEST_TEACLAVE_PREGENERATED_AUTOTOOLS':'1','SGX_MODE':'SIM'},'source_excluding_generated_sha256':sys.argv[5],'whole_input_tree_sha256':sys.argv[6],'files':files,'bindings':{str(p):sha(p) for p in [helper/'prepare-inputs.sh',helper/'approved-functions.sh',out/'source-inputs.json',out/'approved-patches.json',out/'autotools-data.tsv',out/'generation-tools.tsv']}}
 (out/'input-receipt.json').write_text(json.dumps(receipt,indent=2)+'\n')
 print(out/'input-receipt.json')
 RECEIPT

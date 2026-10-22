@@ -47,7 +47,7 @@ version and ensures byte-identical output.
 docker build -f docker/Dockerfile.build -t privasys/enclave-os-build .
 
 # Build the enclave
-docker run --rm -v $(pwd):/src privasys/enclave-os-build
+docker run --rm --security-opt seccomp=unconfined -v /path/to/honest-ehds:/honest privasys/enclave-os-build
 
 # Check MRENCLAVE
 cat build/mrenclave.txt
@@ -63,7 +63,7 @@ cat build/mrenclave.txt
 | GCC | 13.3.0 | Ubuntu 24.04 default |
 | Binutils/ld | 2.42 | Ubuntu 24.04 default |
 | cmake | 3.28.x | Ubuntu 24.04 default |
-| Intel SGX SDK | 2.29.100.1 | Pinned in Dockerfile |
+| Intel SGX SDK | 2.30.101.1 | Pinned in Dockerfile (SHA-256) |
 | Teaclave SGX SDK | privasys-v0.4.0 | Pinned in `Cargo.lock` |
 | All Cargo deps | exact versions | `Cargo.lock` (committed) |
 
@@ -97,7 +97,7 @@ cd enclave-os-mini
 
 # Build in the same container
 docker build -f docker/Dockerfile.build -t enclave-build .
-docker run --rm -v $(pwd):/src enclave-build
+docker run --rm --security-opt seccomp=unconfined -v /path/to/honest-ehds:/honest enclave-build
 
 # Compare MRENCLAVE with the release
 cat build/mrenclave.txt

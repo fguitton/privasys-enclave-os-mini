@@ -5,11 +5,15 @@
 # build-enclave.sh — Deterministic build of enclave-os-mini inside the Docker container.
 #
 # This script is the ENTRYPOINT for docker/Dockerfile.build.
-# It expects the source tree to be mounted at /src.
+# It expects the parent Honest repository, with this tree as its
+# third_party/privasys/enclave-os-mini submodule, to be mounted at /honest:
+# the enclave's fallible-allocation SDK inputs are prepared by that
+# repository's shared helper from its reviewed SDK patches.
 
 set -euo pipefail
 
-SRC=/src
+HONEST_SOURCE=/honest
+SRC="${HONEST_SOURCE}/third_party/privasys/enclave-os-mini"
 BUILD_DIR="${SRC}/build"
 BIN_DIR="${BUILD_DIR}/bin"
 
@@ -32,7 +36,7 @@ echo "╚═══════════════════════�
 echo ""
 echo "  rustc : $(rustc --version)"
 echo "  cargo : $(cargo --version)"
-echo "  gcc   : $(gcc --version | head -1)"
+echo "  gcc   : $(gcc-13 --version | head -1)"
 echo "  cmake : $(cmake --version | head -1)"
 echo "  sgx   : ${SGX_SDK:-/opt/intel/sgxsdk}"
 echo ""
@@ -44,6 +48,23 @@ cargo fetch --locked
 
 # Also fetch the enclave crate (separate workspace)
 cargo fetch --locked --manifest-path enclave/Cargo.toml
+
+# ── Step 1b: Fallible-allocation SDK inputs ─────────────────────────────
+# The patched Cargo checkout is the reviewed SDK source and its identity; the
+# enclave compiles against the profile mirror and Autotools receipt built here.
+echo "==> Preparing fallible-allocation SDK inputs..."
+TEACLAVE_CHECKOUT=$(SGX_SDK_PATH=/opt/intel/sgxsdk \
+    "${HONEST_SOURCE}/scripts/lab/lib/closure-3-teaclave-compat.sh" --apply "${SRC}" \
+    | awk -F '\t' '$1 == "teaclave_checkout" {print $2}')
+[[ -n "${TEACLAVE_CHECKOUT}" ]] || { echo "ERROR: Teaclave preparation failed" >&2; exit 1; }
+FALLIBLE_SOURCE="${BUILD_DIR}/fallible-sdk-source"
+FALLIBLE_AUTOTOOLS="${BUILD_DIR}/fallible-sdk-autotools"
+mkdir -p "${BUILD_DIR}"
+rm -rf -- "${FALLIBLE_SOURCE}" "${FALLIBLE_AUTOTOOLS}"
+bash "${HONEST_SOURCE}/scripts/ci/lib/prepare-fallible-sdk-inputs.sh" \
+    "${TEACLAVE_CHECKOUT}" "${TEACLAVE_CHECKOUT}" \
+    "${FALLIBLE_SOURCE}" "${FALLIBLE_AUTOTOOLS}"
+export HONEST_TEACLAVE_PREGENERATED_AUTOTOOLS=1
 
 # ── Step 2: CMake configure ─────────────────────────────────────────────
 #
@@ -72,8 +93,10 @@ cmake -S "${SRC}" -B "${BUILD_DIR}" \
     -DCMAKE_BUILD_TYPE=Release \
     "${FLAVOR_FLAGS[@]}" \
     ${EXTRA_CMAKE_FLAGS:-} \
-    -DCMAKE_C_COMPILER=gcc \
-    -DCMAKE_CXX_COMPILER=g++
+    -DCMAKE_C_COMPILER=gcc-13 \
+    -DCMAKE_CXX_COMPILER=g++-13 \
+    -DHONEST_PINNED_TEACLAVE_FALLIBLE_SOURCE="${FALLIBLE_SOURCE}" \
+    -DHONEST_TEACLAVE_FALLIBLE_AUTOTOOLS_RECEIPT="${FALLIBLE_AUTOTOOLS}/input-receipt.json"
 
 # ── Step 3: Build everything ────────────────────────────────────────────
 echo "==> Building enclave + host..."
