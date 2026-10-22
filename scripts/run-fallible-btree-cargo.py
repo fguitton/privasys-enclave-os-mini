@@ -37,6 +37,13 @@ def source_inputs(compiler):
     return sysroot.resolve(strict=True), version, hosts[0]
 
 
+def remove_owned(path):
+    """Remove an owned acquisition, including read-only copied library files."""
+    for directory, _, _ in os.walk(path):
+        os.chmod(directory, 0o700)
+    shutil.rmtree(path)
+
+
 def acquire(compiler, build_root):
     functions = runpy.run_path(str(ROOT / 'scripts/prepare-fallible-btree-source.py'))
     original, version, host = source_inputs(compiler)
@@ -56,6 +63,10 @@ def acquire(compiler, build_root):
     recipe = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     build_root.mkdir(parents=True, exist_ok=True)
     owned = build_root / recipe
+    # producer.json is written last and atomically: without it, an earlier
+    # acquisition was interrupted and its partial directory owns nothing.
+    if owned.exists() and not (owned / 'producer.json').is_file():
+        remove_owned(owned)
     if owned.exists():
         record = json.loads((owned / 'producer.json').read_text())
         if record['identity'] != identity:
@@ -71,17 +82,23 @@ def acquire(compiler, build_root):
                 raise ValueError('existing BTree compiler wrapper differs')
     else:
         owned.mkdir()
-        receipt = functions['prepare'](supplier, owned / 'library')
-        compiler_wrapper = functions['sysroot_view'](original, owned / 'library', owned / 'sysroot', compiler)
-        rustdoc = configured('rustdoc')
-        document_wrapper = owned / 'rustdoc'
-        document_wrapper.write_text('#!/bin/sh\nexec ' + shlex.quote(str(rustdoc))
-                                    + ' --sysroot ' + shlex.quote(str(owned / 'sysroot')) + ' "$@"\n')
-        document_wrapper.chmod(0o755)
-        record = {'identity': identity, 'host': host,
-                  'rustc_sha256': digest(compiler_wrapper), 'rustdoc_sha256': digest(document_wrapper),
-                  'source_receipt_sha256': digest(owned / 'source-receipt.json')}
-        (owned / 'producer.json').write_text(json.dumps(record, indent=2) + '\n')
+        try:
+            receipt = functions['prepare'](supplier, owned / 'library')
+            compiler_wrapper = functions['sysroot_view'](original, owned / 'library', owned / 'sysroot', compiler)
+            rustdoc = configured('rustdoc')
+            document_wrapper = owned / 'rustdoc'
+            document_wrapper.write_text('#!/bin/sh\nexec ' + shlex.quote(str(rustdoc))
+                                        + ' --sysroot ' + shlex.quote(str(owned / 'sysroot')) + ' "$@"\n')
+            document_wrapper.chmod(0o755)
+            record = {'identity': identity, 'host': host,
+                      'rustc_sha256': digest(compiler_wrapper), 'rustdoc_sha256': digest(document_wrapper),
+                      'source_receipt_sha256': digest(owned / 'source-receipt.json')}
+            pending = owned / 'producer.json.pending'
+            pending.write_text(json.dumps(record, indent=2) + '\n')
+            os.replace(pending, owned / 'producer.json')
+        except BaseException:
+            remove_owned(owned)
+            raise
     if (owned / 'sysroot/lib/rustlib/src/rust/library').resolve(strict=True) != owned / 'library':
         raise ValueError('owned sysroot does not select generated liballoc source')
     return owned, functions, receipt, host

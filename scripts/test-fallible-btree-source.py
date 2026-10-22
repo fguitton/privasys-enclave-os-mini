@@ -109,6 +109,50 @@ class Controls(unittest.TestCase):
         self.assertEqual(json.loads((output / 'receipt.json').read_text())['status'], 'FAIL')
         self.assertEqual(selected_roots, [self.root / 'target/fallible-btree-source'])
 
+    def acquisition_fixture(self):
+        # A fake compiler whose sysroot supplies the pinned liballoc inputs.
+        import os
+        import sys
+        sysroot = self.root / 'toolchain'
+        library = sysroot / 'lib/rustlib/src/rust/library'
+        shutil.copytree(self.source, library)
+        for path in library.rglob('*'):
+            if path.is_file():
+                path.chmod(0o444)
+        (sysroot / 'bin').mkdir()
+        compiler = sysroot / 'bin/rustc'
+        compiler.write_text('#!' + sys.executable + '\nimport sys\n'
+                            + 'a=sys.argv[1:]\n'
+                            + 'root=a[a.index("--sysroot")+1] if "--sysroot" in a else ' + repr(str(sysroot)) + '\n'
+                            + 'print(root if "sysroot" in a else "rustc fixture\\nhost: x86_64-unknown-linux-gnu")\n')
+        compiler.chmod(0o755)
+        rustdoc = sysroot / 'bin/rustdoc'
+        rustdoc.write_text('#!/bin/sh\n')
+        rustdoc.chmod(0o755)
+        os.environ['RUSTDOC'] = str(rustdoc)
+        self.addCleanup(os.environ.pop, 'RUSTDOC', None)
+        functions = runpy.run_path(str(ROOT / 'scripts/run-fallible-btree-cargo.py'))
+        return functions, compiler, self.root / 'btree-build'
+
+    def test_interrupted_acquisition_leaves_no_owned_directory(self):
+        functions, compiler, build_root = self.acquisition_fixture()
+        def interrupted(*_arguments):
+            raise KeyboardInterrupt('interrupted after the read-only library copy')
+        functions['acquire'].__globals__['configured'] = interrupted
+        with self.assertRaises(KeyboardInterrupt):
+            functions['acquire'](compiler, build_root)
+        self.assertEqual(list(build_root.iterdir()), [])
+
+    def test_incomplete_owned_directory_is_replaced(self):
+        functions, compiler, build_root = self.acquisition_fixture()
+        owned, _, _, _ = functions['acquire'](compiler, build_root)
+        # A killed acquisition leaves read-only library copies and no record.
+        (owned / 'producer.json').unlink()
+        again, _, _, _ = functions['acquire'](compiler, build_root)
+        self.assertEqual(again, owned)
+        self.assertTrue((owned / 'producer.json').is_file())
+        self.assertEqual(functions['acquire'](compiler, build_root)[0], owned)
+
     def test_existing_destination_refuses(self):
         self.destination.mkdir()
         with self.assertRaisesRegex(ValueError, 'must be new'):
