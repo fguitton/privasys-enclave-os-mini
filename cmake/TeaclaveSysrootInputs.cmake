@@ -210,7 +210,7 @@ set(HONEST_BTREE_SOURCE_RECEIPT "")
 set(_btree_inputs "")
 find_program(HONEST_BTREE_SOURCE_PYTHON python3 REQUIRED)
 get_filename_component(_btree_compiler_bin "${CARGO_EXECUTABLE}" DIRECTORY)
-set(_btree_build_root "${CMAKE_BINARY_DIR}/fallible-btree-source")
+set(_btree_build_root "${SGX_SYSROOT_BTREE_SOURCE_DIR}")
 set(_btree_source_record "${_btree_build_root}/inputs.json")
 execute_process(COMMAND "${CMAKE_COMMAND}" -E env
     "RUSTUP_TOOLCHAIN=${RUST_ENCLAVE_TOOLCHAIN}"

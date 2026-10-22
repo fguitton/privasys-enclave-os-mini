@@ -172,6 +172,7 @@ set(TEACLAVE_TLIBC    "${TEACLAVE_CHECKOUT}/common/inc/tlibc")
 # The source checkout and the SDK's old build_sysroot/target are never outputs.
 set(SGX_SYSROOT_DIR "${CMAKE_BINARY_DIR}/sgx-sysroot")
 set(SYSROOT_BUILD_DIR "${CMAKE_BINARY_DIR}/teaclave-sysroot-build")
+set(SGX_SYSROOT_BTREE_SOURCE_DIR "${CMAKE_BINARY_DIR}/fallible-btree-source")
 if(BUILD_ENCLAVE)
     include(cmake/TeaclaveSysrootInputs.cmake)
 endif()
@@ -181,10 +182,13 @@ get_filename_component(SGX_SYSROOT_REMAP_OUTPUT_ROOT
     "${SGX_SYSROOT_DIR}" ABSOLUTE)
 get_filename_component(SGX_SYSROOT_REMAP_BUILD_ROOT
     "${SYSROOT_BUILD_DIR}" ABSOLUTE)
+get_filename_component(SGX_SYSROOT_REMAP_BTREE_ROOT
+    "${SGX_SYSROOT_BTREE_SOURCE_DIR}" ABSOLUTE)
 string(CONCAT SGX_SYSROOT_REPRODUCIBLE_RUSTFLAGS
     "--remap-path-prefix ${TEACLAVE_REMAP_SOURCE_ROOT}=/teaclave-sdk"
     " --remap-path-prefix ${SGX_SYSROOT_REMAP_OUTPUT_ROOT}=/sgx-sysroot"
     " --remap-path-prefix ${SGX_SYSROOT_REMAP_BUILD_ROOT}=/sgx-sysroot-build"
+    " --remap-path-prefix ${SGX_SYSROOT_REMAP_BTREE_ROOT}=/fallible-btree-source"
     "${RUST_REPRODUCIBLE_INPUT_REMAP_FLAGS}"
     " --check-cfg=cfg(target_vendor,values(\"teaclave\"))")
 
