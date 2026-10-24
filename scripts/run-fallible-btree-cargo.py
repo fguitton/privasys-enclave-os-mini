@@ -56,7 +56,7 @@ def acquire(compiler, build_root):
                 'runner_sha256': digest(Path(__file__)),
                 'inputs': before}
     profile = json.loads((functions['PROFILE'] / 'manifest.json').read_text())
-    expected = {row['path']: dict(row) for row in before}
+    expected = {row['path']: {**row, 'mode': functions['owned_file_mode'](row['mode'])} for row in before}
     for row in profile['files']:
         expected[row['path']]['sha256'] = row['after_sha256']
     expected = sorted(expected.values(), key=lambda row: row['path'])

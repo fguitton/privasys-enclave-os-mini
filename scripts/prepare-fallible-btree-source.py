@@ -3,6 +3,8 @@
 import argparse
 import hashlib
 import json
+import os
+import stat
 from pathlib import Path
 import shutil
 import subprocess
@@ -36,6 +38,24 @@ def inventory(root):
     return rows
 
 
+def owned_file_mode(mode):
+    """Owned sources need read/write access; donor executable bits survive."""
+    return mode | stat.S_IRUSR | stat.S_IWUSR
+
+
+def writable_owned_tree(root):
+    for parent, directories, files in os.walk(root, followlinks=False):
+        for path in (Path(parent), *(Path(parent) / name for name in (*directories, *files))):
+            metadata = path.lstat()
+            if stat.S_ISDIR(metadata.st_mode):
+                mode = stat.S_IMODE(metadata.st_mode) | stat.S_IRWXU
+            elif stat.S_ISREG(metadata.st_mode):
+                mode = owned_file_mode(stat.S_IMODE(metadata.st_mode))
+            else:
+                raise ValueError('owned compiler source symlink or irregular member is unsupported')
+            path.chmod(mode, follow_symlinks=False)
+
+
 def prepare(source, destination):
     manifest = json.loads((PROFILE / 'manifest.json').read_text())
     if manifest['schema'] != 1 or manifest['profile'] != 'fallible-btree-insertion':
@@ -56,13 +76,14 @@ def prepare(source, destination):
         if not path.is_file() or path.is_symlink() or digest(path) != row['before_sha256']:
             raise ValueError('liballoc input differs: ' + row['path'])
     before = inventory(source)
-    shutil.copytree(source, destination, copy_function=shutil.copy2)
+    shutil.copytree(source, destination, copy_function=shutil.copy2, symlinks=True)
+    writable_owned_tree(destination)
     environment = {'PATH': '/usr/bin:/bin', 'GIT_CEILING_DIRECTORIES': str(parent)}
     subprocess.run(['git', 'apply', '--check', str(patch)], cwd=destination,
                    env=environment, check=True)
     subprocess.run(['git', 'apply', str(patch)], cwd=destination,
                    env=environment, check=True)
-    expected = {row['path']: dict(row) for row in before}
+    expected = {row['path']: {**row, 'mode': owned_file_mode(row['mode'])} for row in before}
     for row in manifest['files']:
         expected[row['path']]['sha256'] = row['after_sha256']
     for row in manifest['files']:

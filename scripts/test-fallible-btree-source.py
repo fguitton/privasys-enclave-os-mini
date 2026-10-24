@@ -2,6 +2,8 @@
 """Exercise guarded acquisition and runner refusal; these controls do not qualify a compiler."""
 import argparse
 import json
+import os
+import stat
 from pathlib import Path
 import runpy
 import shutil
@@ -33,13 +35,29 @@ class Controls(unittest.TestCase):
     def save(self):
         (self.profile / 'manifest.json').write_text(json.dumps(self.manifest))
 
+    def readonly_donor(self, root):
+        for parent, directories, files in os.walk(root, topdown=False):
+            for name in files: (Path(parent) / name).chmod(0o444)
+            Path(parent).chmod(0o555)
+        def restore_directories():
+            for parent, _, _ in os.walk(root): Path(parent).chmod(0o755)
+        self.addCleanup(restore_directories)
+
     def test_current_source_exact_afterimages_and_modes(self):
+        self.readonly_donor(self.source)
+        # A genuine read-only executable donor also keeps its executable bits.
+        (self.source / self.manifest['files'][0]['path']).chmod(0o555)
+        original_modes = {str(path): stat.S_IMODE(path.stat().st_mode)
+                          for path in (self.source, *self.source.rglob('*'))}
         receipt = self.prepare(self.source, self.destination)
         self.assertEqual(len(receipt['generated_inputs']), len(self.manifest['files']))
         self.assertNotEqual(receipt['original_inputs'], receipt['generated_inputs'])
         for before, after in zip(receipt['original_inputs'], receipt['generated_inputs']):
             self.assertEqual(before['path'], after['path'])
-            self.assertEqual(before['mode'], after['mode'])
+            self.assertEqual(after['mode'], before['mode'] | 0o600)
+            self.assertEqual(before['mode'] & 0o111, after['mode'] & 0o111)
+        self.assertEqual(original_modes, {str(path): stat.S_IMODE(path.stat().st_mode)
+                         for path in (self.source, *self.source.rglob('*'))})
 
     def test_unknown_profile_refuses(self):
         self.manifest['schema'] += 1
@@ -65,6 +83,13 @@ class Controls(unittest.TestCase):
         self.save()
         with self.assertRaisesRegex(ValueError, 'invalid'):
             self.prepare(self.source, self.destination)
+        # Normalization must never chmod through a copied foreign link.
+        foreign = self.root / 'foreign.rs'; foreign.write_bytes(b'foreign source'); foreign.chmod(0o444)
+        owned = self.root / 'owned-link'; owned.mkdir(); (owned / 'link').symlink_to(foreign)
+        with self.assertRaisesRegex(ValueError, 'symlink'):
+            self.prepare.__globals__['writable_owned_tree'](owned)
+        self.assertEqual(stat.S_IMODE(foreign.stat().st_mode), 0o444)
+        self.assertEqual(foreign.read_bytes(), b'foreign source')
 
     def test_duplicate_owner_refuses(self):
         self.manifest['files'][1] = self.manifest['files'][0]
@@ -116,9 +141,7 @@ class Controls(unittest.TestCase):
         sysroot = self.root / 'toolchain'
         library = sysroot / 'lib/rustlib/src/rust/library'
         shutil.copytree(self.source, library)
-        for path in library.rglob('*'):
-            if path.is_file():
-                path.chmod(0o444)
+        self.readonly_donor(library)
         (sysroot / 'bin').mkdir()
         compiler = sysroot / 'bin/rustc'
         compiler.write_text('#!' + sys.executable + '\nimport sys\n'
