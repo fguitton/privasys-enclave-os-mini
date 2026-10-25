@@ -27,7 +27,7 @@
 
 use std::collections::BTreeMap;
 use std::string::String;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::vec::Vec;
 
@@ -39,15 +39,95 @@ use enclave_os_common::modules::{AppIdentity, AttestedEndpointIdentity, ConfigEn
 /// Replacement revokes the old allocation permanently, including across an
 /// unload/reload with identical configuration. It never depends on host time.
 #[derive(Clone)]
-pub struct ConfigurationLease(Arc<AtomicBool>);
+pub struct ConfigurationLease(Arc<AtomicU64>);
+
+const CURRENT_CONFIGURATION: u64 = u64::MAX;
+static NEXT_CONFIGURATION_REQUEST: AtomicU64 = AtomicU64::new(1);
+std::thread_local! {
+    static CONFIGURATION_REQUEST: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// One synchronous dispatch, never transferable to another worker. A revoked
+/// lease records its first invalidator; another request cannot adopt it later.
+pub(crate) struct ConfigurationRequest<'a> {
+    id: u64,
+    store: &'a CertStore,
+    _thread: core::marker::PhantomData<*const ()>,
+}
+
+impl<'a> ConfigurationRequest<'a> {
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub(crate) fn begin(
+        store: &'a CertStore,
+        previous: &ConfigurationLease,
+        hostname: Option<&str>,
+    ) -> Result<Self, &'static str> {
+        {
+            let inner = store.inner.read().map_err(|_| "CertStore poisoned")?;
+            if !previous.is_current()
+                || !Arc::ptr_eq(
+                    &previous.0,
+                    &CertStore::configuration_for(&inner, hostname).0,
+                )
+            {
+                return Err("certificate configuration request has a foreign or stale lease");
+            }
+        }
+        if CONFIGURATION_REQUEST.with(|owner| owner.get() != 0) {
+            return Err("nested certificate configuration request");
+        }
+        let id = NEXT_CONFIGURATION_REQUEST
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+                next.checked_add(1)
+                    .filter(|value| *value < CURRENT_CONFIGURATION)
+            })
+            .map_err(|_| "certificate configuration request identity exhausted")?;
+        CONFIGURATION_REQUEST.with(|owner| owner.set(id));
+        Ok(Self {
+            id,
+            store,
+            _thread: core::marker::PhantomData,
+        })
+    }
+
+    pub(crate) fn completion(
+        self,
+        previous: &ConfigurationLease,
+        hostname: Option<&str>,
+        request_id: u64,
+    ) -> Result<Option<ConfigurationLease>, &'static str> {
+        if request_id != self.id {
+            return Err("certificate configuration response belongs to another request");
+        }
+        if previous.is_current() {
+            return Ok(None);
+        }
+        if previous.0.load(Ordering::Acquire) != self.id {
+            return Err("certificate configuration changed outside this request");
+        }
+        // Subsequent replacement must revoke this final response too. Keeping
+        // only the old lease's invalidator would miss a second transition.
+        let inner = self.store.inner.read().map_err(|_| "CertStore poisoned")?;
+        Ok(Some(CertStore::configuration_for(&inner, hostname).clone()))
+    }
+}
+
+impl Drop for ConfigurationRequest<'_> {
+    fn drop(&mut self) {
+        CONFIGURATION_REQUEST.with(|owner| owner.set(0));
+    }
+}
 
 impl ConfigurationLease {
     fn new() -> Self {
-        Self(Arc::new(AtomicBool::new(true)))
+        Self(Arc::new(AtomicU64::new(CURRENT_CONFIGURATION)))
     }
 
     pub fn is_current(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.load(Ordering::Acquire) == CURRENT_CONFIGURATION
     }
 
     fn replace(&mut self) {
@@ -56,7 +136,13 @@ impl ConfigurationLease {
     }
 
     fn revoke(&self) {
-        self.0.store(false, Ordering::Release);
+        let owner = CONFIGURATION_REQUEST.with(core::cell::Cell::get);
+        let _ = self.0.compare_exchange(
+            CURRENT_CONFIGURATION,
+            owner,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 }
 
@@ -231,18 +317,24 @@ impl CertStore {
         hostname: Option<&str>,
     ) -> Result<(Option<AppCertData>, ConfigurationLease), &'static str> {
         let inner = self.inner.read().map_err(|_| "CertStore poisoned")?;
-        match hostname.and_then(|name| inner.apps.get(name).map(|app| (name, app))) {
-            Some((name, app)) => Ok((Some(Self::app_data(name, app)), app.configuration.clone())),
-            None => Ok((
-                None,
+        let app =
+            hostname.and_then(|name| inner.apps.get(name).map(|app| Self::app_data(name, app)));
+        Ok((app, Self::configuration_for(&inner, hostname).clone()))
+    }
+
+    fn configuration_for<'a>(
+        inner: &'a StoreState,
+        hostname: Option<&str>,
+    ) -> &'a ConfigurationLease {
+        hostname
+            .and_then(|name| inner.apps.get(name).map(|app| &app.configuration))
+            .unwrap_or_else(|| {
                 inner
                     .fixed_peer
                     .as_ref()
                     .filter(|_| hostname == Some(enclave_os_common::modules::HONEST_PEER_SNI))
                     .unwrap_or(&inner.platform)
-                    .clone(),
-            )),
-        }
+            })
     }
 
     /// Resolve an app by SNI hostname.

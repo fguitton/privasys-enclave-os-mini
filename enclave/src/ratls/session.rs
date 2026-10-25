@@ -23,6 +23,15 @@ use std::vec::Vec;
 /// failed sessions never suppress an adopter control opportunity.
 pub(crate) fn current_data_session(session: Option<&mut RaTlsSession>) -> bool {
     session.is_some_and(|session| {
+        // A final mutation reply uses the full control path. Classification
+        // must not destroy that admitted output while rejecting new ingress.
+        if session
+            .response_configuration
+            .as_ref()
+            .is_some_and(ConfigurationLease::is_current)
+        {
+            return false;
+        }
         session.require_current_configuration().is_ok()
             && !session.attestation_failed()
             && session.channel_binder_bytes().is_some()
@@ -166,6 +175,9 @@ pub struct RaTlsSession {
     local_evidence: Option<retained_evidence::RetainedEvidence>,
     attestation_failed: bool,
     configuration: ConfigurationLease,
+    configuration_request: u64,
+    // Response-only successor lease; ingress and evidence retain the original.
+    response_configuration: Option<ConfigurationLease>,
     /// FIDO2 identity, set after a successful FIDO2 ceremony on this
     /// session.  When present, subsequent requests on this TLS session
     /// are authenticated without tokens.
@@ -297,6 +309,8 @@ impl RaTlsSession {
             local_evidence: None,
             attestation_failed: false,
             configuration,
+            configuration_request: 0,
+            response_configuration: None,
             fido2_identity: None,
         }
     }
@@ -653,6 +667,47 @@ impl RaTlsSession {
         self.response.is_some()
     }
 
+    pub(crate) fn begin_configuration_request<'a>(
+        &mut self,
+        store: &'a super::cert_store::CertStore,
+    ) -> Result<super::cert_store::ConfigurationRequest<'a>, &'static str> {
+        self.require_current_configuration()?;
+        if self.response.is_some() || self.response_configuration.is_some() {
+            return Err("certificate configuration response already pending");
+        }
+        let request = super::cert_store::ConfigurationRequest::begin(
+            store,
+            &self.configuration,
+            self.server_name.as_deref(),
+        )?;
+        self.configuration_request = request.id();
+        Ok(request)
+    }
+
+    pub(crate) fn complete_configuration_request(
+        &mut self,
+        request: super::cert_store::ConfigurationRequest<'_>,
+    ) -> Result<(), &'static str> {
+        self.response_configuration = request.completion(
+            &self.configuration,
+            self.server_name.as_deref(),
+            self.configuration_request,
+        )?;
+        Ok(())
+    }
+
+    fn require_response_configuration(&mut self) -> Result<(), &'static str> {
+        if self.configuration.is_current()
+            || self
+                .response_configuration
+                .as_ref()
+                .is_some_and(ConfigurationLease::is_current)
+        {
+            return Ok(());
+        }
+        self.require_current_configuration()
+    }
+
     /// Keep an unconsumed body available for its owner to drop outside STATE.
     pub(crate) fn queue_http_response_owned(
         &mut self,
@@ -692,7 +747,8 @@ impl RaTlsSession {
         pool: Option<&std::sync::Arc<enclave_os_common::allocation::AllocationPoolV1>>,
     ) -> std::ops::ControlFlow<(&'static str, crate::HttpResponsePayload)> {
         let (close, shutdown) = completion;
-        if let Err(error) = self.require_current_configuration() {
+        let close = close || self.response_configuration.is_some();
+        if let Err(error) = self.require_response_configuration() {
             return std::ops::ControlFlow::Break((error, body));
         }
         if self.response.is_some() {
@@ -756,7 +812,7 @@ impl RaTlsSession {
     /// Caller reserves 64 KiB of socket credit before each step. Configuration
     /// revocation is checked even while a previously admitted body is draining.
     pub fn progress_http_response(&mut self) -> Result<(TlsOutput, bool, bool), &'static str> {
-        self.require_current_configuration()?;
+        self.require_response_configuration()?;
         let mut response = self.response.take().ok_or("no pending response")?;
         #[cfg(feature = "diagnostic-transfer-profile")]
         let step_started = response.cost.as_ref().map(|_| std::time::Instant::now());
@@ -793,6 +849,7 @@ impl RaTlsSession {
             cost.tls_bytes += output.len();
         }
         if response.offset == response.body.len() {
+            self.response_configuration = None;
             #[cfg(feature = "diagnostic-transfer-profile")]
             if let Some(cost) = response.cost {
                 let control = control_cost();
@@ -983,7 +1040,7 @@ impl RaTlsSession {
         data: &[u8],
         output: &mut TlsOutput,
     ) -> Result<(), &'static str> {
-        self.require_current_configuration()?;
+        self.require_response_configuration()?;
         use std::io::Write;
         let mut offset = 0;
         while offset < data.len() {
@@ -1281,6 +1338,7 @@ impl RaTlsSession {
             self.read_offset = 0;
             self.stream_chunks = None;
             self.response = None;
+            self.response_configuration = None;
             return Err("certificate configuration changed; reconnect required");
         }
         Ok(())

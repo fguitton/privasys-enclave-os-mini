@@ -831,6 +831,124 @@ fn revocation_prevents_response_after_dispatch_but_preserves_other_workloads() {
         5,
         "session teardown releases an undrained body"
     );
+    checked_mutation_response_completion();
+}
+
+fn checked_mutation_response_completion() {
+    let store = CertStore::new();
+    let name = "mutation.test";
+    // F0's platform session loads a different app hostname during dispatch.
+    let (mut client, mut session) = pair(&store, name);
+    handshake(&mut client, &mut session);
+    write_requests(
+        &mut client,
+        &mut session,
+        b"POST /data HTTP/1.1\r\nHost: mutation.test\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert!(session.recv_http_request().unwrap().is_some());
+    let request = session.begin_configuration_request(&store).unwrap();
+    assert!(
+        session.begin_configuration_request(&store).is_err(),
+        "nested dispatch refused"
+    );
+    register(&store, "loaded-app.test");
+    session.complete_configuration_request(request).unwrap();
+    let body = b"{\"loaded\":true}";
+    session
+        .queue_http_response_owned(200, "application/json", &[], body.to_vec(), false, false)
+        .continue_value()
+        .unwrap();
+    assert!(!super::current_data_session(Some(&mut session)));
+    assert!(
+        session.has_pending_response(),
+        "classification preserves only the admitted final reply"
+    );
+    let (output, close, shutdown) = session.progress_http_response().unwrap();
+    assert!(
+        close && !shutdown,
+        "mutation completion always closes the old connection"
+    );
+    client.read_tls(&mut Cursor::new(output)).unwrap();
+    client.process_new_packets().unwrap();
+    let mut received = [0; 1024];
+    let count = std::io::Read::read(&mut client.reader(), &mut received).unwrap();
+    assert_eq!(
+        &received[..count],
+        &enclave_os_common::protocol::format_http_response(200, body, true)
+    );
+    assert!(session.recv_http_request().is_err());
+    assert!(session.export_hctx(b"stale-after-mutation", &[]).is_err());
+    assert!(session
+        .queue_http_response_owned(200, "application/json", &[], vec![], false, false)
+        .is_break());
+
+    // Another worker's replacement cannot become this request's completion.
+    register(&store, name);
+    let (mut client, mut session) = pair(&store, name);
+    handshake(&mut client, &mut session);
+    let request = session.begin_configuration_request(&store).unwrap();
+    std::thread::scope(|scope| scope.spawn(|| register(&store, name)).join().unwrap());
+    register(&store, name); // Own later mutation cannot adopt the first foreign revocation.
+    assert!(session.complete_configuration_request(request).is_err());
+    assert!(session
+        .queue_http_response_owned(200, "application/json", &[], vec![], false, false)
+        .is_break());
+
+    // A request token is bound to its connection, including equal-SNI peers.
+    register(&store, name);
+    let (mut client, mut session) = pair(&store, name);
+    let (mut other_client, mut other) = pair(&store, name);
+    handshake(&mut client, &mut session);
+    handshake(&mut other_client, &mut other);
+    let request = session.begin_configuration_request(&store).unwrap();
+    register(&store, name);
+    assert!(other.complete_configuration_request(request).is_err());
+    assert!(other
+        .queue_http_response_owned(200, "application/json", &[], vec![], false, false)
+        .is_break());
+
+    // A later replacement revokes even a partially drained mutation reply.
+    register(&store, name);
+    let (mut client, mut session) = pair(&store, name);
+    handshake(&mut client, &mut session);
+    let request = session.begin_configuration_request(&store).unwrap();
+    register(&store, name);
+    session.complete_configuration_request(request).unwrap();
+    session
+        .queue_http_response_owned(
+            200,
+            "application/octet-stream",
+            &[],
+            vec![7; 1024 * 1024],
+            false,
+            false,
+        )
+        .continue_value()
+        .unwrap();
+    assert!(!session.progress_http_response().unwrap().0.is_empty());
+    assert!(session.has_pending_response());
+    register(&store, name);
+    assert!(session.progress_http_response().is_err());
+    assert!(!session.has_pending_response());
+    assert!(session.collect_tls_output().unwrap().is_empty());
+
+    // Ordinary requests retain keep-alive and a dropped scope cannot leak into
+    // the next dispatch. A different store cannot issue this session's scope.
+    register(&store, name);
+    let (mut client, mut session) = pair(&store, name);
+    handshake(&mut client, &mut session);
+    assert!(session
+        .begin_configuration_request(&CertStore::new())
+        .is_err());
+    drop(session.begin_configuration_request(&store).unwrap());
+    let request = session.begin_configuration_request(&store).unwrap();
+    session.complete_configuration_request(request).unwrap();
+    session
+        .queue_http_response_owned(200, "application/json", &[], vec![], false, false)
+        .continue_value()
+        .unwrap();
+    let (_, close, _) = session.progress_http_response().unwrap();
+    assert!(!close);
 }
 
 fn fixed_peer_configuration_boundary() {

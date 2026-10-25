@@ -421,8 +421,9 @@ impl IngressServer {
     }
 
     /// Produce at most 32 KiB of plaintext and 64 KiB of TLS. Small control
-    /// replies complete in the dispatch turn, before a later hook can retire
-    /// their configuration. Every write still requires the current lease.
+    /// replies complete in the dispatch turn. An owned configuration mutation
+    /// may finish its final reply under the captured successor lease and close;
+    /// unrelated revocation still prevents output on a stale configuration.
     fn flush_response(&mut self, conn_id: u32, session: &mut RaTlsSession) -> bool {
         match session.progress_http_response() {
             Ok((bytes, close, shutdown)) => {
@@ -1101,6 +1102,14 @@ impl IngressServer {
                     self.send_close(conn_id);
                     return false;
                 }
+                let configuration_request =
+                    match session.begin_configuration_request(cert_store::cert_store()) {
+                        Ok(request) => request,
+                        Err(_) => {
+                            self.send_close(conn_id);
+                            return false;
+                        }
+                    };
                 // RA-TLS v2 evidence endpoint: served here, where the TLS
                 // session (its exporter, its peer certificate) is at hand.
                 // Every other request sees the peer evidence accepted so
@@ -1222,6 +1231,13 @@ impl IngressServer {
                         handle_http_request_with_session(&http_req, &base_ctx)
                     };
 
+                if session
+                    .complete_configuration_request(configuration_request)
+                    .is_err()
+                {
+                    self.send_close(conn_id);
+                    return false;
+                }
                 // Move the body into a bounded producer; do not construct
                 // either a second HTTP body or a whole-response TLS buffer.
                 let send_close = close || result.shutdown;
