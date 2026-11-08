@@ -63,12 +63,20 @@ pub(super) fn check() {
     };
     pool.arm_fault_fixture(None);
     step().unwrap();
-    assert_eq!(pool.fault_fixture_draws(), 3, "up-front reservations draw nothing");
+    assert_eq!(
+        pool.fault_fixture_draws(),
+        3,
+        "up-front reservations draw nothing"
+    );
     assert_eq!(pool.used(), 0);
     for refused in 0..3 {
         pool.arm_fault_fixture(Some(refused));
         assert!(step().is_none(), "draw {refused} is refused");
-        assert_eq!(pool.fault_fixture_draws(), refused + 1, "nothing after it is drawn");
+        assert_eq!(
+            pool.fault_fixture_draws(),
+            refused + 1,
+            "nothing after it is drawn"
+        );
         assert_eq!(pool.used(), 0, "every earlier draw returns");
     }
     pool.arm_fault_fixture(Some(3));

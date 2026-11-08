@@ -2,13 +2,13 @@
 //! The supplied parser must use the admitted scratch and an allocation-free
 //! syntax-error representation. This owner does not bless arbitrary parsers.
 pub(crate) mod fields;
+/// Shared current parser for retained JWT claim trees.
+#[cfg(feature = "request-json-parser")]
+pub mod parse;
 /// Original-pool sequence backing for parsed JSON arrays and typed lists.
 pub mod sequence;
 /// Parsed JSON values with admitted child backings.
 pub mod value;
-/// Shared current parser for retained JWT claim trees.
-#[cfg(feature = "request-json-parser")]
-pub mod parse;
 
 use crate::allocation::{AllocationLeaseV1, AllocationPoolV1};
 use alloc::{string::String, sync::Arc, vec::Vec};

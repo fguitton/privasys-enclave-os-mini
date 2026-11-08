@@ -95,7 +95,8 @@ pub fn verify_encauth<T: AsRef<str>>(
     if env.v != 1 {
         return Err("unsupported version");
     }
-    let payload_bytes = crate::sessionrelay::b64_decode(env.payload.as_ref()).ok_or("payload b64")?;
+    let payload_bytes =
+        crate::sessionrelay::b64_decode(env.payload.as_ref()).ok_or("payload b64")?;
     let hw_sig_raw = crate::sessionrelay::b64_decode(env.hw_sig.as_ref()).ok_or("hw_sig b64")?;
     let idp_sig_raw = crate::sessionrelay::b64_decode(env.idp_sig.as_ref()).ok_or("idp_sig b64")?;
 
