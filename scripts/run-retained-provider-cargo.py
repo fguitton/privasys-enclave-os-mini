@@ -85,7 +85,7 @@ def verify(source, destination, functions):
     return receipt
 
 
-def run(cargo, manifest, build_root, arguments):
+def run(cargo, manifest, build_root, arguments, remaps=()):
     if not cargo.is_absolute() or not manifest.is_absolute() or not build_root.is_absolute():
         raise ValueError('build inputs must be absolute')
     json_runner = runpy.run_path(str(JSON_RUNNER))
@@ -187,7 +187,7 @@ os.execv({cargo},[{cargo},*forward])
     record = build_root / 'retained-provider-build.json'
     record.write_text(json.dumps(provenance, indent=2) + '\n')
     print('RETAINED-PROVIDER-BUILD', receipt['version'], profile_hash, flush=True)
-    result = json_runner['run'](wrapper, manifest, build_root / 'request-json', arguments)
+    result = json_runner['run'](wrapper, manifest, build_root / 'request-json', arguments, remaps)
     verify(source, destination, functions)
     if sdk_route:
         if sdk_functions['verify'](original, sdk_route['mirror'], target_path) != sdk_route:

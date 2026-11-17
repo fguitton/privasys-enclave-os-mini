@@ -110,7 +110,20 @@ def verify_profile(source, destination, functions):
     return receipt
 
 
-def run(cargo, manifest, build_root, arguments):
+def remapped_rustflags(environment, remaps):
+    """Append path remaps through Cargo's highest-precedence rustflags channel."""
+    if 'CARGO_ENCODED_RUSTFLAGS' in environment:
+        current = environment['CARGO_ENCODED_RUSTFLAGS']
+        flags = current.split('\x1f') if current else []
+    else:
+        flags = environment.get('RUSTFLAGS', '').split()
+    for source, canonical in remaps:
+        flags += ['--remap-path-prefix', str(source) + '=' + canonical]
+    environment.pop('RUSTFLAGS', None)
+    environment['CARGO_ENCODED_RUSTFLAGS'] = '\x1f'.join(flags)
+
+
+def run(cargo, manifest, build_root, arguments, remaps=()):
     if not cargo.is_absolute() or not manifest.is_absolute() or not build_root.is_absolute():
         raise ValueError('build inputs must be absolute')
     cargo_input = cargo_identity(cargo)
@@ -156,12 +169,15 @@ def run(cargo, manifest, build_root, arguments):
                   'runner_sha256': digest(Path(__file__)),
                   'python': str(Path(sys.executable).resolve()),
                   'python_sha256': digest(Path(sys.executable).resolve()),
+                  'path_remaps': [[str(source), canonical] for source, canonical in remaps],
                   'resolved_graph_unchanged': True, 'status': 'RUNNING'}
     record = build_root / 'request-json-build.json'
     record.write_text(json.dumps(provenance, indent=2) + '\n')
     print('REQUEST-JSON-BUILD', receipt['version'], profile_hash, file=sys.stderr, flush=True)
     environment = os.environ.copy()
     environment['HONEST_REQUEST_JSON_SOURCE_RECEIPT'] = str(destination / 'request-json-source-receipt.json')
+    if remaps:
+        remapped_rustflags(environment, remaps)
     result = subprocess.run(command, env=environment)
     verify_profile(source, destination, functions)
     if digest(lock) != lock_before:
@@ -238,14 +254,20 @@ def native_json_run(cargo, build_root, arguments, resolved):
     if not required and not retained:
         # Neither admitted parser nor retained TLS consumer is compiled.
         return subprocess.run([str(cargo), *arguments]).returncode
+    target = Path(resolved['target_directory']).absolute()
     if build_root is None:
-        build_root = Path(resolved['target_directory']) / 'request-json-source'
+        build_root = target / 'request-json-source'
     build_root = build_root.absolute()
+    # Generated supplier sources and build-script outputs live under these
+    # caller-chosen roots; give them the enclave build's canonical names.
+    remaps = [(target, '/cargo-target')]
+    if not build_root.is_relative_to(target):
+        remaps.append((build_root, '/request-json-source'))
     if retained:
         # Reuse the current outer composition: rustls first, then this JSON owner.
         provider = runpy.run_path(str(Path(__file__).with_name('run-retained-provider-cargo.py')))
-        return provider['run'](cargo, manifest, build_root / 'retained-provider', arguments)
-    return run(cargo, manifest, build_root, arguments)
+        return provider['run'](cargo, manifest, build_root / 'retained-provider', arguments, remaps)
+    return run(cargo, manifest, build_root, arguments, remaps)
 
 
 def main():
