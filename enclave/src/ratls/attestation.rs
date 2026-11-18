@@ -349,6 +349,11 @@ fn generate_sgx_quote_paid(
         )
     };
     rpc.with_qe_quote(pool, bytes, |quote| {
+        enclave_os_common::quote::validate_local_sgx_quote(
+            quote,
+            &bytes[..enclave_os_common::quote::SGX_REPORT_BODY_SIZE],
+        )
+        .map_err(|_| -22)?;
         super::session::retained_quote::RetainedQuote::copy_from(pool, quote).ok_or(-12)
     })
     .map_err(|error| format!("QeGetQuote RPC failed: status={error}"))
@@ -428,6 +433,11 @@ fn generate_sgx_quote(report_data: &[u8; 64]) -> Result<Vec<u8>, String> {
         .qe_get_quote(report_bytes)
         .map_err(|e| format!("QeGetQuote RPC failed: status={}", e))?;
 
+    enclave_os_common::quote::validate_local_sgx_quote(
+        &quote,
+        &report_bytes[..enclave_os_common::quote::SGX_REPORT_BODY_SIZE],
+    )
+    .map_err(String::from)?;
     Ok(quote)
 }
 

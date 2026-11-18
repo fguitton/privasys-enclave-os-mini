@@ -32,8 +32,14 @@ use core::fmt::Write;
 //  Constants — field offsets within DCAP quotes
 // ---------------------------------------------------------------------------
 
-/// Minimum size for an SGX v3 quote header + report body.
-pub const SGX_QUOTE_MIN_SIZE: usize = 436;
+/// SGX v3 quote header, followed by the enclave report body and signature length.
+pub const SGX_QUOTE_HEADER_SIZE: usize = 48;
+/// Fixed SGX enclave report body, including the complete ReportData field.
+pub const SGX_REPORT_BODY_SIZE: usize =
+    SGX_REPORT_DATA_OFFSET + REPORT_DATA_SIZE - SGX_QUOTE_HEADER_SIZE;
+/// Minimum size for an SGX v3 quote header, report body and signature length.
+pub const SGX_QUOTE_MIN_SIZE: usize =
+    SGX_QUOTE_HEADER_SIZE + SGX_REPORT_BODY_SIZE + core::mem::size_of::<u32>();
 
 /// Minimum size for a TDX v4 quote header + report body.
 pub const TDX_QUOTE_MIN_SIZE: usize = 584;
@@ -176,6 +182,41 @@ impl QuoteIdentity {
 // ---------------------------------------------------------------------------
 //  Parsing
 // ---------------------------------------------------------------------------
+
+/// Bind a host-returned ECDSA SGX v3 quote to the enclave-local report that
+/// requested it. This allocation-free check precedes retaining or returning it;
+/// cryptographic quote appraisal remains a separate remote verifier operation.
+///
+/// # Errors
+/// Refuses malformed framing or any substituted report-body byte, including
+/// signer, attributes, product/SVN and the challenge in ReportData.
+pub fn validate_local_sgx_quote(
+    quote: &[u8],
+    local_report_body: &[u8],
+) -> Result<(), &'static str> {
+    if quote.len() < SGX_QUOTE_MIN_SIZE
+        || local_report_body.len() != SGX_REPORT_BODY_SIZE
+        || quote[..2] != 3_u16.to_le_bytes()
+        || quote[2..4] != 2_u16.to_le_bytes()
+        || quote[4..8] != 0_u32.to_le_bytes()
+    {
+        return Err("local SGX quote has unsupported framing");
+    }
+    let body_end = SGX_QUOTE_HEADER_SIZE + SGX_REPORT_BODY_SIZE;
+    let signature_size = u32::from_le_bytes(
+        quote[body_end..SGX_QUOTE_MIN_SIZE].try_into().expect("fixed signature length"),
+    );
+    if signature_size == 0
+        || usize::try_from(signature_size).ok()
+            .and_then(|size| SGX_QUOTE_MIN_SIZE.checked_add(size)) != Some(quote.len())
+    {
+        return Err("local SGX quote has an invalid signature length");
+    }
+    if &quote[SGX_QUOTE_HEADER_SIZE..body_end] != local_report_body {
+        return Err("local SGX quote differs from the enclave report");
+    }
+    Ok(())
+}
 
 /// Parse raw attestation evidence and extract the TEE identity.
 ///
@@ -510,5 +551,41 @@ mod simulation_tests {
         zero.extend_from_slice(&[0; 32]);
         zero.extend_from_slice(&[9; 64]);
         assert!(parse_sgx_sim_report(&zero).is_err());
+    }
+}
+
+#[cfg(test)]
+mod local_report_tests {
+    use super::*;
+
+    #[test]
+    fn local_quote_refuses_report_substitution_and_malformed_framing() {
+        let body = [0x51; SGX_REPORT_BODY_SIZE];
+        let mut quote = vec![0; SGX_QUOTE_MIN_SIZE + 1];
+        quote[..2].copy_from_slice(&3_u16.to_le_bytes());
+        quote[2..4].copy_from_slice(&2_u16.to_le_bytes());
+        let end = SGX_QUOTE_HEADER_SIZE + SGX_REPORT_BODY_SIZE;
+        quote[SGX_QUOTE_HEADER_SIZE..end].copy_from_slice(&body);
+        quote[end..SGX_QUOTE_MIN_SIZE].copy_from_slice(&1_u32.to_le_bytes());
+        assert_eq!(validate_local_sgx_quote(&quote, &body), Ok(()));
+        // Every field, reserved byte and challenge byte belongs to this report.
+        for offset in SGX_QUOTE_HEADER_SIZE..end {
+            quote[offset] ^= 1;
+            assert!(validate_local_sgx_quote(&quote, &body).is_err(), "byte {offset}");
+            quote[offset] ^= 1;
+        }
+        for offset in [0, 2, 4, end] {
+            quote[offset] ^= 1;
+            assert!(validate_local_sgx_quote(&quote, &body).is_err());
+            quote[offset] ^= 1;
+        }
+        for length in [0, 1, SGX_QUOTE_MIN_SIZE - 1, SGX_QUOTE_MIN_SIZE] {
+            assert!(validate_local_sgx_quote(&quote[..length], &body).is_err());
+        }
+        assert!(validate_local_sgx_quote(&quote, &body[..body.len() - 1]).is_err());
+        quote.push(0);
+        assert!(validate_local_sgx_quote(&quote, &body).is_err());
+        quote[end..SGX_QUOTE_MIN_SIZE].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(validate_local_sgx_quote(&quote, &body).is_err());
     }
 }
