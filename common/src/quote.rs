@@ -204,11 +204,15 @@ pub fn validate_local_sgx_quote(
     }
     let body_end = SGX_QUOTE_HEADER_SIZE + SGX_REPORT_BODY_SIZE;
     let signature_size = u32::from_le_bytes(
-        quote[body_end..SGX_QUOTE_MIN_SIZE].try_into().expect("fixed signature length"),
+        quote[body_end..SGX_QUOTE_MIN_SIZE]
+            .try_into()
+            .expect("fixed signature length"),
     );
     if signature_size == 0
-        || usize::try_from(signature_size).ok()
-            .and_then(|size| SGX_QUOTE_MIN_SIZE.checked_add(size)) != Some(quote.len())
+        || usize::try_from(signature_size)
+            .ok()
+            .and_then(|size| SGX_QUOTE_MIN_SIZE.checked_add(size))
+            != Some(quote.len())
     {
         return Err("local SGX quote has an invalid signature length");
     }
@@ -571,7 +575,10 @@ mod local_report_tests {
         // Every field, reserved byte and challenge byte belongs to this report.
         for offset in SGX_QUOTE_HEADER_SIZE..end {
             quote[offset] ^= 1;
-            assert!(validate_local_sgx_quote(&quote, &body).is_err(), "byte {offset}");
+            assert!(
+                validate_local_sgx_quote(&quote, &body).is_err(),
+                "byte {offset}"
+            );
             quote[offset] ^= 1;
         }
         for offset in [0, 2, 4, end] {
