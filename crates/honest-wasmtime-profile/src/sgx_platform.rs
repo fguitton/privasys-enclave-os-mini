@@ -25,7 +25,7 @@
 //!
 //! | C API function               | SGX implementation                        |
 //! |------------------------------|-------------------------------------------|
-//! | `wasmtime_mmap_new`          | RWX code pool (≤1MB) or heap alloc (>1MB) |
+//! | `wasmtime_mmap_new`          | RWX code pool (`prot != 0`) or heap (`0`) |
 //! | `wasmtime_mprotect`          | no-op (pool=RWX, heap=RW)                 |
 //! | `wasmtime_munmap`            | heap dealloc (pool: retained)             |
 //! | `wasmtime_mmap_remap`        | zero memory                               |
@@ -187,27 +187,23 @@ extern "C" {
 
 /// Allocate memory for wasmtime.
 ///
-/// Uses the RWX code pool for small allocations (likely code segments)
-/// and the heap allocator for large allocations (likely linear memory).
-///
-/// The heuristic: allocations that will later be mprotect'd to RX are code.
-/// Since we can't predict this at allocation time, we use a size heuristic:
-/// - Allocations ≤ 1 MiB go to the code pool (WASM code segments)
-/// - Larger allocations go to the heap (linear memory, which is RW only)
+/// Uses the RWX code pool for accessible mappings (`Mmap::new`, `prot_flags != 0`)
+/// which carry precompiled code segments that Wasmtime later `mprotect`s to RX,
+/// and the RW enclave heap for `PROT_NONE` reservations (`Mmap::reserve`,
+/// `prot_flags == 0`) used for linear memory so `munmap` releases them.
 ///
 /// prot_flags: 0=NONE, 1=READ, 2=WRITE, 3=RW, 4=EXEC, 5=RX, 7=RWX
 #[no_mangle]
 pub unsafe extern "C" fn wasmtime_mmap_new(
     size: usize,
-    _prot_flags: u32,
+    prot_flags: u32,
     ret_addr: *mut *mut u8,
 ) -> i32 {
     let Some(aligned) = page_align(size) else {
         return -1;
     };
 
-    // Strategy: code segments are typically < 1MB, linear memory is >= 4MB.
-    let use_code_pool = aligned <= 1024 * 1024;
+    let use_code_pool = prot_flags != 0;
 
     let addr = if use_code_pool {
         let ptr = code_pool_alloc(aligned);
