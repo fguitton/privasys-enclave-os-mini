@@ -14,11 +14,37 @@
 //! `rustls` can also complete 1-RTT handshakes with classical-only third-party
 //! peers (for example external NTS servers) when classical groups remain in the
 //! provider's allowlist.
+//!
+//! # Allocation Ownership Scope
+//! - Configuration vectors (`cipher_suites`, `kx_groups`) are fallibly reserved
+//!   by [`try_default_provider`] and prepaid by config owners.
+//! - Per-handshake hybrid objects have separate exact layouts in
+//!   [`hybrid_kx_layouts`]: the active ML-KEM holder, client share (`1216 B`),
+//!   server share (`1120 B`), and shared-secret copy (`64 B`).
+//! - Under `fallible-allocation-v1`, [`start_in`], [`start_and_complete_in`],
+//!   and [`ActiveHybridKxIn::complete_in`] carry a caller-supplied
+//!   `core::alloc::Allocator` (e.g. [`crate::allocation::PoolMapAllocator`] or
+//!   Teaclave's owned loan allocator) through the active ML-KEM holder, public
+//!   share buffers, and zeroized shared-secret buffers.
+//! - Remaining global-heap scope: upstream `rustls::crypto::SupportedKxGroup`
+//!   and `ActiveKeyExchange` trait methods do not accept a `RetainedAllocator`
+//!   in `rustls 0.23.45`, and `ring::kx_group::X25519` allocates its classical
+//!   exchange state, share, and `SharedSecret` on the global heap. Within that
+//!   trait boundary, `ActiveX25519MlKem768` keeps its `1216 B` client share
+//!   inline (eliminating a separate heap `Vec`), `start_and_complete` uses
+//!   fallible `try_reserve_exact`, and secret buffers are zeroized on drop.
 
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::vec::Vec;
+use core::alloc::Layout;
 use core::num::NonZeroU32;
 use std::sync::Arc;
+
+#[cfg(feature = "fallible-allocation-v1")]
+use core::alloc::Allocator;
+#[cfg(feature = "fallible-allocation-v1")]
+use zeroize::Zeroize as _;
 
 use fips203::ml_kem_768::{CipherText, DecapsKey, EncapsKey, CT_LEN, EK_LEN, KG};
 use fips203::traits::{Decaps as _, Encaps as _, KeyGen as _, SerDes as _};
@@ -36,9 +62,12 @@ use zeroize::Zeroizing;
 
 const INVALID_KEY_SHARE: Error = Error::PeerMisbehaved(PeerMisbehaved::InvalidKeyShare);
 const X25519_LEN: usize = 32;
-const CLIENT_SHARE_LEN: usize = EK_LEN + X25519_LEN;
-const SERVER_SHARE_LEN: usize = CT_LEN + X25519_LEN;
-const SHARED_SECRET_LEN: usize = SSK_LEN + X25519_LEN;
+/// Encoded client key-share length (`ML-KEM-768 ek (1184 B) || X25519 pk (32 B)`).
+pub const CLIENT_SHARE_LEN: usize = EK_LEN + X25519_LEN;
+/// Encoded server key-share length (`ML-KEM-768 ct (1088 B) || X25519 pk (32 B)`).
+pub const SERVER_SHARE_LEN: usize = CT_LEN + X25519_LEN;
+/// Combined hybrid shared-secret length (`ML-KEM-768 ss (32 B) || X25519 ss (32 B)`).
+pub const SHARED_SECRET_LEN: usize = SSK_LEN + X25519_LEN;
 
 const _: () = {
     assert!(EK_LEN == 1184);
@@ -48,6 +77,39 @@ const _: () = {
     assert!(SERVER_SHARE_LEN == 1120);
     assert!(SHARED_SECRET_LEN == 64);
 };
+
+/// Separate per-object memory layouts for one hybrid `X25519MLKEM768` handshake,
+/// distinct from [`try_default_provider`] configuration-vector allocations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HybridKxLayoutsV1 {
+    /// Active ML-KEM-768 decapsulation-key holder allocated via the handshake allocator.
+    pub active_holder: Layout,
+    /// Client public key share (`1216 B`).
+    pub client_share: Layout,
+    /// Server public key share (`1120 B`).
+    pub server_share: Layout,
+    /// Combined shared-secret copy (`64 B`).
+    pub shared_secret: Layout,
+}
+
+/// Exact separate layouts for hybrid handshake state, shares, and secret copies.
+#[must_use]
+pub const fn hybrid_kx_layouts() -> HybridKxLayoutsV1 {
+    HybridKxLayoutsV1 {
+        active_holder: Layout::new::<ActiveHybridPayload>(),
+        client_share: Layout::new::<[u8; CLIENT_SHARE_LEN]>(),
+        server_share: Layout::new::<[u8; SERVER_SHARE_LEN]>(),
+        shared_secret: Layout::new::<[u8; SHARED_SECRET_LEN]>(),
+    }
+}
+
+/// Active ML-KEM-768 decapsulation-key holder paired with the classical X25519
+/// exchange state. `DecapsKey` derives `ZeroizeOnDrop` so its secret key bytes
+/// are wiped in place before backing deallocation.
+pub struct ActiveHybridPayload {
+    classical: Option<Box<dyn ActiveKeyExchange>>,
+    decaps_key: DecapsKey,
+}
 
 /// Hybrid `X25519MLKEM768` (`0x11EC`) key-exchange group for TLS 1.3.
 pub static X25519MLKEM768: &dyn SupportedKxGroup = &X25519MlKem768Group;
@@ -228,12 +290,14 @@ impl SupportedKxGroup for X25519MlKem768Group {
         let mut rng = SystemRngAdapter::new();
         let (ek, dk) = KG::try_keygen_with_rng(&mut rng).map_err(|_| Error::FailedToGetRandomBytes)?;
         let ek_bytes = ek.into_bytes();
-        let mut combined_pub_key = Vec::with_capacity(CLIENT_SHARE_LEN);
-        combined_pub_key.extend_from_slice(&ek_bytes);
-        combined_pub_key.extend_from_slice(classical.pub_key());
+        let mut combined_pub_key = [0u8; CLIENT_SHARE_LEN];
+        combined_pub_key[..EK_LEN].copy_from_slice(&ek_bytes);
+        combined_pub_key[EK_LEN..].copy_from_slice(classical.pub_key());
         Ok(Box::new(ActiveX25519MlKem768 {
-            classical,
-            decaps_key: dk,
+            payload: ActiveHybridPayload {
+                classical: Some(classical),
+                decaps_key: dk,
+            },
             combined_pub_key,
         }))
     }
@@ -253,7 +317,10 @@ impl SupportedKxGroup for X25519MlKem768Group {
             .map_err(|_| Error::FailedToGetRandomBytes)?;
 
         let pq_secret_bytes = Zeroizing::new(pq_secret.into_bytes());
-        let mut combined_pub_key = Vec::with_capacity(SERVER_SHARE_LEN);
+        let mut combined_pub_key = Vec::new();
+        combined_pub_key
+            .try_reserve_exact(SERVER_SHARE_LEN)
+            .map_err(|_| Error::General(String::new()))?;
         combined_pub_key.extend_from_slice(&ct.into_bytes());
         combined_pub_key.extend_from_slice(&classical.pub_key);
 
@@ -278,13 +345,12 @@ impl SupportedKxGroup for X25519MlKem768Group {
 }
 
 struct ActiveX25519MlKem768 {
-    classical: Box<dyn ActiveKeyExchange>,
-    decaps_key: DecapsKey,
-    combined_pub_key: Vec<u8>,
+    payload: ActiveHybridPayload,
+    combined_pub_key: [u8; CLIENT_SHARE_LEN],
 }
 
 impl ActiveKeyExchange for ActiveX25519MlKem768 {
-    fn complete(self: Box<Self>, peer_pub_key: &[u8]) -> Result<SharedSecret, Error> {
+    fn complete(mut self: Box<Self>, peer_pub_key: &[u8]) -> Result<SharedSecret, Error> {
         if peer_pub_key.len() != SERVER_SHARE_LEN {
             return Err(INVALID_KEY_SHARE);
         }
@@ -292,8 +358,14 @@ impl ActiveKeyExchange for ActiveX25519MlKem768 {
         let ct_array: [u8; CT_LEN] = pq_share.try_into().map_err(|_| INVALID_KEY_SHARE)?;
         let ct = CipherText::try_from_bytes(ct_array).map_err(|_| INVALID_KEY_SHARE)?;
 
-        let classical_secret = self.classical.complete(classical_share)?;
+        let classical = self
+            .payload
+            .classical
+            .take()
+            .ok_or(INVALID_KEY_SHARE)?;
+        let classical_secret = classical.complete(classical_share)?;
         let pq_secret = self
+            .payload
             .decaps_key
             .try_decaps(&ct)
             .map_err(|_| INVALID_KEY_SHARE)?;
@@ -307,14 +379,20 @@ impl ActiveKeyExchange for ActiveX25519MlKem768 {
     }
 
     fn hybrid_component(&self) -> Option<(NamedGroup, &[u8])> {
-        Some((self.classical.group(), self.classical.pub_key()))
+        let classical = self.payload.classical.as_ref()?;
+        Some((classical.group(), classical.pub_key()))
     }
 
     fn complete_hybrid_component(
-        self: Box<Self>,
+        mut self: Box<Self>,
         peer_pub_key: &[u8],
     ) -> Result<SharedSecret, Error> {
-        self.classical.complete(peer_pub_key)
+        let classical = self
+            .payload
+            .classical
+            .take()
+            .ok_or(INVALID_KEY_SHARE)?;
+        classical.complete(peer_pub_key)
     }
 
     fn pub_key(&self) -> &[u8] {
@@ -324,6 +402,218 @@ impl ActiveKeyExchange for ActiveX25519MlKem768 {
     fn group(&self) -> NamedGroup {
         NamedGroup::X25519MLKEM768
     }
+}
+
+/// Errors from allocator-carrying hybrid key-exchange operations.
+#[cfg(feature = "fallible-allocation-v1")]
+#[derive(Debug)]
+pub enum HybridKxInError {
+    /// The caller's handshake allocator refused one of the hybrid buffers.
+    Allocation,
+    /// The peer's share had an invalid length or malformed ML-KEM encoding.
+    InvalidKeyShare,
+    /// System randomness was unavailable.
+    RandomFailed,
+    /// The underlying classical X25519 exchange rejected the peer share.
+    Classical(Error),
+}
+
+/// Shared-secret buffer allocated in a caller-owned handshake allocator `A`.
+/// Zeroizes its bytes in place on `Drop` before returning backing to `A`.
+#[cfg(feature = "fallible-allocation-v1")]
+pub struct ZeroizingSharedSecretIn<A: Allocator> {
+    bytes: Vec<u8, A>,
+}
+
+#[cfg(feature = "fallible-allocation-v1")]
+impl<A: Allocator> ZeroizingSharedSecretIn<A> {
+    #[must_use]
+    pub fn secret_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+#[cfg(feature = "fallible-allocation-v1")]
+impl<A: Allocator> Drop for ZeroizingSharedSecretIn<A> {
+    fn drop(&mut self) {
+        self.bytes.as_mut_slice().zeroize();
+    }
+}
+
+/// Active client-side hybrid exchange holding the ML-KEM decapsulation key and
+/// client public share in separate allocations owned by `A`.
+#[cfg(feature = "fallible-allocation-v1")]
+pub struct ActiveHybridKxIn<A: Allocator> {
+    holder: Box<ActiveHybridPayload, A>,
+    pub_key: Vec<u8, A>,
+}
+
+#[cfg(feature = "fallible-allocation-v1")]
+impl<A: Allocator + Clone> ActiveHybridKxIn<A> {
+    #[must_use]
+    pub fn group(&self) -> NamedGroup {
+        NamedGroup::X25519MLKEM768
+    }
+
+    #[must_use]
+    pub fn pub_key(&self) -> &[u8] {
+        &self.pub_key
+    }
+
+    #[must_use]
+    pub fn hybrid_component(&self) -> (NamedGroup, &[u8]) {
+        let classical = self
+            .holder
+            .classical
+            .as_ref()
+            .expect("active hybrid exchange holds classical component");
+        (classical.group(), classical.pub_key())
+    }
+
+    /// Complete the client side of `X25519MLKEM768`, allocating the combined
+    /// `64 B` shared secret inside `allocator` and zeroizing all secret
+    /// material in place on drop (including the ML-KEM `DecapsKey` in `self.holder`).
+    pub fn complete_in(
+        mut self,
+        peer_pub_key: &[u8],
+        allocator: A,
+    ) -> Result<ZeroizingSharedSecretIn<A>, HybridKxInError> {
+        if peer_pub_key.len() != SERVER_SHARE_LEN {
+            return Err(HybridKxInError::InvalidKeyShare);
+        }
+        let (pq_share, classical_share) = peer_pub_key.split_at(CT_LEN);
+        let ct_array: [u8; CT_LEN] = pq_share
+            .try_into()
+            .map_err(|_| HybridKxInError::InvalidKeyShare)?;
+        let ct =
+            CipherText::try_from_bytes(ct_array).map_err(|_| HybridKxInError::InvalidKeyShare)?;
+
+        let mut secret_bytes = Vec::new_in(allocator);
+        secret_bytes
+            .try_reserve_exact(SHARED_SECRET_LEN)
+            .map_err(|_| HybridKxInError::Allocation)?;
+        if secret_bytes.capacity() != SHARED_SECRET_LEN {
+            return Err(HybridKxInError::Allocation);
+        }
+
+        let classical = self
+            .holder
+            .classical
+            .take()
+            .ok_or(HybridKxInError::InvalidKeyShare)?;
+        let classical_secret = classical
+            .complete(classical_share)
+            .map_err(HybridKxInError::Classical)?;
+        let pq_secret = self
+            .holder
+            .decaps_key
+            .try_decaps(&ct)
+            .map_err(|_| HybridKxInError::InvalidKeyShare)?;
+        let pq_secret_bytes = Zeroizing::new(pq_secret.into_bytes());
+
+        secret_bytes.extend_from_slice(pq_secret_bytes.as_ref());
+        secret_bytes.extend_from_slice(classical_secret.secret_bytes());
+        Ok(ZeroizingSharedSecretIn {
+            bytes: secret_bytes,
+        })
+    }
+}
+
+/// Completed server-side hybrid exchange holding the `1120 B` server share and
+/// `64 B` zeroizing shared secret in separate allocations owned by `A`.
+#[cfg(feature = "fallible-allocation-v1")]
+pub struct CompletedHybridKxIn<A: Allocator> {
+    pub group: NamedGroup,
+    pub pub_key: Vec<u8, A>,
+    pub secret: ZeroizingSharedSecretIn<A>,
+}
+
+/// Start the client side of `X25519MLKEM768`, allocating the active ML-KEM
+/// holder and the `1216 B` client share separately in `allocator`.
+#[cfg(feature = "fallible-allocation-v1")]
+pub fn start_in<A: Allocator + Clone>(allocator: A) -> Result<ActiveHybridKxIn<A>, HybridKxInError> {
+    let mut pub_key = Vec::new_in(allocator.clone());
+    pub_key
+        .try_reserve_exact(CLIENT_SHARE_LEN)
+        .map_err(|_| HybridKxInError::Allocation)?;
+    if pub_key.capacity() != CLIENT_SHARE_LEN {
+        return Err(HybridKxInError::Allocation);
+    }
+
+    let classical = rustls_ring::kx_group::X25519
+        .start()
+        .map_err(HybridKxInError::Classical)?;
+    let mut rng = SystemRngAdapter::new();
+    let (ek, dk) = KG::try_keygen_with_rng(&mut rng).map_err(|_| HybridKxInError::RandomFailed)?;
+    let ek_bytes = ek.into_bytes();
+    pub_key.extend_from_slice(&ek_bytes);
+    pub_key.extend_from_slice(classical.pub_key());
+
+    let holder = Box::try_new_in(
+        ActiveHybridPayload {
+            classical: Some(classical),
+            decaps_key: dk,
+        },
+        allocator,
+    )
+    .map_err(|_| HybridKxInError::Allocation)?;
+
+    Ok(ActiveHybridKxIn { holder, pub_key })
+}
+
+/// Perform the server side of `X25519MLKEM768`, allocating the `1120 B` server
+/// share and `64 B` zeroizing shared secret separately in `allocator`.
+#[cfg(feature = "fallible-allocation-v1")]
+pub fn start_and_complete_in<A: Allocator + Clone>(
+    client_share: &[u8],
+    allocator: A,
+) -> Result<CompletedHybridKxIn<A>, HybridKxInError> {
+    if client_share.len() != CLIENT_SHARE_LEN {
+        return Err(HybridKxInError::InvalidKeyShare);
+    }
+    let (pq_share, classical_share) = client_share.split_at(EK_LEN);
+    let ek_array: [u8; EK_LEN] = pq_share
+        .try_into()
+        .map_err(|_| HybridKxInError::InvalidKeyShare)?;
+    let ek = EncapsKey::try_from_bytes(ek_array).map_err(|_| HybridKxInError::InvalidKeyShare)?;
+
+    let mut pub_key = Vec::new_in(allocator.clone());
+    pub_key
+        .try_reserve_exact(SERVER_SHARE_LEN)
+        .map_err(|_| HybridKxInError::Allocation)?;
+    if pub_key.capacity() != SERVER_SHARE_LEN {
+        return Err(HybridKxInError::Allocation);
+    }
+
+    let mut secret_bytes = Vec::new_in(allocator);
+    secret_bytes
+        .try_reserve_exact(SHARED_SECRET_LEN)
+        .map_err(|_| HybridKxInError::Allocation)?;
+    if secret_bytes.capacity() != SHARED_SECRET_LEN {
+        return Err(HybridKxInError::Allocation);
+    }
+
+    let classical = rustls_ring::kx_group::X25519
+        .start_and_complete(classical_share)
+        .map_err(HybridKxInError::Classical)?;
+    let mut rng = SystemRngAdapter::new();
+    let (pq_secret, ct) = ek
+        .try_encaps_with_rng(&mut rng)
+        .map_err(|_| HybridKxInError::RandomFailed)?;
+    let pq_secret_bytes = Zeroizing::new(pq_secret.into_bytes());
+
+    pub_key.extend_from_slice(&ct.into_bytes());
+    pub_key.extend_from_slice(&classical.pub_key);
+    secret_bytes.extend_from_slice(pq_secret_bytes.as_ref());
+    secret_bytes.extend_from_slice(classical.secret.secret_bytes());
+
+    Ok(CompletedHybridKxIn {
+        group: NamedGroup::X25519MLKEM768,
+        pub_key,
+        secret: ZeroizingSharedSecretIn {
+            bytes: secret_bytes,
+        },
+    })
 }
 
 #[cfg(test)]
@@ -420,5 +710,235 @@ mod tests {
             provider.cipher_suites.len(),
             rustls_ring::DEFAULT_CIPHER_SUITES.len()
         );
+    }
+
+    #[cfg(feature = "fallible-allocation-v1")]
+    #[test]
+    fn hybrid_kx_allocator_accounts_holder_shares_and_secrets_separately_and_zeroizes() {
+        use crate::allocation::{AllocationPoolV1, PoolMapAllocator};
+        use core::alloc::{AllocError, Allocator};
+        use core::cell::RefCell;
+        use core::ptr::NonNull;
+        use std::rc::Rc;
+
+        #[derive(Default)]
+        struct Observed {
+            requests: usize,
+            refuse: Option<usize>,
+            live: usize,
+            layouts: Vec<Layout>,
+            zeroized_secrets: usize,
+            zeroized_holders: usize,
+        }
+
+        #[derive(Clone)]
+        struct InspectingAllocator {
+            inner: PoolMapAllocator,
+            state: Rc<RefCell<Observed>>,
+        }
+
+        impl InspectingAllocator {
+            fn new(pool: &Arc<AllocationPoolV1>) -> Self {
+                Self {
+                    inner: PoolMapAllocator::try_new(pool).expect("pool allocator"),
+                    state: Rc::new(RefCell::new(Observed::default())),
+                }
+            }
+
+            fn arm(&self, refuse: Option<usize>) {
+                let mut state = self.state.borrow_mut();
+                state.requests = 0;
+                state.refuse = refuse;
+            }
+        }
+
+        // SAFETY: delegates allocation/deallocation directly to `PoolMapAllocator`
+        // and inspects only the live allocation's own initialized bytes right
+        // before freeing.
+        unsafe impl Allocator for InspectingAllocator {
+            fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+                let mut state = self.state.borrow_mut();
+                let ordinal = state.requests;
+                state.requests += 1;
+                if state.refuse == Some(ordinal) {
+                    return Err(AllocError);
+                }
+                let ptr = self.inner.allocate(layout)?;
+                state.live += 1;
+                state.layouts.push(layout);
+                Ok(ptr)
+            }
+
+            unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+                let layouts = hybrid_kx_layouts();
+                let mut state = self.state.borrow_mut();
+                if layout == layouts.shared_secret {
+                    // SAFETY: `ZeroizingSharedSecretIn::drop` ran before `Vec` deallocates.
+                    let slice = unsafe { core::slice::from_raw_parts(ptr.as_ptr(), layout.size()) };
+                    assert!(
+                        slice.iter().all(|&b| b == 0),
+                        "shared-secret buffer must be zeroized before deallocation"
+                    );
+                    state.zeroized_secrets += 1;
+                } else if layout == layouts.active_holder {
+                    // SAFETY: `ActiveHybridPayload` drops `DecapsKey` (ZeroizeOnDrop) in place
+                    // before `Box` deallocates the holder backing.
+                    let dk_offset = core::mem::offset_of!(ActiveHybridPayload, decaps_key);
+                    let dk_size = core::mem::size_of::<DecapsKey>();
+                    let slice = unsafe {
+                        core::slice::from_raw_parts(ptr.as_ptr().add(dk_offset), dk_size)
+                    };
+                    assert!(
+                        slice.iter().all(|&b| b == 0),
+                        "ML-KEM DecapsKey must be zeroized before holder deallocation"
+                    );
+                    state.zeroized_holders += 1;
+                }
+                state.live -= 1;
+                unsafe { self.inner.deallocate(ptr, layout) };
+            }
+        }
+
+        let layouts = hybrid_kx_layouts();
+        assert_eq!(layouts.client_share.size(), CLIENT_SHARE_LEN);
+        assert_eq!(layouts.server_share.size(), SERVER_SHARE_LEN);
+        assert_eq!(layouts.shared_secret.size(), SHARED_SECRET_LEN);
+        assert!(layouts.active_holder.size() >= core::mem::size_of::<DecapsKey>());
+
+        let metadata = PoolMapAllocator::required_metadata_bytes().unwrap();
+        let holder_backend = PoolMapAllocator::backend_layout(layouts.active_holder)
+            .unwrap()
+            .size();
+        let client_share_backend = PoolMapAllocator::backend_layout(layouts.client_share)
+            .unwrap()
+            .size();
+        let server_share_backend = PoolMapAllocator::backend_layout(layouts.server_share)
+            .unwrap()
+            .size();
+        let secret_backend = PoolMapAllocator::backend_layout(layouts.shared_secret)
+            .unwrap()
+            .size();
+
+        // Exact pool budget for client start + server start_and_complete + client complete.
+        let full_budget = metadata
+            + holder_backend
+            + client_share_backend
+            + server_share_backend
+            + secret_backend * 2;
+        let pool = AllocationPoolV1::new(full_budget).unwrap();
+        let alloc = InspectingAllocator::new(&pool);
+
+        // 1. Happy path: separate accounting + full round-trip + zeroization on drop.
+        let client = start_in(alloc.clone()).expect("client start_in");
+        assert_eq!(pool.used(), metadata + holder_backend + client_share_backend);
+        assert_eq!(client.group(), NamedGroup::X25519MLKEM768);
+        assert_eq!(client.pub_key().len(), CLIENT_SHARE_LEN);
+        assert_eq!(client.hybrid_component().0, NamedGroup::X25519);
+
+        let server =
+            start_and_complete_in(client.pub_key(), alloc.clone()).expect("server complete_in");
+        assert_eq!(
+            pool.used(),
+            metadata
+                + holder_backend
+                + client_share_backend
+                + server_share_backend
+                + secret_backend
+        );
+        assert_eq!(server.group, NamedGroup::X25519MLKEM768);
+        assert_eq!(server.pub_key.len(), SERVER_SHARE_LEN);
+        assert!(server.secret.secret_bytes().iter().any(|&b| b != 0));
+
+        let client_secret = client
+            .complete_in(&server.pub_key, alloc.clone())
+            .expect("client complete_in");
+        assert_eq!(client_secret.secret_bytes(), server.secret.secret_bytes());
+        assert_eq!(
+            pool.used(),
+            metadata + server_share_backend + secret_backend * 2
+        );
+        drop(client_secret);
+        drop(server);
+        assert_eq!(pool.used(), metadata);
+        {
+            let state = alloc.state.borrow();
+            assert_eq!(state.live, 0);
+            assert_eq!(state.zeroized_secrets, 2);
+            assert_eq!(state.zeroized_holders, 1);
+            assert!(state.layouts.contains(&layouts.active_holder));
+            assert!(state.layouts.contains(&layouts.client_share));
+            assert!(state.layouts.contains(&layouts.server_share));
+            assert!(state.layouts.contains(&layouts.shared_secret));
+        }
+
+        // 2. Refusal at every individual allocation site leaves zero live allocations.
+        for refuse_at in [0, 1] {
+            alloc.arm(Some(refuse_at));
+            assert!(matches!(
+                start_in(alloc.clone()),
+                Err(HybridKxInError::Allocation)
+            ));
+            assert_eq!(alloc.state.borrow().live, 0);
+            assert_eq!(pool.used(), metadata);
+        }
+
+        alloc.arm(None);
+        let client_for_server = start_in(alloc.clone()).expect("client share");
+        let client_share = client_for_server.pub_key().to_vec();
+        drop(client_for_server);
+        assert_eq!(pool.used(), metadata);
+
+        for refuse_at in [0, 1] {
+            alloc.arm(Some(refuse_at));
+            assert!(matches!(
+                start_and_complete_in(&client_share, alloc.clone()),
+                Err(HybridKxInError::Allocation)
+            ));
+            assert_eq!(alloc.state.borrow().live, 0);
+            assert_eq!(pool.used(), metadata);
+        }
+
+        alloc.arm(None);
+        let client_refusal = start_in(alloc.clone()).expect("client for refusal");
+        let server_valid =
+            start_and_complete_in(client_refusal.pub_key(), alloc.clone()).expect("server valid");
+        alloc.arm(Some(0));
+        assert!(matches!(
+            client_refusal.complete_in(&server_valid.pub_key, alloc.clone()),
+            Err(HybridKxInError::Allocation)
+        ));
+        drop(server_valid);
+        assert_eq!(alloc.state.borrow().live, 0);
+        assert_eq!(pool.used(), metadata);
+
+        // 3. Peer-share validation errors clean up and zeroize the holder.
+        alloc.arm(None);
+        assert!(matches!(
+            start_and_complete_in(&[0u8; CLIENT_SHARE_LEN - 1], alloc.clone()),
+            Err(HybridKxInError::InvalidKeyShare)
+        ));
+        assert_eq!(pool.used(), metadata);
+
+        let client_bad_peer = start_in(alloc.clone()).expect("client bad peer");
+        assert!(matches!(
+            client_bad_peer.complete_in(&[0u8; SERVER_SHARE_LEN - 1], alloc.clone()),
+            Err(HybridKxInError::InvalidKeyShare)
+        ));
+        assert_eq!(alloc.state.borrow().live, 0);
+        assert_eq!(pool.used(), metadata);
+        drop(alloc);
+        assert_eq!(pool.used(), 0);
+
+        // 4. Exact pool-capacity limit-1 refusal for client start_in.
+        let tight_short = AllocationPoolV1::new(metadata + holder_backend + client_share_backend - 1)
+            .unwrap();
+        let tight_alloc = PoolMapAllocator::try_new(&tight_short).unwrap();
+        assert!(matches!(
+            start_in(tight_alloc.clone()),
+            Err(HybridKxInError::Allocation)
+        ));
+        assert_eq!(tight_short.used(), metadata);
+        drop(tight_alloc);
+        assert_eq!(tight_short.used(), 0);
     }
 }

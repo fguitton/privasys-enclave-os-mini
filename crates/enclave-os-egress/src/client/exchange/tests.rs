@@ -167,6 +167,11 @@ fn request(
         if let Ok((parsed, used)) = enclave_os_common::protocol::parse_http_request(&plain) {
             assert_eq!(used, plain.len());
             assert_eq!(parsed.path, attest::ATTEST_PATH);
+            assert_eq!(
+                server.negotiated_key_exchange_group().map(|g| g.name()),
+                Some(rustls::NamedGroup::X25519MLKEM768),
+                "hybrid egress handshake must negotiate X25519MLKEM768 (0x11ec)"
+            );
             return serde_json::from_slice(&parsed.body).unwrap();
         }
     }
@@ -271,6 +276,64 @@ fn live_exporter_binds_evidence_and_replay_cannot_open_application_writes() {
     assert!(replay.peer_evidence().is_none());
     assert!(replay.write_plaintext(b"protected request").is_err());
     assert!(replay.feed_tls_bytes(&[]).is_err());
+
+    // Classical-only peer interoperability: a ring-only server negotiates X25519 (29).
+    let classical_server_cfg = ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![CertificateDer::from(identity.cert.clone())],
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.key.clone())),
+    )
+    .unwrap();
+    let mut classical_client = IncrementalTlsClient::new(
+        "v2.test",
+        &identity.roots(),
+        Some(RaTlsPolicy {
+            tee: TeeType::Sgx,
+            mr_enclave: Some([7; 32]),
+            mr_signer: None,
+            mr_td: None,
+            report_data: ReportDataBinding::ChallengeResponse { nonce: vec![9; 32] },
+            expected_oids: vec![],
+            attestation_servers: vec![],
+            acceptable_tcb_statuses: Vec::new(),
+            client_identity: None,
+            dependencies: None,
+        }),
+        None,
+    )
+    .unwrap();
+    let mut classical_server = ServerConnection::new(Arc::new(classical_server_cfg)).unwrap();
+    for _ in 0..32 {
+        let output = classical_client.collect_tls_output().unwrap();
+        if !output.is_empty() {
+            classical_server
+                .read_tls(&mut std::io::Cursor::new(output))
+                .unwrap();
+            classical_server.process_new_packets().unwrap();
+        }
+        let mut out = Vec::new();
+        while classical_server.wants_write() {
+            classical_server.write_tls(&mut out).unwrap();
+        }
+        if !out.is_empty() {
+            classical_client.feed_tls_bytes(&out).unwrap();
+        }
+        if classical_server.negotiated_key_exchange_group().is_some() {
+            break;
+        }
+    }
+    assert_eq!(
+        classical_server
+            .negotiated_key_exchange_group()
+            .map(|g| g.name()),
+        Some(rustls::NamedGroup::X25519),
+        "classical-only peer must interoperate on X25519 (29)"
+    );
 }
 
 #[test]
