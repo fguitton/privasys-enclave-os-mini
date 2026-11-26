@@ -6,7 +6,7 @@
 //! must prove possession. Accepting its chain here grants no attested identity.
 
 #[cfg(test)]
-use rustls::crypto::ring::default_provider;
+use enclave_os_common::tls_hybrid_kx::default_provider;
 use rustls::crypto::verify_tls13_signature;
 use rustls::pki_types::{CertificateDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};

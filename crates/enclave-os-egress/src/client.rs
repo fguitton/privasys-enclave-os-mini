@@ -22,7 +22,7 @@ use ring::digest;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::{ResolvesClientCert, WebPkiServerVerifier};
-use rustls::crypto::ring::default_provider;
+use enclave_os_common::tls_hybrid_kx::default_provider;
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::server::WebPkiClientVerifier;

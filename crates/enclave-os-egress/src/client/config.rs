@@ -210,9 +210,11 @@ fn required_bytes(
                 .size(),
         )?
         .checked_add(
-            Layout::array::<&'static dyn SupportedKxGroup>(ring::DEFAULT_KX_GROUPS.len())
-                .ok()?
-                .size(),
+            Layout::array::<&'static dyn SupportedKxGroup>(
+                enclave_os_common::tls_hybrid_kx::DEFAULT_KX_GROUPS.len(),
+            )
+            .ok()?
+            .size(),
         )?
         .checked_add(shared_allocation_bytes::<
             rustls::time_provider::DefaultTimeProvider,
@@ -327,7 +329,9 @@ pub(super) fn build(
     #[cfg(not(all(feature = "fallible-allocation-v1", target_vendor = "teaclave")))]
     let allocator = rustls::RetainedAllocator::default();
 
-    let provider = try_arc(rustls::crypto::ring::try_default_provider().map_err(|_| REFUSED)?)?;
+    let provider = try_arc(
+        enclave_os_common::tls_hybrid_kx::try_default_provider().map_err(|_| REFUSED)?,
+    )?;
     let time = try_arc(rustls::time_provider::DefaultTimeProvider)?;
     let builder = ClientConfig::builder_with_details(provider.clone(), time)
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -616,7 +620,7 @@ pub(crate) fn check(roots: &RootCertStore) {
             )
             .unwrap(),
             Layout::array::<&'static dyn rustls::crypto::SupportedKxGroup>(
-                rustls::crypto::ring::DEFAULT_KX_GROUPS.len(),
+                enclave_os_common::tls_hybrid_kx::DEFAULT_KX_GROUPS.len(),
             )
             .unwrap(),
             arc_layout(Layout::new::<CryptoProvider>()),

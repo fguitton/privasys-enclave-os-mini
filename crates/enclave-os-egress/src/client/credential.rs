@@ -209,7 +209,7 @@ impl ClientCredential {
         #[cfg(all(feature = "fallible-allocation-v1", not(target_vendor = "teaclave")))]
         drop(working);
         #[cfg(not(feature = "fallible-allocation-v1"))]
-        let signing_key = rustls::crypto::ring::default_provider()
+        let signing_key = enclave_os_common::tls_hybrid_kx::default_provider()
             .key_provider
             .load_private_key(key_der.clone_key())
             .map_err(|_| ClientCredentialError::Signing)?;

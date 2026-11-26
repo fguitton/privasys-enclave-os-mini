@@ -63,6 +63,9 @@ pub mod drbg;
 #[cfg(all(feature = "crypto", feature = "std"))]
 pub mod attestation_servers;
 
+#[cfg(feature = "tls-hybrid-kx")]
+pub mod tls_hybrid_kx;
+
 /// Re-export `ring::digest` for downstream crates that need hashing.
 #[cfg(feature = "crypto")]
 pub use ring::digest;

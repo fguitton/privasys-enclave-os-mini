@@ -76,7 +76,7 @@ pub(super) fn check_authorization_boundary() {
     let cert = certified.cert.der().to_vec();
     let roots = root_store_from_der([cert.clone()]).unwrap();
     let config = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
+        enclave_os_common::tls_hybrid_kx::default_provider(),
     ))
     .with_safe_default_protocol_versions()
     .unwrap()

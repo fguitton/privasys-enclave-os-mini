@@ -94,7 +94,7 @@ fn pair(
     identity: &Identity,
     client_identity: Option<&Identity>,
 ) -> (IncrementalTlsClient, ServerConnection) {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(enclave_os_common::tls_hybrid_kx::default_provider());
     let builder = ServerConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .unwrap();

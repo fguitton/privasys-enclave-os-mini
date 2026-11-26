@@ -29,15 +29,21 @@ sgx = []
 crypto = ["dep:ring", "dep:base64"]
 # JWT verification & encoding (ECDSA P-256 / ES256)
 jwt = ["crypto", "dep:base64"]
+# Hybrid post-quantum TLS 1.3 key exchange (X25519MLKEM768 over fips203 + ring)
+tls-hybrid-kx = ["std", "crypto", "dep:fips203", "dep:rustls", "dep:webpki", "dep:zeroize"]
 
 [dependencies]
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 httparse = { version = "1", default-features = false }
 
-# Optional: only pulled in when the `jwt` feature is enabled
-ring       = { version = "0.17", optional = true }
-base64     = { version = "0.21", default-features = false, features = ["alloc"], optional = true }
+# Optional: only pulled in when the `jwt` / `tls-hybrid-kx` features are enabled
+ring    = { version = "0.17", optional = true }
+base64  = { version = "0.21", default-features = false, features = ["alloc"], optional = true }
+fips203 = { version = "=0.4.3", default-features = false, features = ["ml-kem-768"], optional = true }
+rustls  = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+webpki  = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["ring", "std"], optional = true }
+zeroize = { version = "1.8", default-features = false, features = ["alloc"], optional = true }
 
 [dev-dependencies]
 ring = "0.17"

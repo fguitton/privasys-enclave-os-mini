@@ -46,9 +46,10 @@ fn retained_children_bytes(authentication: ClientAuthentication) -> Option<usize
         ring::DEFAULT_CIPHER_SUITES.len(),
     )
     .ok()?;
-    let groups =
-        core::alloc::Layout::array::<&'static dyn SupportedKxGroup>(ring::DEFAULT_KX_GROUPS.len())
-            .ok()?;
+    let groups = core::alloc::Layout::array::<&'static dyn SupportedKxGroup>(
+        enclave_os_common::tls_hybrid_kx::DEFAULT_KX_GROUPS.len(),
+    )
+    .ok()?;
     shared_allocation_bytes::<ServerConfig>()?
         .checked_add(shared_allocation_bytes::<CryptoProvider>()?)?
         .checked_add(suites.size())?
@@ -285,9 +286,9 @@ impl ConfigReservation {
     }
     fn provider(&self) -> Option<Arc<rustls::crypto::CryptoProvider>> {
         #[cfg(feature = "fallible-allocation-v1")]
-        let provider = rustls::crypto::ring::try_default_provider().ok()?;
+        let provider = enclave_os_common::tls_hybrid_kx::try_default_provider().ok()?;
         #[cfg(not(feature = "fallible-allocation-v1"))]
-        let provider = rustls::crypto::ring::default_provider();
+        let provider = enclave_os_common::tls_hybrid_kx::default_provider();
         #[cfg(feature = "fallible-allocation-v1")]
         let provider = Arc::try_new(provider).ok()?;
         #[cfg(not(feature = "fallible-allocation-v1"))]
@@ -632,7 +633,10 @@ mod provider_refusal {
         let layouts = [
             Layout::array::<rustls::SupportedCipherSuite>(ring::DEFAULT_CIPHER_SUITES.len())
                 .unwrap(),
-            Layout::array::<&'static dyn SupportedKxGroup>(ring::DEFAULT_KX_GROUPS.len()).unwrap(),
+            Layout::array::<&'static dyn SupportedKxGroup>(
+                enclave_os_common::tls_hybrid_kx::DEFAULT_KX_GROUPS.len(),
+            )
+            .unwrap(),
             arc,
             time,
             verifier,

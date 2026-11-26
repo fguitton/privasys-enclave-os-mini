@@ -128,8 +128,9 @@ fn pair_with_all_pools(
     let mut roots = RootCertStore::empty();
     roots.add(CertificateDer::from(cert.clone())).unwrap();
     #[cfg(not(feature = "fallible-allocation-v1"))]
-    let client =
-        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+    let client = ClientConfig::builder_with_provider(Arc::new(
+        enclave_os_common::tls_hybrid_kx::default_provider(),
+    ))
             .with_protocol_versions(&[&rustls::version::TLS13])
             .unwrap()
             .with_root_certificates(roots)
@@ -218,6 +219,12 @@ fn handshake(client: &mut ClientConnection, session: &mut RaTlsSession) {
             client.process_new_packets().unwrap();
         }
         if !client.is_handshaking() && !session.is_handshaking() {
+            assert_eq!(
+                client
+                    .negotiated_key_exchange_group()
+                    .map(|group| group.name()),
+                Some(rustls::NamedGroup::X25519MLKEM768)
+            );
             return;
         }
     }
