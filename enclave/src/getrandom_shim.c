@@ -98,14 +98,20 @@ int poll(void *fds, unsigned long nfds, int timeout) {
     return -1;
 }
 
+/*
+ * Fail-closed stubs for pthread_mutex_{lock,unlock}: getrandom 0.2's dead
+ * /dev/urandom fallback references these symbols at link time, so they cannot
+ * simply be omitted, but silently returning 0 would leave any unexpected
+ * caller unprotected. Trap immediately if ever invoked inside the enclave.
+ */
 int pthread_mutex_lock(void *mutex) {
     (void)mutex;
-    return 0;
+    __builtin_trap();
 }
 
 int pthread_mutex_unlock(void *mutex) {
     (void)mutex;
-    return 0;
+    __builtin_trap();
 }
 
 int __xpg_strerror_r(int errnum, char *buf, size_t buflen) {
