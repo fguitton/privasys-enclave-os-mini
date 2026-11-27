@@ -447,20 +447,17 @@ fn live_exporter_binds_evidence_and_replay_cannot_open_application_writes() {
     std::thread_local! {
         static WATCHED: std::cell::RefCell<Option<std::sync::Weak<Pool>>> =
             const { std::cell::RefCell::new(None) };
-        static SAW_LIVE_SECRET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static RELEASED_AT: std::cell::RefCell<Vec<usize>> =
+            const { std::cell::RefCell::new(Vec::new()) };
     }
     fn observe_release() {
         WATCHED.with(|watched| {
             if let Some(pool) = watched.borrow().as_ref().and_then(std::sync::Weak::upgrade) {
-                if pool.used() == enclave_os_common::tls_hybrid_kx::hybrid_kx_client_complete_bytes() {
-                    SAW_LIVE_SECRET.with(|seen| seen.set(true));
-                }
+                RELEASED_AT.with(|events| events.borrow_mut().push(pool.used()));
             }
         });
     }
     let full_kx_pool = Pool::new_with_release(kx_start + kx_complete, Some(observe_release)).unwrap();
-    WATCHED.with(|slot| *slot.borrow_mut() = Some(std::sync::Arc::downgrade(&full_kx_pool)));
-    SAW_LIVE_SECRET.with(|seen| seen.set(false));
     let mut full_client = IncrementalTlsClient::new(
         "v2.test",
         &identity.roots(),
@@ -470,9 +467,26 @@ fn live_exporter_binds_evidence_and_replay_cannot_open_application_writes() {
     .unwrap();
     assert_eq!(full_kx_pool.used(), kx_start);
     let mut full_server = ServerConnection::new(hybrid_server_cfg).unwrap();
-    let _full_req = request(&mut full_client, &mut full_server);
-    assert!(SAW_LIVE_SECRET.with(|seen| seen.get()));
+    let hello = full_client.collect_tls_output().unwrap();
+    full_server.read_tls(&mut std::io::Cursor::new(hello)).unwrap();
+    full_server.process_new_packets().unwrap();
+    let mut flight = Vec::new();
+    while full_server.wants_write() {
+        full_server.write_tls(&mut flight).unwrap();
+    }
+    // Observe only the plaintext ServerHello record, before the subsequent
+    // certificate, Finished and application work can release other allocations.
+    assert_eq!(rustls::ContentType::from(flight[0]), rustls::ContentType::Handshake);
+    let end = 5 + usize::from(u16::from_be_bytes([flight[3], flight[4]]));
+    let (server_hello, remaining) = flight.split_at(end);
+    assert_eq!(rustls::HandshakeType::from(server_hello[5]), rustls::HandshakeType::ServerHello);
+    WATCHED.with(|slot| *slot.borrow_mut() = Some(std::sync::Arc::downgrade(&full_kx_pool)));
+    RELEASED_AT.with(|events| events.borrow_mut().clear());
+    full_client.feed_tls_bytes(server_hello).unwrap();
+    RELEASED_AT.with(|events| assert_eq!(events.borrow().as_slice(), [kx_complete, 0]));
     WATCHED.with(|slot| *slot.borrow_mut() = None);
+    full_client.feed_tls_bytes(remaining).unwrap();
+    let _full_req = request(&mut full_client, &mut full_server);
     assert_eq!(
         full_kx_pool.used(),
         0,

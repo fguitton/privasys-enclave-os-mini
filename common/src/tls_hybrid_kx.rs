@@ -177,6 +177,17 @@ fn retain_returned_bytes(origin: Option<&Arc<AllocationPoolV1>>, bytes: usize) -
     })
 }
 
+// Arm the refund only once the raw value exists and is being handed to rustls.
+// Construction can fail after reservation and must leave rollback silent.
+fn publish_returned<T>(value: T) -> T {
+    ACTIVE_HANDSHAKE.with(|cell| {
+        if let Some(lease) = cell.borrow().as_ref().and_then(|scope| scope.returned.as_ref()) {
+            lease.activate_release_notification();
+        }
+    });
+    value
+}
+
 struct HandshakeBudgetGuard {
     previous: Option<HandshakeBudget>,
 }
@@ -468,11 +479,11 @@ impl SupportedKxGroup for X25519MlKem768Group {
         combined_secret[..SSK_LEN].copy_from_slice(pq_secret_bytes.as_ref());
         combined_secret[SSK_LEN..].copy_from_slice(classical.secret.secret_bytes());
 
-        Ok(CompletedKeyExchange {
+        Ok(publish_returned(CompletedKeyExchange {
             group: NamedGroup::X25519MLKEM768,
             pub_key: combined_pub_key,
             secret: SharedSecret::from(&combined_secret[..]),
-        })
+        }))
     }
 
     fn name(&self) -> NamedGroup {
@@ -520,7 +531,7 @@ impl ActiveKeyExchange for ActiveX25519MlKem768 {
         combined_secret[..SSK_LEN].copy_from_slice(pq_secret_bytes.as_ref());
         combined_secret[SSK_LEN..].copy_from_slice(classical_secret.secret_bytes());
 
-        Ok(SharedSecret::from(&combined_secret[..]))
+        Ok(publish_returned(SharedSecret::from(&combined_secret[..])))
     }
 
     fn hybrid_component(&self) -> Option<(NamedGroup, &[u8])> {
@@ -1112,12 +1123,29 @@ mod tests {
 
         let full = AllocationPoolV1::new(client_start + client_complete).unwrap();
         let short_server = AllocationPoolV1::new(server_bytes - 1).unwrap();
-        let server = AllocationPoolV1::new(server_bytes).unwrap();
+        std::thread_local! {
+            static SERVER_RELEASES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+        }
+        let server = AllocationPoolV1::new_with_release(server_bytes, Some(|| {
+            SERVER_RELEASES.with(|count| count.set(count.get() + 1));
+        })).unwrap();
+        SERVER_RELEASES.with(|count| count.set(0));
         let active = start(&full);
         in_handshake_scope(Some(&short_server), || {
             assert!(X25519MLKEM768.start_and_complete(active.pub_key()).is_err());
             assert_eq!(short_server.used(), 0);
         });
+
+        // Valid ML-KEM encoding reaches reservation; ring refuses the zero
+        // X25519 component before a server output is published.
+        let mut invalid_share = active.pub_key().to_vec();
+        invalid_share[EK_LEN..].fill(0);
+        in_handshake_scope(Some(&server), || {
+            assert!(X25519MLKEM768.start_and_complete(&invalid_share).is_err());
+            assert_eq!(server.used(), server_bytes);
+        });
+        assert_eq!(server.used(), 0);
+        SERVER_RELEASES.with(|count| assert_eq!(count.get(), 0));
 
         in_handshake_scope(Some(&server), || {
             let result = X25519MLKEM768.start_and_complete(active.pub_key()).unwrap();
@@ -1132,6 +1160,7 @@ mod tests {
             assert_eq!(server.used(), server_bytes);
         });
         assert_eq!(server.used(), 0);
+        SERVER_RELEASES.with(|count| assert_eq!(count.get(), 1));
 
         for consumer in [None, Some(&exact_start)] {
             let active = start(&exact_start);
