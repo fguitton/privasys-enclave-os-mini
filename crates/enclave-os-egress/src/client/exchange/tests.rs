@@ -441,8 +441,26 @@ fn live_exporter_binds_evidence_and_replay_cannot_open_application_writes() {
 
     // 4. Budget of kx_start + kx_complete completes live 0x11ec handshake and
     // releases all hybrid key-exchange credit back to zero.
-    let full_kx_pool =
-        enclave_os_common::allocation::AllocationPoolV1::new(kx_start + kx_complete).unwrap();
+    // The rustls callback releases its published active holder on completion.
+    // At that instant rustls still owns the raw secret returned by the trait.
+    type Pool = enclave_os_common::allocation::AllocationPoolV1;
+    std::thread_local! {
+        static WATCHED: std::cell::RefCell<Option<std::sync::Weak<Pool>>> =
+            const { std::cell::RefCell::new(None) };
+        static SAW_LIVE_SECRET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    fn observe_release() {
+        WATCHED.with(|watched| {
+            if let Some(pool) = watched.borrow().as_ref().and_then(std::sync::Weak::upgrade) {
+                if pool.used() == enclave_os_common::tls_hybrid_kx::hybrid_kx_client_complete_bytes() {
+                    SAW_LIVE_SECRET.with(|seen| seen.set(true));
+                }
+            }
+        });
+    }
+    let full_kx_pool = Pool::new_with_release(kx_start + kx_complete, Some(observe_release)).unwrap();
+    WATCHED.with(|slot| *slot.borrow_mut() = Some(std::sync::Arc::downgrade(&full_kx_pool)));
+    SAW_LIVE_SECRET.with(|seen| seen.set(false));
     let mut full_client = IncrementalTlsClient::new(
         "v2.test",
         &identity.roots(),
@@ -453,6 +471,8 @@ fn live_exporter_binds_evidence_and_replay_cannot_open_application_writes() {
     assert_eq!(full_kx_pool.used(), kx_start);
     let mut full_server = ServerConnection::new(hybrid_server_cfg).unwrap();
     let _full_req = request(&mut full_client, &mut full_server);
+    assert!(SAW_LIVE_SECRET.with(|seen| seen.get()));
+    WATCHED.with(|slot| *slot.borrow_mut() = None);
     assert_eq!(
         full_kx_pool.used(),
         0,
