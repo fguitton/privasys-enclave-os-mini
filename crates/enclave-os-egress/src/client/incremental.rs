@@ -35,17 +35,20 @@ fn start_client_connection(
         let pool = pool.ok_or("trusted incremental TLS requires the original allocation pool")?;
         let origin = enclave_os_common::allocation::LoanAllocator::from_pool_unpublished(pool)
             .map_err(|_| "incremental TLS origin allocation refused".to_string())?;
-        let connection =
-            ClientConnection::new_with_allocator(config, name, origin.owned_allocator())
-                .map_err(|error| format!("incremental TLS init failed: {error}"))?;
+        let connection = enclave_os_common::tls_hybrid_kx::with_handshake_budget(
+            Some(pool),
+            || ClientConnection::new_with_allocator(config, name, origin.owned_allocator()),
+        )
+        .map_err(|error| format!("incremental TLS init failed: {error}"))?;
         origin.activate_release_notification();
         Ok(connection)
     }
     #[cfg(not(all(feature = "fallible-allocation-v1", target_vendor = "teaclave")))]
     {
-        let _ = pool;
-        ClientConnection::new(config, name)
-            .map_err(|error| format!("incremental TLS init failed: {error}"))
+        enclave_os_common::tls_hybrid_kx::with_handshake_budget(pool, || {
+            ClientConnection::new(config, name)
+        })
+        .map_err(|error| format!("incremental TLS init failed: {error}"))
     }
 }
 
@@ -211,9 +214,11 @@ impl IncrementalTlsClient {
             if read == 0 {
                 break;
             }
-            self.tls_conn
-                .process_new_packets()
-                .map_err(|error| format!("incremental TLS packet rejected: {error}"))?;
+            enclave_os_common::tls_hybrid_kx::with_handshake_budget(
+                self.application_pool.as_ref(),
+                || self.tls_conn.process_new_packets(),
+            )
+            .map_err(|error| format!("incremental TLS packet rejected: {error}"))?;
             self.advance_attestation()?;
         }
         self.advance_attestation()?;
@@ -572,13 +577,23 @@ mod tests {
     #[test]
     fn rustls_buffer_does_not_undercut_the_declared_request_bound() {
         let roots = RootCertStore::empty();
-        let pool = enclave_os_common::allocation::AllocationPoolV1::new(3).unwrap();
+        let kx_start = enclave_os_common::tls_hybrid_kx::hybrid_kx_client_start_bytes();
+        let pool = enclave_os_common::allocation::AllocationPoolV1::new(kx_start + 3).unwrap();
         let mut paid =
             IncrementalTlsClient::new("bounded.invalid", &roots, None, Some(pool.clone())).unwrap();
+        assert_eq!(
+            pool.used(),
+            kx_start,
+            "live incremental client holds hybrid key-exchange budget until completion or drop"
+        );
         paid.append_plaintext(&[1]).unwrap();
-        assert_eq!(pool.used(), 1);
+        assert_eq!(pool.used(), kx_start + 1);
         paid.append_plaintext(&[2]).unwrap();
-        assert_eq!(pool.used(), 2, "old backing was released after replacement");
+        assert_eq!(
+            pool.used(),
+            kx_start + 2,
+            "old backing was released after replacement"
+        );
         assert!(
             paid.append_plaintext(&[3]).is_err(),
             "old/new layouts must coexist before growth"
@@ -588,19 +603,23 @@ mod tests {
         assert_eq!(held.as_ref(), &[1, 2]);
         assert_eq!(
             pool.used(),
-            2,
-            "HTTP recipient retains original plaintext credit"
+            kx_start + 2,
+            "HTTP recipient retains original plaintext credit alongside active handshake holder"
         );
         assert!(std::sync::Arc::ptr_eq(
             paid.application_pool.as_ref().unwrap(),
             &pool
         ));
         drop(paid);
-        assert_eq!(pool.used(), 2);
+        assert_eq!(
+            pool.used(),
+            2,
+            "dropping client releases active hybrid key-exchange credit while held plaintext remains"
+        );
         drop(held);
         assert_eq!(pool.used(), 0);
         let pool = enclave_os_common::allocation::AllocationPoolV1::new(
-            2 * super::MAX_INCREMENTAL_PLAINTEXT,
+            kx_start + 2 * super::MAX_INCREMENTAL_PLAINTEXT,
         )
         .unwrap();
         let mut paid =
@@ -608,7 +627,7 @@ mod tests {
         paid.append_plaintext(&vec![0; super::MAX_INCREMENTAL_PLAINTEXT - 1])
             .unwrap();
         paid.append_plaintext(&[1]).unwrap();
-        assert_eq!(pool.used(), super::MAX_INCREMENTAL_PLAINTEXT);
+        assert_eq!(pool.used(), kx_start + super::MAX_INCREMENTAL_PLAINTEXT);
         assert!(paid.append_plaintext(&[2]).is_err());
         assert_eq!(paid.plaintext.len(), super::MAX_INCREMENTAL_PLAINTEXT);
         drop(paid);

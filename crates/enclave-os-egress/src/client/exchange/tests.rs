@@ -141,6 +141,14 @@ fn request(
     client: &mut IncrementalTlsClient,
     server: &mut ServerConnection,
 ) -> attest::AttestRequest {
+    request_with_group(client, server, rustls::NamedGroup::X25519MLKEM768)
+}
+
+fn request_with_group(
+    client: &mut IncrementalTlsClient,
+    server: &mut ServerConnection,
+    expected_group: rustls::NamedGroup,
+) -> attest::AttestRequest {
     let mut plain = Vec::new();
     for _ in 0..32 {
         let output = client.collect_tls_output().unwrap();
@@ -169,8 +177,8 @@ fn request(
             assert_eq!(parsed.path, attest::ATTEST_PATH);
             assert_eq!(
                 server.negotiated_key_exchange_group().map(|g| g.name()),
-                Some(rustls::NamedGroup::X25519MLKEM768),
-                "hybrid egress handshake must negotiate X25519MLKEM768 (0x11ec)"
+                Some(expected_group),
+                "egress handshake must negotiate expected key-exchange group"
             );
             return serde_json::from_slice(&parsed.body).unwrap();
         }
@@ -277,7 +285,8 @@ fn live_exporter_binds_evidence_and_replay_cannot_open_application_writes() {
     assert!(replay.write_plaintext(b"protected request").is_err());
     assert!(replay.feed_tls_bytes(&[]).is_err());
 
-    // Classical-only peer interoperability: a ring-only server negotiates X25519 (29).
+    // Classical-only peer interoperability: a ring-only server completes a full
+    // end-to-end authenticated exchange and encrypted application write over X25519 (29).
     let classical_server_cfg = ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -289,50 +298,165 @@ fn live_exporter_binds_evidence_and_replay_cannot_open_application_writes() {
         PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.key.clone())),
     )
     .unwrap();
+    let classical_policy = || RaTlsPolicy {
+        tee: TeeType::Sgx,
+        mr_enclave: Some([7; 32]),
+        mr_signer: None,
+        mr_td: None,
+        report_data: ReportDataBinding::ChallengeResponse { nonce: vec![9; 32] },
+        expected_oids: vec![],
+        attestation_servers: vec![],
+        acceptable_tcb_statuses: Vec::new(),
+        client_identity: None,
+        dependencies: None,
+    };
     let mut classical_client = IncrementalTlsClient::new(
         "v2.test",
         &identity.roots(),
-        Some(RaTlsPolicy {
-            tee: TeeType::Sgx,
-            mr_enclave: Some([7; 32]),
-            mr_signer: None,
-            mr_td: None,
-            report_data: ReportDataBinding::ChallengeResponse { nonce: vec![9; 32] },
-            expected_oids: vec![],
-            attestation_servers: vec![],
-            acceptable_tcb_statuses: Vec::new(),
-            client_identity: None,
-            dependencies: None,
-        }),
+        Some(classical_policy()),
         None,
     )
     .unwrap();
     let mut classical_server = ServerConnection::new(Arc::new(classical_server_cfg)).unwrap();
-    for _ in 0..32 {
-        let output = classical_client.collect_tls_output().unwrap();
-        if !output.is_empty() {
-            classical_server
-                .read_tls(&mut std::io::Cursor::new(output))
-                .unwrap();
-            classical_server.process_new_packets().unwrap();
-        }
-        let mut out = Vec::new();
-        while classical_server.wants_write() {
-            classical_server.write_tls(&mut out).unwrap();
-        }
-        if !out.is_empty() {
-            classical_client.feed_tls_bytes(&out).unwrap();
-        }
-        if classical_server.negotiated_key_exchange_group().is_some() {
-            break;
+    let classical_req = request_with_group(
+        &mut classical_client,
+        &mut classical_server,
+        rustls::NamedGroup::X25519,
+    );
+    assert!(!classical_client.is_ready());
+    assert!(classical_client.write_plaintext(b"classical request").is_err());
+    let classical_body =
+        serde_json::to_vec(&response(&identity, &classical_server, &classical_req, false)).unwrap();
+    send(&mut classical_client, &mut classical_server, 200, &classical_body).unwrap();
+    assert!(classical_client.is_ready());
+    let classical_evidence = classical_client.peer_evidence().unwrap();
+    assert_eq!(
+        crate::client::locally_verify_sgx_peer_certificate(
+            &identity.cert,
+            [7; 32],
+            classical_evidence,
+        )
+        .unwrap()
+        .mr_enclave,
+        [7; 32]
+    );
+    classical_client
+        .write_plaintext(b"classical protected request")
+        .unwrap();
+    let app_wire = classical_client.collect_tls_output().unwrap();
+    classical_server
+        .read_tls(&mut std::io::Cursor::new(app_wire))
+        .unwrap();
+    classical_server.process_new_packets().unwrap();
+    let mut decrypted = Vec::new();
+    let mut buf = [0u8; 256];
+    loop {
+        match classical_server.reader().read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => decrypted.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => panic!("classical server plaintext read: {e}"),
         }
     }
+    assert_eq!(decrypted, b"classical protected request");
     assert_eq!(
         classical_server
             .negotiated_key_exchange_group()
             .map(|g| g.name()),
         Some(rustls::NamedGroup::X25519),
-        "classical-only peer must interoperate on X25519 (29)"
+        "completed authenticated classical-only peer exchange must negotiate X25519 (29)"
+    );
+
+    // Live egress hybrid handshake connection-budget charging, exhaustion at
+    // limit - 1, early-drop release, and completion release.
+    let kx_start = enclave_os_common::tls_hybrid_kx::hybrid_kx_client_start_bytes();
+    let kx_complete = enclave_os_common::tls_hybrid_kx::hybrid_kx_client_complete_bytes();
+    let hybrid_server_cfg = Arc::new(
+        ServerConfig::builder_with_provider(Arc::new(
+            enclave_os_common::tls_hybrid_kx::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(identity.cert.clone())],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.key.clone())),
+        )
+        .unwrap(),
+    );
+
+    // 1. Refusal at kx_start - 1 leaves zero credit charged.
+    let short_start_pool =
+        enclave_os_common::allocation::AllocationPoolV1::new(kx_start - 1).unwrap();
+    assert!(IncrementalTlsClient::new(
+        "v2.test",
+        &identity.roots(),
+        Some(classical_policy()),
+        Some(short_start_pool.clone()),
+    )
+    .is_err());
+    assert_eq!(short_start_pool.used(), 0);
+
+    // 2. Exact kx_start holds active credit during ClientHello and releases on early drop.
+    let start_only_pool = enclave_os_common::allocation::AllocationPoolV1::new(kx_start).unwrap();
+    let early_drop_client = IncrementalTlsClient::new(
+        "v2.test",
+        &identity.roots(),
+        Some(classical_policy()),
+        Some(start_only_pool.clone()),
+    )
+    .unwrap();
+    assert_eq!(start_only_pool.used(), kx_start);
+    drop(early_drop_client);
+    assert_eq!(start_only_pool.used(), 0);
+
+    // 3. Budget of kx_start + kx_complete - 1 refuses ServerHello completion and
+    // releases all credit when the failed client drops.
+    let short_complete_pool =
+        enclave_os_common::allocation::AllocationPoolV1::new(kx_start + kx_complete - 1).unwrap();
+    let mut short_client = IncrementalTlsClient::new(
+        "v2.test",
+        &identity.roots(),
+        Some(classical_policy()),
+        Some(short_complete_pool.clone()),
+    )
+    .unwrap();
+    assert_eq!(short_complete_pool.used(), kx_start);
+    let mut short_server = ServerConnection::new(hybrid_server_cfg.clone()).unwrap();
+    let client_hello = short_client.collect_tls_output().unwrap();
+    short_server
+        .read_tls(&mut std::io::Cursor::new(client_hello))
+        .unwrap();
+    short_server.process_new_packets().unwrap();
+    let mut server_hello = Vec::new();
+    while short_server.wants_write() {
+        short_server.write_tls(&mut server_hello).unwrap();
+    }
+    assert!(
+        short_client.feed_tls_bytes(&server_hello).is_err(),
+        "live egress handshake must refuse when connection pool is 1 byte short of shared secret"
+    );
+    drop(short_client);
+    assert_eq!(short_complete_pool.used(), 0);
+
+    // 4. Budget of kx_start + kx_complete completes live 0x11ec handshake and
+    // releases all hybrid key-exchange credit back to zero.
+    let full_kx_pool =
+        enclave_os_common::allocation::AllocationPoolV1::new(kx_start + kx_complete).unwrap();
+    let mut full_client = IncrementalTlsClient::new(
+        "v2.test",
+        &identity.roots(),
+        Some(classical_policy()),
+        Some(full_kx_pool.clone()),
+    )
+    .unwrap();
+    assert_eq!(full_kx_pool.used(), kx_start);
+    let mut full_server = ServerConnection::new(hybrid_server_cfg).unwrap();
+    let _full_req = request(&mut full_client, &mut full_server);
+    assert_eq!(
+        full_kx_pool.used(),
+        0,
+        "completed live hybrid egress handshake must release active key-exchange credit"
     );
 }
 

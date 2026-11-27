@@ -14,6 +14,7 @@ mod record_owner_check;
 
 struct Payload {
     config: Arc<ServerConfig>,
+    pool: Arc<AllocationPoolV1>,
     // Every config/connection alias precedes the certificate byte/outer-Vec
     // credit. The final shared payload owns both until the final alias drops.
     _certificates: Option<enclave_os_common::allocation::AllocationLeaseV1>,
@@ -107,12 +108,18 @@ impl RetainedTlsConfig {
             },
         )
     }
+    pub(crate) fn pool(&self) -> &Arc<AllocationPoolV1> {
+        &self.0.pool
+    }
     #[cfg(target_vendor = "teaclave")]
     pub(crate) fn accept(
         self,
         accepted: rustls::server::Accepted,
     ) -> Result<RetainedConnection, (rustls::Error, rustls::server::AcceptedAlert)> {
-        let connection = accepted.into_connection(Arc::clone(&self.0.config))?;
+        let connection = enclave_os_common::tls_hybrid_kx::with_handshake_budget(
+            Some(self.pool()),
+            || accepted.into_connection(Arc::clone(&self.0.config)),
+        )?;
         Ok(RetainedConnection {
             connection,
             _retained: self,
@@ -311,6 +318,7 @@ impl ConfigReservation {
             .allocation
             .try_finish(Payload {
                 config,
+                pool: self.pool,
                 _certificates: certificates,
                 _key_spki: key_spki,
             })
@@ -318,6 +326,7 @@ impl ConfigReservation {
         #[cfg(not(feature = "fallible-allocation-v1"))]
         let retained = self.allocation.finish(Payload {
             config,
+            pool: self.pool,
             _certificates: certificates,
             _key_spki: key_spki,
         });
@@ -352,7 +361,10 @@ impl RetainedConnection {
         self.connection.write_tls(writer)
     }
     pub(crate) fn process_new_packets(&mut self) -> Result<rustls::IoState, rustls::Error> {
-        self.connection.process_new_packets()
+        enclave_os_common::tls_hybrid_kx::with_handshake_budget(
+            Some(self._retained.pool()),
+            || self.connection.process_new_packets(),
+        )
     }
     pub(crate) fn reader(&mut self) -> rustls::Reader<'_> {
         self.connection.reader()

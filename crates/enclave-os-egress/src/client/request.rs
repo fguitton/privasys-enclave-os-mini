@@ -522,21 +522,25 @@ fn start_connection(
                 "HTTPS TLS origin allocation refused",
             )
         })?;
-        let connection =
-            ClientConnection::new_with_allocator(config, server_name, allocator.owned_allocator())
-                .map_err(|error| {
-                    HttpsFetchError::new(
-                        HttpsFetchFailurePhase::TlsBeforeDispatch,
-                        format!("TLS init failed: {error}"),
-                    )
-                })?;
+        let connection = enclave_os_common::tls_hybrid_kx::with_handshake_budget(
+            Some(pool),
+            || ClientConnection::new_with_allocator(config, server_name, allocator.owned_allocator()),
+        )
+        .map_err(|error| {
+            HttpsFetchError::new(
+                HttpsFetchFailurePhase::TlsBeforeDispatch,
+                format!("TLS init failed: {error}"),
+            )
+        })?;
         allocator.activate_release_notification();
         Ok(connection)
     }
     #[cfg(not(all(feature = "fallible-allocation-v1", target_vendor = "teaclave")))]
     {
-        let _ = pool;
-        ClientConnection::new(config, server_name).map_err(|error| {
+        enclave_os_common::tls_hybrid_kx::with_handshake_budget(pool, || {
+            ClientConnection::new(config, server_name)
+        })
+        .map_err(|error| {
             HttpsFetchError::new(
                 HttpsFetchFailurePhase::TlsBeforeDispatch,
                 format!("TLS init failed: {error}"),
@@ -568,7 +572,7 @@ fn https_request_connected(
     tls_conn.set_buffer_limit(Some(
         (crate::attest::MAX_MESSAGE + 4096).max(TLS_OUTPUT_WINDOW),
     ));
-    tls_handshake(io, fd, &mut tls_conn).map_err(|error| {
+    tls_handshake(io, fd, &mut tls_conn, setup.pool).map_err(|error| {
         HttpsFetchError::new(
             HttpsFetchFailurePhase::TlsBeforeDispatch,
             format!("TLS handshake failed: {error}"),
@@ -636,7 +640,11 @@ fn https_request_connected(
                     match tls_conn.read_tls(&mut cursor) {
                         Ok(0) => break,
                         Ok(_) => {
-                            tls_conn.process_new_packets().map_err(|error| {
+                            enclave_os_common::tls_hybrid_kx::with_handshake_budget(
+                                setup.pool,
+                                || tls_conn.process_new_packets(),
+                            )
+                            .map_err(|error| {
                                 HttpsFetchError::after_dispatch(
                                     HttpsFetchFailurePhase::AmbiguousAfterDispatch,
                                     tls_peer,
@@ -831,6 +839,7 @@ fn tls_handshake(
     io: &mut dyn InterruptibleBlockingNetIo,
     fd: i32,
     tls_conn: &mut ClientConnection,
+    pool: Option<&Arc<enclave_os_common::allocation::AllocationPoolV1>>,
 ) -> Result<(), String> {
     loop {
         flush_tls(io, fd, tls_conn).map_err(|_| String::from("flush failed"))?;
@@ -845,9 +854,10 @@ fn tls_handshake(
                     match tls_conn.read_tls(&mut cursor) {
                         Ok(0) => break,
                         Ok(_) => {
-                            tls_conn
-                                .process_new_packets()
-                                .map_err(|error| error.to_string())?;
+                            enclave_os_common::tls_hybrid_kx::with_handshake_budget(pool, || {
+                                tls_conn.process_new_packets()
+                            })
+                            .map_err(|error| error.to_string())?;
                         }
                         Err(error) => return Err(format!("read_tls: {error}")),
                     }

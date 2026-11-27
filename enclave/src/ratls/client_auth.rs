@@ -178,17 +178,23 @@ mod tests {
         let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
             server_identity.key_pair.serialize_der(),
         ));
-        let (certificate_bytes, _) =
+        let (certificate_bytes, certificate_retained) =
             crate::ratls::session::retained_tls_config::ConfigReservation::factory_bytes(
                 &certificates,
                 &private_key,
             )
             .unwrap();
+        let config_bytes = RetainedTlsConfig::required_bytes(authentication).unwrap();
+        let handshake_peak = config_bytes
+            .checked_add(certificate_retained)
+            .unwrap()
+            .checked_add(enclave_os_common::tls_hybrid_kx::hybrid_kx_server_handshake_bytes())
+            .unwrap();
         let config_pool = enclave_os_common::allocation::AllocationPoolV1::new(
-            RetainedTlsConfig::required_bytes(authentication)
-                .unwrap()
+            config_bytes
                 .checked_add(certificate_bytes)
-                .unwrap(),
+                .unwrap()
+                .max(handshake_peak),
         )
         .unwrap();
         let server_config = RetainedTlsConfig::reserve(&config_pool, authentication)

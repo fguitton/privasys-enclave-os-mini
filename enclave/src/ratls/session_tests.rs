@@ -113,10 +113,15 @@ fn pair_with_all_pools(
         enclave_os_common::allocation::AllocationPoolV1::new(config_bytes - 1).unwrap();
     assert!(RetainedTlsConfig::reserve(&config_short, authentication).is_none());
     assert_eq!(config_short.used(), 0);
+    let config_peak = config_bytes.checked_add(certificate_peak_bytes).unwrap();
+    let handshake_peak = config_bytes
+        .checked_add(certificate_retained_bytes)
+        .unwrap()
+        .checked_add(enclave_os_common::tls_hybrid_kx::hybrid_kx_server_handshake_bytes())
+        .unwrap();
     let config_pool = enclave_os_common::allocation::AllocationPoolV1::new(
-        config_bytes
-            .checked_add(certificate_peak_bytes)
-            .unwrap()
+        config_peak
+            .max(handshake_peak)
             .checked_add(extra_config_bytes)
             .unwrap(),
     )
@@ -2070,25 +2075,44 @@ fn checked_retained_tls_config() {
         register(&store, "config-paid.test");
         let (mut client, mut session, cert_pool, config_pool, certificate_retained) =
             pair_with_all_pools(&store, "config-paid.test", extra);
-        assert_eq!(
-            config_pool.used(),
-            needed.checked_add(certificate_retained).unwrap()
-        );
+        let retained_used = needed.checked_add(certificate_retained).unwrap();
+        assert_eq!(config_pool.used(), retained_used);
+        // Live ingress hybrid handshake budget exhaustion at limit - 1 refuses
+        // cleanly with zero leaked credit, while exact headroom completes 0x11ec
+        // and releases back to the retained config baseline.
+        if extra == 0 {
+            let handshake_bytes =
+                enclave_os_common::tls_hybrid_kx::hybrid_kx_server_handshake_bytes();
+            let free = config_pool.capacity().checked_sub(retained_used).unwrap();
+            assert!(free >= handshake_bytes);
+            let blocker_bytes = free
+                .checked_sub(handshake_bytes - 1)
+                .unwrap();
+            let blocker = config_pool.reserve(blocker_bytes).unwrap();
+            let first_flight = flight(&mut client);
+            assert!(
+                session.feed_tls_bytes(&first_flight).is_err(),
+                "ingress handshake must refuse when connection pool is 1 byte short of hybrid_kx_server_handshake_bytes"
+            );
+            assert_eq!(
+                config_pool.used(),
+                retained_used.checked_add(blocker_bytes).unwrap()
+            );
+            drop(blocker);
+            drop(session);
+            assert_eq!(cert_pool.used(), 0);
+            assert_eq!(config_pool.used(), 0);
+            continue;
+        }
         // A real Session and a cached-style alias share one original payer.
         let alias = session.tls_conn.alias();
         handshake(&mut client, &mut session);
-        assert_eq!(
-            config_pool.used(),
-            needed.checked_add(certificate_retained).unwrap()
-        );
+        assert_eq!(config_pool.used(), retained_used);
         register(&store, "config-paid.test");
         assert!(session.feed_tls_bytes(&[]).is_err());
         drop(session);
         assert_eq!(cert_pool.used(), 0);
-        assert_eq!(
-            config_pool.used(),
-            needed.checked_add(certificate_retained).unwrap()
-        );
+        assert_eq!(config_pool.used(), retained_used);
         drop(alias);
         assert_eq!(config_pool.used(), 0);
     }

@@ -26,20 +26,30 @@
 //!   `core::alloc::Allocator` (e.g. [`crate::allocation::PoolMapAllocator`] or
 //!   Teaclave's owned loan allocator) through the active ML-KEM holder, public
 //!   share buffers, and zeroized shared-secret buffers.
+//! - Live `rustls` ingress and egress handshakes bind their connection
+//!   [`crate::allocation::AllocationPoolV1`] via [`with_handshake_budget`] so
+//!   [`X25519MLKEM768`] charges and releases [`hybrid_kx_client_start_bytes`],
+//!   [`hybrid_kx_client_complete_bytes`], and [`hybrid_kx_server_handshake_bytes`]
+//!   against the live connection budget before allocating or returning key-share
+//!   and shared-secret buffers.
 //! - Remaining global-heap scope: upstream `rustls::crypto::SupportedKxGroup`
 //!   and `ActiveKeyExchange` trait methods do not accept a `RetainedAllocator`
 //!   in `rustls 0.23.45`, and `ring::kx_group::X25519` allocates its classical
 //!   exchange state, share, and `SharedSecret` on the global heap. Within that
-//!   trait boundary, `ActiveX25519MlKem768` keeps its `1216 B` client share
-//!   inline (eliminating a separate heap `Vec`), `start_and_complete` uses
-//!   fallible `try_reserve_exact`, and secret buffers are zeroized on drop.
+//!   trait boundary, live handshakes are still admission-gated by the connection
+//!   pool, `ActiveX25519MlKem768` keeps its `1216 B` client share inline,
+//!   `start_and_complete` uses fallible `try_reserve_exact`, and secret buffers
+//!   are zeroized on drop.
 
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::alloc::Layout;
+use core::cell::RefCell;
 use core::num::NonZeroU32;
 use std::sync::Arc;
+
+use crate::allocation::{AllocationLeaseV1, AllocationPoolV1};
 
 #[cfg(feature = "fallible-allocation-v1")]
 use core::alloc::Allocator;
@@ -101,6 +111,63 @@ pub const fn hybrid_kx_layouts() -> HybridKxLayoutsV1 {
         server_share: Layout::new::<[u8; SERVER_SHARE_LEN]>(),
         shared_secret: Layout::new::<[u8; SHARED_SECRET_LEN]>(),
     }
+}
+
+/// Exact live connection-budget bytes charged by `X25519MLKEM768::start()` for
+/// the active client key-exchange holder (including `DecapsKey` and the inline
+/// `1216 B` client share) from `start()` until `complete()` or drop.
+#[must_use]
+pub const fn hybrid_kx_client_start_bytes() -> usize {
+    Layout::new::<ActiveX25519MlKem768>().size()
+}
+
+/// Exact live connection-budget bytes charged by `ActiveX25519MlKem768::complete()`
+/// for the `64 B` combined shared-secret copy.
+#[must_use]
+pub const fn hybrid_kx_client_complete_bytes() -> usize {
+    hybrid_kx_layouts().shared_secret.size()
+}
+
+/// Exact live connection-budget bytes charged by `X25519MLKEM768::start_and_complete()`
+/// on the server (`1120 B` server share + `64 B` combined shared-secret copy).
+#[must_use]
+pub const fn hybrid_kx_server_handshake_bytes() -> usize {
+    hybrid_kx_layouts().server_share.size() + hybrid_kx_layouts().shared_secret.size()
+}
+
+std::thread_local! {
+    static ACTIVE_HANDSHAKE_POOL: RefCell<Option<Arc<AllocationPoolV1>>> = const { RefCell::new(None) };
+}
+
+fn current_handshake_pool() -> Option<Arc<AllocationPoolV1>> {
+    ACTIVE_HANDSHAKE_POOL.with(|cell| cell.borrow().clone())
+}
+
+struct HandshakeBudgetGuard {
+    previous: Option<Arc<AllocationPoolV1>>,
+}
+
+impl Drop for HandshakeBudgetGuard {
+    fn drop(&mut self) {
+        ACTIVE_HANDSHAKE_POOL.with(|cell| {
+            *cell.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+/// Scope a live TLS handshake operation (`ClientConnection::new`,
+/// `ServerConnection::process_new_packets`, `Accepted::into_connection`, etc.)
+/// so `X25519MLKEM768` charges and releases its active holder, public shares,
+/// and shared-secret buffers against `pool`. Restores any outer binding on
+/// normal return or unwind.
+pub fn with_handshake_budget<T>(
+    pool: Option<&Arc<AllocationPoolV1>>,
+    f: impl FnOnce() -> T,
+) -> T {
+    let previous = ACTIVE_HANDSHAKE_POOL
+        .with(|cell| core::mem::replace(&mut *cell.borrow_mut(), pool.cloned()));
+    let _guard = HandshakeBudgetGuard { previous };
+    f()
 }
 
 /// Active ML-KEM-768 decapsulation-key holder paired with the classical X25519
@@ -286,20 +353,40 @@ struct X25519MlKem768Group;
 
 impl SupportedKxGroup for X25519MlKem768Group {
     fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, Error> {
+        let pool = current_handshake_pool();
+        let holder_lease = match pool.as_ref() {
+            Some(pool) => Some(
+                pool.reserve_unpublished(hybrid_kx_client_start_bytes())
+                    .ok_or_else(|| Error::General(String::new()))?,
+            ),
+            None => None,
+        };
         let classical = rustls_ring::kx_group::X25519.start()?;
         let mut rng = SystemRngAdapter::new();
-        let (ek, dk) = KG::try_keygen_with_rng(&mut rng).map_err(|_| Error::FailedToGetRandomBytes)?;
+        let (ek, dk) =
+            KG::try_keygen_with_rng(&mut rng).map_err(|_| Error::FailedToGetRandomBytes)?;
         let ek_bytes = ek.into_bytes();
         let mut combined_pub_key = [0u8; CLIENT_SHARE_LEN];
         combined_pub_key[..EK_LEN].copy_from_slice(&ek_bytes);
         combined_pub_key[EK_LEN..].copy_from_slice(classical.pub_key());
-        Ok(Box::new(ActiveX25519MlKem768 {
+        let active = ActiveX25519MlKem768 {
             payload: ActiveHybridPayload {
                 classical: Some(classical),
                 decaps_key: dk,
             },
             combined_pub_key,
-        }))
+            pool,
+            _holder_lease: holder_lease,
+        };
+        #[cfg(feature = "fallible-allocation-v1")]
+        {
+            let boxed = Box::try_new(active).map_err(|_| Error::General(String::new()))?;
+            Ok(boxed)
+        }
+        #[cfg(not(feature = "fallible-allocation-v1"))]
+        {
+            Ok(Box::new(active))
+        }
     }
 
     fn start_and_complete(&self, client_share: &[u8]) -> Result<CompletedKeyExchange, Error> {
@@ -309,6 +396,22 @@ impl SupportedKxGroup for X25519MlKem768Group {
         let (pq_share, classical_share) = client_share.split_at(EK_LEN);
         let ek_array: [u8; EK_LEN] = pq_share.try_into().map_err(|_| INVALID_KEY_SHARE)?;
         let ek = EncapsKey::try_from_bytes(ek_array).map_err(|_| INVALID_KEY_SHARE)?;
+
+        let pool = current_handshake_pool();
+        let _server_share_lease = match pool.as_ref() {
+            Some(pool) => Some(
+                pool.reserve_unpublished(hybrid_kx_layouts().server_share.size())
+                    .ok_or_else(|| Error::General(String::new()))?,
+            ),
+            None => None,
+        };
+        let _secret_lease = match pool.as_ref() {
+            Some(pool) => Some(
+                pool.reserve_unpublished(hybrid_kx_layouts().shared_secret.size())
+                    .ok_or_else(|| Error::General(String::new()))?,
+            ),
+            None => None,
+        };
 
         let classical = rustls_ring::kx_group::X25519.start_and_complete(classical_share)?;
         let mut rng = SystemRngAdapter::new();
@@ -347,6 +450,10 @@ impl SupportedKxGroup for X25519MlKem768Group {
 struct ActiveX25519MlKem768 {
     payload: ActiveHybridPayload,
     combined_pub_key: [u8; CLIENT_SHARE_LEN],
+    pool: Option<Arc<AllocationPoolV1>>,
+    // Field order is deliberate: `payload` (holding `DecapsKey` with
+    // `ZeroizeOnDrop`) drops before `_holder_lease` releases connection credit.
+    _holder_lease: Option<AllocationLeaseV1>,
 }
 
 impl ActiveKeyExchange for ActiveX25519MlKem768 {
@@ -357,6 +464,16 @@ impl ActiveKeyExchange for ActiveX25519MlKem768 {
         let (pq_share, classical_share) = peer_pub_key.split_at(CT_LEN);
         let ct_array: [u8; CT_LEN] = pq_share.try_into().map_err(|_| INVALID_KEY_SHARE)?;
         let ct = CipherText::try_from_bytes(ct_array).map_err(|_| INVALID_KEY_SHARE)?;
+
+        let scoped_pool = current_handshake_pool();
+        let budget_pool = self.pool.as_ref().or(scoped_pool.as_ref());
+        let _secret_lease = match budget_pool {
+            Some(pool) => Some(
+                pool.reserve_unpublished(hybrid_kx_client_complete_bytes())
+                    .ok_or_else(|| Error::General(String::new()))?,
+            ),
+            None => None,
+        };
 
         let classical = self
             .payload
@@ -940,5 +1057,75 @@ mod tests {
         assert_eq!(tight_short.used(), metadata);
         drop(tight_alloc);
         assert_eq!(tight_short.used(), 0);
+
+        // 5. Live SupportedKxGroup / ActiveKeyExchange connection-budget charging,
+        // exhaustion at limit - 1, early-drop release, classical fallback release,
+        // and completion release via `with_handshake_budget`.
+        let client_start = hybrid_kx_client_start_bytes();
+        let client_complete = hybrid_kx_client_complete_bytes();
+        let server_bytes = hybrid_kx_server_handshake_bytes();
+        assert_eq!(client_complete, SHARED_SECRET_LEN);
+        assert_eq!(server_bytes, SERVER_SHARE_LEN + SHARED_SECRET_LEN);
+
+        let short_start = AllocationPoolV1::new(client_start - 1).unwrap();
+        assert!(with_handshake_budget(Some(&short_start), || X25519MLKEM768.start()).is_err());
+        assert_eq!(short_start.used(), 0);
+
+        let exact_start = AllocationPoolV1::new(client_start).unwrap();
+        let active_drop =
+            with_handshake_budget(Some(&exact_start), || X25519MLKEM768.start()).unwrap();
+        assert_eq!(exact_start.used(), client_start);
+        drop(active_drop);
+        assert_eq!(exact_start.used(), 0);
+
+        let active_short_complete =
+            with_handshake_budget(Some(&exact_start), || X25519MLKEM768.start()).unwrap();
+        assert_eq!(exact_start.used(), client_start);
+        let short_server = AllocationPoolV1::new(server_bytes - 1).unwrap();
+        assert!(with_handshake_budget(Some(&short_server), || {
+            X25519MLKEM768.start_and_complete(active_short_complete.pub_key())
+        })
+        .is_err());
+        assert_eq!(short_server.used(), 0);
+
+        let exact_server = AllocationPoolV1::new(server_bytes).unwrap();
+        let server_done = with_handshake_budget(Some(&exact_server), || {
+            X25519MLKEM768.start_and_complete(active_short_complete.pub_key())
+        })
+        .unwrap();
+        assert_eq!(exact_server.used(), 0);
+        // Client pool only has `client_start`, so `complete()` cannot reserve `64 B`.
+        assert!(active_short_complete.complete(&server_done.pub_key).is_err());
+        assert_eq!(exact_start.used(), 0);
+
+        let full_client = AllocationPoolV1::new(client_start + client_complete).unwrap();
+        let active_ok =
+            with_handshake_budget(Some(&full_client), || X25519MLKEM768.start()).unwrap();
+        assert_eq!(full_client.used(), client_start);
+        let server_ok = with_handshake_budget(Some(&exact_server), || {
+            X25519MLKEM768.start_and_complete(active_ok.pub_key())
+        })
+        .unwrap();
+        assert_eq!(exact_server.used(), 0);
+        let client_ok = active_ok.complete(&server_ok.pub_key).unwrap();
+        assert_eq!(client_ok.secret_bytes(), server_ok.secret.secret_bytes());
+        assert_eq!(full_client.used(), 0);
+
+        // Classical hybrid-component completion also releases the active holder credit.
+        let active_classical =
+            with_handshake_budget(Some(&exact_start), || X25519MLKEM768.start()).unwrap();
+        assert_eq!(exact_start.used(), client_start);
+        let (_, classical_pk) = active_classical.hybrid_component().unwrap();
+        let classical_srv = rustls_ring::kx_group::X25519
+            .start_and_complete(classical_pk)
+            .unwrap();
+        let classical_cli = active_classical
+            .complete_hybrid_component(&classical_srv.pub_key)
+            .unwrap();
+        assert_eq!(
+            classical_cli.secret_bytes(),
+            classical_srv.secret.secret_bytes()
+        );
+        assert_eq!(exact_start.used(), 0);
     }
 }
